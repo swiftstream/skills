@@ -1,4 +1,16 @@
 {
   "schemaVersion": 2,
-  "sources": []
+  "sources": [
+    {
+      "sourceId": "swifql-swifql",
+      "repository": "SwifQL/SwifQL",
+      "repositoryId": 161410190,
+      "ref": "refs/heads/master",
+      "skillsRoot": ".agent/skills",
+      "skillPrefixes": [
+        "swifql"
+      ],
+      "description": "A strongly typed, declarative, composable Swift SQL-building library."
+    }
+  ]
 }
