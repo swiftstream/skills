@@ -1541,6 +1541,7 @@ trust revocation + cleanup effective atomically
 
 The concise user-facing procedures live in:
 
+- [`HOW-TO-PREPARE-SOURCE.md`](HOW-TO-PREPARE-SOURCE.md)
 - [`HOW-TO-ADD.md`](HOW-TO-ADD.md)
 - [`HOW-TO-UPDATE.md`](HOW-TO-UPDATE.md)
 - [`HOT-TO-REMOVE.md`](HOT-TO-REMOVE.md)

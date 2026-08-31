@@ -5,6 +5,7 @@ This repository is the public federation/distribution collection for Agent Skill
 ## Canonical mechanics
 
 - `docs/MECHANICS.md` is the canonical human-readable specification for repository mechanics, trust boundaries, federation state transitions, naming/prefix ownership, interactive PR behavior, publication, failure handling, and generated catalog behavior.
+- `docs/HOW-TO-PREPARE-SOURCE.md` is the canonical agent-facing operational guide for source-repository skill package structure, legacy-skill migration, PUBLIC-vs-LOCAL classification, and pre-C03 notifier readiness. Source-migration agents should read it instead of inferring package layout from `scripts/federate.py`.
 - Implementation, workflows, schemas, and other documentation must not silently contradict `docs/MECHANICS.md`.
 - Intentional mechanics changes must update `docs/MECHANICS.md` and all affected user guides/README behavior before the new mechanics are treated as accepted.
 

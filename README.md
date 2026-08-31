@@ -20,6 +20,7 @@ The complete federation, trust, publication, naming, failure, and automation mod
 
 ## Publish your repository
 
+- **[Prepare a source repository](docs/HOW-TO-PREPARE-SOURCE.md)** — migrate legacy skill files into canonical `<skill-name>/SKILL.md` packages, classify public versus local skills, and prepare safely for the source notifier without guessing C03-only values.
 - **[Add a repository](docs/HOW-TO-ADD.md)** — register a new source, choose its skills root and public namespace prefixes, then let federation discover its skills automatically.
 - **[Update a registered repository](docs/HOW-TO-UPDATE.md)** — change its description, branch, skills root, prefixes, or verified GitHub location.
 - **[Remove a repository](docs/HOT-TO-REMOVE.md)** — revoke source trust and automatically remove its generated skills from the collection.

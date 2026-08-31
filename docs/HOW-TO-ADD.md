@@ -4,6 +4,8 @@ Use this flow when your repository is not yet registered in `swiftstream/skills`
 
 For the full trust, validation, naming, automation, and publication model, see [MECHANICS.md](MECHANICS.md).
 
+Before opening the registration request, use [HOW-TO-PREPARE-SOURCE.md](HOW-TO-PREPARE-SOURCE.md) to migrate legacy flat skill files into canonical `<skill-name>/SKILL.md` packages, classify PUBLIC versus LOCAL skills, repair source routing references, and avoid inventing notifier values that belong to the later C03 contract.
+
 ## What you are requesting
 
 Adding a repository is a trust/configuration operation.
