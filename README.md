@@ -1,27 +1,61 @@
+<p align="center">
+    <a href="LICENSE">
+        <img src="https://img.shields.io/badge/license-MIT-brightgreen.svg" alt="MIT License">
+    </a>
+    <a href="https://agentskills.io">
+        <img src="https://img.shields.io/badge/Agent%20Skills-open%20format-brightgreen.svg" alt="Agent Skills">
+    </a>
+    <a href="https://discord.gg/q5wCPYv">
+        <img src="https://img.shields.io/discord/612561840765141005" alt="Swift.Stream">
+    </a>
+</p>
+
+<br>
+
 # Swift Stream Skills
 
-Swift Stream Skills is a curated public collection of Agent Skills for Swift Stream ecosystem packages.
+Swift Stream Skills is a curated public collection of source-owned Agent Skills. Skills stay maintained in their original repositories while this repository provides one trusted place for discovery, validation, provenance, and installation.
 
-The semantic source for each skill remains in its owning product repository. This repository federates accepted source packages for public discovery and installation without duplicating their authoring authority.
+The complete federation, trust, publication, naming, failure, and automation model is documented in **[Repository Mechanics](docs/MECHANICS.md)**.
 
-The packages follow the open Agent Skills format. GitHub CLI's `gh skill` commands are currently a preview capability and are one supported installation route, not the semantic authority for the skill format.
+## Publish your repository
 
-## Install
+- **[Add a repository](docs/HOW-TO-ADD.md)** — register a new source, choose its skills root and public namespace prefixes, then let federation discover its skills automatically.
+- **[Update a registered repository](docs/HOW-TO-UPDATE.md)** — change its description, branch, skills root, prefixes, or verified GitHub location.
+- **[Remove a repository](docs/HOT-TO-REMOVE.md)** — revoke source trust and automatically remove its generated skills from the collection.
 
-Browse available skills interactively with:
+Ordinary skill additions, edits, and removals do not require a registry PR. Once a source is registered, its current prefix-matching skills are discovered from the accepted source tree and published through validated automation.
+
+## Installation
+
+Browse the collection with GitHub CLI's Agent Skills support:
 
 ```text
 gh skill install swiftstream/skills
 ```
 
-Install a specific skill with:
+Install a specific skill by name:
 
 ```text
-gh skill install swiftstream/skills swifql-query-building
+gh skill install swiftstream/skills <skill-name>
 ```
 
-## Bootstrap status
+`gh skill` is a preview installation route. It is not the semantic authority for the Agent Skills format or for this repository's federation mechanics.
 
-This repository is currently in its empty federation bootstrap state. Public skills are not seeded until the subsequent federation seed task is completed and published, so the specific-skill example above describes the intended post-seed flow rather than claiming that the skill is already available from this repository.
+## Skill Store
 
-Once skills are seeded, use your Agent Skills-compatible client or CLI discovery to see the current collection rather than relying on a hand-maintained catalog in this README.
+The catalog below is generated from accepted `federation.json` source metadata and the validated metadata of currently published skill packages. Do not edit the generated section by hand.
+
+<!-- BEGIN FEDERATED SKILLS CATALOG -->
+
+_No repositories have published skills through the federation yet._
+
+<!-- END FEDERATED SKILLS CATALOG -->
+
+## How it works
+
+Source repositories own their skill content. `federation.json` owns central trust/configuration. Generated `skills/**`, `federation.lock.json`, and the Skill Store catalog record the accepted publication state.
+
+Normal source content changes can publish automatically after validation. Adding, reconfiguring, relocating, or removing a trusted source always requires an explicit manual federation-registry merge.
+
+See **[Repository Mechanics](docs/MECHANICS.md)** for the complete state machines and security boundaries.
