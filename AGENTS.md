@@ -5,7 +5,7 @@ This repository is the public federation/distribution collection for Agent Skill
 ## Canonical mechanics
 
 - `docs/MECHANICS.md` is the canonical human-readable specification for repository mechanics, trust boundaries, federation state transitions, naming/prefix ownership, interactive PR behavior, publication, failure handling, and generated catalog behavior.
-- `docs/HOW-TO-PREPARE-SOURCE.md` is the canonical agent-facing operational guide for source-repository skill package structure, legacy-skill migration, PUBLIC-vs-LOCAL classification, and pre-C03 notifier readiness. Source-migration agents should read it instead of inferring package layout from `scripts/federate.py`.
+- `docs/HOW-TO-PREPARE-SOURCE.md` is the canonical agent-facing operational guide for source-repository skill package structure and legacy-skill migration. Source-migration agents should read it instead of inferring package layout from `scripts/federate.py`.
 - Implementation, workflows, schemas, and other documentation must not silently contradict `docs/MECHANICS.md`.
 - Intentional mechanics changes must update `docs/MECHANICS.md` and all affected user guides/README behavior before the new mechanics are treated as accepted.
 
@@ -26,8 +26,8 @@ This repository is the public federation/distribution collection for Agent Skill
 - Ordinary generated skill/lock/catalog publication from an already trusted and unchanged source configuration may auto-merge only after all required checks and global single-writer finalization against current central `main` pass.
 - Failed machine-generated federation PRs must receive an actionable bot comment and close automatically rather than remaining as stale red PRs.
 - Invalid intermediate proposals in interactive manual add/update PRs remain open for correction; the last valid file proposal remains authoritative.
-- Automatic notifications from repositories absent from accepted `federation.json` are ignored and cannot onboard a source.
-- There is no scheduled/cron reconciliation. Recovery is through a later source push or an explicit manual reconciliation request.
+- Scheduled/manual reconciliation operates only on repositories accepted in central `federation.json`; an unknown targeted repository ID is a bounded NOOP and cannot onboard a source.
+- Central scheduled polling runs about every 15 minutes, with manual all-source or targeted reconciliation available. Recovery is current-state polling, not a source notifier or event queue.
 
 ## Validation and execution safety
 

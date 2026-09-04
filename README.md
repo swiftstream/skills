@@ -20,12 +20,12 @@ The complete federation, trust, publication, naming, failure, and automation mod
 
 ## Publish your repository
 
-- **[Prepare a source repository](docs/HOW-TO-PREPARE-SOURCE.md)** — migrate legacy skill files into canonical `<skill-name>/SKILL.md` packages, classify public versus local skills, and prepare safely for the source notifier without guessing C03-only values.
+- **[Prepare a source repository](docs/HOW-TO-PREPARE-SOURCE.md)** — migrate legacy skill files into canonical `<skill-name>/SKILL.md` packages and classify public versus local skills; a source repository needs no federation notifier workflow, federation secret, OIDC setup, wake URL, signing key, or central credential.
 - **[Add a repository](docs/HOW-TO-ADD.md)** — register a new source, choose its skills root and public namespace prefixes, then let federation discover its skills automatically.
 - **[Update a registered repository](docs/HOW-TO-UPDATE.md)** — change its description, branch, skills root, prefixes, or verified GitHub location.
 - **[Remove a repository](docs/HOT-TO-REMOVE.md)** — revoke source trust and automatically remove its generated skills from the collection.
 
-Ordinary skill additions, edits, and removals do not require a registry PR. Once a source is registered, its current prefix-matching skills are discovered from the accepted source tree and published through validated automation.
+Ordinary skill additions, edits, and removals do not require a registry PR. Once a source is registered, its current prefix-matching skills are discovered from the accepted source tree and published through validated automation. After a source is accepted in central `federation.json`, central scheduled polling (about every 15 minutes) reconciles its current source state and publication. A maintainer can manually dispatch reconciliation sooner; a normal source change may otherwise take until the next successful poll to appear centrally.
 
 ## Installation
 

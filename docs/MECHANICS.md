@@ -444,170 +444,47 @@ Conceptually:
 
 The exact lock schema remains versioned and deterministic.
 
-## 8. Source push notification flow
+## 8. Central polling and authoritative reconciliation
 
-Once a source is registered, pushes to its canonical branch can wake central reconciliation.
+Central polls accepted sources approximately every 15 minutes and also supports manual all-source or targeted reconciliation. Source repositories do not run a federation workflow and do not receive federation credentials.
 
-The canonical source-side integration is a small GitHub Actions notifier workflow. It does **not** receive a central repository write token or a long-lived cross-repository dispatch credential.
+The scheduled/manual workflow reads exact current accepted `federation.json` authority from central `main`, orders sources deterministically, and invokes the existing one-source reconciliation operation. It never treats workflow inputs, source bytes, or source metadata as trust authority. A missing or moved source during a sweep is bounded stale/current-state behavior; it cannot onboard a source. An empty registry is a clean NOOP and an unknown targeted repository ID is a bounded NOOP.
 
-The notifier uses:
+Central independently derives the accepted source ID, immutable repository ID, canonical locator/ref, skills root, and owned prefixes. Source and PR bytes remain data. `scripts/federate.py` is the sole semantic federation engine.
 
-```text
-contents: read
-id-token: write
-```
+Polling is current-state and idempotent rather than an event queue. The controller may reconcile each accepted source once in deterministic order and emits at most one finalizer wake for changed work in an all-source sweep. A targeted manual run preserves the one-source operation and its existing finalizer wake behavior.
 
-and performs two tasks:
+## 9. Global publication serialization
 
-1. optionally determine whether the final `skillsRoot` tree changed between the push-before and push-after states;
-2. when reconciliation should be requested, obtain a short-lived GitHub Actions OIDC identity token for the fixed federation audience and send it to the narrow Swift Stream federation wake endpoint.
+Generated `federation.lock.json`, `skills/**`, and the README catalog are global shared state. All central state-mutating federation transitions therefore use one serialized finalizer:
 
-The wake endpoint is an authentication/dispatch relay only. It is not a source of federation configuration or publication authority.
+1. reconciliation computes deterministic machine work from current accepted authority;
+2. a machine publication PR is validated against the exact current accepted base and generated scope;
+3. the finalizer re-reads current main, PR head/base, source identity, App identity, and singular App-owned `federation/trusted-validation` evidence;
+4. trusted candidate validation is confirmed again before the finalizer publishes green;
+5. only the exact current head SHA is eligible for expected-head merge;
+6. a main/head/base/source/App/check race makes the candidate stale and prevents merge.
 
-It must validate the GitHub-issued OIDC token, including at minimum:
+Manual ADD/UPDATE/REMOVE trust/configuration PRs remain human-merge decisions. Their exact current base and deterministic consequences must be revalidated before a maintainer merges them.
 
-```text
-issuer
-audience
-expiry/not-before
-repository_id
-repository/ref identity
-event_name == push
-```
+## 10. Unknown and empty reconciliation inputs
 
-and should bind/restrict the accepted notifier workflow identity (`workflow_ref`/equivalent claim) and reject replay where practical using token/run identity.
+An unknown targeted repository ID, an empty accepted registry, or a source that disappears during a poll produces bounded NOOP/current-state behavior. These paths must not alter `federation.json`, reserve prefixes, create onboarding trust, or create generated packages by themselves.
 
-The endpoint derives the registered source from the verified immutable `repository_id`; it does not trust a caller-supplied `sourceId`, repository name, ref, skills root, prefix, or package path.
+## 11. Scheduled/manual recovery
 
-The verified `ref` must equal the accepted canonical source ref in `federation.json`. A push from another branch does not wake publication for that source.
+The scheduled poll is the normal recovery path for source changes. A source change may take until the next successful poll to appear centrally. A maintainer can manually dispatch reconciliation sooner for all accepted sources or one accepted repository ID.
 
-If the verified repository ID is not registered, the endpoint/central dispatcher performs the unknown-source no-op described below.
+## 12. Current-state publication, not event history
 
-### 8.1 Source-side tree-change optimization
-
-The source Action may perform a cheap before/after skill-tree comparison to avoid unnecessary wake requests.
-
-The optimization compares final tree state, not whether any intermediate commit happened to touch a skill.
-
-For example, if 100 commits were pushed and a skill changed in commit 20 but was restored to its original final state by commit 99, there is no publication change to report.
-
-Conceptually:
-
-```text
-skillsRoot tree @ push-before
-vs
-skillsRoot tree @ push-after
-```
-
-If they are equal, the notifier may stop.
-
-If they differ, or the notifier cannot establish a safe comparison because of force-push/missing-before history or another ambiguity, it must request central reconciliation rather than suppressing it.
-
-The source-side comparison is an optimization, never a security authority. Central independently recomputes current accepted state.
-
-### 8.2 Notifier enrollment
-
-After a new source is manually accepted, the onboarding bot provides the standard notifier workflow snippet configured for that source's accepted canonical branch and skills root.
-
-Installing that workflow enables automatic push-driven refreshes without granting the source repository central write authority.
-
-The initial post-onboarding federation does not depend on this notification path; central triggers the first reconciliation directly after the manual onboarding merge.
-
-If a source owner has not yet installed the notifier, the source remains registered and can still be reconciled manually, but later source pushes cannot be expected to wake central automatically until the notifier is present.
-
-## 9. Unknown source notifications
-
-An automatic notification from a repository that is not already registered in `federation.json` is ignored.
-
-It must not:
-
-- create an onboarding PR;
-- reserve a prefix;
-- alter `federation.json`;
-- create generated packages;
-- produce an automatic trust decision.
-
-New source trust can enter the system only through the manual onboarding flow described below.
-
-## 10. Central reconciliation is authoritative
-
-A source notification is only a wake-up signal.
-
-The central workflow independently reads accepted `federation.json` and derives:
-
-- trusted source identity;
-- expected repository ID;
-- current canonical repository locator;
-- canonical branch;
-- skills root;
-- owned prefixes.
-
-Central then independently fetches and validates the canonical source state.
-
-A notification must not be able to override repository, ref, root, prefix ownership, previous declaration identity, or package paths.
-
-## 11. No scheduled reconciliation
-
-There is deliberately no daily/cron reconciliation.
-
-The system accepts eventual recovery through either:
-
-- the next canonical source push; or
-- an explicit manual reconciliation request.
-
-If a notification is lost and no later push ever occurs, the central copy may remain on the last successfully published source state until someone manually requests reconciliation. This trade-off is intentional.
-
-## 12. Pushes are wake-ups, not a publication queue
-
-One source push does not imply one central publication.
-
-If central currently publishes source commit `C1` and the source rapidly advances through:
-
-```text
-C2
-C3
-C4
-C5
-```
-
-central only needs to reconcile:
-
-```text
-last successfully merged central state
-vs
-current canonical source state
-```
-
-It does not need to publish C2, C3, and C4 individually.
-
-Per-source concurrency should collapse superseded computation for the same source. A later run may cancel or replace an earlier in-progress reconciliation for that source.
-
-If a generated PR already exists, the latest reconciliation may update that same bot branch/PR to the newest source state. Checks must then run against the new candidate state.
-
-Per-source concurrency alone is **not** sufficient for publication because `federation.lock.json` and the generated README catalog are global shared state and two different sources may change them concurrently.
-
-All central state-mutating federation transitions therefore use a **global single-writer finalization rule**:
-
-1. source-specific discovery/validation may run concurrently;
-2. before a machine publication PR can merge, its finalizer acquires the global federation publication lease/serialization gate;
-3. it refreshes from the latest accepted default-branch state;
-4. it reruns the relevant reconciliation and regenerates every shared output against that latest base;
-5. it updates the PR head to that exact final candidate and reruns required checks;
-6. only that current head may merge while the global finalization gate is held/equivalently serialized;
-7. if the default branch changes before merge, the candidate becomes stale and must be finalized again rather than merging a snapshot computed from an older base.
-
-The implementation mechanism may be a dedicated serialized finalizer, merge queue, or another audited equivalent, but the observable invariant is one accepted writer at a time for shared generated federation state.
-
-Manual trust/configuration PRs that include atomic generated consequences are also subject to an up-to-date-base check: a base change invalidates their generated proposal until the bot revalidates/regenerates it.
-
-If an obsolete notification arrives after the latest state has already merged, reconciliation evaluates to a no-op.
+If a source advances through several commits between polls, central compares the last successfully published state with the source's current accepted state and publishes only the current deterministic result. It does not need to publish each intermediate commit. Global finalization still serializes shared generated outputs and retries from a fresh current base after races.
 
 ## 13. Automatic federation PR lifecycle
 
-For an already registered source with a real publication change:
+For an already registered source with a real publication change discovered by polling:
 
 ```text
-source push
+scheduled/manual central poll
   -> central reconciliation
   -> generated federation PR
   -> independent PR validation
@@ -635,7 +512,7 @@ If validation fails:
 
 Failed machine-generated federation PRs must not accumulate as stale red PRs.
 
-The source repository is fixed at the source. A later source push naturally retries reconciliation from the last successfully published central state.
+The source repository is fixed at the source. A later polling run retries reconciliation from the last successfully published central state.
 
 ### NOOP
 
@@ -967,7 +844,7 @@ A registered source may be rechecked manually without changing federation config
 
 A dedicated technical PR/request contains its repository URL.
 
-The bot resolves it to an already registered source and runs the same reconciliation used for source push notifications.
+The bot resolves it to an already registered source and runs the same reconciliation used by central polling.
 
 Outcomes:
 
@@ -1004,7 +881,7 @@ After the manual merge, no separate cleanup PR is required for correctness: trus
 
 A post-merge reconciliation may verify the resulting central state, but it must not be required to revoke publication authority.
 
-Future automatic push notifications from the removed source are ignored because it is no longer registered.
+After removal, scheduled polling no longer enumerates the source from accepted `federation.json`. A later targeted reconcile using that removed/unknown repository ID is a bounded NOOP and cannot restore trust or onboard the source.
 
 ## 21. Manual trust/configuration PR behavior summary
 
@@ -1284,9 +1161,7 @@ A later GitHub description change does not silently rewrite central catalog word
 
 Source repositories must not receive a broad credential that can directly write arbitrary central repository content.
 
-A source notifier should have only the minimum capability needed to wake central reconciliation.
-
-Central automation owns generated central branches/PRs and uses its own narrowly scoped GitHub App or equivalent accepted automation identity.
+Central automation owns generated central branches/PRs and uses its own narrowly scoped GitHub App or equivalent accepted automation identity. Source repositories require no federation credential.
 
 The central PR validation workflow must independently verify generated state before auto-merge.
 
@@ -1331,7 +1206,7 @@ real gh skill publish: forbidden
 
 Validation may use `gh skill publish --dry-run` or equivalent non-publishing compatibility checks only.
 
-The zero-tag/zero-release invariant is part of the canonical mechanics, not merely repository-local governance. Central automation that detects a tag/release or cannot establish the required channel state must fail closed rather than continue publication under an ambiguous client-resolution model.
+Wave-1 zero-tags/zero-releases/no-real-publish is a trusted maintainer/operator policy. C03 runtime federation automation does not enumerate remote tags/releases merely to police the administrator; C03 runtime federation automation does not perform a channel-readiness/anti-admin gate. Maintainers must not create or use those publication channels until a later separately researched and audited release policy explicitly replaces this Wave-1 rule.
 
 ## 31. Fail-closed remote/source behavior
 
@@ -1370,9 +1245,9 @@ current accepted source configuration + current canonical source tree
 
 Intermediate source commits need not appear centrally.
 
-A missed event can be recovered by the next source push or manual reconciliation.
+A source change can be recovered by the next successful approximately 15-minute poll or manual reconciliation.
 
-No cron is required.
+Scheduled polling is the normal recovery path; manual dispatch remains available for immediate work.
 
 ## 34. Source additions, updates, removals, and content publication are different operations
 
@@ -1421,19 +1296,20 @@ registered source changes public skills
 
 ## 35. State-machine summary
 
-### 35.1 Automatic source push
+### 35.1 Scheduled/manual polling
 
 ```text
-SOURCE PUSH
+CENTRAL POLL
     |
     v
-is source registered?
+is each source accepted?
    / \
  NO   YES
  |     |
-ignore |
+empty registry -> bounded NOOP
+       |
        v
-   reconcile current canonical state
+   reconcile each current accepted source
        |
        v
    publication changed?
@@ -1609,3 +1485,13 @@ When mechanics intentionally change:
 3. update schema/scripts/workflows/tests;
 4. independently validate the changed trust and failure boundaries;
 5. only then treat the new behavior as accepted repository mechanics.
+
+### 37.4 C03 simplified closure
+
+C03 uses central scheduled/manual polling and the C02-backed
+`scripts/federate.py` engine. Source repositories require no notifier,
+credential, OIDC relay, signing key, proof, or remote readiness ceremony.
+Manual trust/configuration PRs remain human decisions; machine publication is
+eligible only through exact current-state/App/check/CAS validation and one
+serialized finalizer. Wave 1 remains a default-branch HEAD policy with no
+tags, releases, or real `gh skill publish` execution.

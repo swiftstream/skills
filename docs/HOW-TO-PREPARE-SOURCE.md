@@ -379,73 +379,23 @@ Do not leave an index pointing at deleted flat files.
 
 If PUBLIC and LOCAL skills coexist, the index may route both; federation publication status and source-repository routing are different concerns.
 
-## 10. Source notifier: what can be prepared before C03
+## 10. Federation readiness and polling
 
-The accepted security model for a future source notifier is already fixed at the mechanics level:
+Source preparation is complete when the package layout and PUBLIC-versus-LOCAL
+classification are correct. Accepted source repositories require no federation
+workflow, notifier, secret, OIDC setup, wake URL, signing key, or central
+credential.
 
-```text
-source canonical-branch push
--> source GitHub Action
--> short-lived GitHub Actions OIDC identity
--> narrow Swift Stream Skills wake endpoint
--> central independently reads accepted federation.json
--> central reconciliation
-```
+After a maintainer accepts the source in central `federation.json`,
+`swiftstream/skills` discovers current source state through scheduled polling
+about every 15 minutes. A maintainer may manually reconcile all accepted
+sources or target one accepted repository ID. A source change may therefore
+take until the next successful poll to appear centrally.
 
-The source repository must **not** receive a broad central write token, central PAT, or long-lived cross-repository secret.
-
-The notifier workflow's eventual minimum permissions are:
-
-```yaml
-permissions:
-  contents: read
-  id-token: write
-```
-
-The notifier is wake-only. It must not be publication authority and must not be allowed to override accepted central values such as:
-
-```text
-sourceId
-repositoryId
-repository locator
-canonical ref
-skillsRoot
-skillPrefixes
-package paths
-```
-
-Central derives authority from accepted `federation.json` plus verified OIDC claims.
-
-The workflow should run for pushes to the accepted canonical branch. There is no cron/scheduled reconciliation requirement.
-
-A source-side before/after skills-root tree comparison may suppress an obviously unchanged wake, but ambiguity such as force-push or unavailable before-history must wake central rather than guessing NOOP.
-
-### Important pre-C03 rule
-
-At the current C02 checkpoint, central does **not** yet contain the live wake endpoint, fixed OIDC audience, or canonical source notifier workflow implementation.
-
-Therefore, before C03 establishes those exact values:
-
-- do not invent a wake URL;
-- do not invent an OIDC audience;
-- do not invent a request body/protocol;
-- do not add a central PAT/secret as a workaround;
-- do not commit a guessed `.github/workflows/...` notifier and call it production-ready.
-
-The correct pre-C03 source-repository state is:
-
-```text
-skills/packages fully migrated and ready
-canonical branch known
-skillsRoot known
-intended public prefix(es) known
-notifier security requirements understood
-live notifier waits for the canonical C03 template/contract
-```
-
-If an agent is asked to "prepare the GitHub Action" before C03, it may prepare a clearly non-live draft under ignored `.artifacts/**` or produce a readiness report, but it must **not** place speculative endpoint/audience semantics into committed `.github/**`.
-
-Once central commits the canonical notifier template/contract, source agents must copy/adapt that exact template rather than re-designing the OIDC protocol independently.
+Central reads accepted configuration as authority and uses
+`scripts/federate.py` as the sole semantic federation engine. Source and PR
+bytes are data; privileged central automation executes trusted central code
+only. No source-side setup is needed for this polling path.
 
 ## 11. Do not mutate central registration from the source-migration task
 
@@ -480,7 +430,7 @@ A source-migration agent should not declare completion until it can answer all o
 [ ] Source SKILL_INDEX/AGENTS/routing references point at */SKILL.md.
 [ ] Relative links were repaired after directory-depth migration.
 [ ] No source task guessed or mutated central sourceId/repositoryId/registry state.
-[ ] No speculative live notifier endpoint/audience/secret was invented before C03.
+[ ] No source-side federation workflow or credential was added; central polling is the refresh mechanism.
 [ ] Existing unrelated source worktree changes were preserved.
 [ ] Git staging/commit/push occurred only when separately authorized.
 ```

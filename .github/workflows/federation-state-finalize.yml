@@ -1,0 +1,59 @@
+name: Federation state finalizer
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        required: false
+        type: number
+      expected_source_id:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swiftstream-skills-federation-state-finalizer
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - id: trusted-checkout
+        name: Bind trusted checkout to HEAD
+        run: |
+          trusted_head="$(git rev-parse --verify HEAD^{commit})"
+          if [[ ! "$trusted_head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "trusted checkout HEAD is not a lowercase commit SHA" >&2
+            exit 1
+          fi
+          echo "sha=$trusted_head" >> "$GITHUB_OUTPUT"
+      - id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-actions: write
+          permission-checks: write
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Run trusted finalizer controller
+        env:
+          FEDERATION_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          FEDERATION_APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          FEDERATION_EVENT_PATH: $GITHUB_EVENT_PATH
+          FEDERATION_WAKE_PULL_NUMBER: ${{ inputs.pull_number }}
+          FEDERATION_WORK_LIMIT: "8"
+          FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ steps.trusted-checkout.outputs.sha }}
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m automation.federation.controller state-finalize
