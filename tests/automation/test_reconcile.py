@@ -95,7 +95,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_unknown_repository_id_is_noop_without_mutation(self):
         client = ReconcileClient()
-        client.main = "c1b45baa1ee531d1c309b80200aec0dae21ad697"
+        client.main = c02.head_commit_oid()
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U", "app[bot]"))
         controller._accepted_sources = lambda _main=None: ()
         result = controller.reconcile("99")
@@ -246,7 +246,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_trusted_manifest_read_is_capsule_bound_and_parent_environment_restored(self):
         client = ReconcileClient()
-        client.main = "c1b45baa1ee531d1c309b80200aec0dae21ad697"
+        client.main = c02.head_commit_oid()
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U", "app[bot]"))
         original = dict(os.environ)
         hostile = {"PATH": "/attacker", "GIT_DIR": "/attacker/repo", "HOME": "/attacker/home", "TMPDIR": "/attacker/tmp", "HTTPS_PROXY": "http://attacker.invalid", "FEDERATION_GITHUB_TOKEN": "secret"}
