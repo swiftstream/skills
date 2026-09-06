@@ -736,9 +736,9 @@ This repository is now allowed to publish through this federation configuration.
 
 The onboarding PR should primarily accept the trust/configuration entry in `federation.json`; it does not need to mix that human trust decision with generated package publication.
 
-Immediately after the manual onboarding merge, central automatically runs the source's first reconciliation.
+After the manual onboarding merge, the source is accepted and eligible for central reconciliation. Scheduled polling is the normal automatic trigger and may take until the next successful approximately 15-minute poll. A maintainer may manually dispatch all-source or targeted reconciliation sooner when immediate work is desired.
 
-That reconciliation generates the normal publication transition:
+When reconciliation actually runs, it begins the normal generated publication transition:
 
 ```text
 skills/**
@@ -1260,7 +1260,9 @@ human proposes trust
 -> interactive validation
 -> federation.json diff
 -> manual merge
--> automatic first reconciliation
+-> source becomes eligible for central reconciliation
+-> next scheduled poll or maintainer manual reconcile
+-> generated publication PR when publication changes
 ```
 
 ### Update source configuration
@@ -1351,7 +1353,10 @@ bot prints complete proposal + hint    |
 manual maintainer merge only
         |
         v
-central triggers first reconciliation
+source accepted for reconciliation
+        |
+        v
+scheduled poll or maintainer manual reconcile
         |
         v
 generated publication PR

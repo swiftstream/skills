@@ -119,6 +119,25 @@ class PollingTests(unittest.TestCase):
         self.assertIn("c03 runtime federation automation does not enumerate remote tags/releases", mechanics)
         self.assertIn("does not perform a channel-readiness/anti-admin gate", mechanics)
 
+    def test_mechanics_first_onboarding_reconcile_trigger_matches_scheduled_manual_runtime(self):
+        mechanics = re.sub(r"\s+", " ", (ROOT / "docs/MECHANICS.md").read_text(encoding="utf-8")).lower()
+
+        for stale_claim in (
+            "immediately after the manual onboarding merge, central automatically runs the source's first reconciliation",
+            "-> automatic first reconciliation",
+            "central triggers first reconciliation",
+        ):
+            self.assertNotIn(stale_claim, mechanics)
+
+        first_reconcile = mechanics.split("## 16. first federation after onboarding merge", 1)[1].split("## 17.", 1)[0]
+        self.assertIn("the onboarding pr should primarily accept the trust/configuration entry in `federation.json`", mechanics)
+        self.assertIn("after the manual onboarding merge, the source is accepted and eligible for central reconciliation", first_reconcile)
+        self.assertIn("scheduled polling is the normal automatic trigger", first_reconcile)
+        self.assertIn("approximately 15-minute poll", first_reconcile)
+        self.assertIn("a maintainer may manually dispatch all-source or targeted reconciliation sooner when immediate work is desired", first_reconcile)
+        self.assertIn("when reconciliation actually runs, it begins the normal generated publication transition", first_reconcile)
+        self.assertIn("it does not need to mix that human trust decision with generated package publication", mechanics)
+
     def test_deleted_notifier_relay_and_ceremony_are_absent_from_stable_production_surface(self):
         production_paths = list((ROOT / "automation/federation").rglob("*.py")) + [
             *((ROOT / ".github/workflows").glob("federation-*.yml")),

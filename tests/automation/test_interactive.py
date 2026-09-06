@@ -114,7 +114,7 @@ class ProductionAddClient(FakeClient):
 
     def __init__(self):
         super().__init__()
-        self.main_oid = "c1b45baa1ee531d1c309b80200aec0dae21ad697"
+        self.main_oid = c02.head_commit_oid()
         self.central_node_id = "R_central_graphql"
         self.blobs = {
             "manifest": b'{"schemaVersion": 2, "sources": []}\n',
@@ -305,7 +305,7 @@ class InteractiveTests(unittest.TestCase):
             "FEDERATION_GITHUB_TOKEN": "token",
             "FEDERATION_APP_SLUG": APP.slug,
             "FEDERATION_WAKE_PULL_NUMBER": "7",
-            "FEDERATION_TRUSTED_CHECKOUT_SHA": "c1b45baa1ee531d1c309b80200aec0dae21ad697",
+            "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
         }
         with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["interactive"]), 0)
