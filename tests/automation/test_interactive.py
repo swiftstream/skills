@@ -1,3 +1,4 @@
+import io
 import os
 import json
 import subprocess
@@ -34,7 +35,7 @@ from automation.federation.controller import (
 )
 import automation.federation.controller as controller_module
 from scripts import federate as c02
-from automation.federation.github_api import RefCASConflict
+from automation.federation.github_api import GraphQLError, RefCASConflict
 from automation.federation.github_api import CheckRun, GitCommitMetadata, GitObject, GitTreeEntry, IssueComment, PullRequestMetadata, RepositoryMetadata
 from automation.federation.request_model import RequestClass, body_sha256, parse_request_body, RequestAnchor
 
@@ -665,9 +666,41 @@ class InteractiveTests(unittest.TestCase):
         self.assertFalse(any("patch:201" in item.body for item in fake.created))
         event_file.unlink(missing_ok=True)
 
+    def test_controller_logs_only_validated_graphql_diagnostics(self):
+        environment = {
+            "GITHUB_REPOSITORY": "swiftstream/skills",
+            "FEDERATION_GITHUB_TOKEN": "token",
+            "FEDERATION_APP_SLUG": APP.slug,
+        }
+
+        def run_with(error):
+            stderr = io.StringIO()
+            with patch("automation.federation.controller.GitHubClient", return_value=object()), patch.object(controller_module, "resolve_app_identity", side_effect=error), patch.dict(os.environ, environment, clear=True), patch("sys.stderr", stderr):
+                self.assertEqual(main(["trusted-validation"]), 1)
+            return stderr.getvalue()
+
+        safe = run_with(GraphQLError("GRAPHQL:FORBIDDEN:repository.pullRequest.comments.0.author"))
+        self.assertEqual(safe, "C03-R02 controller blocked: GraphQLError:GRAPHQL:FORBIDDEN:repository.pullRequest.comments.0.author\n")
+
+        for error, sentinel in (
+            (GraphQLError("server-secret-sentinel"), "server-secret-sentinel"),
+            (GraphQLError("GRAPHQL:FORBIDDEN:repository.bad-segment"), "bad-segment"),
+            (RefCASConflict("subclass-secret-sentinel"), "subclass-secret-sentinel"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                output = run_with(error)
+                self.assertEqual(output, "C03-R02 controller blocked: GraphQLError:GRAPHQL:UNKNOWN:unknown-path\n")
+                self.assertNotIn(sentinel, output)
+
+        non_graphql = run_with(R02Error("user-secret-sentinel"))
+        self.assertEqual(non_graphql, "C03-R02 controller blocked: R02Error\n")
+        self.assertNotIn("user-secret-sentinel", non_graphql)
+
     def test_workflows_have_exact_triggers_pins_and_no_pr_head_execution(self):
         for name in ("federation-interactive.yml", "federation-trusted-validation.yml", "federation-state-finalize.yml"):
             text = (ROOT / ".github/workflows" / name).read_text()
+            self.assertIn("FEDERATION_EVENT_PATH: ${{ github.event_path }}", text)
+            self.assertNotIn("FEDERATION_EVENT_PATH: $GITHUB_EVENT_PATH", text)
             self.assertIn("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1", text)
             self.assertIn("actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1", text)
             self.assertIn("persist-credentials: false", text)
