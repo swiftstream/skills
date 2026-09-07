@@ -25,6 +25,10 @@ REQUEST_TIMEOUT_SECONDS = 15.0
 MAX_RESPONSE_BYTES = 1_048_576
 ZERO_OID = "0" * 40
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+_GRAPHQL_ERROR_TYPE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_GRAPHQL_ERROR_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_GRAPHQL_GENERIC_DIAGNOSTIC = "GRAPHQL:UNKNOWN:unknown-path"
+_GRAPHQL_DIAGNOSTIC_MAX_BYTES = 512
 
 UPDATE_REFS_MUTATION = """mutation FederationUpdateRefs($repositoryId: ID!, $refUpdates: [RefUpdate!]!) {
   updateRefs(input: {repositoryId: $repositoryId, refUpdates: $refUpdates}) {
@@ -92,6 +96,33 @@ def _optional_bounded_text(value: Any, label: str, limit: int) -> str:
     if type(value) is not str or len(value) > limit or c02.contains_control(value):
         raise InvalidResponseError(f"{label} has invalid bounded text")
     return value
+
+
+def _graphql_error_diagnostic(error: Mapping[str, Any]) -> str:
+    error_type = error.get("type")
+    if type(error_type) is not str or not _GRAPHQL_ERROR_TYPE_RE.fullmatch(error_type):
+        error_type = "UNKNOWN"
+
+    raw_path = error.get("path")
+    rendered_path = "unknown-path"
+    if type(raw_path) is list and raw_path and len(raw_path) <= 16:
+        parts: list[str] = []
+        valid = True
+        for segment in raw_path:
+            if type(segment) is str and _GRAPHQL_ERROR_PATH_SEGMENT_RE.fullmatch(segment):
+                parts.append(segment)
+            elif type(segment) is int and type(segment) is not bool and 0 <= segment <= 999_999:
+                parts.append(str(segment))
+            else:
+                valid = False
+                break
+        if valid:
+            rendered_path = ".".join(parts)
+
+    diagnostic = f"GRAPHQL:{error_type}:{rendered_path}"
+    if len(diagnostic.encode("utf-8")) > _GRAPHQL_DIAGNOSTIC_MAX_BYTES:
+        return _GRAPHQL_GENERIC_DIAGNOSTIC
+    return diagnostic
 
 
 class GitHubAPIError(RuntimeError):
@@ -449,7 +480,7 @@ class GitHubClient:
         if "errors" in result:
             if type(result["errors"]) is not list or not result["errors"] or any(type(item) is not dict for item in result["errors"]):
                 raise GraphQLError("GraphQL returned malformed errors")
-            raise GraphQLError("GraphQL operation failed")
+            raise GraphQLError(_graphql_error_diagnostic(result["errors"][0]))
         if set(result) != {"data"} or type(result["data"]) is not dict:
             raise InvalidResponseError("GraphQL response has invalid exact top-level shape")
         return result["data"]
