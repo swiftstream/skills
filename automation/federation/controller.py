@@ -21,6 +21,7 @@ from .github_api import (
     CheckRun,
     GitHubAPIError,
     GitHubClient,
+    GraphQLError,
     IssueComment,
     InvalidResponseError,
     MergeResult,
@@ -52,6 +53,32 @@ from .workspace import validate_trusted_ref
 from . import workspace as r01_workspace
 
 _MACHINE_BRANCH_RE = re.compile(r"^bot/federation/([a-z0-9]+(?:-[a-z0-9]+)*)$")
+_GRAPHQL_DIAGNOSTIC_TYPE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_GRAPHQL_DIAGNOSTIC_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_GRAPHQL_DIAGNOSTIC_INDEX_RE = re.compile(r"^[0-9]{1,6}$")
+_GRAPHQL_GENERIC_DIAGNOSTIC = "GRAPHQL:UNKNOWN:unknown-path"
+
+
+def _safe_graphql_diagnostic(error: GraphQLError) -> str:
+    text = str(error)
+    if len(text.encode("utf-8")) > 512 or not text.startswith("GRAPHQL:"):
+        return _GRAPHQL_GENERIC_DIAGNOSTIC
+    parts = text.split(":", 2)
+    if len(parts) != 3 or parts[0] != "GRAPHQL" or not _GRAPHQL_DIAGNOSTIC_TYPE_RE.fullmatch(parts[1]):
+        return _GRAPHQL_GENERIC_DIAGNOSTIC
+    path = parts[2]
+    if path == "unknown-path":
+        return text
+    segments = path.split(".")
+    if not segments or len(segments) > 16:
+        return _GRAPHQL_GENERIC_DIAGNOSTIC
+    for segment in segments:
+        if _GRAPHQL_DIAGNOSTIC_FIELD_RE.fullmatch(segment):
+            continue
+        if _GRAPHQL_DIAGNOSTIC_INDEX_RE.fullmatch(segment) and str(int(segment)) == segment and int(segment) <= 999_999:
+            continue
+        return _GRAPHQL_GENERIC_DIAGNOSTIC
+    return text
 
 
 class ControllerError(RuntimeError):
@@ -2169,7 +2196,10 @@ def main(argv: list[str] | None = None) -> int:
                     _post_bounded_result(client, repository, number, comments, kind=result_kind, identity=identity, result="PROPOSAL_BLOCKED", reason=type(error).__name__)
             except Exception:
                 pass
-        print(f"C03-R02 controller blocked: {type(error).__name__}", file=sys.stderr)
+        if isinstance(error, GraphQLError):
+            print(f"C03-R02 controller blocked: GraphQLError:{_safe_graphql_diagnostic(error)}", file=sys.stderr)
+        else:
+            print(f"C03-R02 controller blocked: {type(error).__name__}", file=sys.stderr)
         return 1
 
 

@@ -50,7 +50,7 @@ jobs:
         env:
           FEDERATION_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           FEDERATION_APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-          FEDERATION_EVENT_PATH: $GITHUB_EVENT_PATH
+          FEDERATION_EVENT_PATH: ${{ github.event_path }}
           FEDERATION_WAKE_PULL_NUMBER: ${{ inputs.pull_number }}
           FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ steps.trusted-checkout.outputs.sha }}
         run: |

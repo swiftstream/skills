@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from automation.federation.github_api import (
     GRAPHQL_ENDPOINT,
+    PULL_REQUEST_QUERY,
     UPDATE_REFS_MUTATION,
     ZERO_OID,
     GitHubClient,
@@ -42,6 +43,15 @@ class FakeTransport:
 
 
 class GitHubAPITests(unittest.TestCase):
+    def _graphql_error(self, error, *, errors=None, token="test-token", variables=None, client_class=GitHubClient):
+        payload = {"errors": [error] if errors is None else errors, "data": {"mustNotReturn": True}}
+        fake = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, json.dumps(payload, separators=(",", ":")).encode()))
+        client = client_class(token, fake)
+        supplied_variables = variables if variables is not None else {"owner": "swiftstream", "name": "skills", "number": 1}
+        with self.assertRaises(GraphQLError) as caught:
+            client._graphql(PULL_REQUEST_QUERY, supplied_variables)
+        return str(caught.exception), fake
+
     def test_headers_token_redaction_and_json(self):
         fake = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, b'{"data":{"updateRefs":{"clientMutationId":null}}}'))
         token = "super-secret-token"
@@ -58,6 +68,71 @@ class GitHubAPITests(unittest.TestCase):
         self.assertIn("updateRefs", payload["query"])
         self.assertNotIn("repo-node", payload["query"])
         self.assertEqual(len(payload["variables"]["refUpdates"]), 1)
+
+    def test_graphql_error_diagnostic_preserves_only_bounded_structure(self):
+        text, _ = self._graphql_error({"type": "FORBIDDEN", "path": ["repository", "pullRequest"]})
+        self.assertEqual(text, "GRAPHQL:FORBIDDEN:repository.pullRequest")
+
+        text, _ = self._graphql_error({"type": "FORBIDDEN", "path": ["repository", "pullRequest", "comments", 0, "author"]})
+        self.assertEqual(text, "GRAPHQL:FORBIDDEN:repository.pullRequest.comments.0.author")
+
+        for error, expected in (
+            ({"type": "FORBIDDEN"}, "GRAPHQL:FORBIDDEN:unknown-path"),
+            ({"type": "forbidden", "path": ["repository"]}, "GRAPHQL:UNKNOWN:repository"),
+            ({"type": "A" * 65, "path": ["repository"]}, "GRAPHQL:UNKNOWN:repository"),
+            ({"type": "FORBIDDEN", "path": ["repository", True]}, "GRAPHQL:FORBIDDEN:unknown-path"),
+            ({"type": "FORBIDDEN", "path": ["repository", "bad-segment"]}, "GRAPHQL:FORBIDDEN:unknown-path"),
+            ({"type": "FORBIDDEN", "path": ["repository", "bad\nsegment"]}, "GRAPHQL:FORBIDDEN:unknown-path"),
+            ({"type": "FORBIDDEN", "path": ["repository", -1]}, "GRAPHQL:FORBIDDEN:unknown-path"),
+            ({"type": "FORBIDDEN", "path": ["repository", 1_000_000]}, "GRAPHQL:FORBIDDEN:unknown-path"),
+            ({"type": "FORBIDDEN", "path": ["x"] * 17}, "GRAPHQL:FORBIDDEN:unknown-path"),
+            ({"type": "FORBIDDEN", "path": []}, "GRAPHQL:FORBIDDEN:unknown-path"),
+        ):
+            with self.subTest(error=error):
+                text, _ = self._graphql_error(error)
+                self.assertEqual(text, expected)
+
+        long_path = ["a" * 64] * 16
+        text, _ = self._graphql_error({"type": "A" * 64, "path": long_path})
+        self.assertEqual(text, "GRAPHQL:UNKNOWN:unknown-path")
+        self.assertLessEqual(len(text.encode("utf-8")), 512)
+
+    def test_graphql_error_diagnostic_uses_first_error_and_excludes_remote_or_request_secrets(self):
+        message_sentinel = "message-secret-sentinel"
+        extension_sentinel = "extension-secret-sentinel"
+        variable_sentinel = "variable-secret-sentinel"
+        token_sentinel = "token-secret-sentinel"
+        header_sentinel = "header-secret-sentinel"
+
+        class SentinelHeaderClient(GitHubClient):
+            def _headers(self):
+                headers = super()._headers()
+                headers["X-Test-Sentinel"] = header_sentinel
+                return headers
+
+        first = {
+            "type": "FORBIDDEN",
+            "path": ["repository", "pullRequest"],
+            "message": message_sentinel,
+            "extensions": {"private": extension_sentinel},
+        }
+        second = {"type": "UNAUTHORIZED", "path": ["second", "mustNotAppear"], "message": "second-message-sentinel"}
+        variables = {"owner": variable_sentinel, "name": "skills", "number": 1}
+        text, fake = self._graphql_error(first, errors=[first, second], token=token_sentinel, variables=variables, client_class=SentinelHeaderClient)
+        self.assertEqual(text, "GRAPHQL:FORBIDDEN:repository.pullRequest")
+        self.assertEqual(fake.calls[0][2]["X-Test-Sentinel"], header_sentinel)
+        for sentinel in (message_sentinel, extension_sentinel, variable_sentinel, token_sentinel, header_sentinel, "second", "second-message-sentinel"):
+            self.assertNotIn(sentinel, text)
+
+    def test_graphql_errors_remain_fail_closed_for_malformed_shapes_and_data(self):
+        for errors in ({}, [], ["bad"], [{"type": "FORBIDDEN"}, "bad"]):
+            payload = {"errors": errors, "data": {"mustNotReturn": True}}
+            fake = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, json.dumps(payload, separators=(",", ":")).encode()))
+            with self.subTest(errors=errors), self.assertRaises(GraphQLError):
+                GitHubClient(None, fake)._graphql(PULL_REQUEST_QUERY, {"owner": "swiftstream", "name": "skills", "number": 1})
+
+        text, _ = self._graphql_error({"type": "FORBIDDEN", "path": ["repository"]})
+        self.assertEqual(text, "GRAPHQL:FORBIDDEN:repository")
 
     def test_cas_semantics_and_single_atomic_call(self):
         with self.assertRaises(Exception):
