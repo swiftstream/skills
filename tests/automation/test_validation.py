@@ -52,9 +52,17 @@ class ValidationTests(unittest.TestCase):
                     return HttpResponse(200, url, b'{"id":77,"slug":"swiftstream-federation","node_id":"A_app"}')
                 if url == REST_BASE_URL + "/users/swiftstream-federation%5Bbot%5D":
                     return HttpResponse(200, url, b'{"id":88,"login":"swiftstream-federation[bot]","node_id":"U_bot","type":"Bot"}')
+                if url == REST_BASE_URL + "/repos/swiftstream/skills/pulls/7":
+                    return HttpResponse(200, url, json.dumps({
+                        "number": 7,
+                        "body": "body",
+                        "user": {"login": "alice", "node_id": "U_author"},
+                        "head": {"sha": "a" * 40, "ref": "proposal", "repo": {"node_id": "7", "full_name": "swiftstream/skills"}},
+                        "base": {"sha": "b" * 40, "ref": "main", "repo": {"node_id": "7", "full_name": "swiftstream/skills"}},
+                    }).encode())
                 payload = json.loads(body)
-                if "FederationPullRequest" in payload["query"]:
-                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"pullRequest": {"number": 7, "body": "body", "author": {"id": "U_author", "login": "alice"}, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "headRepository": {"id": "7", "nameWithOwner": "swiftstream/skills"}, "baseRepository": {"id": "7", "nameWithOwner": "swiftstream/skills"}, "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
+                if "FederationPullRequestRoutingBefore" in payload["query"] or "FederationPullRequestRoutingAfter" in payload["query"]:
+                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
                 cursor = payload["variables"]["after"]
                 node = {"id": "IC_" + ("2" if cursor else "1"), "databaseId": 2 if cursor else 1, "body": "comment", "author": {"id": "U_author", "login": "alice", "__typename": "User"}, "editor": None, "lastEditedAt": None, "includesCreatedEdit": False}
                 page = {"nodes": [node], "pageInfo": {"hasNextPage": cursor is None, "endCursor": "cursor-1" if cursor is None else None}}

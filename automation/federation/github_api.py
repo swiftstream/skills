@@ -38,18 +38,42 @@ UPDATE_REFS_MUTATION = """mutation FederationUpdateRefs($repositoryId: ID!, $ref
 
 # These documents are deliberately fixed strings.  All repository, login, ref,
 # and comment values enter as GraphQL variables; none can become query syntax.
-PULL_REQUEST_QUERY = """query FederationPullRequest($owner: String!, $name: String!, $number: Int!) {
+PULL_REQUEST_ROUTING_BEFORE_QUERY = """query FederationPullRequestRoutingBefore($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
-    id
     nameWithOwner
-    defaultBranchRef { name }
     pullRequest(number: $number) {
-      number body
-      author { id login }
-      headRefOid baseRefOid headRefName baseRefName
-      headRepository { id nameWithOwner }
-      baseRepository { id nameWithOwner }
-      lastEditedAt includesCreatedEdit
+      number
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      lastEditedAt
+      includesCreatedEdit
+    }
+  }
+}"""
+
+PULL_REQUEST_ROUTING_AFTER_QUERY = """query FederationPullRequestRoutingAfter($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequest(number: $number) {
+      number
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      lastEditedAt
+      includesCreatedEdit
+    }
+  }
+}"""
+
+PULL_REQUEST_BODY_FALLBACK_QUERY = """query FederationPullRequestBodyFallback($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    pullRequest(number: $number) {
+      number
+      body
     }
   }
 }"""
@@ -98,7 +122,7 @@ def _optional_bounded_text(value: Any, label: str, limit: int) -> str:
     return value
 
 
-def _graphql_error_diagnostic(error: Mapping[str, Any]) -> str:
+def _graphql_error_diagnostic(error: Mapping[str, Any], operation: str | None = None) -> str:
     error_type = error.get("type")
     if type(error_type) is not str or not _GRAPHQL_ERROR_TYPE_RE.fullmatch(error_type):
         error_type = "UNKNOWN"
@@ -118,6 +142,16 @@ def _graphql_error_diagnostic(error: Mapping[str, Any]) -> str:
                 break
         if valid:
             rendered_path = ".".join(parts)
+
+    if operation is not None:
+        if rendered_path == "unknown-path":
+            rendered_path = operation
+        else:
+            candidate = f"{operation}.{rendered_path}"
+            if type(raw_path) is list and len(raw_path) < 16 and len(f"GRAPHQL:{error_type}:{candidate}".encode("utf-8")) <= _GRAPHQL_DIAGNOSTIC_MAX_BYTES:
+                rendered_path = candidate
+            else:
+                rendered_path = operation
 
     diagnostic = f"GRAPHQL:{error_type}:{rendered_path}"
     if len(diagnostic.encode("utf-8")) > _GRAPHQL_DIAGNOSTIC_MAX_BYTES:
@@ -232,6 +266,33 @@ class PullRequestMetadata:
     base_repository: str
     last_edited_at: str | None
     includes_created_edit: bool
+
+
+@dataclass(frozen=True)
+class _PullRequestRoutingSnapshot:
+    number: int
+    head_oid: str
+    base_oid: str
+    head_ref: str
+    base_ref: str
+    last_edited_at: str | None
+    includes_created_edit: bool
+
+
+@dataclass(frozen=True)
+class _PullRequestRESTDetail:
+    number: int
+    body: str | None
+    author_id: str
+    author_login: str
+    head_oid: str
+    base_oid: str
+    head_ref: str
+    base_ref: str
+    head_repository_id: str
+    head_repository: str
+    base_repository_id: str
+    base_repository: str
 
 
 @dataclass(frozen=True)
@@ -471,8 +532,16 @@ class GitHubClient:
         path = "/" + "/".join(_validate_segment(segment) for segment in path_segments)
         return self._request(method, REST_BASE_URL + path, payload)
 
-    def _graphql(self, document: str, variables: Mapping[str, Any]) -> dict[str, Any]:
-        if type(document) is not str or document not in {PULL_REQUEST_QUERY, ISSUE_COMMENTS_QUERY, APP_QUERY, BOT_QUERY, UPDATE_REFS_MUTATION}:
+    def _graphql(self, document: str, variables: Mapping[str, Any], *, operation: str | None = None) -> dict[str, Any]:
+        if type(document) is not str or document not in {
+            PULL_REQUEST_ROUTING_BEFORE_QUERY,
+            PULL_REQUEST_ROUTING_AFTER_QUERY,
+            PULL_REQUEST_BODY_FALLBACK_QUERY,
+            ISSUE_COMMENTS_QUERY,
+            APP_QUERY,
+            BOT_QUERY,
+            UPDATE_REFS_MUTATION,
+        }:
             raise GitHubAPIError("GraphQL document is not an accepted trusted document")
         result = self._request("POST", GRAPHQL_ENDPOINT, {"query": document, "variables": dict(variables)})
         if type(result) is not dict:
@@ -480,7 +549,7 @@ class GitHubClient:
         if "errors" in result:
             if type(result["errors"]) is not list or not result["errors"] or any(type(item) is not dict for item in result["errors"]):
                 raise GraphQLError("GraphQL returned malformed errors")
-            raise GraphQLError(_graphql_error_diagnostic(result["errors"][0]))
+            raise GraphQLError(_graphql_error_diagnostic(result["errors"][0], operation))
         if set(result) != {"data"} or type(result["data"]) is not dict:
             raise InvalidResponseError("GraphQL response has invalid exact top-level shape")
         return result["data"]
@@ -615,43 +684,129 @@ class GitHubClient:
             actual_type,
         )
 
+    @staticmethod
+    def _parse_pull_request_routing(data: Mapping[str, Any], repository: str, number: int) -> _PullRequestRoutingSnapshot:
+        if set(data) != {"repository"} or type(data["repository"]) is not dict:
+            raise InvalidResponseError("pull request routing response has invalid repository shape")
+        repo = data["repository"]
+        if _bounded_text(repo.get("nameWithOwner"), "repository.nameWithOwner") != repository:
+            raise InvalidResponseError("pull request routing repository does not match requested repository")
+        pull = repo.get("pullRequest")
+        if type(pull) is not dict:
+            raise InvalidResponseError("pull request routing metadata is missing")
+        if type(pull.get("number")) is not int or type(pull.get("number")) is bool or pull["number"] != number:
+            raise InvalidResponseError("pull request routing number does not match requested number")
+        if type(pull.get("includesCreatedEdit")) is not bool:
+            raise InvalidResponseError("PR.includesCreatedEdit must be boolean")
+        return _PullRequestRoutingSnapshot(
+            number,
+            GitHubClient._sha(pull.get("headRefOid"), "PR.headRefOid"),
+            GitHubClient._sha(pull.get("baseRefOid"), "PR.baseRefOid"),
+            _bounded_text(pull.get("headRefName"), "PR.headRefName"),
+            _bounded_text(pull.get("baseRefName"), "PR.baseRefName"),
+            _optional_iso(pull.get("lastEditedAt"), "PR.lastEditedAt"),
+            pull["includesCreatedEdit"],
+        )
+
+    @staticmethod
+    def _body_text(value: Any, label: str) -> str:
+        if type(value) is not str:
+            raise InvalidResponseError(f"{label} must be a string")
+        try:
+            if len(value.encode("utf-8")) > 16_384:
+                raise InvalidResponseError(f"{label} exceeds 16KiB")
+        except UnicodeEncodeError:
+            raise InvalidResponseError(f"{label} is not valid UTF-8") from None
+        return value
+
+    @classmethod
+    def _parse_pull_request_rest_detail(cls, value: Any, number: int) -> _PullRequestRESTDetail:
+        if type(value) is not dict:
+            raise InvalidResponseError("pull request REST response must be an object")
+        if type(value.get("number")) is not int or type(value.get("number")) is bool or value["number"] != number:
+            raise InvalidResponseError("pull request REST number does not match requested number")
+        if "body" not in value:
+            raise InvalidResponseError("pull request REST body is missing")
+        body_value = value["body"]
+        body = None if body_value is None else cls._body_text(body_value, "pull request REST body")
+        if type(value.get("user")) is not dict or type(value.get("head")) is not dict or type(value.get("base")) is not dict:
+            raise InvalidResponseError("pull request REST identity metadata is incomplete")
+        user = value["user"]
+        head = value["head"]
+        base = value["base"]
+        if type(head.get("repo")) is not dict or type(base.get("repo")) is not dict:
+            raise InvalidResponseError("pull request REST repository metadata is incomplete")
+        head_repo = head["repo"]
+        base_repo = base["repo"]
+        return _PullRequestRESTDetail(
+            number,
+            body,
+            _bounded_text(user.get("node_id"), "PR.author.node_id"),
+            _bounded_text(user.get("login"), "PR.author.login"),
+            cls._sha(head.get("sha"), "PR.head.sha"),
+            cls._sha(base.get("sha"), "PR.base.sha"),
+            _bounded_text(head.get("ref"), "PR.head.ref"),
+            _bounded_text(base.get("ref"), "PR.base.ref"),
+            _bounded_text(head_repo.get("node_id"), "PR.head.repo.node_id"),
+            _bounded_text(head_repo.get("full_name"), "PR.head.repo.full_name"),
+            _bounded_text(base_repo.get("node_id"), "PR.base.repo.node_id"),
+            _bounded_text(base_repo.get("full_name"), "PR.base.repo.full_name"),
+        )
+
+    @staticmethod
+    def _parse_pull_request_body_fallback(data: Mapping[str, Any], repository: str, number: int) -> str:
+        if set(data) != {"repository"} or type(data["repository"]) is not dict:
+            raise InvalidResponseError("pull request body fallback has invalid repository shape")
+        repo = data["repository"]
+        if _bounded_text(repo.get("nameWithOwner"), "repository.nameWithOwner") != repository:
+            raise InvalidResponseError("pull request body fallback repository does not match requested repository")
+        pull = repo.get("pullRequest")
+        if type(pull) is not dict or type(pull.get("number")) is not int or type(pull.get("number")) is bool or pull["number"] != number:
+            raise InvalidResponseError("pull request body fallback number does not match requested number")
+        return GitHubClient._body_text(pull.get("body"), "pull request body fallback")
+
     def get_pull_request_metadata(self, repository: str, number: int) -> PullRequestMetadata:
         owner, name = self._owner_repo(repository)
         if type(number) is not int or type(number) is bool or number <= 0:
             raise GitHubAPIError("pull request number must be positive")
-        value = self._graphql(PULL_REQUEST_QUERY, {"owner": owner, "name": name, "number": number})
-        if set(value) != {"repository"} or type(value["repository"]) is not dict:
-            raise InvalidResponseError("pull request response has invalid repository shape")
-        repo = value["repository"]
-        pull = repo.get("pullRequest")
-        if type(pull) is not dict:
-            raise InvalidResponseError("pull request metadata is missing")
-        author = pull.get("author")
-        head_repo = pull.get("headRepository")
-        base_repo = pull.get("baseRepository")
-        if type(author) is not dict or type(head_repo) is not dict or type(base_repo) is not dict:
-            raise InvalidResponseError("pull request identity metadata is incomplete")
-        author_id = _bounded_text(author.get("id"), "PR.author.id")
-        author_login = _bounded_text(author.get("login"), "PR.author.login")
-        if type(pull.get("number")) is not int or pull["number"] != number or type(pull.get("body")) is not str or len(pull["body"].encode("utf-8")) > 16_384:
-            raise InvalidResponseError("pull request number/body has invalid shape")
-        if type(pull.get("includesCreatedEdit")) is not bool:
-            raise InvalidResponseError("PR.includesCreatedEdit must be boolean")
+        variables = {"owner": owner, "name": name, "number": number}
+        before = self._parse_pull_request_routing(
+            self._graphql(PULL_REQUEST_ROUTING_BEFORE_QUERY, variables, operation="pullRoutingBefore"), repository, number
+        )
+        rest = self._parse_pull_request_rest_detail(self.request_json("GET", ["repos", owner, name, "pulls", str(number)]), number)
+        body = rest.body
+        if body is None:
+            body = self._parse_pull_request_body_fallback(
+                self._graphql(PULL_REQUEST_BODY_FALLBACK_QUERY, variables, operation="pullBodyFallback"), repository, number
+            )
+        after = self._parse_pull_request_routing(
+            self._graphql(PULL_REQUEST_ROUTING_AFTER_QUERY, variables, operation="pullRoutingAfter"), repository, number
+        )
+        if before != after:
+            raise InvalidResponseError("pull request routing authority changed during composite read")
+        if (rest.number, rest.head_oid, rest.base_oid, rest.head_ref, rest.base_ref) != (
+            before.number,
+            before.head_oid,
+            before.base_oid,
+            before.head_ref,
+            before.base_ref,
+        ):
+            raise InvalidResponseError("pull request REST topology does not match routing authority")
         return PullRequestMetadata(
-            number,
-            pull["body"],
-            author_id,
-            author_login,
-            self._sha(pull.get("headRefOid"), "PR.headRefOid"),
-            self._sha(pull.get("baseRefOid"), "PR.baseRefOid"),
-            _bounded_text(pull.get("headRefName"), "PR.headRefName"),
-            _bounded_text(pull.get("baseRefName"), "PR.baseRefName"),
-            _bounded_text(head_repo.get("id"), "PR.headRepository.id"),
-            _bounded_text(head_repo.get("nameWithOwner"), "PR.headRepository.nameWithOwner"),
-            _bounded_text(base_repo.get("id"), "PR.baseRepository.id"),
-            _bounded_text(base_repo.get("nameWithOwner"), "PR.baseRepository.nameWithOwner"),
-            _optional_iso(pull.get("lastEditedAt"), "PR.lastEditedAt"),
-            pull["includesCreatedEdit"],
+            before.number,
+            body,
+            rest.author_id,
+            rest.author_login,
+            before.head_oid,
+            before.base_oid,
+            before.head_ref,
+            before.base_ref,
+            rest.head_repository_id,
+            rest.head_repository,
+            rest.base_repository_id,
+            rest.base_repository,
+            before.last_edited_at,
+            before.includes_created_edit,
         )
 
     def list_issue_comments(self, repository: str, number: int, *, max_pages: int = 100, max_records: int = 10_000) -> tuple[IssueComment, ...]:
