@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from automation.federation.github_api import (
     GRAPHQL_ENDPOINT,
-    ISSUE_COMMENTS_QUERY,
+    PULL_REQUEST_COMMENTS_QUERY,
     PULL_REQUEST_BODY_FALLBACK_QUERY,
     PULL_REQUEST_ROUTING_AFTER_QUERY,
     PULL_REQUEST_ROUTING_BEFORE_QUERY,
@@ -95,6 +95,41 @@ class PullMetadataTransport:
         raise AssertionError((method, url))
 
 
+class CommentsTransport:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def request(self, method, url, headers, body, timeout):
+        self.calls.append((method, url, headers, body, timeout))
+        if url != GRAPHQL_ENDPOINT:
+            raise AssertionError((method, url))
+        payload = json.loads(body)
+        if payload["query"] != PULL_REQUEST_COMMENTS_QUERY:
+            raise AssertionError(payload["query"])
+        if not self.responses:
+            raise AssertionError("unexpected comments request")
+        return HttpResponse(200, url, json.dumps(self.responses.pop(0), separators=(",", ":")).encode())
+
+
+def _comment_node(database_id=1, *, author=None, editor=None, last_edited_at=None, includes_created_edit=False, body="comment"):
+    return {
+        "id": f"IC_{database_id}",
+        "databaseId": database_id,
+        "body": body,
+        "author": author,
+        "editor": editor,
+        "lastEditedAt": last_edited_at,
+        "includesCreatedEdit": includes_created_edit,
+    }
+
+
+def _comments_response(nodes, *, has_next=False, end_cursor=None, pull_request=True):
+    if pull_request is True:
+        pull_request = {"comments": {"nodes": nodes, "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor}}}
+    return {"data": {"repository": {"pullRequest": pull_request}}}
+
+
 def _call_signature(calls):
     return [(method, url, None if body is None else json.loads(body)["query"]) for method, url, _headers, body, _timeout in calls]
 
@@ -106,7 +141,7 @@ class GitHubAPITests(unittest.TestCase):
         client = client_class(token, fake)
         supplied_variables = variables if variables is not None else {"owner": "swiftstream", "name": "skills", "number": 1}
         with self.assertRaises(GraphQLError) as caught:
-            client._graphql(ISSUE_COMMENTS_QUERY, supplied_variables)
+            client._graphql(PULL_REQUEST_COMMENTS_QUERY, supplied_variables)
         return str(caught.exception), fake
 
     def test_headers_token_redaction_and_json(self):
@@ -186,10 +221,136 @@ class GitHubAPITests(unittest.TestCase):
             payload = {"errors": errors, "data": {"mustNotReturn": True}}
             fake = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, json.dumps(payload, separators=(",", ":")).encode()))
             with self.subTest(errors=errors), self.assertRaises(GraphQLError):
-                GitHubClient(None, fake)._graphql(ISSUE_COMMENTS_QUERY, {"owner": "swiftstream", "name": "skills", "number": 1})
+                GitHubClient(None, fake)._graphql(PULL_REQUEST_COMMENTS_QUERY, {"owner": "swiftstream", "name": "skills", "number": 1})
 
         text, _ = self._graphql_error({"type": "FORBIDDEN", "path": ["repository"]})
         self.assertEqual(text, "GRAPHQL:FORBIDDEN:repository")
+
+    def test_pull_request_comments_query_shape_and_trusted_allowlist(self):
+        self.assertIn("pullRequest(number: $number)", PULL_REQUEST_COMMENTS_QUERY)
+        self.assertNotIn("issue(number: $number)", PULL_REQUEST_COMMENTS_QUERY)
+        for field in ("id", "databaseId", "body", "author", "editor", "lastEditedAt", "includesCreatedEdit", "pageInfo", "hasNextPage", "endCursor", "first: 100", "after: $after"):
+            self.assertIn(field, PULL_REQUEST_COMMENTS_QUERY)
+        old_issue_parent = """query FederationIssueComments($owner: String!, $name: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $name) { issue(number: $number) { comments(first: 100, after: $after) { nodes { id } } } }
+        }"""
+        with self.assertRaises(GitHubAPIError):
+            GitHubClient(None, FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, b'{"data":{}}')))._graphql(
+                old_issue_parent, {"owner": "swiftstream", "name": "skills", "number": 7, "after": None}
+            )
+
+    def test_pull_request_comments_parsing_one_page_and_complete_metadata(self):
+        author = {"id": "U_author", "login": "alice", "__typename": "User"}
+        editor = {"id": "U_editor", "login": "bob", "__typename": "User"}
+        response = _comments_response([
+            _comment_node(9, author=author, editor=editor, last_edited_at="2026-09-10T00:00:00Z", includes_created_edit=True, body="edited"),
+            _comment_node(2, author=None, editor=None, last_edited_at=None, includes_created_edit=False),
+        ])
+        transport = CommentsTransport([response])
+        comments = GitHubClient(None, transport).list_issue_comments("swiftstream/skills", 7)
+        self.assertEqual([item.database_id for item in comments], [2, 9])
+        self.assertEqual(comments[0].author_id, None)
+        self.assertEqual(comments[0].editor_id, None)
+        self.assertIsNone(comments[0].last_edited_at)
+        self.assertFalse(comments[0].includes_created_edit)
+        self.assertEqual((comments[1].body, comments[1].author_login, comments[1].editor_login), ("edited", "alice", "bob"))
+        self.assertEqual(comments[1].last_edited_at, "2026-09-10T00:00:00Z")
+        self.assertTrue(comments[1].includes_created_edit)
+        payload = json.loads(transport.calls[0][3])
+        self.assertEqual(payload["variables"], {"owner": "swiftstream", "name": "skills", "number": 7, "after": None})
+
+    def test_pull_request_comments_parsing_two_pages_uses_cursor_and_stable_database_order(self):
+        first = _comments_response([_comment_node(30)], has_next=True, end_cursor="cursor-1")
+        second = _comments_response([_comment_node(10), _comment_node(20)])
+        transport = CommentsTransport([first, second])
+        comments = GitHubClient(None, transport).list_issue_comments("swiftstream/skills", 7)
+        self.assertEqual([item.database_id for item in comments], [10, 20, 30])
+        variables = [json.loads(call[3])["variables"] for call in transport.calls]
+        self.assertEqual([item["after"] for item in variables], [None, "cursor-1"])
+
+    def test_pull_request_comments_missing_or_malformed_pull_request_fails_closed(self):
+        responses = (
+            {"data": {}},
+            {"data": {"repository": None}},
+            {"data": {"repository": {}}},
+            {"data": {"repository": {"pullRequest": None}}},
+            {"data": {"repository": {"pullRequest": "bad"}}},
+            _comments_response([], pull_request={}),
+            _comments_response([], pull_request={"comments": None}),
+        )
+        for response in responses:
+            with self.subTest(response=response), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, CommentsTransport([response])).list_issue_comments("swiftstream/skills", 7)
+
+    def test_pull_request_comments_connection_node_and_page_info_validation(self):
+        valid = _comment_node()
+        invalid_responses = (
+            _comments_response("bad"),
+            _comments_response([None]),
+            _comments_response([valid], pull_request={"comments": {"nodes": [valid], "pageInfo": None}}),
+            _comments_response([valid], pull_request={"comments": {"nodes": [valid], "pageInfo": {"hasNextPage": "yes", "endCursor": None}}}),
+            _comments_response([valid], has_next=True, end_cursor=None),
+        )
+        for response in invalid_responses:
+            with self.subTest(response=response), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, CommentsTransport([response])).list_issue_comments("swiftstream/skills", 7)
+
+    def test_pull_request_comments_field_validation_is_fail_closed(self):
+        valid = _comment_node(author={"id": "U", "login": "alice", "__typename": "User"})
+        variants = (
+            ("databaseId", 0),
+            ("databaseId", "1"),
+            ("body", None),
+            ("body", 1),
+            ("author", "bad"),
+            ("editor", "bad"),
+            ("lastEditedAt", 1),
+            ("includesCreatedEdit", None),
+        )
+        for field, value in variants:
+            node = dict(valid)
+            node[field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, CommentsTransport([_comments_response([node])])).list_issue_comments("swiftstream/skills", 7)
+        for field, value in (("author", {"id": "U", "login": None, "__typename": "User"}),
+                             ("editor", {"id": None, "login": "bob"})):
+            node = dict(valid)
+            node[field] = value
+            with self.subTest(field=field), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, CommentsTransport([_comments_response([node])])).list_issue_comments("swiftstream/skills", 7)
+
+    def test_pull_request_comments_bounds_are_enforced(self):
+        valid = _comments_response([_comment_node()])
+        client = GitHubClient(None, CommentsTransport([valid]))
+        for kwargs in ({"max_pages": 0}, {"max_records": 0}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(GitHubAPIError):
+                client.list_issue_comments("swiftstream/skills", 7, **kwargs)
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, CommentsTransport([_comments_response([_comment_node(1), _comment_node(2)])])).list_issue_comments("swiftstream/skills", 7, max_records=1)
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, CommentsTransport([_comments_response([], has_next=True, end_cursor="cursor")])).list_issue_comments("swiftstream/skills", 7, max_pages=1)
+
+    def test_pull_request_comments_diagnostic_identity_is_local_and_secret_free(self):
+        secret = "remote-comments-secret"
+        error = {"type": "FORBIDDEN", "path": ["repository", "pullRequest", "comments"], "message": secret, "extensions": {"secret": secret}}
+        fake = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, json.dumps({"errors": [error], "data": {}}).encode()))
+        with self.assertRaises(GraphQLError) as caught:
+            GitHubClient(None, fake)._graphql(
+                PULL_REQUEST_COMMENTS_QUERY,
+                {"owner": "swiftstream", "name": "skills", "number": 7, "after": None},
+                operation="pullRequestComments",
+            )
+        self.assertEqual(str(caught.exception), "GRAPHQL:FORBIDDEN:pullRequestComments.repository.pullRequest.comments")
+        self.assertNotIn(secret, str(caught.exception))
+
+        unknown_fake = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, json.dumps({"errors": [{"type": "UNKNOWN"}], "data": {}}).encode()))
+        with self.assertRaises(GraphQLError) as caught:
+            GitHubClient(None, unknown_fake)._graphql(
+                PULL_REQUEST_COMMENTS_QUERY,
+                {"owner": "swiftstream", "name": "skills", "number": 7, "after": None},
+                operation="pullRequestComments",
+            )
+        self.assertEqual(str(caught.exception), "GRAPHQL:UNKNOWN:pullRequestComments")
 
     def test_cas_semantics_and_single_atomic_call(self):
         with self.assertRaises(Exception):

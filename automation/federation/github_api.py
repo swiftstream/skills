@@ -78,9 +78,9 @@ PULL_REQUEST_BODY_FALLBACK_QUERY = """query FederationPullRequestBodyFallback($o
   }
 }"""
 
-ISSUE_COMMENTS_QUERY = """query FederationIssueComments($owner: String!, $name: String!, $number: Int!, $after: String) {
+PULL_REQUEST_COMMENTS_QUERY = """query FederationPullRequestComments($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
-    issue(number: $number) {
+    pullRequest(number: $number) {
       comments(first: 100, after: $after) {
         nodes { id databaseId body author { id login __typename } editor { id login __typename } lastEditedAt includesCreatedEdit }
         pageInfo { hasNextPage endCursor }
@@ -537,7 +537,7 @@ class GitHubClient:
             PULL_REQUEST_ROUTING_BEFORE_QUERY,
             PULL_REQUEST_ROUTING_AFTER_QUERY,
             PULL_REQUEST_BODY_FALLBACK_QUERY,
-            ISSUE_COMMENTS_QUERY,
+            PULL_REQUEST_COMMENTS_QUERY,
             APP_QUERY,
             BOT_QUERY,
             UPDATE_REFS_MUTATION,
@@ -816,13 +816,13 @@ class GitHubClient:
         comments: list[IssueComment] = []
         cursor: str | None = None
         for _page in range(max_pages):
-            data = self._graphql(ISSUE_COMMENTS_QUERY, {"owner": owner, "name": name, "number": number, "after": cursor})
+            data = self._graphql(PULL_REQUEST_COMMENTS_QUERY, {"owner": owner, "name": name, "number": number, "after": cursor}, operation="pullRequestComments")
             repo = data.get("repository")
-            if type(repo) is not dict or type(repo.get("issue")) is not dict:
-                raise InvalidResponseError("issue comment response is missing issue")
-            connection = repo["issue"].get("comments")
+            if type(repo) is not dict or type(repo.get("pullRequest")) is not dict:
+                raise InvalidResponseError("pull request comment response is missing pull request")
+            connection = repo["pullRequest"].get("comments")
             if type(connection) is not dict or type(connection.get("nodes")) is not list or type(connection.get("pageInfo")) is not dict:
-                raise InvalidResponseError("issue comment connection has invalid shape")
+                raise InvalidResponseError("pull request comment connection has invalid shape")
             for value in connection["nodes"]:
                 if type(value) is not dict:
                     raise InvalidResponseError("issue comment node must be an object")
