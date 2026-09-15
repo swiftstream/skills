@@ -66,7 +66,7 @@ class ValidationTests(unittest.TestCase):
                 cursor = payload["variables"]["after"]
                 node = {"id": "IC_" + ("2" if cursor else "1"), "databaseId": 2 if cursor else 1, "body": "comment", "author": {"id": "U_author", "login": "alice", "__typename": "User"}, "editor": None, "lastEditedAt": None, "includesCreatedEdit": False}
                 page = {"nodes": [node], "pageInfo": {"hasNextPage": cursor is None, "endCursor": "cursor-1" if cursor is None else None}}
-                return HttpResponse(200, url, json.dumps({"data": {"repository": {"issue": {"comments": page}}}}).encode())
+                return HttpResponse(200, url, json.dumps({"data": {"repository": {"pullRequest": {"comments": page}}}}).encode())
 
         transport = Transport()
         client = GitHubClient("token", transport)
