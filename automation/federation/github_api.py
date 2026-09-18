@@ -8,6 +8,7 @@ import hashlib
 import re
 import socket
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Iterable, Mapping, Protocol
 from urllib import error as urlerror
 from urllib import parse as urlparse
@@ -78,12 +79,29 @@ PULL_REQUEST_BODY_FALLBACK_QUERY = """query FederationPullRequestBodyFallback($o
   }
 }"""
 
-PULL_REQUEST_COMMENTS_QUERY = """query FederationPullRequestComments($owner: String!, $name: String!, $number: Int!, $after: String) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      comments(first: 100, after: $after) {
-        nodes { id databaseId body author { id login __typename } editor { id login __typename } lastEditedAt includesCreatedEdit }
-        pageInfo { hasNextPage endCursor }
+ISSUE_COMMENT_NODES_QUERY = """query FederationIssueCommentNodes($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    __typename
+    id
+    ... on IssueComment {
+      fullDatabaseId
+      body
+      createdAt
+      updatedAt
+      author {
+        __typename
+        login
+        ... on Node { id }
+      }
+      editor {
+        __typename
+        login
+        ... on Node { id }
+      }
+      lastEditedAt
+      includesCreatedEdit
+      userContentEdits(first: 1) {
+        totalCount
       }
     }
   }
@@ -120,6 +138,17 @@ def _optional_bounded_text(value: Any, label: str, limit: int) -> str:
     if type(value) is not str or len(value) > limit or c02.contains_control(value):
         raise InvalidResponseError(f"{label} has invalid bounded text")
     return value
+
+
+def _parse_github_timestamp(value: Any, label: str) -> Any:
+    text = _bounded_text(value, label, 128)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise InvalidResponseError(f"{label} must be a valid timestamp") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise InvalidResponseError(f"{label} must be timezone-aware")
+    return parsed
 
 
 def _graphql_error_diagnostic(error: Mapping[str, Any], operation: str | None = None) -> str:
@@ -308,6 +337,19 @@ class IssueComment:
     editor_type: str | None
     last_edited_at: str | None
     includes_created_edit: bool
+
+
+@dataclass(frozen=True)
+class _IssueCommentRESTRecord:
+    database_id: int
+    node_id: str
+    body: str
+    author_id: str | None
+    author_login: str | None
+    author_type: str | None
+    created_at: str
+    updated_at: str
+    issue_url: str
 
 
 @dataclass(frozen=True)
@@ -537,7 +579,7 @@ class GitHubClient:
             PULL_REQUEST_ROUTING_BEFORE_QUERY,
             PULL_REQUEST_ROUTING_AFTER_QUERY,
             PULL_REQUEST_BODY_FALLBACK_QUERY,
-            PULL_REQUEST_COMMENTS_QUERY,
+            ISSUE_COMMENT_NODES_QUERY,
             APP_QUERY,
             BOT_QUERY,
             UPDATE_REFS_MUTATION,
@@ -809,56 +851,228 @@ class GitHubClient:
             before.includes_created_edit,
         )
 
+    @classmethod
+    def _parse_issue_comment_rest_record(cls, value: Any, issue_url: str) -> _IssueCommentRESTRecord:
+        if type(value) is not dict:
+            raise InvalidResponseError("issue comment REST record must be an object")
+        database_id = _positive_id(value.get("id"), "comment.id")
+        node_id = _bounded_text(value.get("node_id"), "comment.node_id")
+        body = cls._body_text(value.get("body"), "comment.body")
+        created_at = _bounded_text(value.get("created_at"), "comment.created_at", 128)
+        updated_at = _bounded_text(value.get("updated_at"), "comment.updated_at", 128)
+        created_instant = _parse_github_timestamp(created_at, "comment.created_at")
+        updated_instant = _parse_github_timestamp(updated_at, "comment.updated_at")
+        if updated_instant < created_instant:
+            raise InvalidResponseError("comment.updated_at is earlier than comment.created_at")
+
+        user = value.get("user")
+        if user is None:
+            author_id = author_login = author_type = None
+        else:
+            if type(user) is not dict:
+                raise InvalidResponseError("comment.user must be null or an object")
+            author_id = _bounded_text(user.get("node_id"), "comment.author.node_id")
+            author_login = _bounded_text(user.get("login"), "comment.author.login")
+            author_type = _bounded_text(user.get("type"), "comment.author.type")
+
+        returned_issue_url = _bounded_text(value.get("issue_url"), "comment.issue_url", 2_048)
+        if returned_issue_url != issue_url:
+            raise InvalidResponseError("comment.issue_url does not match the requested issue")
+        return _IssueCommentRESTRecord(
+            database_id,
+            node_id,
+            body,
+            author_id,
+            author_login,
+            author_type,
+            created_at,
+            updated_at,
+            returned_issue_url,
+        )
+
+    @classmethod
+    def _validate_comment_bounds(cls, max_pages: int, max_records: int) -> tuple[int, int]:
+        if type(max_pages) is not int or max_pages <= 0 or max_pages > 100:
+            raise GitHubAPIError("comment max_pages must be a positive integer no greater than 100")
+        if type(max_records) is not int or max_records <= 0 or max_records > 10_000:
+            raise GitHubAPIError("comment max_records must be a positive integer no greater than 10000")
+        return max_pages, max_records
+
+    def _read_issue_comment_rest_snapshot(self, owner: str, name: str, number: int, max_pages: int, max_records: int) -> tuple[_IssueCommentRESTRecord, ...]:
+        issue_url = f"{REST_BASE_URL}/repos/{owner}/{name}/issues/{number}"
+        records: list[_IssueCommentRESTRecord] = []
+        seen_database_ids: set[int] = set()
+        seen_node_ids: set[str] = set()
+        previous_database_id: int | None = None
+
+        for page in range(1, max_pages + 1):
+            url = f"{REST_BASE_URL}/repos/{owner}/{name}/issues/{number}/comments?per_page=100&page={page}"
+            value = self._request("GET", url)
+            if type(value) is not list:
+                raise InvalidResponseError("issue comment REST page must be a list")
+            if len(value) > 100:
+                raise InvalidResponseError("issue comment REST page exceeds 100 records")
+            for raw_record in value:
+                record = self._parse_issue_comment_rest_record(raw_record, issue_url)
+                if previous_database_id is not None and record.database_id <= previous_database_id:
+                    raise InvalidResponseError("issue comment REST database IDs are not strictly increasing")
+                if record.database_id in seen_database_ids:
+                    raise InvalidResponseError("issue comment REST database ID is duplicated")
+                if record.node_id in seen_node_ids:
+                    raise InvalidResponseError("issue comment REST node ID is duplicated")
+                records.append(record)
+                seen_database_ids.add(record.database_id)
+                seen_node_ids.add(record.node_id)
+                previous_database_id = record.database_id
+                if len(records) > max_records:
+                    raise InvalidResponseError("issue comment REST snapshot exceeds configured record bound")
+
+            if len(value) < 100:
+                return tuple(records)
+            if len(records) >= max_records:
+                if page == 100 and max_pages == 100 and max_records == 10_000 and len(records) == 10_000:
+                    sentinel_url = f"{REST_BASE_URL}/repos/{owner}/{name}/issues/{number}/comments?per_page=100&page=101"
+                    sentinel = self._request("GET", sentinel_url)
+                    if type(sentinel) is not list or sentinel:
+                        raise InvalidResponseError("issue comment REST page 101 must be an empty sentinel")
+                    return tuple(records)
+                raise InvalidResponseError("full issue comment REST page exhausted configured bound")
+            if page == max_pages:
+                raise InvalidResponseError("issue comment REST pagination exceeds configured page bound")
+        raise InvalidResponseError("issue comment REST pagination exceeds configured page bound")
+
+    @staticmethod
+    def _parse_issue_comment_graphql_actor(value: Any, label: str) -> tuple[str, str, str]:
+        if type(value) is not dict:
+            raise InvalidResponseError(f"{label} must be an object")
+        return (
+            _bounded_text(value.get("id"), f"{label}.id"),
+            _bounded_text(value.get("login"), f"{label}.login"),
+            _bounded_text(value.get("__typename"), f"{label}.__typename"),
+        )
+
+    @classmethod
+    def _parse_issue_comment_graphql_node(cls, value: Any, rest: _IssueCommentRESTRecord) -> IssueComment:
+        if type(value) is not dict:
+            raise InvalidResponseError("issue comment GraphQL node must be an object")
+        if value.get("__typename") != "IssueComment":
+            raise InvalidResponseError("issue comment GraphQL node has the wrong type")
+        node_id = _bounded_text(value.get("id"), "comment.node_id")
+        if node_id != rest.node_id:
+            raise InvalidResponseError("comment GraphQL node ID does not match REST")
+
+        full_database_id = value.get("fullDatabaseId")
+        if type(full_database_id) is not str or not re.fullmatch(r"[0-9]{1,19}", full_database_id):
+            raise InvalidResponseError("comment.fullDatabaseId must be strict bounded decimal text")
+        try:
+            database_id = _positive_id(int(full_database_id), "comment.fullDatabaseId")
+        except (ValueError, TypeError):
+            raise InvalidResponseError("comment.fullDatabaseId is invalid") from None
+        if database_id != rest.database_id:
+            raise InvalidResponseError("comment GraphQL database ID does not match REST")
+
+        body = cls._body_text(value.get("body"), "comment.body")
+        if body != rest.body:
+            raise InvalidResponseError("comment body does not match REST")
+        created_at = _bounded_text(value.get("createdAt"), "comment.createdAt", 128)
+        updated_at = _bounded_text(value.get("updatedAt"), "comment.updatedAt", 128)
+        if _parse_github_timestamp(created_at, "comment.createdAt") != _parse_github_timestamp(rest.created_at, "comment.created_at"):
+            raise InvalidResponseError("comment created timestamp does not match REST")
+        if _parse_github_timestamp(updated_at, "comment.updatedAt") != _parse_github_timestamp(rest.updated_at, "comment.updated_at"):
+            raise InvalidResponseError("comment updated timestamp does not match REST")
+
+        author = value.get("author")
+        if rest.author_id is None:
+            if author is not None:
+                raise InvalidResponseError("comment GraphQL author is present but REST author is null")
+        else:
+            author_id, author_login, author_type = cls._parse_issue_comment_graphql_actor(author, "comment.author")
+            if (author_id, author_login, author_type) != (rest.author_id, rest.author_login, rest.author_type):
+                raise InvalidResponseError("comment author does not match REST")
+
+        editor = value.get("editor")
+        if editor is None:
+            editor_id = editor_login = editor_type = None
+        else:
+            editor_id, editor_login, editor_type = cls._parse_issue_comment_graphql_actor(editor, "comment.editor")
+
+        last_edited_at = value.get("lastEditedAt")
+        if last_edited_at is not None:
+            last_edited_at = _bounded_text(last_edited_at, "comment.lastEditedAt", 128)
+            _parse_github_timestamp(last_edited_at, "comment.lastEditedAt")
+        includes_created_edit = value.get("includesCreatedEdit")
+        if type(includes_created_edit) is not bool:
+            raise InvalidResponseError("comment.includesCreatedEdit must be boolean")
+        history = value.get("userContentEdits")
+        if type(history) is not dict:
+            raise InvalidResponseError("comment.userContentEdits must be an object")
+        total_count = history.get("totalCount")
+        if type(total_count) is not int or type(total_count) is bool or total_count < 0:
+            raise InvalidResponseError("comment.userContentEdits.totalCount is invalid")
+        if total_count == 0:
+            if last_edited_at is not None or editor is not None or includes_created_edit:
+                raise InvalidResponseError("comment history is inconsistent with a clean comment")
+        elif last_edited_at is None:
+            raise InvalidResponseError("edited comment is missing lastEditedAt")
+
+        return IssueComment(
+            rest.node_id,
+            rest.database_id,
+            rest.body,
+            rest.author_id,
+            rest.author_login,
+            rest.author_type,
+            editor_id,
+            editor_login,
+            editor_type,
+            last_edited_at,
+            includes_created_edit,
+        )
+
+    def _enrich_issue_comment_snapshot(self, records: tuple[_IssueCommentRESTRecord, ...]) -> tuple[IssueComment, ...]:
+        enriched: dict[str, IssueComment] = {}
+        for offset in range(0, len(records), 100):
+            batch = records[offset:offset + 100]
+            requested_ids = [record.node_id for record in batch]
+            data = self._graphql(ISSUE_COMMENT_NODES_QUERY, {"ids": requested_ids}, operation="issueCommentNodes")
+            if set(data) != {"nodes"} or type(data["nodes"]) is not list:
+                raise InvalidResponseError("issue comment GraphQL nodes response has invalid shape")
+            nodes = data["nodes"]
+            if len(nodes) != len(requested_ids):
+                raise InvalidResponseError("issue comment GraphQL node count does not match the request")
+            requested_set = set(requested_ids)
+            returned: dict[str, Any] = {}
+            for node in nodes:
+                if type(node) is not dict:
+                    raise InvalidResponseError("issue comment GraphQL node must not be null or non-object")
+                returned_id = _bounded_text(node.get("id"), "comment.node_id")
+                if returned_id not in requested_set:
+                    raise InvalidResponseError("issue comment GraphQL node was not requested")
+                if returned_id in returned:
+                    raise InvalidResponseError("issue comment GraphQL node ID is duplicated")
+                returned[returned_id] = node
+            if set(returned) != requested_set:
+                raise InvalidResponseError("issue comment GraphQL node IDs do not match the request")
+            for record in batch:
+                enriched[record.node_id] = self._parse_issue_comment_graphql_node(returned[record.node_id], record)
+        return tuple(enriched[record.node_id] for record in records)
+
     def list_issue_comments(self, repository: str, number: int, *, max_pages: int = 100, max_records: int = 10_000) -> tuple[IssueComment, ...]:
         owner, name = self._owner_repo(repository)
-        if max_pages <= 0 or max_records <= 0:
-            raise GitHubAPIError("comment pagination bounds must be positive")
-        comments: list[IssueComment] = []
-        cursor: str | None = None
-        for _page in range(max_pages):
-            data = self._graphql(PULL_REQUEST_COMMENTS_QUERY, {"owner": owner, "name": name, "number": number, "after": cursor}, operation="pullRequestComments")
-            repo = data.get("repository")
-            if type(repo) is not dict or type(repo.get("pullRequest")) is not dict:
-                raise InvalidResponseError("pull request comment response is missing pull request")
-            connection = repo["pullRequest"].get("comments")
-            if type(connection) is not dict or type(connection.get("nodes")) is not list or type(connection.get("pageInfo")) is not dict:
-                raise InvalidResponseError("pull request comment connection has invalid shape")
-            for value in connection["nodes"]:
-                if type(value) is not dict:
-                    raise InvalidResponseError("issue comment node must be an object")
-                author = value.get("author")
-                editor = value.get("editor")
-                if author is not None and type(author) is not dict:
-                    raise InvalidResponseError("comment author has invalid shape")
-                if editor is not None and type(editor) is not dict:
-                    raise InvalidResponseError("comment editor has invalid shape")
-                if type(value.get("includesCreatedEdit")) is not bool or type(value.get("body")) is not str:
-                    raise InvalidResponseError("comment body/edit metadata has invalid shape")
-                comments.append(IssueComment(
-                    _bounded_text(value.get("id"), "comment.node_id"),
-                    _positive_id(value.get("databaseId"), "comment.databaseId"),
-                    value["body"],
-                    _bounded_text(author.get("id"), "comment.author.id") if author is not None else None,
-                    _bounded_text(author.get("login"), "comment.author.login") if author is not None else None,
-                    _bounded_text(author.get("__typename"), "comment.author.type") if author is not None and author.get("__typename") is not None else None,
-                    _bounded_text(editor.get("id"), "comment.editor.id") if editor is not None else None,
-                    _bounded_text(editor.get("login"), "comment.editor.login") if editor is not None else None,
-                    _bounded_text(editor.get("__typename"), "comment.editor.type") if editor is not None and editor.get("__typename") is not None else None,
-                    _optional_iso(value.get("lastEditedAt"), "comment.lastEditedAt"),
-                    value["includesCreatedEdit"],
-                ))
-                if len(comments) > max_records:
-                    raise InvalidResponseError("comment pagination exceeds configured bound")
-            page_info = connection["pageInfo"]
-            if type(page_info.get("hasNextPage")) is not bool:
-                raise InvalidResponseError("comment pageInfo.hasNextPage must be boolean")
-            if not page_info["hasNextPage"]:
-                return tuple(sorted(comments, key=lambda item: item.database_id))
-            cursor_value = page_info.get("endCursor")
-            if type(cursor_value) is not str or not cursor_value:
-                raise InvalidResponseError("next comment page is missing endCursor")
-            cursor = cursor_value
-        raise InvalidResponseError("comment pagination exceeds configured page bound")
+        if type(number) is not int or type(number) is bool or number <= 0:
+            raise GitHubAPIError("issue number must be positive")
+        max_pages, max_records = self._validate_comment_bounds(max_pages, max_records)
+        rest_a = self._read_issue_comment_rest_snapshot(owner, name, number, max_pages, max_records)
+        if not rest_a:
+            rest_b = self._read_issue_comment_rest_snapshot(owner, name, number, max_pages, max_records)
+            if rest_a != rest_b:
+                raise InvalidResponseError("issue comment REST authority changed during composite read")
+            return ()
+        enriched = self._enrich_issue_comment_snapshot(rest_a)
+        rest_b = self._read_issue_comment_rest_snapshot(owner, name, number, max_pages, max_records)
+        if rest_a != rest_b:
+            raise InvalidResponseError("issue comment REST authority changed during composite read")
+        return enriched
 
     def create_issue_comment(self, repository: str, number: int, body: str) -> IssueComment:
         owner, name = self._owner_repo(repository)
