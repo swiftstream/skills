@@ -11,6 +11,8 @@ from automation.federation.controller import (
     DuplicateCheckRunError,
     MissingTrustedCheckError,
     R02Error,
+    AnchorComment,
+    authorized_patch_events,
     TRUSTED_VALIDATION_NAME,
     TrustedValidationResult,
     evaluate_trusted_validation,
@@ -20,11 +22,13 @@ from automation.federation.controller import (
     upsert_trusted_validation_check,
     main,
     trusted_c02_execution,
+    validate_unique_anchor,
 )
 import automation.federation.controller as controller_module
 from scripts import federate as c02
-from automation.federation.github_api import CheckRun, RepositoryMetadata
-from automation.federation.github_api import REST_BASE_URL, GitHubClient, HttpResponse, UrllibTransport
+from automation.federation.github_api import CheckRun, IssueComment, PullRequestMetadata, RepositoryMetadata
+from automation.federation.github_api import ISSUE_COMMENT_NODES_QUERY, REST_BASE_URL, GitHubClient, HttpResponse, UrllibTransport
+from automation.federation.request_model import RequestAnchor, RequestClass, body_sha256, parse_request_body
 from tests.automation.test_interactive import ProductionAddClient
 
 
@@ -45,6 +49,7 @@ class ValidationTests(unittest.TestCase):
         class Transport:
             def __init__(self):
                 self.calls = []
+                self.comment_reads = 0
 
             def request(self, method, url, headers, body, timeout):
                 self.calls.append((method, url, body))
@@ -60,13 +65,23 @@ class ValidationTests(unittest.TestCase):
                         "head": {"sha": "a" * 40, "ref": "proposal", "repo": {"node_id": "7", "full_name": "swiftstream/skills"}},
                         "base": {"sha": "b" * 40, "ref": "main", "repo": {"node_id": "7", "full_name": "swiftstream/skills"}},
                     }).encode())
+                if url == REST_BASE_URL + "/repos/swiftstream/skills/issues/7/comments?per_page=100&page=1":
+                    self.comment_reads += 1
+                    comment = {"id": 1, "node_id": "IC_1", "body": "comment", "created_at": "2026-09-10T00:00:00Z", "updated_at": "2026-09-10T00:00:00Z", "issue_url": "https://api.github.com/repos/swiftstream/skills/issues/7", "user": {"node_id": "U_author", "login": "alice", "type": "User"}}
+                    return HttpResponse(200, url, json.dumps([comment]).encode())
                 payload = json.loads(body)
                 if "FederationPullRequestRoutingBefore" in payload["query"] or "FederationPullRequestRoutingAfter" in payload["query"]:
                     return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
-                cursor = payload["variables"]["after"]
-                node = {"id": "IC_" + ("2" if cursor else "1"), "databaseId": 2 if cursor else 1, "body": "comment", "author": {"id": "U_author", "login": "alice", "__typename": "User"}, "editor": None, "lastEditedAt": None, "includesCreatedEdit": False}
-                page = {"nodes": [node], "pageInfo": {"hasNextPage": cursor is None, "endCursor": "cursor-1" if cursor is None else None}}
-                return HttpResponse(200, url, json.dumps({"data": {"repository": {"pullRequest": {"comments": page}}}}).encode())
+                if payload["query"] == ISSUE_COMMENT_NODES_QUERY:
+                    self.assert_comment_query(payload)
+                    node = {"__typename": "IssueComment", "id": "IC_1", "fullDatabaseId": "1", "body": "comment", "createdAt": "2026-09-10T00:00:00Z", "updatedAt": "2026-09-10T00:00:00Z", "author": {"id": "U_author", "login": "alice", "__typename": "User"}, "editor": None, "lastEditedAt": None, "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
+                    return HttpResponse(200, url, json.dumps({"data": {"nodes": [node]}}).encode())
+                raise AssertionError(payload["query"])
+
+            def assert_comment_query(self, payload):
+                self.last_comment_variables = payload["variables"]
+                if self.last_comment_variables != {"ids": ["IC_1"]}:
+                    raise AssertionError(self.last_comment_variables)
 
         transport = Transport()
         client = GitHubClient("token", transport)
@@ -74,8 +89,53 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(client.get_app_metadata("swiftstream-federation").id, 77)
         self.assertEqual(client.get_bot_metadata("swiftstream-federation").node_id, "U_bot")
         self.assertEqual(client.get_pull_request_metadata("swiftstream/skills", 7).head_oid, "a" * 40)
-        self.assertEqual([item.database_id for item in client.list_issue_comments("swiftstream/skills", 7)], [1, 2])
-        self.assertTrue(all("swiftstream/skills" not in json.loads(call[2])["query"] for call in transport.calls if call[0] == "POST"))
+        self.assertEqual([item.database_id for item in client.list_issue_comments("swiftstream/skills", 7)], [1])
+        self.assertEqual(transport.comment_reads, 2)
+        graphql_queries = [json.loads(call[2])["query"] for call in transport.calls if call[0] == "POST"]
+        self.assertIn(ISSUE_COMMENT_NODES_QUERY, graphql_queries)
+        self.assertNotIn("FederationPullRequestComments", "\n".join(graphql_queries))
+        self.assertEqual(transport.last_comment_variables, {"ids": ["IC_1"]})
+
+    def _compatibility_fixture(self):
+        body = "Repository URL:\nhttps://github.com/example/source\nDescription:\nA source\nBranch:\nmain\nSkills root:\nskills\nSkill prefixes:\nexample\n"
+        request = parse_request_body(RequestClass.ADD, body)
+        pr = PullRequestMetadata(7, body, "U_author", "alice", "a" * 40, "b" * 40, "proposal", "main", "N_head", "swiftstream/skills", "N_base", "swiftstream/skills", None, False)
+        anchor = RequestAnchor(7, RequestClass.ADD, "U_author", "alice", body_sha256(body), request)
+        anchor_comment = IssueComment("IC_anchor", 1, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot", None, None, None, None, False)
+        return pr, anchor, AnchorComment(anchor, anchor_comment)
+
+    def test_edited_immutable_anchor_is_rejected_by_unchanged_controller(self):
+        pr, anchor, anchor_item = self._compatibility_fixture()
+        edited = replace(anchor_item.comment, editor_id="U_editor", editor_login="editor", editor_type="User", last_edited_at="2026-09-10T01:00:00Z", includes_created_edit=True)
+        with self.assertRaises(R02Error):
+            validate_unique_anchor([edited], pr, RequestClass.ADD, APP)
+
+    def test_edited_original_author_patch_remains_authorized(self):
+        pr, anchor, anchor_item = self._compatibility_fixture()
+        patch_comment = IssueComment("IC_patch", 2, "Federation PATCH\nDescription:\nUpdated\n", "U_author", "alice", "User", "U_editor", "editor", "User", "2026-09-10T01:00:00Z", True)
+        events = authorized_patch_events(object(), "swiftstream/skills", anchor_item, [patch_comment])
+        self.assertEqual([(event.comment_id, event.authorized) for event in events], [(2, True)])
+
+    def test_edited_maintainer_patch_remains_authorized(self):
+        _pr, _anchor, anchor_item = self._compatibility_fixture()
+        patch_comment = IssueComment("IC_patch", 2, "Federation PATCH\nDescription:\nUpdated\n", "U_maint", "maintainer", "User", "U_editor", "editor", "User", "2026-09-10T01:00:00Z", False)
+        class MaintainerClient:
+            def get_collaborator_permission(self, repository, login):
+                self.seen = (repository, login)
+                return "maintain"
+        client = MaintainerClient()
+        events = authorized_patch_events(client, "swiftstream/skills", anchor_item, [patch_comment])
+        self.assertTrue(events[0].authorized)
+        self.assertEqual(client.seen, ("swiftstream/skills", "maintainer"))
+
+    def test_edit_history_does_not_grant_unauthorized_patch_authority(self):
+        _pr, _anchor, anchor_item = self._compatibility_fixture()
+        patch_comment = IssueComment("IC_patch", 2, "Federation PATCH\nDescription:\nUpdated\n", "U_other", "commenter", "User", "U_editor", "editor", "User", "2026-09-10T01:00:00Z", True)
+        class ReadClient:
+            def get_collaborator_permission(self, repository, login):
+                return "read"
+        events = authorized_patch_events(ReadClient(), "swiftstream/skills", anchor_item, [patch_comment])
+        self.assertFalse(events[0].authorized)
 
     def test_commit_metadata_is_frozen_and_check_update_cannot_retarget_head(self):
         tree = "1" * 40
