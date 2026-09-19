@@ -200,6 +200,27 @@ class GitHubAPITests(unittest.TestCase):
         self.assertNotIn("repo-node", payload["query"])
         self.assertEqual(len(payload["variables"]["refUpdates"]), 1)
 
+    def test_update_pull_request_branch_uses_exact_expected_head_cas(self):
+        url = REST_BASE_URL + "/repos/swiftstream/skills/pulls/7/update-branch"
+        response = {"message": "Updating pull request branch.", "url": "https://github.com/swiftstream/skills/pull/7"}
+        fake = FakeTransport(HttpResponse(202, url, json.dumps(response, separators=(",", ":")).encode()))
+        client = GitHubClient("test-token", fake)
+        client.update_pull_request_branch("swiftstream/skills", 7, expected_head_sha="a" * 40)
+        method, request_url, headers, body, timeout = fake.calls[0]
+        self.assertEqual((method, request_url, timeout), ("PUT", url, 15.0))
+        self.assertEqual(headers["Authorization"], "Bearer test-token")
+        self.assertEqual(json.loads(body), {"expected_head_sha": "a" * 40})
+
+    def test_update_pull_request_branch_rejects_invalid_identity_before_transport(self):
+        fake = FakeTransport(HttpResponse(202, REST_BASE_URL + "/unused", b"{}"))
+        client = GitHubClient(None, fake)
+        for number in (0, -1, True):
+            with self.subTest(number=number), self.assertRaises(GitHubAPIError):
+                client.update_pull_request_branch("swiftstream/skills", number, expected_head_sha="a" * 40)
+        with self.assertRaises(InvalidResponseError):
+            client.update_pull_request_branch("swiftstream/skills", 7, expected_head_sha="not-a-sha")
+        self.assertEqual(fake.calls, [])
+
     def test_graphql_error_diagnostic_preserves_only_bounded_structure(self):
         text, _ = self._graphql_error({"type": "FORBIDDEN", "path": ["repository", "pullRequest"]})
         self.assertEqual(text, "GRAPHQL:FORBIDDEN:repository.pullRequest")

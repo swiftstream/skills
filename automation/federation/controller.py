@@ -1942,6 +1942,7 @@ class R02Controller:
         sources = self._accepted_sources(current_main)
         machine = self._machine_prs(current_main, repository, sources)
         wake_finalizer = False
+        updated_manual = 0
         dispatched: set[str] = set()
         for source_id in sorted(machine):
             if machine[source_id]:
@@ -1961,11 +1962,26 @@ class R02Controller:
                     or pr.base_repository_id != repository.node_id
                     or pr.head_repository_id != repository.node_id
                     or pr.base_ref != repository.default_branch
-                    or pr.base_oid != current_main
                 ):
                     continue
                 comments = self.client.list_issue_comments(self.central_repository, number)
                 anchors = _anchor_candidates(comments)
+                if pr.base_oid != current_main:
+                    # Initial marker-only manual requests are safe to normalize
+                    # automatically when main advances.  Validate the request
+                    # head against the PR's own accepted historical base first,
+                    # then let GitHub merge current main into the head with an
+                    # expected-head CAS.  The resulting synchronize event wakes
+                    # the ordinary interactive/trusted-validation cloud path.
+                    if anchors:
+                        continue
+                    request_class = read_request_marker(self.client, self.central_repository, pr.head_oid)
+                    if request_class not in MANUAL_CLASSES:
+                        continue
+                    validate_existing_request_head(self.client, self.central_repository, pr, request_class, pr.base_oid)
+                    self.client.update_pull_request_branch(self.central_repository, number, expected_head_sha=pr.head_oid)
+                    updated_manual += 1
+                    continue
                 if len(anchors) == 1 and anchors[0].anchor.request_class in MANUAL_CLASSES:
                     validate_unique_anchor(comments, pr, anchors[0].anchor.request_class, self.app)
                     wake_finalizer = True
@@ -1973,7 +1989,7 @@ class R02Controller:
                 continue
         if wake_finalizer:
             self.client.dispatch_workflow(self.central_repository, "federation-state-finalize.yml", "refs/heads/main", {})
-        return f"MAIN_ADVANCE_DISPATCHED:{len(dispatched)}" if (dispatched or wake_finalizer) else "MAIN_ADVANCE_NOOP"
+        return f"MAIN_ADVANCE_DISPATCHED:{len(dispatched)}" if (dispatched or wake_finalizer or updated_manual) else "MAIN_ADVANCE_NOOP"
 
     def finalize_one_manual_pr(self, summary: Mapping[str, Any]) -> None:
         """Re-derive one current manual PR; never treats an enumeration hint as authority."""
