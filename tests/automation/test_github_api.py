@@ -16,6 +16,7 @@ from automation.federation.github_api import (
     ZERO_OID,
     GitHubClient,
     GitHubAPIError,
+    GitTreeEntry,
     GraphQLError,
     HttpResponse,
     InvalidResponseError,
@@ -220,6 +221,23 @@ class GitHubAPITests(unittest.TestCase):
         with self.assertRaises(InvalidResponseError):
             client.update_pull_request_branch("swiftstream/skills", 7, expected_head_sha="not-a-sha")
         self.assertEqual(fake.calls, [])
+
+    def test_optional_commit_file_distinguishes_absent_from_malformed_present_marker(self):
+        client = GitHubClient(None, FakeTransport(HttpResponse(200, REST_BASE_URL + "/unused", b"{}")))
+        with patch.object(client, "get_commit_tree", return_value=("1" * 40, ())):
+            self.assertIsNone(client.read_optional_commit_file("swiftstream/skills", "a" * 40, ".federation-request", expected_mode="100644"))
+
+        wrong_mode = GitTreeEntry(".federation-request", "100755", "blob", "2" * 40)
+        with patch.object(client, "get_commit_tree", return_value=("1" * 40, (wrong_mode,))):
+            with self.assertRaises(InvalidResponseError):
+                client.read_optional_commit_file("swiftstream/skills", "a" * 40, ".federation-request", expected_mode="100644")
+
+        exact = GitTreeEntry(".federation-request", "100644", "blob", "3" * 40)
+        with patch.object(client, "get_commit_tree", return_value=("1" * 40, (exact,))), patch.object(client, "get_blob", return_value=b"add-source\n"):
+            self.assertEqual(
+                client.read_optional_commit_file("swiftstream/skills", "a" * 40, ".federation-request", expected_mode="100644"),
+                b"add-source\n",
+            )
 
     def test_graphql_error_diagnostic_preserves_only_bounded_structure(self):
         text, _ = self._graphql_error({"type": "FORBIDDEN", "path": ["repository", "pullRequest"]})
