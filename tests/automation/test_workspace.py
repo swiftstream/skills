@@ -24,6 +24,9 @@ from automation.federation.workspace import (
 )
 
 
+ROOT = Path(__file__).resolve().parents[2]
+
+
 def git(repo, args, *, text=True):
     return federate.run_git(args, cwd=repo, text=text, source_workspace=True)
 
@@ -34,7 +37,7 @@ class WorkspaceTests(unittest.TestCase):
         self.addCleanup(os.environ.update, self._ambient_git)
 
     def fixture(self):
-        temp = tempfile.TemporaryDirectory()
+        temp = tempfile.TemporaryDirectory(dir=str(ROOT.parent))
         repo = Path(temp.name) / "repo"
         repo.mkdir()
         git(repo, ["init", "--quiet"])

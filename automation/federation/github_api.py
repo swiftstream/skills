@@ -685,11 +685,19 @@ class GitHubClient:
         return data
 
     def read_commit_file(self, repository: str, commit_sha: str, path: str, *, expected_mode: str | None = None) -> bytes:
+        data = self.read_optional_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
+        if data is None:
+            raise InvalidResponseError("requested committed file is missing or ambiguous")
+        return data
+
+    def read_optional_commit_file(self, repository: str, commit_sha: str, path: str, *, expected_mode: str | None = None) -> bytes | None:
         _validate_tree_path(path)
         _tree_sha, entries = self.get_commit_tree(repository, commit_sha)
         matches = [item for item in entries if item.path == path]
+        if not matches:
+            return None
         if len(matches) != 1:
-            raise InvalidResponseError("requested committed file is missing or ambiguous")
+            raise InvalidResponseError("requested committed file is ambiguous")
         entry = matches[0]
         if entry.object_type != "blob" or (expected_mode is not None and entry.mode != expected_mode):
             raise InvalidResponseError("requested committed file is not the expected regular blob")

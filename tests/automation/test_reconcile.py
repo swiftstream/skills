@@ -762,8 +762,24 @@ class ReconcileTests(unittest.TestCase):
         self.assertIn("contents: read", workflow)
         self.assertIn("permission-contents: write", workflow)
         self.assertIn("permission-pull-requests: write", workflow)
+        self.assertIn("group: swiftstream-skills-federation-manual-authority", workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn("queue: max", workflow)
         self.assertIn("persist-credentials: false", workflow)
         self.assertNotIn("FEDERATION_NO_BYPASS_PROOF_V2", workflow)
+
+    def test_main_advance_and_interactive_share_request_anchor_authority_concurrency(self):
+        workflows = controller_module.Path(__file__).resolve().parents[2] / ".github/workflows"
+        main_advance = (workflows / "federation-main-advance.yml").read_text()
+        interactive = (workflows / "federation-interactive.yml").read_text()
+        group = "group: swiftstream-skills-federation-manual-authority"
+        self.assertEqual(main_advance.count(group), 1)
+        self.assertEqual(interactive.count(group), 1)
+        self.assertIn("cancel-in-progress: false", main_advance)
+        self.assertIn("cancel-in-progress: false", interactive)
+        self.assertIn("queue: max", main_advance)
+        self.assertIn("queue: max", interactive)
+        self.assertNotIn("group: federation-interactive-pr-", interactive)
 
 
 if __name__ == "__main__":
