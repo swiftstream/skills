@@ -542,6 +542,7 @@ class ReconcileTests(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.prs = prs
+                self.updated_branches = []
 
             def list_open_pull_requests(self, _repository):
                 return tuple({"number": number} for number in self.prs)
@@ -551,6 +552,9 @@ class ReconcileTests(unittest.TestCase):
 
             def list_issue_comments(self, _repository, number):
                 return tuple(comments_by_pr.get(number, ()))
+
+            def update_pull_request_branch(self, _repository, number, *, expected_head_sha):
+                self.updated_branches.append((number, expected_head_sha))
 
         client = MainAdvanceClient()
         source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
@@ -676,6 +680,49 @@ class ReconcileTests(unittest.TestCase):
         )
         self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
         self.assertEqual(client.dispatches, [])
+        self.assertEqual(client.updated_branches, [])
+
+    def test_main_advance_stale_initial_marker_request_is_cloud_normalized_with_head_cas(self):
+        stale_pr, _ = self._manual_main_advance_pr(base_oid="b" * 40)
+        client, controller = self._main_advance_with_prs({stale_pr.number: stale_pr}, {stale_pr.number: ()})
+        with patch.object(controller_module, "read_request_marker", return_value=RequestClass.ADD) as read_marker, patch.object(controller_module, "validate_existing_request_head") as validate_head:
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
+        read_marker.assert_called_once_with(client, "swiftstream/skills", stale_pr.head_oid)
+        validate_head.assert_called_once_with(client, "swiftstream/skills", stale_pr, RequestClass.ADD, stale_pr.base_oid)
+        self.assertEqual(client.updated_branches, [(stale_pr.number, stale_pr.head_oid)])
+        self.assertEqual(client.dispatches, [])
+
+    def test_main_advance_stale_initial_request_ignores_ordinary_non_request_anchor_comment(self):
+        stale_pr, _ = self._manual_main_advance_pr(base_oid="b" * 40)
+        compatibility_comment = IssueComment(
+            "IC_compat",
+            201,
+            "SwiftStream federation P1 compatibility anchor: C02-20260917-3b7e91c2",
+            "U_author",
+            "alice",
+            "User",
+            None,
+            None,
+            None,
+            None,
+            False,
+        )
+        client, controller = self._main_advance_with_prs(
+            {stale_pr.number: stale_pr},
+            {stale_pr.number: (compatibility_comment,)},
+        )
+        with patch.object(controller_module, "read_request_marker", return_value=RequestClass.ADD), patch.object(controller_module, "validate_existing_request_head"):
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
+        self.assertEqual(client.updated_branches, [(stale_pr.number, stale_pr.head_oid)])
+        self.assertEqual(client.dispatches, [])
+
+    def test_main_advance_stale_initial_request_fails_closed_before_update_on_scope_error(self):
+        stale_pr, _ = self._manual_main_advance_pr(base_oid="b" * 40)
+        client, controller = self._main_advance_with_prs({stale_pr.number: stale_pr}, {stale_pr.number: ()})
+        with patch.object(controller_module, "read_request_marker", return_value=RequestClass.ADD), patch.object(controller_module, "validate_existing_request_head", side_effect=R02Error("unsafe stale request")):
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        self.assertEqual(client.updated_branches, [])
+        self.assertEqual(client.dispatches, [])
 
     def test_main_advance_unrelated_wrong_app_and_stale_manual_prs_do_not_wake(self):
         body = "Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\nDemo\nBranch:\nmain\nSkills root:\nskills\nSkill prefixes:\ndemo\n"
@@ -713,6 +760,8 @@ class ReconcileTests(unittest.TestCase):
         workflow = (controller_module.Path(__file__).resolve().parents[2] / ".github/workflows/federation-main-advance.yml").read_text()
         self.assertIn("branches: [main]", workflow)
         self.assertIn("contents: read", workflow)
+        self.assertIn("permission-contents: write", workflow)
+        self.assertIn("permission-pull-requests: write", workflow)
         self.assertIn("persist-credentials: false", workflow)
         self.assertNotIn("FEDERATION_NO_BYPASS_PROOF_V2", workflow)
 

@@ -676,6 +676,12 @@ Every trust/configuration PR has a strict diff-scope check. The latest validated
 
 Every bot proposal commit is tied to the exact PR head SHA from which it was computed. Any subsequent requester push invalidates the previous proposal checks and requires a fresh full proposal validation. Manual merge is permitted only for the latest head SHA whose required checks all passed after the final bot mutation.
 
+When accepted central `main` advances while an initial same-repository manual request is still based on an older accepted main, the trusted `Federation main advance` workflow may normalize that request entirely inside GitHub. This automatic normalization is allowed only before an immutable RequestAnchor exists and only after trusted code proves that the current request head differs from its own recorded historical PR base by exactly the valid initial `.federation-request` marker shape for ADD, UPDATE, or REMOVE. Fork heads, malformed or missing markers, anchored stale proposals, unrelated diffs, unexpected modes, or any request whose exact authority cannot be re-established remain fail-closed and are not updated automatically.
+
+The normalization mutation uses GitHub's pull-request `update-branch` operation with the exact current PR head SHA as `expected_head_sha`. The GitHub App token is minted on the GitHub-hosted `Federation main advance` runner and is scoped to the central repository with the write permissions needed for that one cloud mutation. No maintainer workstation credential, private-key read, local JWT, installation token, or local REST controller participates.
+
+A successful cloud update creates the ordinary GitHub `synchronize` event. That event, rather than a second manual dispatch, wakes `Federation interactive` and `Federation trusted validation`; those trusted workflows then re-read current authority, generate the proposal, and continue the normal finalizer path. Thus a main advance can recover a safe stale initial request without a maintainer click while preserving the same exact-head and exact-base race rules used by the interactive flow.
+
 The bot must never merge or mark ready a proposal whose validated SHA differs from the current PR head.
 
 ### 15.7 Invalid interactive proposal
@@ -1230,6 +1236,8 @@ SUPERSEDED -> updated or closed in favor of current state
 ```
 
 An intentionally open trust/configuration PR means a human decision or interactive proposal is still pending.
+
+A same-repository initial manual request must also not become permanently stranded merely because trusted central `main` advanced after the request was opened. On every `main` push, trusted main-advance automation re-enumerates open requests from current GitHub authority. A stale initial marker-only ADD/UPDATE/REMOVE request may be brought forward with GitHub's exact-head `update-branch` CAS after validation against its recorded historical base; the resulting `synchronize` event resumes the ordinary interactive pipeline. Stale requests that have already acquired an immutable anchor are not silently rebased by this recovery rule and remain subject to their normal exact-base revalidation/recovery semantics.
 
 ## 33. Eventual consistency model
 

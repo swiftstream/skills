@@ -34,8 +34,8 @@ jobs:
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-actions: write
-          permission-contents: read
-          permission-pull-requests: read
+          permission-contents: write
+          permission-pull-requests: write
       - name: Run trusted main-advance controller
         env:
           FEDERATION_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

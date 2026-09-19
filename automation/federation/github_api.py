@@ -1312,6 +1312,22 @@ class GitHubClient:
         if type(value) is not dict or type(value.get("number")) is not int or value["number"] != number:
             raise InvalidResponseError("updated pull request response is malformed")
 
+    def update_pull_request_branch(self, repository: str, number: int, *, expected_head_sha: str) -> None:
+        """Merge the current base into a PR head with GitHub's expected-head CAS."""
+        owner, name = self._owner_repo(repository)
+        if type(number) is not int or type(number) is bool or number <= 0:
+            raise GitHubAPIError("pull request number must be positive")
+        head = self._sha(expected_head_sha, "expected PR head SHA")
+        value = self.request_json(
+            "PUT",
+            ["repos", owner, name, "pulls", str(number), "update-branch"],
+            {"expected_head_sha": head},
+        )
+        if type(value) is not dict or set(value) != {"message", "url"}:
+            raise InvalidResponseError("update-branch response has invalid exact shape")
+        _bounded_text(value.get("message"), "update-branch.message", 512)
+        _bounded_text(value.get("url"), "update-branch.url", 2_048)
+
     def merge_machine_pull_request(self, repository: str, number: int, *, expected_head_sha: str) -> MergeResult:
         """Merge only with GitHub's exact expected-head compare-and-swap input."""
         owner, name = self._owner_repo(repository)
