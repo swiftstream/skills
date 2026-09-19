@@ -685,11 +685,19 @@ class GitHubClient:
         return data
 
     def read_commit_file(self, repository: str, commit_sha: str, path: str, *, expected_mode: str | None = None) -> bytes:
+        data = self.read_optional_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
+        if data is None:
+            raise InvalidResponseError("requested committed file is missing or ambiguous")
+        return data
+
+    def read_optional_commit_file(self, repository: str, commit_sha: str, path: str, *, expected_mode: str | None = None) -> bytes | None:
         _validate_tree_path(path)
         _tree_sha, entries = self.get_commit_tree(repository, commit_sha)
         matches = [item for item in entries if item.path == path]
+        if not matches:
+            return None
         if len(matches) != 1:
-            raise InvalidResponseError("requested committed file is missing or ambiguous")
+            raise InvalidResponseError("requested committed file is ambiguous")
         entry = matches[0]
         if entry.object_type != "blob" or (expected_mode is not None and entry.mode != expected_mode):
             raise InvalidResponseError("requested committed file is not the expected regular blob")
@@ -1311,6 +1319,22 @@ class GitHubClient:
         value = self.request_json("PATCH", ["repos", owner, name, "pulls", str(number)], {"state": state})
         if type(value) is not dict or type(value.get("number")) is not int or value["number"] != number:
             raise InvalidResponseError("updated pull request response is malformed")
+
+    def update_pull_request_branch(self, repository: str, number: int, *, expected_head_sha: str) -> None:
+        """Merge the current base into a PR head with GitHub's expected-head CAS."""
+        owner, name = self._owner_repo(repository)
+        if type(number) is not int or type(number) is bool or number <= 0:
+            raise GitHubAPIError("pull request number must be positive")
+        head = self._sha(expected_head_sha, "expected PR head SHA")
+        value = self.request_json(
+            "PUT",
+            ["repos", owner, name, "pulls", str(number), "update-branch"],
+            {"expected_head_sha": head},
+        )
+        if type(value) is not dict or set(value) != {"message", "url"}:
+            raise InvalidResponseError("update-branch response has invalid exact shape")
+        _bounded_text(value.get("message"), "update-branch.message", 512)
+        _bounded_text(value.get("url"), "update-branch.url", 2_048)
 
     def merge_machine_pull_request(self, repository: str, number: int, *, expected_head_sha: str) -> MergeResult:
         """Merge only with GitHub's exact expected-head compare-and-swap input."""
