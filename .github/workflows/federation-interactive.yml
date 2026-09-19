@@ -15,8 +15,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: federation-interactive-pr-${{ github.event.pull_request.number || inputs.pull_number || github.event.issue.number }}
+  group: swiftstream-skills-federation-manual-authority
   cancel-in-progress: false
+  queue: max
 
 jobs:
   interactive:

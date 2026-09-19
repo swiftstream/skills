@@ -16,6 +16,7 @@ from automation.federation.github_api import (
     ZERO_OID,
     GitHubClient,
     GitHubAPIError,
+    GitTreeEntry,
     GraphQLError,
     HttpResponse,
     InvalidResponseError,
@@ -199,6 +200,44 @@ class GitHubAPITests(unittest.TestCase):
         self.assertIn("updateRefs", payload["query"])
         self.assertNotIn("repo-node", payload["query"])
         self.assertEqual(len(payload["variables"]["refUpdates"]), 1)
+
+    def test_update_pull_request_branch_uses_exact_expected_head_cas(self):
+        url = REST_BASE_URL + "/repos/swiftstream/skills/pulls/7/update-branch"
+        response = {"message": "Updating pull request branch.", "url": "https://github.com/swiftstream/skills/pull/7"}
+        fake = FakeTransport(HttpResponse(202, url, json.dumps(response, separators=(",", ":")).encode()))
+        client = GitHubClient("test-token", fake)
+        client.update_pull_request_branch("swiftstream/skills", 7, expected_head_sha="a" * 40)
+        method, request_url, headers, body, timeout = fake.calls[0]
+        self.assertEqual((method, request_url, timeout), ("PUT", url, 15.0))
+        self.assertEqual(headers["Authorization"], "Bearer test-token")
+        self.assertEqual(json.loads(body), {"expected_head_sha": "a" * 40})
+
+    def test_update_pull_request_branch_rejects_invalid_identity_before_transport(self):
+        fake = FakeTransport(HttpResponse(202, REST_BASE_URL + "/unused", b"{}"))
+        client = GitHubClient(None, fake)
+        for number in (0, -1, True):
+            with self.subTest(number=number), self.assertRaises(GitHubAPIError):
+                client.update_pull_request_branch("swiftstream/skills", number, expected_head_sha="a" * 40)
+        with self.assertRaises(InvalidResponseError):
+            client.update_pull_request_branch("swiftstream/skills", 7, expected_head_sha="not-a-sha")
+        self.assertEqual(fake.calls, [])
+
+    def test_optional_commit_file_distinguishes_absent_from_malformed_present_marker(self):
+        client = GitHubClient(None, FakeTransport(HttpResponse(200, REST_BASE_URL + "/unused", b"{}")))
+        with patch.object(client, "get_commit_tree", return_value=("1" * 40, ())):
+            self.assertIsNone(client.read_optional_commit_file("swiftstream/skills", "a" * 40, ".federation-request", expected_mode="100644"))
+
+        wrong_mode = GitTreeEntry(".federation-request", "100755", "blob", "2" * 40)
+        with patch.object(client, "get_commit_tree", return_value=("1" * 40, (wrong_mode,))):
+            with self.assertRaises(InvalidResponseError):
+                client.read_optional_commit_file("swiftstream/skills", "a" * 40, ".federation-request", expected_mode="100644")
+
+        exact = GitTreeEntry(".federation-request", "100644", "blob", "3" * 40)
+        with patch.object(client, "get_commit_tree", return_value=("1" * 40, (exact,))), patch.object(client, "get_blob", return_value=b"add-source\n"):
+            self.assertEqual(
+                client.read_optional_commit_file("swiftstream/skills", "a" * 40, ".federation-request", expected_mode="100644"),
+                b"add-source\n",
+            )
 
     def test_graphql_error_diagnostic_preserves_only_bounded_structure(self):
         text, _ = self._graphql_error({"type": "FORBIDDEN", "path": ["repository", "pullRequest"]})

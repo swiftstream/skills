@@ -744,6 +744,20 @@ def read_request_marker(client: GitHubClient, repository: str, head_sha: str) ->
     return marker_classes(REQUEST_MARKER, value)
 
 
+def read_optional_request_marker(client: GitHubClient, repository: str, head_sha: str) -> RequestClass | None:
+    """Treat an absent marker as unrelated while malformed present markers still fail closed."""
+    raw = client.read_optional_commit_file(repository, head_sha, REQUEST_MARKER, expected_mode="100644")
+    if raw is None:
+        return None
+    if len(raw) > 128 or not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise R02Error("request marker bytes are not exactly one value plus final newline")
+    try:
+        value = raw[:-1].decode("ascii")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        raise R02Error("request marker is not exact ASCII data") from None
+    return marker_classes(REQUEST_MARKER, value)
+
+
 def evaluate_trusted_validation(
     request_class: RequestClass,
     head_sha: str,
@@ -1542,7 +1556,7 @@ class R02Controller:
 
     def reconcile_interactive_request(self, pr_number: int, accepted_base_sha: str) -> MachineReconcileResult:
         """Execute one immutable manual RECONCILE request and close its PR."""
-        pr, anchor, fold, comments = self.anchor_and_reconstruct(pr_number, RequestClass.RECONCILE)
+        pr, anchor, fold, comments = self.interactive_anchor_and_reconstruct(pr_number, RequestClass.RECONCILE)
         if fold.request != anchor.anchor.initial_request:
             raise R02Error("RECONCILE request was changed by a mutable patch")
         repository, current_main = self.current_accepted_main()
@@ -1614,17 +1628,22 @@ class R02Controller:
         self.client.update_pull_request_state(self.central_repository, pr.number, state="closed")
         return result
 
-    def anchor_and_reconstruct(self, pr_number: int, request_class: RequestClass, semantic_validator: Callable[[Request], bool] | None = None) -> tuple[PullRequestMetadata, AnchorComment, PatchFoldResult, tuple[IssueComment, ...]]:
+    def anchor_and_reconstruct_existing(self, pr_number: int, request_class: RequestClass, semantic_validator: Callable[[Request], bool] | None = None) -> tuple[PullRequestMetadata, AnchorComment, PatchFoldResult, tuple[IssueComment, ...]]:
         pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
         require_same_repository_head(pr, self.central_repository)
         comments = self.client.list_issue_comments(self.central_repository, pr.number)
-        if _anchor_candidates(comments):
-            anchor = validate_unique_anchor(comments, pr, request_class, self.app)
-        else:
-            anchor = create_anchor_once(self.client, self.central_repository, pr, request_class, self.app, comments)
+        anchor = validate_unique_anchor(comments, pr, request_class, self.app)
+        return pr, anchor, reconstruct_from_github(self.client, self.central_repository, pr, anchor, comments, semantic_validator), comments
+
+    def interactive_anchor_and_reconstruct(self, pr_number: int, request_class: RequestClass, semantic_validator: Callable[[Request], bool] | None = None) -> tuple[PullRequestMetadata, AnchorComment, PatchFoldResult, tuple[IssueComment, ...]]:
+        pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+        require_same_repository_head(pr, self.central_repository)
+        comments = self.client.list_issue_comments(self.central_repository, pr.number)
+        if not _anchor_candidates(comments):
+            create_anchor_once(self.client, self.central_repository, pr, request_class, self.app, comments)
             pr = self.client.get_pull_request_metadata(self.central_repository, pr.number)
             comments = self.client.list_issue_comments(self.central_repository, pr.number)
-            anchor = validate_unique_anchor(comments, pr, request_class, self.app)
+        anchor = validate_unique_anchor(comments, pr, request_class, self.app)
         return pr, anchor, reconstruct_from_github(self.client, self.central_repository, pr, anchor, comments, semantic_validator), comments
 
     def interactive_proposal(self, pr_number: int, request_class: RequestClass, accepted_base_sha: str, request_ref: str, *, semantic_validator: Callable[[Request], bool] | None = None) -> ProposalCandidate:
@@ -1635,7 +1654,7 @@ class R02Controller:
         repository, current_main = self.current_accepted_main()
         if accepted_base_sha != current_main:
             raise StaleAuthorityError("interactive proposal was not bound to current accepted main")
-        pr, anchor, fold, comments = self.anchor_and_reconstruct(pr_number, request_class, semantic_validator)
+        pr, anchor, fold, comments = self.anchor_and_reconstruct_existing(pr_number, request_class, semantic_validator)
         if pr.base_ref != repository.default_branch or pr.base_oid != current_main:
             raise StaleAuthorityError("PR base is not the exact accepted central base")
         validate_existing_request_head(self.client, self.central_repository, pr, request_class, current_main)
@@ -1738,7 +1757,7 @@ class R02Controller:
             if len(anchors) != 1:
                 return False, "ANCHOR_AUTHORITY_INVALID"
             request_class = anchors[0].anchor.request_class
-            pr, anchor, fold, _comments = self.anchor_and_reconstruct(pr_number, request_class)
+            pr, anchor, fold, _comments = self.anchor_and_reconstruct_existing(pr_number, request_class)
             if expected_head_sha is not None and pr.head_oid != expected_head_sha:
                 return False, "VALIDATION_HEAD_CHANGED"
             candidate_builder = self.candidate_builder
@@ -1942,6 +1961,7 @@ class R02Controller:
         sources = self._accepted_sources(current_main)
         machine = self._machine_prs(current_main, repository, sources)
         wake_finalizer = False
+        updated_manual = 0
         dispatched: set[str] = set()
         for source_id in sorted(machine):
             if machine[source_id]:
@@ -1961,11 +1981,30 @@ class R02Controller:
                     or pr.base_repository_id != repository.node_id
                     or pr.head_repository_id != repository.node_id
                     or pr.base_ref != repository.default_branch
-                    or pr.base_oid != current_main
                 ):
                     continue
                 comments = self.client.list_issue_comments(self.central_repository, number)
                 anchors = _anchor_candidates(comments)
+                if pr.base_oid != current_main:
+                    # Initial marker-only manual requests are safe to normalize
+                    # automatically when main advances.  The trusted main-advance
+                    # and interactive workflows share one repository-wide GitHub
+                    # Actions concurrency group, so RequestAnchor creation cannot
+                    # overlap this no-anchor classification/update authority
+                    # window.  Validate the request head against the PR's own
+                    # accepted historical base first, then let GitHub merge
+                    # current main into the head with an expected-head CAS.  The
+                    # resulting synchronize event wakes the ordinary
+                    # interactive/trusted-validation cloud path.
+                    if anchors:
+                        continue
+                    request_class = read_request_marker(self.client, self.central_repository, pr.head_oid)
+                    if request_class not in MANUAL_CLASSES:
+                        continue
+                    validate_existing_request_head(self.client, self.central_repository, pr, request_class, pr.base_oid)
+                    self.client.update_pull_request_branch(self.central_repository, number, expected_head_sha=pr.head_oid)
+                    updated_manual += 1
+                    continue
                 if len(anchors) == 1 and anchors[0].anchor.request_class in MANUAL_CLASSES:
                     validate_unique_anchor(comments, pr, anchors[0].anchor.request_class, self.app)
                     wake_finalizer = True
@@ -1973,7 +2012,7 @@ class R02Controller:
                 continue
         if wake_finalizer:
             self.client.dispatch_workflow(self.central_repository, "federation-state-finalize.yml", "refs/heads/main", {})
-        return f"MAIN_ADVANCE_DISPATCHED:{len(dispatched)}" if (dispatched or wake_finalizer) else "MAIN_ADVANCE_NOOP"
+        return f"MAIN_ADVANCE_DISPATCHED:{len(dispatched)}" if (dispatched or wake_finalizer or updated_manual) else "MAIN_ADVANCE_NOOP"
 
     def finalize_one_manual_pr(self, summary: Mapping[str, Any]) -> None:
         """Re-derive one current manual PR; never treats an enumeration hint as authority."""
@@ -2121,7 +2160,9 @@ def main(argv: list[str] | None = None) -> int:
                     request_class = anchors[0].anchor.request_class
                 else:
                     pr = client.get_pull_request_metadata(repository, number)
-                    request_class = read_request_marker(client, repository, pr.head_oid)
+                    request_class = read_optional_request_marker(client, repository, pr.head_oid)
+                    if request_class is None:
+                        return 0
                 repository_metadata, accepted_main = controller.current_accepted_main()
                 pr = client.get_pull_request_metadata(repository, number)
                 if request_class is RequestClass.RECONCILE:
@@ -2139,13 +2180,15 @@ def main(argv: list[str] | None = None) -> int:
                     trigger_comment = next((item for item in comments if item.database_id == triggering_comment_id), None)
                     if trigger_comment is None:
                         raise R02Error("triggering issue comment is not present in the authoritative comment fold")
-                    _pr, trigger_anchor, trigger_fold, _fold_comments = controller.anchor_and_reconstruct(number, request_class)
+                    _pr, trigger_anchor, trigger_fold, _fold_comments = controller.interactive_anchor_and_reconstruct(number, request_class)
                     trigger_result, should_apply = _trigger_result(trigger_fold.evidence, triggering_comment_id)
                     if has_result_for_comment(comments, result_kind, result_identity):
                         return 0
                     if not should_apply:
                         _post_bounded_result(client, repository, number, comments, kind=result_kind, identity=result_identity, result=trigger_result, reason="trigger-comment-not-applied")
                         return 0
+                if event_kind != "issue_comment":
+                    controller.interactive_anchor_and_reconstruct(number, request_class)
                 candidate = controller.interactive_proposal(number, request_class, accepted_main, f"refs/heads/{pr.head_ref}")
                 updated_comments = client.list_issue_comments(repository, number)
                 anchor = validate_unique_anchor(updated_comments, pr, request_class, app)
@@ -2162,6 +2205,8 @@ def main(argv: list[str] | None = None) -> int:
                     controller.publish_validation_result(result)
                     client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
                 else:
+                    if not _anchor_candidates(comments) and read_optional_request_marker(client, repository, initial_pr.head_oid) is None:
+                        return 0
                     result = controller.trusted_validation(number, accepted_main, controller.production_candidate_check(number, accepted_main, expected_head_sha=initial_pr.head_oid), expected_head_sha=initial_pr.head_oid)
                     controller.publish_validation_result(result)
                     client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})

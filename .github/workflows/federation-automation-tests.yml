@@ -1,0 +1,36 @@
+name: Federation automation tests
+
+on:
+  pull_request:
+    paths:
+      - "automation/**"
+      - "scripts/**"
+      - "tests/automation/**"
+      - ".github/workflows/federation-*.yml"
+      - ".github/workflows/federation-automation-tests.yml"
+      - "docs/MECHANICS.md"
+  push:
+    branches: [main]
+    paths:
+      - "automation/**"
+      - "scripts/**"
+      - "tests/automation/**"
+      - ".github/workflows/federation-*.yml"
+      - ".github/workflows/federation-automation-tests.yml"
+      - "docs/MECHANICS.md"
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          persist-credentials: false
+      - name: Run federation automation unit tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -B -m unittest discover -s tests/automation -p 'test_*.py' -v

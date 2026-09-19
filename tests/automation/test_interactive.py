@@ -128,7 +128,7 @@ class ProductionAddClient(FakeClient):
         self.source_dir = Path(tempfile.mkdtemp(prefix="c03-source-fixture-"))
         self.source_bare = self.source_dir / "repo.git"
         work = self.source_dir / "work"
-        subprocess.run(["git", "init", "-q", str(work)], check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
         subprocess.run(["git", "-C", str(work), "config", "user.email", "test@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(work), "config", "user.name", "C03 test"], check=True)
         (work / "skills" / "swiftstream-demo").mkdir(parents=True)
@@ -162,6 +162,14 @@ class ProductionAddClient(FakeClient):
             self.marker_read = (repository, commit_sha, path, expected_mode)
             return b"add-source\n"
         return {"federation.json": self.blobs["manifest"], "federation.lock.json": self.blobs["lock"], "README.md": self.blobs["readme"]}[path]
+
+    def read_optional_commit_file(self, repository, commit_sha, path, *, expected_mode=None):
+        if commit_sha == self.marker_head and path == ".federation-request":
+            self.marker_read = (repository, commit_sha, path, expected_mode)
+            return b"add-source\n"
+        if path == ".federation-request":
+            return None
+        return self.read_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
 
     def get_commit_tree(self, repository, commit_sha):
         entries = (
@@ -284,6 +292,48 @@ class InteractiveTests(unittest.TestCase):
         with self.assertRaises(R02Error):
             validate_unique_anchor([one], changed_pr, RequestClass.ADD, APP)
 
+    def test_existing_anchor_only_path_cannot_create_missing_anchor(self):
+        fake = FakeClient()
+        controller = R02Controller(fake, "swiftstream/skills", APP)
+        with patch.object(controller_module, "create_anchor_once", wraps=create_anchor_once) as creator:
+            with self.assertRaises(DuplicateAnchorError):
+                controller.anchor_and_reconstruct_existing(7, RequestClass.ADD)
+        creator.assert_not_called()
+        self.assertEqual(fake.created, [])
+
+    def test_interactive_anchor_path_is_the_creation_capability(self):
+        fake = FakeClient()
+        controller = R02Controller(fake, "swiftstream/skills", APP)
+        controller.interactive_anchor_and_reconstruct(7, RequestClass.ADD)
+        self.assertEqual(len(fake.created), 1)
+        controller.interactive_anchor_and_reconstruct(7, RequestClass.ADD)
+        self.assertEqual(len(fake.created), 1)
+
+    def test_state_finalizer_cannot_recreate_anchor_after_authority_disappears(self):
+        current_pr = replace(pr(), base_oid="c" * 40)
+        anchor = self.anchor(pr_value=current_pr)
+        anchor_comment = comment(100, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot")
+
+        class VanishingAnchorClient(FakeClient):
+            def __init__(self):
+                super().__init__(current_pr=current_pr, comments=[anchor_comment])
+                self.comment_reads = 0
+
+            def list_issue_comments(self, repository, number):
+                self.comment_reads += 1
+                return (anchor_comment,) if self.comment_reads == 1 else ()
+
+        fake = VanishingAnchorClient()
+        controller = R02Controller(fake, "swiftstream/skills", APP, candidate_builder=lambda *_args: None)
+        with patch.object(controller_module, "create_anchor_once", wraps=create_anchor_once) as creator, patch.object(
+            controller_module,
+            "upsert_trusted_validation_check",
+            return_value=CheckRun(1, "federation/trusted-validation", current_pr.head_oid, "completed", "failure", APP.app_id),
+        ):
+            controller.finalize_one_manual_pr({"number": 7})
+        creator.assert_not_called()
+        self.assertEqual(fake.created, [])
+
     def test_pre_anchor_edit_is_rejected(self):
         edited_pr = PullRequestMetadata(7, BODY, "U_author", "alice", "a" * 40, "b" * 40, "proposal", "main", "7", "swiftstream/skills", "7", "swiftstream/skills", "2026-01-01", True)
         with self.assertRaises(R02Error):
@@ -318,6 +368,30 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(len(fake.created), 2)
         self.assertEqual(fake.dispatches, [("swiftstream/skills", "federation-state-finalize.yml", "refs/heads/main", {"pull_number": "7"})])
         self.assertNotIn("FEDERATION_REQUEST_CLASS", environment)
+
+    def test_unrelated_pr_without_marker_is_clean_noop_for_federation_entrypoints(self):
+        class UnrelatedClient(ProductionAddClient):
+            def read_optional_commit_file(self, repository, commit_sha, path, *, expected_mode=None):
+                if path == ".federation-request":
+                    return None
+                return super().read_optional_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
+
+        for command in ("interactive", "trusted-validation"):
+            with self.subTest(command=command):
+                fake = UnrelatedClient()
+                environment = {
+                    "GITHUB_REPOSITORY": "swiftstream/skills",
+                    "FEDERATION_GITHUB_TOKEN": "token",
+                    "FEDERATION_APP_SLUG": APP.slug,
+                    "FEDERATION_WAKE_PULL_NUMBER": "7",
+                    "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
+                }
+                with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.dict(os.environ, environment, clear=False):
+                    self.assertEqual(main([command]), 0)
+                self.assertEqual(fake.created, [])
+                self.assertEqual(fake.ref_calls, [])
+                self.assertEqual(fake.dispatches, [])
+                self.assertEqual(fake.checks, [])
 
     def test_c05_hostile_environment_uses_verified_git_exact_env_and_restores_parent(self):
         fake = ProductionAddClient()
@@ -429,6 +503,11 @@ class InteractiveTests(unittest.TestCase):
                 if commit_sha == self.marker_head and path == ".federation-request":
                     return b"update-source\n"
                 return super().read_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
+
+            def read_optional_commit_file(self, repository, commit_sha, path, *, expected_mode=None):
+                if commit_sha == self.marker_head and path == ".federation-request":
+                    return b"update-source\n"
+                return super().read_optional_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
 
         source = c02.SourceDeclaration("owner-repo", "Owner/Repo", 99, "refs/heads/main", "skills", ("swiftstream",), "A source repository")
         previous_manifest = c02.Manifest((source,))
@@ -558,6 +637,7 @@ class InteractiveTests(unittest.TestCase):
             race.current_pr = replace(race.current_pr, last_edited_at="2026-09-02T00:00:00Z", includes_created_edit=True)
             return ProposalCandidate("d" * 40, race.main_oid, ("federation.json",), RequestClass.ADD)
         controller = R02Controller(race, "swiftstream/skills", APP, candidate_builder=edit_and_restore)
+        controller.interactive_anchor_and_reconstruct(7, RequestClass.ADD)
         with self.assertRaises(StaleAuthorityError):
             controller.interactive_proposal(7, RequestClass.ADD, race.main_oid, "refs/heads/proposal")
         self.assertEqual(race.ref_calls, [])
