@@ -2248,10 +2248,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 def classify_request(
     *,
     marker_content: str | None = None,
@@ -2320,3 +2316,7 @@ class R01Controller:
     def reconcile(self, *args: Any, **kwargs: Any) -> None:
         del args, kwargs
         raise PhaseNotImplementedError("R03 reconciliation is not implemented in C03-R01")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
