@@ -1,6 +1,9 @@
+import ast
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
+import automation.federation.controller as controller_module
 from automation.federation.controller import PhaseNotImplementedError, R01Controller, classify_request, parse_c02_manifest
 from automation.federation.request_model import CommentEvent, RequestClass, RequestAnchor, parse_request_body, body_sha256
 
@@ -70,6 +73,37 @@ class ControllerCoreTests(unittest.TestCase):
         self.assertEqual(controller.classify(marker_content="unrelated"), RequestClass.UNRELATED)
         with self.assertRaises(PhaseNotImplementedError):
             controller.mutate_github("would mutate")
+
+    def test_module_entrypoint_guard_follows_all_top_level_definitions(self):
+        path = Path(controller_module.__file__).resolve()
+        module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+        def is_main_guard(node):
+            return (
+                isinstance(node, ast.If)
+                and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name)
+                and node.test.left.id == "__name__"
+                and len(node.test.ops) == 1
+                and isinstance(node.test.ops[0], ast.Eq)
+                and len(node.test.comparators) == 1
+                and isinstance(node.test.comparators[0], ast.Constant)
+                and node.test.comparators[0].value == "__main__"
+            )
+
+        guard_indices = [index for index, node in enumerate(module.body) if is_main_guard(node)]
+        self.assertEqual(guard_indices, [len(module.body) - 1])
+        guard_index = guard_indices[0]
+        definitions = {
+            node.name: index
+            for index, node in enumerate(module.body)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        self.assertLess(definitions["main"], guard_index)
+        self.assertLess(definitions["validate_candidate_diff"], guard_index)
+        self.assertFalse(
+            any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) for node in module.body[guard_index + 1:])
+        )
 
 
 if __name__ == "__main__":
