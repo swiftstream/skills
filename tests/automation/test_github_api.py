@@ -138,8 +138,10 @@ def _rest_comment(database_id=1, *, node_id=None, author=None, body="comment", c
     }
 
 
-def _graphql_comment_node(rest, *, editor=None, last_edited_at=None, includes_created_edit=False, total_count=0, body=None, created_at=None, updated_at=None, node_id=None, typename="IssueComment", full_database_id=None):
+def _graphql_comment_node(rest, *, editor=None, last_edited_at=None, includes_created_edit=False, total_count=0, body=None, created_at=None, updated_at=None, node_id=None, typename="IssueComment", full_database_id=None, graphql_author=None):
     author = None if rest["user"] is None else {"id": rest["user"]["node_id"], "login": rest["user"]["login"], "__typename": rest["user"]["type"]}
+    if graphql_author is not None:
+        author = graphql_author
     return {
         "__typename": typename,
         "id": node_id or rest["node_id"],
@@ -336,6 +338,37 @@ class GitHubAPITests(unittest.TestCase):
         self.assertIsNone(result[1].author_id)
         variables = json.loads(next(call[3] for call in transport.calls if call[1] == GRAPHQL_ENDPOINT))["variables"]
         self.assertEqual(variables, {"ids": ["IC_1", "IC_2"]})
+
+    def test_issue_comment_bot_author_login_canonicalization(self):
+        bot_rest = _rest_comment(1, author={"node_id": "U_bot", "login": "swift-stream-federation[bot]", "type": "Bot"})
+
+        def run(rest_record, graphql_author):
+            node = _graphql_comment_node(rest_record, graphql_author=graphql_author)
+            transport = CommentsTransport([_snapshot([rest_record]), _snapshot([rest_record])], [_graphql_response([node])])
+            return GitHubClient(None, transport).list_issue_comments("swiftstream/skills", 7)
+
+        result = run(bot_rest, {"id": "U_bot", "login": "swift-stream-federation", "__typename": "Bot"})
+        self.assertEqual(result[0].author_id, "U_bot")
+        self.assertEqual(result[0].author_login, "swift-stream-federation[bot]")
+        self.assertEqual(result[0].author_type, "Bot")
+
+        canonical = run(bot_rest, {"id": "U_bot", "login": "swift-stream-federation[bot]", "__typename": "Bot"})
+        self.assertEqual(canonical[0].author_login, "swift-stream-federation[bot]")
+
+        rejected = (
+            ("wrong Bot Node ID", bot_rest, {"id": "U_other", "login": "swift-stream-federation", "__typename": "Bot"}),
+            ("unrelated bare Bot login", bot_rest, {"id": "U_bot", "login": "other-app", "__typename": "Bot"}),
+            ("unrelated suffixed Bot login", bot_rest, {"id": "U_bot", "login": "other-app[bot]", "__typename": "Bot"}),
+            ("REST Bot GraphQL User", bot_rest, {"id": "U_bot", "login": "swift-stream-federation[bot]", "__typename": "User"}),
+            ("REST User GraphQL Bot", _clean_rest_comment(1), {"id": "U_author", "login": "alice", "__typename": "Bot"}),
+            ("REST Bot login without suffix", _rest_comment(1, author={"node_id": "U_bot", "login": "swift-stream-federation", "type": "Bot"}), {"id": "U_bot", "login": "swift-stream-federation", "__typename": "Bot"}),
+            ("REST Bot login only suffix", _rest_comment(1, author={"node_id": "U_bot", "login": "[bot]", "type": "Bot"}), {"id": "U_bot", "login": "[bot]", "__typename": "Bot"}),
+            ("REST Bot repeated suffix", _rest_comment(1, author={"node_id": "U_bot", "login": "swift-stream-federation[bot][bot]", "type": "Bot"}), {"id": "U_bot", "login": "swift-stream-federation[bot][bot]", "__typename": "Bot"}),
+            ("User login mismatch", _clean_rest_comment(1), {"id": "U_author", "login": "other-user", "__typename": "User"}),
+        )
+        for label, rest_record, graphql_author in rejected:
+            with self.subTest(label=label), self.assertRaises(InvalidResponseError):
+                run(rest_record, graphql_author)
 
     def test_issue_comment_pagination_short_full_and_multi_page(self):
         records = [_clean_rest_comment(1)]
