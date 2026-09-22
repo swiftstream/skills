@@ -96,6 +96,48 @@ class ValidationTests(unittest.TestCase):
         self.assertNotIn("FederationPullRequestComments", "\n".join(graphql_queries))
         self.assertEqual(transport.last_comment_variables, {"ids": ["IC_1"]})
 
+    def test_bot_anchor_comment_adapter_reaches_unchanged_controller(self):
+        body = "Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\nA source\nBranch:\nmain\nSkills root:\nskills\nSkill prefixes:\nswiftstream\n"
+        request = parse_request_body(RequestClass.ADD, body)
+        anchor = RequestAnchor(7, RequestClass.ADD, "U_author", "alice", body_sha256(body), request)
+        anchor_body = anchor.render()
+
+        class Transport:
+            def __init__(self):
+                self.comment_reads = 0
+
+            def request(self, method, url, headers, request_body, timeout):
+                if url == REST_BASE_URL + "/apps/swift-stream-federation":
+                    return HttpResponse(200, url, b'{"id":77,"slug":"swift-stream-federation","node_id":"A_app"}')
+                if url == REST_BASE_URL + "/users/swift-stream-federation%5Bbot%5D":
+                    return HttpResponse(200, url, b'{"id":88,"login":"swift-stream-federation[bot]","node_id":"U_bot","type":"Bot"}')
+                if url == REST_BASE_URL + "/repos/swiftstream/skills/pulls/7":
+                    return HttpResponse(200, url, json.dumps({
+                        "number": 7,
+                        "body": body,
+                        "user": {"login": "alice", "node_id": "U_author"},
+                        "head": {"sha": "a" * 40, "ref": "proposal", "repo": {"node_id": "N_head", "full_name": "swiftstream/skills"}},
+                        "base": {"sha": "b" * 40, "ref": "main", "repo": {"node_id": "N_base", "full_name": "swiftstream/skills"}},
+                    }).encode())
+                if url == REST_BASE_URL + "/repos/swiftstream/skills/issues/7/comments?per_page=100&page=1":
+                    self.comment_reads += 1
+                    comment = {"id": 1, "node_id": "IC_anchor", "body": anchor_body, "created_at": "2026-09-10T00:00:00Z", "updated_at": "2026-09-10T00:00:00Z", "issue_url": "https://api.github.com/repos/swiftstream/skills/issues/7", "user": {"node_id": "U_bot", "login": "swift-stream-federation[bot]", "type": "Bot"}}
+                    return HttpResponse(200, url, json.dumps([comment]).encode())
+                payload = json.loads(request_body)
+                if "FederationPullRequestRoutingBefore" in payload["query"] or "FederationPullRequestRoutingAfter" in payload["query"]:
+                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
+                if payload["query"] == ISSUE_COMMENT_NODES_QUERY:
+                    node = {"__typename": "IssueComment", "id": "IC_anchor", "fullDatabaseId": "1", "body": anchor_body, "createdAt": "2026-09-10T00:00:00Z", "updatedAt": "2026-09-10T00:00:00Z", "author": {"id": "U_bot", "login": "swift-stream-federation", "__typename": "Bot"}, "editor": None, "lastEditedAt": None, "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
+                    return HttpResponse(200, url, json.dumps({"data": {"nodes": [node]}}).encode())
+                raise AssertionError((method, url))
+
+        client = GitHubClient("token", Transport())
+        comments = client.list_issue_comments("swiftstream/skills", 7)
+        app = resolve_app_identity(client, "swift-stream-federation")
+        pr_metadata = client.get_pull_request_metadata("swiftstream/skills", 7)
+        self.assertEqual(comments[0].author_login, "swift-stream-federation[bot]")
+        validate_unique_anchor(comments, pr_metadata, RequestClass.ADD, app)
+
     def _compatibility_fixture(self):
         body = "Repository URL:\nhttps://github.com/example/source\nDescription:\nA source\nBranch:\nmain\nSkills root:\nskills\nSkill prefixes:\nexample\n"
         request = parse_request_body(RequestClass.ADD, body)

@@ -959,6 +959,32 @@ class GitHubClient:
             _bounded_text(value.get("__typename"), f"{label}.__typename"),
         )
 
+    @staticmethod
+    def _validate_issue_comment_author_parity(
+        rest_author_id: str,
+        rest_author_login: str,
+        rest_author_type: str,
+        graphql_author_id: str,
+        graphql_author_login: str,
+        graphql_author_type: str,
+    ) -> None:
+        if graphql_author_id != rest_author_id:
+            raise InvalidResponseError("comment author does not match REST")
+        if graphql_author_type != rest_author_type:
+            raise InvalidResponseError("comment author does not match REST")
+        if rest_author_type != "Bot":
+            if graphql_author_login != rest_author_login:
+                raise InvalidResponseError("comment author does not match REST")
+            return
+        suffix = "[bot]"
+        if not rest_author_login.endswith(suffix):
+            raise InvalidResponseError("comment author does not match REST")
+        bare_login = rest_author_login[:-len(suffix)]
+        if not bare_login or bare_login.endswith(suffix):
+            raise InvalidResponseError("comment author does not match REST")
+        if graphql_author_login not in {rest_author_login, bare_login}:
+            raise InvalidResponseError("comment author does not match REST")
+
     @classmethod
     def _parse_issue_comment_graphql_node(cls, value: Any, rest: _IssueCommentRESTRecord) -> IssueComment:
         if type(value) is not dict:
@@ -995,8 +1021,14 @@ class GitHubClient:
                 raise InvalidResponseError("comment GraphQL author is present but REST author is null")
         else:
             author_id, author_login, author_type = cls._parse_issue_comment_graphql_actor(author, "comment.author")
-            if (author_id, author_login, author_type) != (rest.author_id, rest.author_login, rest.author_type):
-                raise InvalidResponseError("comment author does not match REST")
+            cls._validate_issue_comment_author_parity(
+                rest.author_id,
+                rest.author_login,
+                rest.author_type,
+                author_id,
+                author_login,
+                author_type,
+            )
 
         editor = value.get("editor")
         if editor is None:
