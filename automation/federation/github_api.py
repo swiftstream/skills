@@ -1273,9 +1273,15 @@ class GitHubClient:
             allowed_output_keys = {"title", "summary", "text", "annotations_count", "annotations_url", "images"}
             if type(output_value) is not dict or not {"title", "summary", "text"}.issubset(output_value) or not set(output_value).issubset(allowed_output_keys):
                 raise InvalidResponseError("check.output has invalid exact shape")
-            _bounded_text(output_value.get("title"), "check.output.title", 256)
-            _bounded_text(output_value.get("summary"), "check.output.summary", 512)
-            output_text = _bounded_text(output_value.get("text"), "check.output.text", 4_096)
+            title = output_value.get("title")
+            summary = output_value.get("summary")
+            text = output_value.get("text")
+            if title is not None:
+                _bounded_text(title, "check.output.title", 256)
+            if summary is not None:
+                _bounded_text(summary, "check.output.summary", 512)
+            if text is not None:
+                output_text = _bounded_text(text, "check.output.text", 4_096)
             if "annotations_count" in output_value and (type(output_value["annotations_count"]) is not int or not 0 <= output_value["annotations_count"] <= 50_000):
                 raise InvalidResponseError("check.output.annotations_count is invalid")
             if "annotations_url" in output_value:
