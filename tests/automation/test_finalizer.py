@@ -128,6 +128,162 @@ class FinalizerTests(unittest.TestCase):
             with self.subTest(output=output), self.assertRaises(InvalidResponseError):
                 GitHubClient._parse_check({**base, "output": output})
 
+    def test_check_run_parser_accepts_nullable_output_members(self):
+        head = "a" * 40
+        base = {"id": 1, "name": "trusted-validation", "head_sha": head, "status": "completed", "conclusion": "success", "app": {"id": 15368}}
+        nullable = GitHubClient._parse_check({
+            **base,
+            "output": {
+                "title": None,
+                "summary": None,
+                "text": None,
+                "annotations_count": 0,
+                "annotations_url": "https://api.github.com/check-runs/1/annotations",
+            },
+        })
+        self.assertEqual(nullable.id, 1)
+        self.assertEqual(nullable.name, "trusted-validation")
+        self.assertEqual(nullable.head_sha, head)
+        self.assertEqual(nullable.status, "completed")
+        self.assertEqual(nullable.conclusion, "success")
+        self.assertEqual(nullable.app_id, 15368)
+        self.assertIsNone(nullable.output)
+
+        retained = GitHubClient._parse_check({
+            **base,
+            "id": 2,
+            "output": {"title": None, "summary": "summary", "text": "canonical evidence"},
+        })
+        self.assertEqual(retained.output, "canonical evidence")
+
+        missing_text = GitHubClient._parse_check({
+            **base,
+            "id": 3,
+            "output": {"title": "title", "summary": None, "text": None},
+        })
+        self.assertIsNone(missing_text.output)
+
+    def test_check_run_parser_nullable_members_keep_non_null_validation_fail_closed(self):
+        base = {
+            "id": 1,
+            "name": "check",
+            "head_sha": "a" * 40,
+            "status": "completed",
+            "conclusion": "failure",
+            "app": {"id": 7},
+        }
+        limits = {"title": 256, "summary": 512, "text": 4_096}
+        for field, limit in limits.items():
+            for invalid in (False, 1, {}, [], "", "bad\x00value", "x" * (limit + 1)):
+                output = {"title": "title", "summary": "summary", "text": "text"}
+                output[field] = invalid
+                with self.subTest(field=field, invalid=repr(invalid)), self.assertRaises(InvalidResponseError):
+                    GitHubClient._parse_check({**base, "output": output})
+
+    def test_check_run_parser_nullable_change_preserves_shape_annotation_and_image_guards(self):
+        base = {
+            "id": 1,
+            "name": "check",
+            "head_sha": "a" * 40,
+            "status": "completed",
+            "conclusion": "failure",
+            "app": {"id": 7},
+        }
+        valid = {"title": None, "summary": None, "text": None}
+        invalid_outputs = [
+            {"title": None, "summary": None},
+            {"title": None, "text": None},
+            {"summary": None, "text": None},
+            {**valid, "unexpected": "x"},
+            {**valid, "annotations_count": False},
+            {**valid, "annotations_count": -1},
+            {**valid, "annotations_count": 50_001},
+            {**valid, "annotations_url": 1},
+            {**valid, "annotations_url": ""},
+            {**valid, "annotations_url": "x" * 2_049},
+            {**valid, "images": {}},
+            {**valid, "images": [{"alt": "alt", "image_url": "url"}] * 11},
+            {**valid, "images": [{"alt": "alt"}]},
+            {**valid, "images": [{"alt": "", "image_url": "url"}]},
+            {**valid, "images": [{"alt": "alt", "image_url": ""}]},
+            {**valid, "images": [{"alt": "x" * 257, "image_url": "url"}]},
+            {**valid, "images": [{"alt": "alt", "image_url": "x" * 2_049}]},
+        ]
+        for output in invalid_outputs:
+            with self.subTest(output=output), self.assertRaises(InvalidResponseError):
+                GitHubClient._parse_check({**base, "output": output})
+
+    def test_list_check_runs_parses_nullable_foreign_and_canonical_trusted_checks(self):
+        import json
+
+        head = "a" * 40
+        canonical = f"class=machine-publication; head={head}; accepted_base={'b' * 40}; sourceId=demo; repositoryId=99; result=READY"
+        payload = {
+            "check_runs": [
+                {
+                    "id": 1,
+                    "name": TRUSTED_VALIDATION_NAME,
+                    "head_sha": head,
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "app": {"id": 15368},
+                    "output": {
+                        "title": None,
+                        "summary": None,
+                        "text": None,
+                        "annotations_count": 0,
+                        "annotations_url": "https://api.github.com/check-runs/1/annotations",
+                    },
+                },
+                {
+                    "id": 2,
+                    "name": TRUSTED_VALIDATION_NAME,
+                    "head_sha": head,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "app": {"id": 4834068},
+                    "output": {
+                        "title": "Federation validation",
+                        "summary": "Trusted validation",
+                        "text": canonical,
+                        "annotations_count": 0,
+                    },
+                },
+            ]
+        }
+
+        class Transport:
+            def request(self, method, url, headers, body, timeout):
+                self.last_request = (method, url, headers, body, timeout)
+                return HttpResponse(200, url, json.dumps(payload).encode())
+
+        transport = Transport()
+        checks = GitHubClient("token", transport).list_check_runs("swiftstream/skills", head)
+        self.assertEqual([check.id for check in checks], [1, 2])
+        self.assertIsNone(checks[0].output)
+        self.assertEqual(checks[1].output, canonical)
+        trusted = [
+            check
+            for check in checks
+            if check.name == TRUSTED_VALIDATION_NAME and check.head_sha == head and check.app_id == 4834068
+        ]
+        self.assertEqual([check.id for check in trusted], [2])
+        verify_machine_check_identity(
+            trusted[0],
+            head_sha=head,
+            accepted_base_sha="b" * 40,
+            source_id="demo",
+            repository_id=99,
+        )
+        with self.assertRaises(Exception):
+            verify_machine_check_identity(
+                checks[0],
+                head_sha=head,
+                accepted_base_sha="b" * 40,
+                source_id="demo",
+                repository_id=99,
+            )
+
     def test_finalizer_workflow_preserves_global_serialization_without_readiness_ceremony(self):
         finalizer = (ROOT / ".github/workflows/federation-state-finalize.yml").read_text()
         self.assertIn("swiftstream-skills-federation-state-finalizer", finalizer)
