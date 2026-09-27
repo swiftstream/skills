@@ -362,11 +362,14 @@ class ValidationTests(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.ref_reads = 0
+                self.moved_main = False
 
             def get_ref_oid(self, repository, branch):
                 self.ref_reads += 1
-                if self.ref_reads == 7:
+                # After the proposal commit exists, the next main read observes a moved tip.
+                if getattr(self, "created_commit", None) is not None and not self.moved_main:
                     self.main_oid = "e" * 40
+                    self.moved_main = True
                 return self.main_oid
 
         fake = RuntimeClient()

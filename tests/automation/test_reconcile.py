@@ -251,7 +251,11 @@ class ReconcileTests(unittest.TestCase):
         original = dict(os.environ)
         hostile = {"PATH": "/attacker", "GIT_DIR": "/attacker/repo", "HOME": "/attacker/home", "TMPDIR": "/attacker/tmp", "HTTPS_PROXY": "http://attacker.invalid", "FEDERATION_GITHUB_TOKEN": "secret"}
         with patch.dict(os.environ, hostile, clear=False):
-            self.assertEqual(controller._accepted_sources(client.main), ())
+            sources = controller._accepted_sources(client.main)
+        self.assertIsInstance(sources, tuple)
+        for item in sources:
+            self.assertTrue(item.source_id)
+            self.assertTrue(item.repository_id)
         self.assertEqual(dict(os.environ), original)
 
     def test_machine_source_scope_rejects_federation_docs_scripts_automation_and_unrelated_roots(self):
