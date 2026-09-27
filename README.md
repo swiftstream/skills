@@ -49,7 +49,14 @@ The catalog below is generated from accepted `federation.json` source metadata a
 
 <!-- BEGIN FEDERATED SKILLS CATALOG -->
 
-_No repositories have published skills through the federation yet._
+### [SwifQL/SwifQL](https://github.com/SwifQL/SwifQL)
+
+A strongly typed, declarative, composable Swift SQL\-building library\.
+
+| Skill | Description |
+| --- | --- |
+| swifql\-custom\-extensions | Create downstream custom SwifQL functions, fluent helpers, structural continuations, custom clause ownership, or reusable extension libraries\. Use in consuming apps or packages, not for modifying SwifQL's built\-in source, functions, builders, dialects, or renderer\. |
+| swifql\-query\-building | Build, translate, review, or prepare SQL in downstream Swift code that imports SwifQL\. Use for application or package query construction and preparation, not for changing SwifQL's own builders, functions, dialect implementation, renderer, or core source\. |
 
 <!-- END FEDERATED SKILLS CATALOG -->
 
