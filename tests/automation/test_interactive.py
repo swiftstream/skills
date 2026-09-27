@@ -196,7 +196,10 @@ class ProductionAddClient(FakeClient):
         return {"1" * 40: self.blobs["manifest"], "2" * 40: self.blobs["lock"], "3" * 40: self.blobs["readme"]}[blob_sha]
 
     def get_commit_metadata(self, repository, commit_sha):
-        return GitCommitMetadata(commit_sha, "6" * 40 if commit_sha == self.candidate_head else "4" * 40, (self.main_oid,) if commit_sha == self.candidate_head else ())
+        return GitCommitMetadata(commit_sha, "6" * 40 if commit_sha == self.candidate_head else "4" * 40, (self.main_oid,) if commit_sha == self.candidate_head else (), "2026-09-27T22:17:00Z")
+
+    def bot_commit_timestamp_after(self, repository, parent_sha):
+        return "2026-09-27T22:17:01Z"
 
     def create_blob(self, repository, content, *, encoding="base64"):
         self.created_blob = content
@@ -206,8 +209,8 @@ class ProductionAddClient(FakeClient):
         self.created_tree = (base_tree, list(entries))
         return GitObject("6" * 40)
 
-    def create_commit(self, repository, message, tree, parents):
-        self.created_commit = (message, tree, list(parents))
+    def create_commit(self, repository, message, tree, parents, *, timestamp=None):
+        self.created_commit = (message, tree, list(parents), timestamp)
         return GitObject(self.candidate_head)
 
     def update_refs(self, repository_id, updates):

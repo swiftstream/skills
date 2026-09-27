@@ -183,10 +183,11 @@ class ValidationTests(unittest.TestCase):
         tree = "1" * 40
         parent = "2" * 40
         message = "Swift Stream federation add-source\n"
+        timestamp = "2026-09-27T22:17:01Z"
         body = (
             f"tree {tree}\nparent {parent}\n"
-            "author Swift Stream Federation <automation@swiftstream.invalid> 946684800 +0000\n"
-            "committer Swift Stream Federation <automation@swiftstream.invalid> 946684800 +0000\n\n"
+            "author Swift Stream Federation <automation@swiftstream.invalid> 1790547421 +0000\n"
+            "committer Swift Stream Federation <automation@swiftstream.invalid> 1790547421 +0000\n\n"
         ).encode() + message.encode()
         commit_sha = hashlib.sha1(b"commit " + str(len(body)).encode() + b"\0" + body).hexdigest()
 
@@ -197,17 +198,17 @@ class ValidationTests(unittest.TestCase):
             def request(self, method, url, headers, payload, timeout):
                 self.calls.append((method, url, payload))
                 if method == "POST" and url.endswith("/git/commits"):
-                    return HttpResponse(201, url, json.dumps({"sha": commit_sha, "author": {"name": "Swift Stream Federation", "email": "automation@swiftstream.invalid", "date": "2000-01-01T00:00:00Z"}, "committer": {"name": "Swift Stream Federation", "email": "automation@swiftstream.invalid", "date": "2000-01-01T00:00:00Z"}}).encode())
+                    return HttpResponse(201, url, json.dumps({"sha": commit_sha, "author": {"name": "Swift Stream Federation", "email": "automation@swiftstream.invalid", "date": timestamp}, "committer": {"name": "Swift Stream Federation", "email": "automation@swiftstream.invalid", "date": timestamp}}).encode())
                 if method == "PATCH" and "/check-runs/12" in url:
                     return HttpResponse(200, url, json.dumps({"id": 12, "name": TRUSTED_VALIDATION_NAME, "head_sha": "a" * 40, "status": "completed", "conclusion": "success", "app": {"id": 77}}).encode())
                 raise AssertionError((method, url))
 
         transport = Transport()
         client = GitHubClient("token", transport)
-        self.assertEqual(client.create_commit("swiftstream/skills", message, tree, [parent]).sha, commit_sha)
-        self.assertEqual(client.create_commit("swiftstream/skills", message, tree, [parent]).sha, commit_sha)
+        self.assertEqual(client.create_commit("swiftstream/skills", message, tree, [parent], timestamp=timestamp).sha, commit_sha)
+        self.assertEqual(client.create_commit("swiftstream/skills", message, tree, [parent], timestamp=timestamp).sha, commit_sha)
         commit_payloads = [json.loads(item[2]) for item in transport.calls if item[0] == "POST"]
-        self.assertEqual(commit_payloads[0]["author"], {"name": "Swift Stream Federation", "email": "automation@swiftstream.invalid", "date": "2000-01-01T00:00:00Z"})
+        self.assertEqual(commit_payloads[0]["author"], {"name": "Swift Stream Federation", "email": "automation@swiftstream.invalid", "date": timestamp})
         updated = client.update_check_run("swiftstream/skills", 12, head_sha="a" * 40, conclusion="success")
         self.assertEqual(updated.head_sha, "a" * 40)
         patch_payload = json.loads(next(item[2] for item in transport.calls if item[0] == "PATCH"))

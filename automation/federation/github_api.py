@@ -8,7 +8,7 @@ import hashlib
 import re
 import socket
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable, Mapping, Protocol
 from urllib import error as urlerror
 from urllib import parse as urlparse
@@ -370,6 +370,7 @@ class GitCommitMetadata:
     sha: str
     tree_sha: str
     parents: tuple[str, ...]
+    author_date: str = "2000-01-01T00:00:00Z"
 
 
 @dataclass(frozen=True)
@@ -637,7 +638,11 @@ class GitHubClient:
         returned_sha = value.get("sha", commit)
         if returned_sha != commit:
             raise InvalidResponseError("Git commit response identity does not match requested commit")
-        return GitCommitMetadata(commit, tree_sha, tuple(parents))
+        author = value.get("author")
+        author_date = "2000-01-01T00:00:00Z"
+        if type(author) is dict and type(author.get("date")) is str:
+            author_date = _parse_github_timestamp(author["date"], "commit.author.date").strftime("%Y-%m-%dT%H:%M:%SZ")
+        return GitCommitMetadata(commit, tree_sha, tuple(parents), author_date)
 
     def get_commit_tree(self, repository: str, commit_sha: str) -> tuple[str, tuple[GitTreeEntry, ...]]:
         owner, name = self._owner_repo(repository)
@@ -1183,7 +1188,7 @@ class GitHubClient:
             raise InvalidResponseError("Git tree response is malformed")
         return GitObject(self._sha(value.get("sha"), "tree.sha"))
 
-    def create_commit(self, repository: str, message: str, tree: str, parents: Iterable[str]) -> GitObject:
+    def create_commit(self, repository: str, message: str, tree: str, parents: Iterable[str], *, timestamp: str | None = None) -> GitObject:
         owner, name = self._owner_repo(repository)
         if type(message) is not str or not message or len(message.encode("utf-8")) > 16_384:
             raise GitHubAPIError("commit message is invalid")
@@ -1191,7 +1196,14 @@ class GitHubClient:
         parent_list = list(parents)
         if any(type(parent) is not str or not _SHA40_RE.fullmatch(parent) for parent in parent_list):
             raise GitHubAPIError("commit parents are invalid")
-        author = {"name": "Swift Stream Federation", "email": "automation@swiftstream.invalid", "date": "2000-01-01T00:00:00Z"}
+        if timestamp is None:
+            raise GitHubAPIError("commit timestamp is required")
+        if type(timestamp) is not str or not timestamp.endswith("Z") or "T" not in timestamp:
+            raise GitHubAPIError("commit timestamp must be UTC ISO-8601 ending in Z")
+        author_instant = _parse_github_timestamp(timestamp, "commit.timestamp")
+        git_timestamp = f"{int(author_instant.timestamp())} +0000"
+        iso_date = author_instant.strftime("%Y-%m-%dT%H:%M:%SZ")
+        author = {"name": "Swift Stream Federation", "email": "automation@swiftstream.invalid", "date": iso_date}
         committer = dict(author)
         payload = {"message": message, "tree": tree_sha, "parents": parent_list, "author": author, "committer": committer}
         value = self.request_json("POST", ["repos", owner, name, "git", "commits"], payload)
@@ -1201,12 +1213,11 @@ class GitHubClient:
         # GitHub's commit API accepts author/committer metadata.  Recompute the
         # Git object identity locally so a server rewrite cannot silently break
         # deterministic regeneration or cause a ref-CAS convergence loop.
-        timestamp = "946684800 +0000"
         commit_body = (
             f"tree {tree_sha}\n"
             + "".join(f"parent {parent}\n" for parent in parent_list)
-            + f"author Swift Stream Federation <automation@swiftstream.invalid> {timestamp}\n"
-            + f"committer Swift Stream Federation <automation@swiftstream.invalid> {timestamp}\n\n"
+            + f"author Swift Stream Federation <automation@swiftstream.invalid> {git_timestamp}\n"
+            + f"committer Swift Stream Federation <automation@swiftstream.invalid> {git_timestamp}\n\n"
         ).encode("utf-8") + message.encode("utf-8")
         expected_sha = hashlib.sha1(b"commit " + str(len(commit_body)).encode("ascii") + b"\0" + commit_body).hexdigest()
         if returned_sha != expected_sha:
@@ -1217,6 +1228,12 @@ class GitHubClient:
                 if type(returned) is not dict or returned.get("name") != author["name"] or returned.get("email") != author["email"] or returned.get("date") != author["date"]:
                     raise InvalidResponseError("GitHub rewrote deterministic commit metadata")
         return GitObject(returned_sha)
+
+    def bot_commit_timestamp_after(self, repository: str, parent_sha: str) -> str:
+        """Deterministic bot timestamp: parent author date + 1s (stable per parent, never epoch-2000)."""
+        parent = self.get_commit_metadata(repository, parent_sha)
+        instant = _parse_github_timestamp(parent.author_date, "parent.author.date")
+        return (instant + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def create_check_run(self, repository: str, name: str, head_sha: str, *, status: str = "completed", conclusion: str | None = None, output: Mapping[str, Any] | None = None) -> CheckRun:
         owner, repo = self._owner_repo(repository)
