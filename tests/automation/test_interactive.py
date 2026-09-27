@@ -133,8 +133,15 @@ class ProductionAddClient(FakeClient):
         subprocess.run(["git", "-C", str(work), "config", "user.name", "C03 test"], check=True)
         (work / "skills" / "swiftstream-demo").mkdir(parents=True)
         (work / "skills" / "swiftstream-demo" / "SKILL.md").write_text("---\nname: swiftstream-demo\ndescription: Demo\n---\n\n# Demo\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(work), "add", "skills"], check=True)
+        # Live registry may already publish SwifQL (skillsRoot=.agent/skills).
+        (work / ".agent" / "skills" / "swifql-query-building").mkdir(parents=True)
+        (work / ".agent" / "skills" / "swifql-query-building" / "SKILL.md").write_text("---\nname: swifql-query-building\ndescription: Demo\n---\n\n# Demo\n", encoding="utf-8")
+        (work / ".agent" / "skills" / "swifql-custom-extensions").mkdir(parents=True)
+        (work / ".agent" / "skills" / "swifql-custom-extensions" / "SKILL.md").write_text("---\nname: swifql-custom-extensions\ndescription: Demo\n---\n\n# Demo\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(work), "add", "skills", ".agent"], check=True)
         subprocess.run(["git", "-C", str(work), "commit", "-qm", "fixture"], check=True)
+        # SwifQL is configured with refs/heads/master; keep both refs on the fixture tip.
+        subprocess.run(["git", "-C", str(work), "branch", "master"], check=True)
         subprocess.run(["git", "clone", "-q", "--bare", str(work), str(self.source_bare)], check=True)
         self.source_commit = subprocess.check_output(["git", "-C", str(work), "rev-parse", "HEAD"], text=True).strip()
         self.checks = []
@@ -196,7 +203,10 @@ class ProductionAddClient(FakeClient):
         return {"1" * 40: self.blobs["manifest"], "2" * 40: self.blobs["lock"], "3" * 40: self.blobs["readme"]}[blob_sha]
 
     def get_commit_metadata(self, repository, commit_sha):
-        return GitCommitMetadata(commit_sha, "6" * 40 if commit_sha == self.candidate_head else "4" * 40, (self.main_oid,) if commit_sha == self.candidate_head else ())
+        return GitCommitMetadata(commit_sha, "6" * 40 if commit_sha == self.candidate_head else "4" * 40, (self.main_oid,) if commit_sha == self.candidate_head else (), "2026-09-27T22:17:00Z")
+
+    def bot_commit_timestamp_after(self, repository, parent_sha):
+        return "2026-09-27T22:17:01Z"
 
     def create_blob(self, repository, content, *, encoding="base64"):
         self.created_blob = content
@@ -206,8 +216,8 @@ class ProductionAddClient(FakeClient):
         self.created_tree = (base_tree, list(entries))
         return GitObject("6" * 40)
 
-    def create_commit(self, repository, message, tree, parents):
-        self.created_commit = (message, tree, list(parents))
+    def create_commit(self, repository, message, tree, parents, *, timestamp=None):
+        self.created_commit = (message, tree, list(parents), timestamp)
         return GitObject(self.candidate_head)
 
     def update_refs(self, repository_id, updates):
@@ -243,14 +253,19 @@ class ProductionAddClient(FakeClient):
         self.source_http_observations.append((url, dict(headers), dict(os.environ)))
         if url.endswith("/repos/Owner/Repo"):
             body = json.dumps({"id": 99, "full_name": "Owner/Repo", "default_branch": "main", "description": "A source repository"}).encode()
-        elif url.endswith("/git/ref/heads/main"):
-            body = json.dumps({"ref": "refs/heads/main", "object": {"type": "commit", "sha": self.source_commit}}).encode()
+        elif url.endswith("/repos/SwifQL/SwifQL"):
+            body = json.dumps({"id": 161410190, "full_name": "SwifQL/SwifQL", "default_branch": "master", "description": "A strongly typed, declarative, composable Swift SQL-building library."}).encode()
+        elif url.endswith("/git/ref/heads/main") or url.endswith("/git/ref/heads/master"):
+            ref = "refs/heads/master" if url.endswith("master") else "refs/heads/main"
+            body = json.dumps({"ref": ref, "object": {"type": "commit", "sha": self.source_commit}}).encode()
         else:
             raise AssertionError(f"unexpected source URL: {url}")
         return c02.HttpResponse(200, url, body)
 
     def source_branch_fetcher(self, repo_path, source):
-        subprocess.run(["git", "-C", str(repo_path), "fetch", "--no-tags", "--force", str(self.source_bare), source.ref], check=True)
+        # Fixture only has refs/heads/main; live registry sources may use other refs
+        # (e.g. SwifQL master). Always fetch the fixture main tip and report that SHA.
+        subprocess.run(["git", "-C", str(repo_path), "fetch", "--no-tags", "--force", str(self.source_bare), "refs/heads/main"], check=True)
         return subprocess.check_output(["git", "-C", str(repo_path), "rev-parse", "FETCH_HEAD^{commit}"], text=True).strip()
 
 

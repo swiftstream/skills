@@ -1146,7 +1146,8 @@ class C02CandidateBuilder:
                 blob = self.client.create_blob(self.central_repository, base64.b64encode(data).decode("ascii"))
                 tree_updates.append({"path": path, "mode": mode, "type": "blob", "sha": blob.sha})
         tree_object = self.client.create_tree(self.central_repository, base_tree, tree_updates)
-        commit = self.client.create_commit(self.central_repository, f"Swift Stream federation {request_class.value}\n", tree_object.sha, [accepted_base_sha])
+        bot_timestamp = self.client.bot_commit_timestamp_after(self.central_repository, accepted_base_sha)
+        commit = self.client.create_commit(self.central_repository, f"Swift Stream federation {request_class.value}\n", tree_object.sha, [accepted_base_sha], timestamp=bot_timestamp)
         return ProposalCandidate(commit.sha, accepted_base_sha, changed, request_class, source_id, repository_id, False)
 
     def _machine_desired(self, accepted_base_sha: str, source_id: str) -> tuple[dict[str, tuple[str, bytes]], dict[str, tuple[str, str, str]], c02.SourceDeclaration]:
@@ -1211,7 +1212,8 @@ class C02CandidateBuilder:
                 blob = self.client.create_blob(self.central_repository, base64.b64encode(data).decode("ascii"))
                 updates.append({"path": path, "mode": mode, "type": "blob", "sha": blob.sha})
         tree_object = self.client.create_tree(self.central_repository, base_tree, updates)
-        commit = self.client.create_commit(self.central_repository, "Swift Stream federation machine publication\n", tree_object.sha, [accepted_base_sha])
+        bot_timestamp = self.client.bot_commit_timestamp_after(self.central_repository, accepted_base_sha)
+        commit = self.client.create_commit(self.central_repository, "Swift Stream federation machine publication\n", tree_object.sha, [accepted_base_sha], timestamp=bot_timestamp)
         return ProposalCandidate(commit.sha, accepted_base_sha, changed, RequestClass.MACHINE_PUBLICATION, source.source_id, source.repository_id, False)
 
     def validate_machine_head(self, accepted_base_sha: str, source_id: str, head_sha: str) -> tuple[bool, str]:
