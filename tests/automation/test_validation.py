@@ -10,8 +10,10 @@ from automation.federation.controller import (
     AppIdentity,
     DuplicateCheckRunError,
     MissingTrustedCheckError,
+    R02Controller,
     R02Error,
     AnchorComment,
+    StaleAuthorityError,
     authorized_patch_events,
     TRUSTED_VALIDATION_NAME,
     TrustedValidationResult,
@@ -257,9 +259,9 @@ class ValidationTests(unittest.TestCase):
         with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, env, clear=False):
             self.assertEqual(main(["interactive"]), 0)
             self.assertEqual(main(["state-finalize"]), 0)
-            self.assertEqual(fake.check_objects, [])
-            self.assertEqual(fake.dispatches[-1][1], "federation-trusted-validation.yml")
-            self.assertEqual(fake.dispatches[-1][3], {"pull_number": "7"})
+            # The finalizer may create the missing App check and publish success after revalidation.
+            self.assertEqual(len(fake.check_objects), 1)
+            self.assertEqual(fake.check_objects[0].conclusion, "success")
             self.assertEqual(main(["trusted-validation"]), 0)
             self.assertEqual(main(["state-finalize"]), 0)
         self.assertEqual(fake.checks[-1][1], TRUSTED_VALIDATION_NAME)
@@ -417,6 +419,254 @@ class ValidationTests(unittest.TestCase):
         with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, env, clear=False):
             self.assertEqual(main(["interactive"]), 1)
         self.assertEqual(fake.ref_calls, [])
+
+    def test_upsert_finalizer_can_create_missing_check_and_publish_success(self):
+        class Checks:
+            def __init__(self):
+                self.checks = []
+                self.created = []
+                self.updated = []
+
+            def list_check_runs(self, repository, head_sha):
+                return tuple(item for item in self.checks if item.head_sha == head_sha)
+
+            def create_check_run(self, repository, name, head_sha, **kwargs):
+                output = kwargs.get("output") or {}
+                text = output.get("text") if isinstance(output, dict) else output
+                value = CheckRun(99, name, head_sha, "completed", kwargs.get("conclusion"), APP.app_id, text)
+                self.created.append(value)
+                self.checks.append(value)
+                return value
+
+            def update_check_run(self, repository, check_id, *, head_sha, status="completed", conclusion=None, output=None):
+                self.updated.append((check_id, conclusion))
+                return next(item for item in self.checks if item.id == check_id)
+
+        head = "a" * 40
+        green = TrustedValidationResult("success", bounded_check_output(RequestClass.ADD, head, "b" * 40, reason="READY"))
+        client = Checks()
+        created = upsert_trusted_validation_check(client, "swiftstream/skills", APP, green, allow_create=True, allow_green=True)
+        self.assertEqual(len(client.created), 1)
+        self.assertEqual(client.created[0].conclusion, "success")
+        self.assertEqual(client.created[0].name, TRUSTED_VALIDATION_NAME)
+        self.assertEqual(client.created[0].app_id, APP.app_id)
+        self.assertEqual(created.id, 99)
+        self.assertEqual(client.updated, [])
+
+    def test_upsert_validation_writer_still_cannot_publish_success(self):
+        head = "a" * 40
+        green = TrustedValidationResult("success", bounded_check_output(RequestClass.ADD, head, "b" * 40, reason="READY"))
+
+        class Checks:
+            def __init__(self, checks=()):
+                self.checks = list(checks)
+                self.created = []
+
+            def list_check_runs(self, repository, head_sha):
+                return tuple(self.checks)
+
+            def create_check_run(self, repository, name, head_sha, **kwargs):
+                self.created.append(name)
+                value = CheckRun(99, name, head_sha, "completed", kwargs.get("conclusion"), APP.app_id)
+                self.checks.append(value)
+                return value
+
+        for allow_create in (True, False):
+            with self.subTest(allow_create=allow_create):
+                client = Checks([])
+                with self.assertRaises(R02Error):
+                    upsert_trusted_validation_check(client, "swiftstream/skills", APP, green, allow_create=allow_create, allow_green=False)
+                self.assertEqual(client.created, [])
+        owned = CheckRun(2, TRUSTED_VALIDATION_NAME, head, "completed", "failure", APP.app_id)
+        with self.assertRaises(R02Error):
+            upsert_trusted_validation_check(Checks([owned]), "swiftstream/skills", APP, green, allow_create=True, allow_green=False)
+
+        controller = object.__new__(R02Controller)
+        controller.client = Checks([])
+        controller.central_repository = "swiftstream/skills"
+        controller.app = APP
+        with self.assertRaises(R02Error):
+            controller.publish_validation_result(green)
+
+    def test_publish_finalizer_result_refuses_success_without_snapshot(self):
+        calls = []
+
+        class Client:
+            def list_check_runs(self, *args):
+                calls.append("list")
+                return ()
+
+            def create_check_run(self, *args, **kwargs):
+                calls.append("create")
+                raise AssertionError("must not create")
+
+            def update_check_run(self, *args, **kwargs):
+                calls.append("update")
+                raise AssertionError("must not update")
+
+            def get_repository_metadata(self, *args):
+                calls.append("repo")
+                raise AssertionError("must not revalidate")
+
+        controller = object.__new__(R02Controller)
+        controller.client = Client()
+        controller.central_repository = "swiftstream/skills"
+        controller.app = APP
+        head = "a" * 40
+        result = TrustedValidationResult("success", bounded_check_output(RequestClass.ADD, head, "b" * 40, reason="READY"), None)
+        with self.assertRaises(R02Error):
+            controller.publish_finalizer_result(result)
+        self.assertEqual(calls, [])
+
+    def test_upsert_duplicate_app_checks_raise_duplicate_check_run_error(self):
+        head = "a" * 40
+        result = TrustedValidationResult("failure", bounded_check_output(RequestClass.ADD, head, "b" * 40, reason="BLOCKED"))
+
+        class Checks:
+            def list_check_runs(self, repository, head_sha):
+                return (
+                    CheckRun(1, TRUSTED_VALIDATION_NAME, head, "completed", "failure", APP.app_id),
+                    CheckRun(2, TRUSTED_VALIDATION_NAME, head, "completed", "failure", APP.app_id),
+                )
+
+            def create_check_run(self, *args, **kwargs):
+                raise AssertionError("must not create")
+
+            def update_check_run(self, *args, **kwargs):
+                raise AssertionError("must not update")
+
+        with self.assertRaises(DuplicateCheckRunError):
+            upsert_trusted_validation_check(Checks(), "swiftstream/skills", APP, result, allow_create=True)
+
+    def test_unrelated_base_mismatch_missing_anchor_do_not_green(self):
+        head = "a" * 40
+        base = "b" * 40
+        outcomes = (
+            evaluate_trusted_validation(RequestClass.UNRELATED, head, base, lambda: (True, "CANDIDATE_MATCHES_C02")),
+            evaluate_trusted_validation(RequestClass.UNRELATED, head, base, lambda: (False, "ACCEPTED_BASE_MISMATCH")),
+            evaluate_trusted_validation(RequestClass.UNRELATED, head, base, lambda: (False, "ANCHOR_AUTHORITY_INVALID")),
+        )
+        for result in outcomes:
+            self.assertEqual(result.conclusion, "failure")
+            self.assertNotEqual(result.conclusion, "success")
+
+        class Client:
+            def __init__(self, main_oid):
+                self.main_oid = main_oid
+                self.pr = PullRequestMetadata(7, "", "U_a", "alice", head, base, "proposal", "main", "7", "swiftstream/skills", "7", "swiftstream/skills", None, False)
+
+            def get_pull_request_metadata(self, repository, number):
+                return self.pr
+
+            def list_issue_comments(self, repository, number):
+                return ()
+
+            def get_repository_metadata(self, repository):
+                return RepositoryMetadata(7, "R_7", "swiftstream/skills", "main")
+
+            def get_ref_oid(self, repository, branch):
+                return self.main_oid
+
+        controller = object.__new__(R02Controller)
+        controller.central_repository = "swiftstream/skills"
+        controller.app = APP
+        controller.client = Client("c" * 40)
+        moved = controller.trusted_validation(7, base, lambda: (True, "ok"), expected_head_sha=head)
+        self.assertEqual(moved.conclusion, "failure")
+        self.assertNotEqual(moved.conclusion, "success")
+        controller.client = Client(base)
+        missing_anchor = controller.trusted_validation(7, base, lambda: (True, "ok"), expected_head_sha=head)
+        self.assertEqual(missing_anchor.conclusion, "failure")
+        self.assertNotEqual(missing_anchor.conclusion, "success")
+
+    def test_stale_snapshot_aborts_check_publication(self):
+        calls = []
+
+        class Client:
+            def get_repository_metadata(self, repository):
+                calls.append("repo")
+                raise StaleAuthorityError("validation authority changed before check publication")
+
+            def list_check_runs(self, *args):
+                calls.append("list")
+                raise AssertionError("must not list checks")
+
+            def create_check_run(self, *args, **kwargs):
+                calls.append("create")
+                raise AssertionError("must not create")
+
+            def update_check_run(self, *args, **kwargs):
+                calls.append("update")
+                raise AssertionError("must not update")
+
+        controller = object.__new__(R02Controller)
+        controller.client = Client()
+        controller.central_repository = "swiftstream/skills"
+        controller.app = APP
+        result = TrustedValidationResult("failure", bounded_check_output(RequestClass.ADD, "a" * 40, "b" * 40, reason="BLOCKED"), snapshot=object())  # type: ignore[arg-type]
+        with self.assertRaises(StaleAuthorityError):
+            controller.publish_finalizer_result(result)
+        with self.assertRaises(StaleAuthorityError):
+            controller.publish_validation_result(result)
+        self.assertEqual(calls, ["repo", "repo"])
+
+    def test_markerless_publishes_skipped_not_success(self):
+        fake = ProductionAddClient()
+        fake.list_issue_comments = lambda repository, number: ()
+        fake.read_optional_commit_file = lambda repository, commit_sha, path, *, expected_mode=None: None
+        fake.list_pull_request_files = lambda repository, number: ({"filename": "docs/README.md"},)
+        env = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, env, clear=False):
+            self.assertEqual(main(["trusted-validation"]), 0)
+        self.assertEqual(len(fake.check_objects), 1)
+        self.assertEqual(fake.check_objects[0].conclusion, "skipped")
+        self.assertNotEqual(fake.check_objects[0].conclusion, "success")
+        self.assertEqual(fake.checks[-1][3]["conclusion"], "skipped")
+        text = fake.checks[-1][3]["output"]["text"]
+        self.assertIn("MAINTENANCE_SCOPE_OK", text)
+        self.assertNotIn("result=READY", text)
+
+    def test_markerless_unrelated_publishes_failure(self):
+        fake = ProductionAddClient()
+        fake.list_issue_comments = lambda repository, number: ()
+        fake.read_optional_commit_file = lambda repository, commit_sha, path, *, expected_mode=None: None
+        fake.list_pull_request_files = lambda repository, number: ({"filename": "automation/federation/controller.py"},)
+        env = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, env, clear=False):
+            self.assertEqual(main(["trusted-validation"]), 0)
+        self.assertEqual(len(fake.check_objects), 1)
+        self.assertEqual(fake.check_objects[0].conclusion, "failure")
+        self.assertNotIn(fake.check_objects[0].conclusion, {"success", "skipped"})
+        text = fake.checks[-1][3]["output"]["text"]
+        self.assertIn("OUT_OF_FEDERATION_SCOPE", text)
+
+    def test_finalizer_create_green_requires_allow_green(self):
+        head = "a" * 40
+        green = TrustedValidationResult("success", bounded_check_output(RequestClass.ADD, head, "b" * 40, reason="READY"))
+
+        class Checks:
+            def __init__(self):
+                self.created = []
+                self.updated = []
+
+            def list_check_runs(self, repository, head_sha):
+                return ()
+
+            def create_check_run(self, repository, name, head_sha, **kwargs):
+                self.created.append(kwargs)
+                return CheckRun(1, name, head_sha, "completed", kwargs.get("conclusion"), APP.app_id)
+
+            def update_check_run(self, repository, check_id, *, head_sha, conclusion=None, output=None):
+                self.updated.append((check_id, conclusion))
+                raise AssertionError("must not update")
+
+        for allow_create in (True, False):
+            with self.subTest(allow_create=allow_create):
+                client = Checks()
+                with self.assertRaises(R02Error):
+                    upsert_trusted_validation_check(client, "swiftstream/skills", APP, green, allow_create=allow_create, allow_green=False)
+                self.assertEqual(client.created, [])
+                self.assertEqual(client.updated, [])
 
 if __name__ == "__main__":
     unittest.main()

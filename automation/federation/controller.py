@@ -117,7 +117,7 @@ class DuplicateCheckRunError(R02Error):
 
 
 class MissingTrustedCheckError(R02Error):
-    """The finalizer may recover a missing check but may not create it."""
+    """A non-create writer cannot complete when the App check is missing; the finalizer may create it after revalidation."""
 
 
 class ForkHeadError(R02Error):
@@ -696,11 +696,12 @@ def upsert_trusted_validation_check(
     result: TrustedValidationResult,
     *,
     allow_create: bool,
+    allow_green: bool = False,
 ) -> CheckRun:
-    """Write exactly one App-owned check, with creation owned by validation only."""
-    if type(allow_create) is not bool:
+    """Write exactly one App-owned check. Green is finalizer-grade only."""
+    if type(allow_create) is not bool or type(allow_green) is not bool:
         raise R02Error("check writer mode is invalid")
-    if allow_create and result.conclusion == "success":
+    if result.conclusion == "success" and not allow_green:
         raise R02Error("the validation writer cannot publish a green conclusion")
     head_sha = result.output.get("head")
     if type(head_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
@@ -1771,13 +1772,13 @@ class R02Controller:
             raise R02Error("trusted-validation writer cannot publish a green conclusion")
         if result.snapshot is not None:
             assert_validation_snapshot_current(self.client, self.central_repository, self.app, result)
-        return upsert_trusted_validation_check(self.client, self.central_repository, self.app, result, allow_create=True)
+        return upsert_trusted_validation_check(self.client, self.central_repository, self.app, result, allow_create=True, allow_green=False)
 
     def publish_finalizer_result(self, result: TrustedValidationResult) -> CheckRun:
         if result.conclusion == "success" and result.snapshot is None:
             raise R02Error("finalizer success has no bound authority snapshot")
         assert_validation_snapshot_current(self.client, self.central_repository, self.app, result)
-        return upsert_trusted_validation_check(self.client, self.central_repository, self.app, result, allow_create=False)
+        return upsert_trusted_validation_check(self.client, self.central_repository, self.app, result, allow_create=True, allow_green=True)
 
     def dispatch_trusted_validation_recovery(self, pr_number: int) -> None:
         if type(pr_number) is not int or pr_number <= 0:
@@ -1830,23 +1831,22 @@ class R02Controller:
         checks = tuple(item for item in self.client.list_check_runs(self.central_repository, candidate.commit_sha) if item.name == TRUSTED_VALIDATION_NAME and item.head_sha == candidate.commit_sha and item.app_id == self.app.app_id)
         if len(checks) > 1:
             return "duplicate-check"
-        if not checks:
-            self.dispatch_trusted_validation_recovery(authority.number)
-            return "check-recovery-dispatched"
-        try:
-            verify_machine_check_identity(
-                checks[0],
-                head_sha=candidate.commit_sha,
-                accepted_base_sha=accepted_main,
-                source_id=source.source_id,
-                repository_id=source.repository_id,
-            )
-        except R02Error:
-            return "check-evidence-blocked"
+        if checks:
+            try:
+                verify_machine_check_identity(
+                    checks[0],
+                    head_sha=candidate.commit_sha,
+                    accepted_base_sha=accepted_main,
+                    source_id=source.source_id,
+                    repository_id=source.repository_id,
+                )
+            except R02Error:
+                return "check-evidence-blocked"
         valid, reason = self.candidate_builder.validate_machine_head(accepted_main, source.source_id, candidate.commit_sha)  # type: ignore[attr-defined]
         if not valid:
             result = TrustedValidationResult("failure", bounded_check_output(RequestClass.MACHINE_PUBLICATION, candidate.commit_sha, accepted_main, source.source_id, source.repository_id, reason))
-            self.client.update_check_run(self.central_repository, checks[0].id, head_sha=candidate.commit_sha, conclusion="failure", output=render_check_run_output(result))
+            if checks:
+                self.client.update_check_run(self.central_repository, checks[0].id, head_sha=candidate.commit_sha, conclusion="failure", output=render_check_run_output(result))
             self._close_machine_pr(authority.number, "MACHINE_RECONCILE_FAILED", reason)
             return "closed"
         # The final explicit reads close the main/head TOCTOU window before the
@@ -1856,7 +1856,25 @@ class R02Controller:
         if latest_repository.default_branch != repository.default_branch or latest_main != accepted_main or latest_pr.head_oid != candidate.commit_sha or latest_pr.base_oid != latest_main or latest_pr.base_ref != latest_repository.default_branch:
             return "stale"
         ready_result = TrustedValidationResult("success", bounded_check_output(RequestClass.MACHINE_PUBLICATION, candidate.commit_sha, accepted_main, source.source_id, source.repository_id, "READY"))
-        self.client.update_check_run(self.central_repository, checks[0].id, head_sha=candidate.commit_sha, conclusion="success", output=render_check_run_output(ready_result))
+        if checks:
+            self.client.update_check_run(self.central_repository, checks[0].id, head_sha=candidate.commit_sha, conclusion="success", output=render_check_run_output(ready_result))
+        else:
+            try:
+                created = upsert_trusted_validation_check(
+                    self.client,
+                    self.central_repository,
+                    self.app,
+                    ready_result,
+                    allow_create=True,
+                    allow_green=True,
+                )
+            except DuplicateCheckRunError:
+                return "duplicate-check"
+            except Exception:
+                self.dispatch_trusted_validation_recovery(authority.number)
+                return "check-recovery-dispatched"
+            if created.name != TRUSTED_VALIDATION_NAME or created.head_sha != candidate.commit_sha or created.app_id != self.app.app_id:
+                return "check-evidence-blocked"
         final_repository, final_main = self.current_accepted_main()
         final_sources = tuple(item for item in self._accepted_sources(final_main) if item.source_id == source.source_id and item.repository_id == source.repository_id)
         final_pr = self.client.get_pull_request_metadata(self.central_repository, authority.number)
@@ -2037,7 +2055,7 @@ class R02Controller:
             regenerated = self.client.get_pull_request_metadata(self.central_repository, number)
             result = TrustedValidationResult("failure", bounded_check_output(request_class, regenerated.head_oid, accepted_base, reason=_bounded_reason(error)))
             try:
-                upsert_trusted_validation_check(self.client, self.central_repository, self.app, result, allow_create=False)
+                upsert_trusted_validation_check(self.client, self.central_repository, self.app, result, allow_create=True)
             except MissingTrustedCheckError:
                 self.dispatch_trusted_validation_recovery(number)
             return
@@ -2109,6 +2127,24 @@ def _result_comment(kind: str, identity: int, result: str, reason: str) -> str:
 def _post_bounded_result(client: GitHubClient, repository: str, pr_number: int, comments: Iterable[IssueComment], *, kind: str, identity: int, result: str, reason: str) -> None:
     if not has_result_for_comment(comments, kind, identity):
         client.create_issue_comment(repository, pr_number, _result_comment(kind, identity, result, reason))
+
+
+PRIVILEGED_PATH_PREFIXES = ("automation/", ".github/", "skills/", "scripts/")
+PRIVILEGED_PATHS = frozenset({
+    "federation.json",
+    "federation.lock.json",
+    "docs/MECHANICS.md",
+})
+
+
+def markerless_maintenance_scope(paths) -> str:
+    normalized = tuple(sorted(set(paths)))
+    if not normalized:
+        return "OUT_OF_FEDERATION_SCOPE"
+    for path in normalized:
+        if path in PRIVILEGED_PATHS or path.startswith(PRIVILEGED_PATH_PREFIXES):
+            return "OUT_OF_FEDERATION_SCOPE"
+    return "MAINTENANCE_SCOPE_OK"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2208,6 +2244,29 @@ def main(argv: list[str] | None = None) -> int:
                     client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
                 else:
                     if not _anchor_candidates(comments) and read_optional_request_marker(client, repository, initial_pr.head_oid) is None:
+                        try:
+                            require_same_repository_head(initial_pr, repository)
+                        except ForkHeadError:
+                            result = TrustedValidationResult(
+                                "failure",
+                                bounded_check_output(RequestClass.UNRELATED, initial_pr.head_oid, accepted_main, reason="OUT_OF_FEDERATION_SCOPE"),
+                            )
+                            controller.publish_validation_result(result)
+                            return 0
+                        files = client.list_pull_request_files(repository, number)
+                        paths = tuple(item.get("filename") for item in files if type(item) is dict and type(item.get("filename")) is str)
+                        scope = markerless_maintenance_scope(paths)
+                        if scope == "MAINTENANCE_SCOPE_OK":
+                            result = TrustedValidationResult(
+                                "skipped",
+                                bounded_check_output(RequestClass.UNRELATED, initial_pr.head_oid, accepted_main, reason="MAINTENANCE_SCOPE_OK"),
+                            )
+                        else:
+                            result = TrustedValidationResult(
+                                "failure",
+                                bounded_check_output(RequestClass.UNRELATED, initial_pr.head_oid, accepted_main, reason="OUT_OF_FEDERATION_SCOPE"),
+                            )
+                        controller.publish_validation_result(result)
                         return 0
                     result = controller.trusted_validation(number, accepted_main, controller.production_candidate_check(number, accepted_main, expected_head_sha=initial_pr.head_oid), expected_head_sha=initial_pr.head_oid)
                     controller.publish_validation_result(result)

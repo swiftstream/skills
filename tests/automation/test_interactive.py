@@ -391,6 +391,9 @@ class InteractiveTests(unittest.TestCase):
                     return None
                 return super().read_optional_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
 
+            def list_pull_request_files(self, repository, number):
+                return ({"filename": "docs/README.md"},)
+
         for command in ("interactive", "trusted-validation"):
             with self.subTest(command=command):
                 fake = UnrelatedClient()
@@ -406,7 +409,42 @@ class InteractiveTests(unittest.TestCase):
                 self.assertEqual(fake.created, [])
                 self.assertEqual(fake.ref_calls, [])
                 self.assertEqual(fake.dispatches, [])
-                self.assertEqual(fake.checks, [])
+                if command == "interactive":
+                    self.assertEqual(fake.checks, [])
+                    self.assertEqual(fake.check_objects, [])
+                else:
+                    self.assertEqual(len(fake.check_objects), 1)
+                    self.assertEqual(fake.check_objects[0].conclusion, "skipped")
+                    self.assertNotEqual(fake.check_objects[0].conclusion, "success")
+
+    def test_markerless_fork_head_publishes_failure_not_skipped(self):
+        class ForkUnrelatedClient(ProductionAddClient):
+            def __init__(self):
+                super().__init__()
+                self.current_pr = replace(self.current_pr, head_repository="attacker/fork", head_repository_id="R_fork")
+
+            def read_optional_commit_file(self, repository, commit_sha, path, *, expected_mode=None):
+                if path == ".federation-request":
+                    return None
+                return super().read_optional_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
+
+            def list_pull_request_files(self, repository, number):
+                return ({"filename": "docs/README.md"},)
+
+        fake = ForkUnrelatedClient()
+        environment = {
+            "GITHUB_REPOSITORY": "swiftstream/skills",
+            "FEDERATION_GITHUB_TOKEN": "token",
+            "FEDERATION_APP_SLUG": APP.slug,
+            "FEDERATION_WAKE_PULL_NUMBER": "7",
+            "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
+        }
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.dict(os.environ, environment, clear=False):
+            self.assertEqual(main(["trusted-validation"]), 0)
+        self.assertEqual(len(fake.check_objects), 1)
+        self.assertEqual(fake.check_objects[0].conclusion, "failure")
+        self.assertNotEqual(fake.check_objects[0].conclusion, "skipped")
+        self.assertNotEqual(fake.check_objects[0].conclusion, "success")
 
     def test_c05_hostile_environment_uses_verified_git_exact_env_and_restores_parent(self):
         fake = ProductionAddClient()
