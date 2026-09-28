@@ -540,11 +540,97 @@ class GitHubAPITests(unittest.TestCase):
         )
         for label, changed in changes:
             with self.subTest(label=label):
-                transport = CommentsTransport([_snapshot([original]), _snapshot(changed)], [_graphql_response([valid_node])])
+                snapshots = []
+                graphql = []
+                for _attempt in range(3):
+                    snapshots.extend([_snapshot([original]), _snapshot(changed)])
+                    graphql.append(_graphql_response([valid_node]))
+                transport = CommentsTransport(snapshots, graphql)
                 with self.assertRaises(InvalidResponseError):
                     GitHubClient(None, transport).list_issue_comments("swiftstream/skills", 7)
         transport = CommentsTransport([_snapshot([original]), _snapshot([original])], [_graphql_response([valid_node])])
         self.assertEqual(GitHubClient(None, transport).list_issue_comments("swiftstream/skills", 7)[0].database_id, 1)
+
+    def test_issue_comment_composite_race_then_stable_succeeds(self):
+        original = _clean_rest_comment(1)
+        changed = _clean_rest_comment(2)
+        valid_node = _graphql_comment_node(original)
+        transport = CommentsTransport(
+            [
+                _snapshot([original]),
+                _snapshot([changed]),
+                _snapshot([original]),
+                _snapshot([original]),
+            ],
+            [_graphql_response([valid_node]), _graphql_response([valid_node])],
+        )
+        result = GitHubClient(None, transport).list_issue_comments("swiftstream/skills", 7)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].database_id, 1)
+        rest_calls = [call for call in transport.calls if "/comments?per_page=100" in call[1]]
+        self.assertEqual(len(rest_calls), 4)
+        graphql_calls = [call for call in transport.calls if call[1] == GRAPHQL_ENDPOINT]
+        self.assertEqual(len(graphql_calls), 2)
+        self.assertEqual(len(transport.rest_snapshots), 0)
+
+    def test_issue_comment_composite_permanent_race_fails_closed(self):
+        original = _clean_rest_comment(1)
+        changed = _clean_rest_comment(2)
+        valid_node = _graphql_comment_node(original)
+        snapshots = []
+        graphql = []
+        for _attempt in range(3):
+            snapshots.extend([_snapshot([original]), _snapshot([changed])])
+            graphql.append(_graphql_response([valid_node]))
+        transport = CommentsTransport(snapshots, graphql)
+        with self.assertRaises(InvalidResponseError) as caught:
+            GitHubClient(None, transport).list_issue_comments("swiftstream/skills", 7)
+        self.assertEqual(str(caught.exception), "issue comment REST authority changed during composite read")
+        self.assertEqual(len(transport.rest_snapshots), 0)
+        rest_calls = [call for call in transport.calls if "/comments?per_page=100" in call[1]]
+        self.assertEqual(len(rest_calls), 6)
+        graphql_calls = [call for call in transport.calls if call[1] == GRAPHQL_ENDPOINT]
+        self.assertEqual(len(graphql_calls), 3)
+
+    def test_issue_comment_composite_other_invalid_response_is_not_retried(self):
+        transport = CommentsTransport([[{"not": "a list"}]], [])
+        with self.assertRaises(InvalidResponseError) as caught:
+            GitHubClient(None, transport).list_issue_comments("swiftstream/skills", 7)
+        self.assertEqual(str(caught.exception), "issue comment REST page must be a list")
+        rest_calls = [call for call in transport.calls if "/comments?per_page=100" in call[1]]
+        self.assertEqual(len(rest_calls), 1)
+        graphql_calls = [call for call in transport.calls if call[1] == GRAPHQL_ENDPOINT]
+        self.assertEqual(len(graphql_calls), 0)
+
+    def test_issue_comment_empty_race_then_stable_empty_succeeds(self):
+        changed = [_clean_rest_comment(1)]
+        transport = CommentsTransport(
+            [
+                _snapshot([]),
+                _snapshot(changed),
+                _snapshot([]),
+                _snapshot([]),
+            ],
+            [],
+        )
+        result = GitHubClient(None, transport).list_issue_comments("swiftstream/skills", 7)
+        self.assertEqual(result, ())
+        graphql_calls = [call for call in transport.calls if call[1] == GRAPHQL_ENDPOINT]
+        self.assertEqual(len(graphql_calls), 0)
+        rest_calls = [call for call in transport.calls if "/comments?per_page=100" in call[1]]
+        self.assertEqual(len(rest_calls), 4)
+
+    def test_issue_comment_retry_predicate_is_exact_string_and_exact_type(self):
+        source = Path("/Users/imike/Development/SwiftStream/skills/automation/federation/github_api.py").read_text(encoding="utf-8")
+        start = source.index("def list_issue_comments(")
+        end = source.index("\n    def create_issue_comment(", start)
+        body = source[start:end]
+        self.assertIn("except InvalidResponseError as error:", body)
+        self.assertNotIn("except TransportError", body)
+        self.assertNotIn("except GitHubAPIError", body)
+        self.assertNotIn("except GraphQLError", body)
+        self.assertIn('_ISSUE_COMMENT_COMPOSITE_RACE', body)
+        self.assertIn("str(error) != _ISSUE_COMMENT_COMPOSITE_RACE", body)
 
     def test_cas_semantics_and_single_atomic_call(self):
         with self.assertRaises(Exception):
