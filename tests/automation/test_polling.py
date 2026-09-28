@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def source(source_id: str, repository_id: int) -> c02.SourceDeclaration:
-    return c02.SourceDeclaration(source_id, f"Owner/{source_id}", repository_id, "refs/heads/main", "skills", (source_id,), source_id)
+    return c02.SourceDeclaration(source_id, f"Owner/{source_id}", repository_id, "skills", source_id, (c02.LineDeclaration("refs/heads/main", (source_id,)),))
 
 
 class PollingTests(unittest.TestCase):

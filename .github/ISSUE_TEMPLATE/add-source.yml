@@ -30,13 +30,16 @@ body:
         <optional value>
 
         Branch:
-        <optional value>
+        <optional single-line value>
 
         Skills root:
         <optional value>
 
         Skill prefixes:
         <optional comma-separated value>
+
+        Publication lines:
+        <optional multi-major; refs/heads/...=prefix[,prefix...]; ...>
         ```
 
         After the App creates the immutable RequestAnchor, the body and repository URL are immutable. Refine mutable fields only with a comment whose first non-empty line is exactly `Federation PATCH`.
@@ -77,6 +80,9 @@ body:
 
         Skill prefixes:
         <optional comma-separated value>
+
+        Publication lines:
+        <optional multi-major; refs/heads/...=prefix[,prefix...]; ...>
 
   - type: markdown
     attributes:

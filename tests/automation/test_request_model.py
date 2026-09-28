@@ -20,6 +20,8 @@ from automation.federation.request_model import (
     parse_anchor,
     parse_patch,
     parse_request_body,
+    proposed_line_refs,
+    validate_drop_set,
 )
 from automation.federation.workspace import validate_trusted_ref
 
@@ -179,16 +181,16 @@ class RequestModelTests(unittest.TestCase):
         anchor = RequestAnchor(7, RequestClass.ADD, "42", "alice", body_sha256(body), parse_request_body(RequestClass.ADD, body))
         rendered = anchor.render()
         value = json.loads(rendered.splitlines()[1])
-        for key, replacement in (("schemaVersion", 2), ("prNumber", True), ("initialBodySha256", "bad"), ("originalAuthorId", 4), ("originalAuthorLogin", "a\x00b")):
+        for key, replacement in (("schemaVersion", 1), ("schemaVersion", 3), ("prNumber", True), ("initialBodySha256", "bad"), ("originalAuthorId", 4), ("originalAuthorLogin", "a\x00b")):
             candidate = dict(value)
             candidate[key] = replacement
-            with self.subTest(key=key), self.assertRaises(RequestModelError):
+            with self.subTest(key=key, replacement=replacement), self.assertRaises(RequestModelError):
                 parse_anchor(ANCHOR_MARKER + "\n" + json.dumps(candidate) + "\n")
         with self.assertRaises(RequestModelError):
             parse_anchor("swiftstream-federation-request-anchor:v1\n" + rendered.splitlines()[1] + "\n")
         with self.assertRaises(RequestModelError):
             parse_anchor(rendered + "extra\n")
-        duplicate_json = rendered.splitlines()[1].replace('"schemaVersion":1', '"schemaVersion":1,"schemaVersion":1', 1)
+        duplicate_json = rendered.splitlines()[1].replace('"schemaVersion":2', '"schemaVersion":2,"schemaVersion":2', 1)
         with self.assertRaises(RequestModelError):
             parse_anchor(ANCHOR_MARKER + "\n" + duplicate_json + "\n")
         initial = value["initialRequest"]
@@ -205,7 +207,7 @@ class RequestModelTests(unittest.TestCase):
         request = parse_request_body(RequestClass.ADD, body)
         cases = (
             Request(RequestClass.ADD, request.repository_url, request.description, "main", request.skills_root, request.skill_prefixes),
-            Request(RequestClass.ADD, request.repository_url, request.description, request.branch, request.skills_root, request.skill_prefixes, "reason"),
+            Request(RequestClass.ADD, request.repository_url, request.description, request.branch, request.skills_root, request.skill_prefixes, reason="reason"),
             Request(RequestClass.ADD, "https://github.com/O/R/", request.description, request.branch, request.skills_root, request.skill_prefixes),
             Request(RequestClass.ADD, request.repository_url, " bad", request.branch, request.skills_root, request.skill_prefixes),
             Request(RequestClass.ADD, request.repository_url, request.description, request.branch, "../bad", request.skill_prefixes),
@@ -234,6 +236,159 @@ class RequestModelTests(unittest.TestCase):
             result = fold_patch_events(anchor, events)
             self.assertEqual(result.request, request)
             self.assertEqual([item.kind for item in result.evidence], ["invalid"] * len(events))
+
+    def test_single_line_body_still_parses_branch_and_prefixes(self):
+        request = parse_request_body(RequestClass.ADD, add_body())
+        self.assertEqual(request.branch, "refs/heads/main")
+        self.assertEqual(request.skill_prefixes, ("swifql",))
+        self.assertIsNone(request.publication_lines)
+        self.assertIsNone(request.dropped_publication_lines)
+
+    def test_publication_lines_semicolon_grammar_parses_pairs(self):
+        body = (
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Publication lines:\nrefs/heads/release/4=vapor4; refs/heads/main=vapor5\n"
+        )
+        request = parse_request_body(RequestClass.ADD, body)
+        self.assertEqual(len(request.publication_lines), 2)
+        self.assertEqual(request.publication_lines[0].ref, "refs/heads/release/4")
+        self.assertEqual(request.publication_lines[0].skill_prefixes, ("vapor4",))
+        self.assertEqual(request.publication_lines[1].ref, "refs/heads/main")
+        self.assertEqual(request.publication_lines[1].skill_prefixes, ("vapor5",))
+        multi = parse_request_body(
+            RequestClass.ADD,
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Publication lines:\nrefs/heads/main=vapor5,vapor5extra\n",
+        )
+        self.assertEqual(multi.publication_lines[0].skill_prefixes, ("vapor5", "vapor5extra"))
+
+    def test_publication_lines_rejects_tags_duplicate_refs_and_shared_roots(self):
+        base = "Repository URL:\nhttps://github.com/vapor/vapor\nPublication lines:\n"
+        for value in (
+            "refs/tags/4.0.0=vapor4",
+            "refs/heads/main=vapor5; refs/heads/main=vapor5",
+            "refs/heads/main=vapor5; refs/heads/other=vapor5",
+            "refs/heads/main=vapor-5; refs/heads/other=vapor-4",
+            "",
+            "refs/heads/main",
+            "refs/heads/main=",
+            "refs/heads/main=vapor5;",
+        ):
+            with self.subTest(value=value), self.assertRaises(RequestModelError):
+                parse_request_body(RequestClass.ADD, base + value + "\n")
+
+    def test_publication_lines_with_branch_requires_exact_line_match(self):
+        ok = (
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Branch:\nrefs/heads/main\n"
+            "Skill prefixes:\nvapor5\n"
+            "Publication lines:\nrefs/heads/release/4=vapor4; refs/heads/main=vapor5\n"
+        )
+        request = parse_request_body(RequestClass.ADD, ok)
+        self.assertEqual(request.branch, "refs/heads/main")
+        bad = (
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Branch:\nrefs/heads/missing\n"
+            "Publication lines:\nrefs/heads/release/4=vapor4; refs/heads/main=vapor5\n"
+        )
+        with self.assertRaises(RequestModelError):
+            parse_request_body(RequestClass.ADD, bad)
+
+    def test_dropped_publication_lines_requires_update_and_exact_set(self):
+        drop_body = (
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Publication lines:\nrefs/heads/main=vapor5\n"
+            "Dropped publication lines:\nrefs/heads/release/4\n"
+        )
+        with self.assertRaises(RequestModelError):
+            parse_request_body(RequestClass.ADD, drop_body)
+        request = parse_request_body(RequestClass.UPDATE, drop_body)
+        self.assertEqual(request.dropped_publication_lines, ("refs/heads/release/4",))
+        proposed = proposed_line_refs(
+            request,
+            default_branch="main",
+            default_prefixes=("vapor5",),
+            existing_refs=("refs/heads/release/4", "refs/heads/main"),
+        )
+        validate_drop_set(
+            RequestClass.UPDATE,
+            request,
+            accepted_line_refs=("refs/heads/release/4", "refs/heads/main"),
+            proposed_refs=proposed,
+        )
+        with self.assertRaises(RequestModelError):
+            validate_drop_set(
+                RequestClass.UPDATE,
+                request,
+                accepted_line_refs=("refs/heads/release/4", "refs/heads/main", "refs/heads/other"),
+                proposed_refs=proposed,
+            )
+
+    def test_drop_last_line_is_invalid(self):
+        request = parse_request_body(
+            RequestClass.UPDATE,
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Dropped publication lines:\nrefs/heads/main\n",
+        )
+        with self.assertRaises(RequestModelError):
+            validate_drop_set(
+                RequestClass.UPDATE,
+                request,
+                accepted_line_refs=("refs/heads/main",),
+                proposed_refs=(),
+            )
+
+    def test_patch_can_fold_publication_and_dropped_lines(self):
+        body = (
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Publication lines:\nrefs/heads/release/4=vapor4; refs/heads/main=vapor5\n"
+        )
+        request = parse_request_body(RequestClass.UPDATE, body)
+        anchor = RequestAnchor(1, RequestClass.UPDATE, "id", "login", body_sha256(body), request)
+        result = fold_patch_events(
+            anchor,
+            [
+                CommentEvent(
+                    2,
+                    True,
+                    f"{PATCH_SENTINEL}\n\nPublication lines:\nrefs/heads/main=vapor5\n"
+                    f"\nDropped publication lines:\nrefs/heads/release/4\n",
+                )
+            ],
+        )
+        self.assertEqual(result.request.publication_lines[0].ref, "refs/heads/main")
+        self.assertEqual(result.request.dropped_publication_lines, ("refs/heads/release/4",))
+        invalid = fold_patch_events(
+            anchor,
+            [CommentEvent(3, True, f"{PATCH_SENTINEL}\n\nPublication lines:\nrefs/tags/x=vapor5\n")],
+        )
+        self.assertEqual(invalid.request, request)
+        self.assertEqual(invalid.evidence[0].kind, "invalid")
+
+    def test_anchor_v2_round_trips_publication_and_dropped_fields(self):
+        body = (
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Publication lines:\nrefs/heads/main=vapor5\n"
+            "Dropped publication lines:\nrefs/heads/release/4\n"
+        )
+        request = parse_request_body(RequestClass.UPDATE, body)
+        anchor = RequestAnchor(9, RequestClass.UPDATE, "42", "alice", body_sha256(body), request)
+        rendered = anchor.render()
+        value = json.loads(rendered.splitlines()[1])
+        self.assertEqual(value["schemaVersion"], 2)
+        self.assertEqual(value["initialRequest"]["Publication lines"][0]["ref"], "refs/heads/main")
+        self.assertEqual(value["initialRequest"]["Dropped publication lines"], ["refs/heads/release/4"])
+        self.assertEqual(parse_anchor(rendered), anchor)
+
+    def test_anchor_v1_after_cutover_fails_closed(self):
+        body = add_body()
+        request = parse_request_body(RequestClass.ADD, body)
+        anchor = RequestAnchor(1, RequestClass.ADD, "id", "login", body_sha256(body), request)
+        value = json.loads(anchor.render().splitlines()[1])
+        value["schemaVersion"] = 1
+        with self.assertRaises(RequestModelError) as caught:
+            parse_anchor(ANCHOR_MARKER + "\n" + json.dumps(value) + "\n")
+        self.assertIn("schemaVersion", str(caught.exception))
 
 
 if __name__ == "__main__":

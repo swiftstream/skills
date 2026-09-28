@@ -49,6 +49,23 @@ foo, fdb
 
 You do **not** list individual skills. Federation discovers public packages under the skills root whose names match an accepted prefix.
 
+### Optional multi-line form
+
+For a source that publishes more than one major/maintenance line from one repository, use `Publication lines:` instead of `Branch:` + `Skill prefixes:` (the single-line form remains fully sufficient for one line).
+
+```text
+Publication lines:
+refs/heads/release/4=vapor4; refs/heads/main=vapor5
+```
+
+Rules:
+
+- Items are separated by `;`.
+- Each item is `ref=prefix[,prefix...]` with a full `refs/heads/**` ref.
+- Prefixes on different lines must be disjoint and must not share a root namespace (first hyphen component). Use `vapor4` / `vapor5`, not `vapor-4` / `vapor-5`.
+- If `Branch:` and/or `Skill prefixes:` are also present, they must match exactly one listed line.
+- Empty `Publication lines:` is invalid; omit the field and use the single-line form instead.
+
 The source repository needs no federation notifier workflow, secret, OIDC setup, wake URL, signing key, or central credential.
 
 ## 3. Review and refine

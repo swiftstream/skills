@@ -36,7 +36,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class FinalizerTests(unittest.TestCase):
     def _production_finalizer_fixture(self):
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         main = "a" * 40
         head = "d" * 40
         authority = MachinePRAuthority(41, "demo", 99, head)
@@ -329,7 +329,7 @@ class FinalizerTests(unittest.TestCase):
     def test_finalizer_bounded_merge_rejections_self_wake_once(self):
         controller = object.__new__(R02Controller)
         repository = type("Repo", (), {"default_branch": "main"})()
-        source = c02.SourceDeclaration("b", "Owner/Repo", 2, "refs/heads/main", "skills", ("b",), "B")
+        source = c02.SourceDeclaration("b", "Owner/Repo", 2, "skills", "B", (c02.LineDeclaration("refs/heads/main", ("b",)),))
         authority = MachinePRAuthority(2, "b", 2, "a" * 40)
         attempts, wakes = [], []
         controller.current_accepted_main = lambda: (repository, "c" * 40)
@@ -344,8 +344,8 @@ class FinalizerTests(unittest.TestCase):
     def test_finalizer_restarts_enumeration_after_close_before_next_source(self):
         controller = object.__new__(R02Controller)
         repository = type("Repo", (), {"default_branch": "main"})()
-        source_a = c02.SourceDeclaration("a", "Owner/A", 1, "refs/heads/main", "skills", ("a",), "A")
-        source_b = c02.SourceDeclaration("b", "Owner/B", 2, "refs/heads/main", "skills", ("b",), "B")
+        source_a = c02.SourceDeclaration("a", "Owner/A", 1, "skills", "A", (c02.LineDeclaration("refs/heads/main", ("a",)),))
+        source_b = c02.SourceDeclaration("b", "Owner/B", 2, "skills", "B", (c02.LineDeclaration("refs/heads/main", ("b",)),))
         authority_a = MachinePRAuthority(1, "a", 1, "a" * 40)
         authority_b = MachinePRAuthority(2, "b", 2, "b" * 40)
         enumerations = [{"a": [authority_a], "b": [authority_b]}, {"a": [], "b": []}]
@@ -372,7 +372,7 @@ class FinalizerTests(unittest.TestCase):
         controller = object.__new__(R02Controller)
         order = []
         controller.current_accepted_main = lambda: (type("Repo", (), {"default_branch": "main"})(), "c" * 40)
-        controller._accepted_sources = lambda _main=None: (c02.SourceDeclaration("a", "Owner/A", 1, "refs/heads/main", "skills", ("a",), "A"),)
+        controller._accepted_sources = lambda _main=None: (c02.SourceDeclaration("a", "Owner/A", 1, "skills", "A", (c02.LineDeclaration("refs/heads/main", ("a",)),)),)
         controller._state_finalize_machine_sweep = lambda **kwargs: order.append("machine") or "machine-sweep-complete"
         controller.client = object()
         controller.central_repository = "swiftstream/skills"
@@ -450,7 +450,7 @@ class FinalizerTests(unittest.TestCase):
         def mutate_app(client):
             client.app_metadata = AppMetadata(78, "swiftstream-federation", "A_changed")
         def mutate_source(client):
-            client.source = c02.SourceDeclaration("demo", "Owner/Rebound", 100, "refs/heads/main", "skills", ("demo",), "Rebound")
+            client.source = c02.SourceDeclaration("demo", "Owner/Rebound", 100, "skills", "Rebound", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         races = (mutate_main, mutate_head, mutate_base, mutate_check, mutate_app, mutate_source)
         for mutate in races:
             with self.subTest(race=mutate.__name__):

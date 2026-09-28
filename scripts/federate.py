@@ -59,14 +59,19 @@ class HistoricalAttemptAmbiguous(Exception):
 
 
 @dataclass(frozen=True)
+class LineDeclaration:
+    ref: str
+    skill_prefixes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class SourceDeclaration:
     source_id: str
     repository: str
     repository_id: int
-    ref: str
     skills_root: str
-    skill_prefixes: tuple[str, ...]
     description: str
+    lines: tuple[LineDeclaration, ...]
 
 
 @dataclass(frozen=True)
@@ -85,6 +90,7 @@ class Manifest:
 @dataclass(frozen=True)
 class LockEntry:
     source_id: str
+    line_ref: str
     resolved_commit: str
     content_sha256: str
 
@@ -105,6 +111,7 @@ class HttpResponse:
 @dataclass(frozen=True)
 class BoundSource:
     source: SourceDeclaration
+    line: LineDeclaration
     path: Path
     commit: str
 
@@ -155,6 +162,7 @@ class PackageDeclarationIdentity:
     ref: str
     skills_root: str
     skill_name: str
+    skill_prefixes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -402,6 +410,18 @@ def validate_posix_relative_path(value: Any, context: str) -> str:
     return value
 
 
+def source_line_for_ref(source: SourceDeclaration, ref: str) -> LineDeclaration | None:
+    for line in source.lines:
+        if line.ref == ref:
+            return line
+    return None
+
+
+def skill_matches_line_prefixes(line: LineDeclaration, skill_name: str) -> bool:
+    validate_name(skill_name)
+    return any(skill_name.startswith(prefix + "-") for prefix in line.skill_prefixes)
+
+
 HttpRequester = Callable[[str, dict[str, str], float, int], HttpResponse]
 
 
@@ -478,8 +498,8 @@ def github_repository_api_url(repository: str) -> str:
     )
 
 
-def github_ref_api_url(source: SourceDeclaration) -> str:
-    ref_suffix = source.ref.removeprefix("refs/")
+def github_ref_api_url(source: SourceDeclaration, ref: str) -> str:
+    ref_suffix = ref.removeprefix("refs/")
     return f"{github_repository_api_url(source.repository)}/git/ref/{urllib_parse.quote(ref_suffix, safe='/')}"
 
 
@@ -529,15 +549,16 @@ def read_repository_identity(
 
 def read_exact_ref_commit(
     source: SourceDeclaration,
+    ref: str,
     *,
     headers: dict[str, str],
     http_get: HttpRequester,
 ) -> str:
-    response = github_get(github_ref_api_url(source), headers=headers, http_get=http_get)
+    response = github_get(github_ref_api_url(source, ref), headers=headers, http_get=http_get)
     if response.status != 200:
         fail(f"GitHub exact configured ref returned HTTP {response.status}")
     value = decode_http_json_object(response, "GitHub exact configured ref")
-    if value.get("ref") != source.ref:
+    if value.get("ref") != ref:
         fail("GitHub exact ref response does not match configured ref")
     object_value = value.get("object")
     if type(object_value) is not dict:
@@ -552,8 +573,8 @@ def read_exact_ref_commit(
 
 def load_manifest_from_value(value: dict[str, Any], context: str) -> Manifest:
     require_exact_keys(value, {"schemaVersion", "sources"}, context)
-    if not is_exact_int(value["schemaVersion"], 2):
-        fail(f"{context}.schemaVersion must be integer 2")
+    if not is_exact_int(value["schemaVersion"], 3):
+        fail(f"{context}.schemaVersion must be integer 3")
     sources_value = value["sources"]
     if type(sources_value) is not list:
         fail(f"{context}.sources must be an array")
@@ -569,31 +590,52 @@ def load_manifest_from_value(value: dict[str, Any], context: str) -> Manifest:
             fail(f"{source_context} must be an object")
         require_exact_keys(
             source_value,
-            {"sourceId", "repository", "repositoryId", "ref", "skillsRoot", "skillPrefixes", "description"},
+            {"sourceId", "repository", "repositoryId", "skillsRoot", "description", "lines"},
             source_context,
         )
         source_id = validate_source_id(source_value["sourceId"])
         repository = validate_repository(source_value["repository"])
         repository_id = validate_repository_id(source_value["repositoryId"])
-        ref = validate_ref(source_value["ref"])
         skills_root = validate_posix_relative_path(source_value["skillsRoot"], f"{source_context}.skillsRoot")
-        prefixes_value = source_value["skillPrefixes"]
-        if type(prefixes_value) is not list or not prefixes_value:
-            fail(f"{source_context}.skillPrefixes must be a nonempty array")
-        prefixes = tuple(
-            validate_lower_hyphen_identifier(prefix, f"{source_context}.skillPrefixes[{index}]")
-            for index, prefix in enumerate(prefixes_value)
-        )
-        if list(prefixes) != sorted(prefixes):
-            fail(f"{source_context}.skillPrefixes must already be lexically sorted")
-        if len(set(prefixes)) != len(prefixes):
-            fail(f"{source_context}.skillPrefixes contains duplicates")
-        for prefix in prefixes:
-            root_namespace = prefix.split("-", 1)[0]
-            if root_namespace in root_namespaces:
-                fail(f"duplicate global root namespace: {root_namespace}")
-            root_namespaces.add(root_namespace)
         description = validate_description(source_value["description"])
+        lines_value = source_value["lines"]
+        if type(lines_value) is not list or not lines_value:
+            fail(f"{source_context}.lines must be a nonempty array")
+        lines: list[LineDeclaration] = []
+        source_prefixes: set[str] = set()
+        source_refs: set[str] = set()
+        for line_index, line_value in enumerate(lines_value):
+            line_context = f"{source_context}.lines[{line_index}]"
+            if type(line_value) is not dict:
+                fail(f"{line_context} must be an object")
+            require_exact_keys(line_value, {"ref", "skillPrefixes"}, line_context)
+            ref = validate_ref(line_value["ref"])
+            if ref in source_refs:
+                fail(f"{source_context}.lines contains duplicate ref: {ref}")
+            source_refs.add(ref)
+            prefixes_value = line_value["skillPrefixes"]
+            if type(prefixes_value) is not list or not prefixes_value:
+                fail(f"{line_context}.skillPrefixes must be a nonempty array")
+            prefixes = tuple(
+                validate_lower_hyphen_identifier(prefix, f"{line_context}.skillPrefixes[{index}]")
+                for index, prefix in enumerate(prefixes_value)
+            )
+            if list(prefixes) != sorted(prefixes):
+                fail(f"{line_context}.skillPrefixes must already be lexically sorted")
+            if len(set(prefixes)) != len(prefixes):
+                fail(f"{line_context}.skillPrefixes contains duplicates")
+            for prefix in prefixes:
+                if prefix in source_prefixes:
+                    fail(f"{source_context}.lines contains duplicate skill prefix: {prefix}")
+                source_prefixes.add(prefix)
+                root_namespace = prefix.split("-", 1)[0]
+                if root_namespace in root_namespaces:
+                    fail(f"duplicate global root namespace: {root_namespace}")
+                root_namespaces.add(root_namespace)
+            lines.append(LineDeclaration(ref=ref, skill_prefixes=prefixes))
+        line_refs = [line.ref for line in lines]
+        if line_refs != sorted(line_refs):
+            fail(f"{source_context}.lines must already be lexically sorted by ref")
         if source_id in source_ids:
             fail(f"duplicate sourceId: {source_id}")
         if repository_id in repository_ids:
@@ -605,10 +647,9 @@ def load_manifest_from_value(value: dict[str, Any], context: str) -> Manifest:
                 source_id=source_id,
                 repository=repository,
                 repository_id=repository_id,
-                ref=ref,
                 skills_root=skills_root,
-                skill_prefixes=prefixes,
                 description=description,
+                lines=tuple(lines),
             )
         )
 
@@ -624,8 +665,8 @@ def load_manifest(path: Path = MANIFEST_PATH) -> Manifest:
 
 def load_lock_from_value(value: dict[str, Any], manifest: Manifest, context: str) -> LockState:
     require_exact_keys(value, {"schemaVersion", "contentDigestAlgorithm", "publishedSourceIds", "skills"}, context)
-    if not is_exact_int(value["schemaVersion"], 2):
-        fail(f"{context}.schemaVersion must be integer 2")
+    if not is_exact_int(value["schemaVersion"], 3):
+        fail(f"{context}.schemaVersion must be integer 3")
     if type(value["contentDigestAlgorithm"]) is not str or value["contentDigestAlgorithm"] != DIGEST_ALGORITHM:
         fail(f"{context}.contentDigestAlgorithm must be {DIGEST_ALGORITHM!r}")
     published_value = value["publishedSourceIds"]
@@ -649,19 +690,35 @@ def load_lock_from_value(value: dict[str, Any], manifest: Manifest, context: str
         name = validate_name(name_value)
         if type(entry_value) is not dict:
             fail(f"lock entry for {name} must be an object")
-        require_exact_keys(entry_value, {"sourceId", "resolvedCommit", "contentSha256"}, f"lock entry {name}")
+        require_exact_keys(
+            entry_value,
+            {"sourceId", "lineRef", "resolvedCommit", "contentSha256"},
+            f"lock entry {name}",
+        )
         source_id = validate_source_id(entry_value["sourceId"])
         if source_id not in manifest_source_ids:
             fail(f"lock entry {name}.sourceId is not present in manifest: {source_id}")
         if source_id not in published_source_ids:
             fail(f"lock entry {name}.sourceId is not present in publishedSourceIds: {source_id}")
+        line_ref = validate_ref(entry_value["lineRef"])
+        source = manifest.by_source_id[source_id]
+        line = source_line_for_ref(source, line_ref)
+        if line is None:
+            fail(f"lock entry {name}.lineRef is not an accepted line of source {source_id}: {line_ref}")
+        if not skill_matches_line_prefixes(line, name):
+            fail(f"lock entry {name} does not match lineRef skillPrefixes: {line_ref}")
         resolved_commit = entry_value["resolvedCommit"]
         content_sha = entry_value["contentSha256"]
         if type(resolved_commit) is not str or not HEX40_RE.fullmatch(resolved_commit):
             fail(f"lock entry {name}.resolvedCommit must be lowercase 40-hex")
         if type(content_sha) is not str or not HEX64_RE.fullmatch(content_sha):
             fail(f"lock entry {name}.contentSha256 must be lowercase 64-hex")
-        entries[name] = LockEntry(source_id=source_id, resolved_commit=resolved_commit, content_sha256=content_sha)
+        entries[name] = LockEntry(
+            source_id=source_id,
+            line_ref=line_ref,
+            resolved_commit=resolved_commit,
+            content_sha256=content_sha,
+        )
     return LockState(published_source_ids=published_source_ids, skills=entries)
 
 
@@ -675,11 +732,12 @@ def render_lock(lock: LockState) -> bytes:
         entry = lock.skills[name]
         skills[name] = {
             "sourceId": entry.source_id,
+            "lineRef": entry.line_ref,
             "resolvedCommit": entry.resolved_commit,
             "contentSha256": entry.content_sha256,
         }
     value = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "contentDigestAlgorithm": DIGEST_ALGORITHM,
         "publishedSourceIds": sorted(lock.published_source_ids),
         "skills": skills,
@@ -722,10 +780,10 @@ def git_commit_exists(repo_path: Path, commit: str) -> bool:
     return result.returncode == 0
 
 
-def git_fetch_configured_branch(repo_path: Path, source: SourceDeclaration) -> str:
+def git_fetch_configured_branch(repo_path: Path, source: SourceDeclaration, ref: str) -> str:
     assert_source_workspace_isolated(repo_path)
     result = run_git(
-        ["-C", str(repo_path), "fetch", "--no-tags", "--force", "origin", source.ref],
+        ["-C", str(repo_path), "fetch", "--no-tags", "--force", "origin", ref],
         check=False,
         network=True,
         source_workspace=True,
@@ -757,37 +815,44 @@ def git_fetch_exact_commit(repo_path: Path, source: SourceDeclaration, commit: s
         fail("exact historical commit fetch completed without materializing a commit object")
 
 
-BranchFetcher = Callable[[Path, SourceDeclaration], str]
+BranchFetcher = Callable[[Path, SourceDeclaration, str], str]
 ExactCommitFetcher = Callable[[Path, SourceDeclaration, str], None]
 
 
 def bind_source_snapshot(
     temp_root: Path,
     source: SourceDeclaration,
+    line: LineDeclaration,
     *,
     http_get: HttpRequester = stdlib_http_get,
     branch_fetcher: BranchFetcher = git_fetch_configured_branch,
 ) -> BoundSource:
     headers = github_headers()
-    binding_root = Path(tempfile.mkdtemp(prefix=f"source-{source.source_id}-binding-", dir=temp_root))
+    binding_root = Path(
+        tempfile.mkdtemp(prefix=f"source-{source.source_id}-binding-", dir=temp_root)
+    )
     last_error = "repository identity/ref/fetch binding did not converge"
     for attempt in range(1, MAX_NETWORK_ATTEMPTS + 1):
         repo_path = binding_root / f"attempt-{attempt}.git"
         try:
             read_repository_identity(source, headers=headers, http_get=http_get)
-            api_commit_before = read_exact_ref_commit(source, headers=headers, http_get=http_get)
+            api_commit_before = read_exact_ref_commit(
+                source, line.ref, headers=headers, http_get=http_get
+            )
             initialize_source_repository(repo_path, source)
-            git_fetched_commit = branch_fetcher(repo_path, source)
+            git_fetched_commit = branch_fetcher(repo_path, source, line.ref)
             if not HEX40_RE.fullmatch(git_fetched_commit) or not git_commit_exists(repo_path, git_fetched_commit):
                 fail("configured source branch fetch did not materialize the reported commit")
             read_repository_identity(source, headers=headers, http_get=http_get)
-            api_commit_after = read_exact_ref_commit(source, headers=headers, http_get=http_get)
+            api_commit_after = read_exact_ref_commit(
+                source, line.ref, headers=headers, http_get=http_get
+            )
             if api_commit_before != api_commit_after:
                 fail("configured source ref moved during identity-bound fetch")
             if git_fetched_commit != api_commit_after:
                 fail("Git-fetched source commit does not match post-fetch GitHub exact ref")
             assert_source_workspace_isolated(repo_path)
-            return BoundSource(source=source, path=repo_path, commit=git_fetched_commit)
+            return BoundSource(source=source, line=line, path=repo_path, commit=git_fetched_commit)
         except FederationError as error:
             last_error = str(error)
             if repo_path.exists():
@@ -823,7 +888,9 @@ def retrieve_historical_commit(
         attempt_path = classifier_root / f"attempt-{attempt}.git"
         try:
             read_repository_identity(source, headers=headers, http_get=http_get)
-            witness_ref_before = read_exact_ref_commit(source, headers=headers, http_get=http_get)
+            witness_ref_before = read_exact_ref_commit(
+                source, bound_source.line.ref, headers=headers, http_get=http_get
+            )
             response = github_get(
                 github_commit_api_url(source, requested_commit),
                 headers=headers,
@@ -845,7 +912,9 @@ def retrieve_historical_commit(
                 raise HistoricalAttemptAmbiguous()
 
             read_repository_identity(source, headers=headers, http_get=http_get)
-            witness_ref_after = read_exact_ref_commit(source, headers=headers, http_get=http_get)
+            witness_ref_after = read_exact_ref_commit(
+                source, bound_source.line.ref, headers=headers, http_get=http_get
+            )
             if witness_ref_before != witness_ref_after:
                 raise HistoricalAttemptAmbiguous()
 
@@ -955,6 +1024,7 @@ def enumerate_git_package(
 
 def discover_public_skills(bound_source: BoundSource) -> tuple[DiscoveredSkill, ...]:
     source = bound_source.source
+    line = bound_source.line
     repo_path = bound_source.path
     commit = bound_source.commit
     assert_source_workspace_isolated(repo_path)
@@ -975,7 +1045,7 @@ def discover_public_skills(bound_source: BoundSource) -> tuple[DiscoveredSkill, 
         text=False,
         source_workspace=True,
     )
-    prefix_bytes = tuple((prefix + "-").encode("ascii") for prefix in source.skill_prefixes)
+    prefix_bytes = tuple((prefix + "-").encode("ascii") for prefix in line.skill_prefixes)
     discovered: list[DiscoveredSkill] = []
 
     for item in direct.stdout.split(b"\0"):
@@ -1018,7 +1088,7 @@ def discover_public_skills(bound_source: BoundSource) -> tuple[DiscoveredSkill, 
                 source_id=source.source_id,
                 repository_id=source.repository_id,
                 repository=source.repository,
-                ref=source.ref,
+                ref=line.ref,
                 skills_root=source.skills_root,
                 skill_name=name,
                 resolved_commit=commit,
@@ -1036,16 +1106,18 @@ def bind_manifest_sources(
     *,
     http_get: HttpRequester = stdlib_http_get,
     branch_fetcher: BranchFetcher = git_fetch_configured_branch,
-) -> dict[str, BoundSource]:
+) -> dict[tuple[str, str], BoundSource]:
     validate_stable_identity_continuity(previous_manifest, manifest)
-    bound_sources: dict[str, BoundSource] = {}
+    bound_sources: dict[tuple[str, str], BoundSource] = {}
     for source in manifest.sources:
-        bound_sources[source.source_id] = bind_source_snapshot(
-            temp_root,
-            source,
-            http_get=http_get,
-            branch_fetcher=branch_fetcher,
-        )
+        for line in source.lines:
+            bound_sources[(source.source_id, line.ref)] = bind_source_snapshot(
+                temp_root,
+                source,
+                line,
+                http_get=http_get,
+                branch_fetcher=branch_fetcher,
+            )
     return bound_sources
 
 
@@ -1056,7 +1128,7 @@ def discover_manifest_skills(
     *,
     http_get: HttpRequester = stdlib_http_get,
     branch_fetcher: BranchFetcher = git_fetch_configured_branch,
-) -> tuple[dict[str, BoundSource], tuple[DiscoveredSkill, ...]]:
+) -> tuple[dict[tuple[str, str], BoundSource], tuple[DiscoveredSkill, ...]]:
     bound_sources = bind_manifest_sources(
         temp_root,
         manifest,
@@ -1068,12 +1140,13 @@ def discover_manifest_skills(
     skill_names: set[str] = set()
 
     for source in manifest.sources:
-        bound = bound_sources[source.source_id]
-        for skill in discover_public_skills(bound):
-            if skill.skill_name in skill_names:
-                fail(f"duplicate discovered public skill name across sources: {skill.skill_name}")
-            skill_names.add(skill.skill_name)
-            discovered.append(skill)
+        for line in source.lines:
+            bound = bound_sources[(source.source_id, line.ref)]
+            for skill in discover_public_skills(bound):
+                if skill.skill_name in skill_names:
+                    fail(f"duplicate discovered public skill name across sources: {skill.skill_name}")
+                skill_names.add(skill.skill_name)
+                discovered.append(skill)
 
     discovered.sort(key=lambda skill: skill.skill_name.encode("utf-8"))
     return bound_sources, tuple(discovered)
@@ -1081,21 +1154,29 @@ def discover_manifest_skills(
 
 def skill_matches_source_prefix(source: SourceDeclaration, skill_name: str) -> bool:
     validate_name(skill_name)
-    return any(skill_name.startswith(prefix + "-") for prefix in source.skill_prefixes)
+    return any(skill_matches_line_prefixes(line, skill_name) for line in source.lines)
 
 
-def declaration_identity(source: SourceDeclaration, skill_name: str) -> PackageDeclarationIdentity:
+def declaration_identity(
+    source: SourceDeclaration,
+    line: LineDeclaration,
+    skill_name: str,
+) -> PackageDeclarationIdentity:
     return PackageDeclarationIdentity(
         source_id=source.source_id,
         repository_id=source.repository_id,
         repository=source.repository,
-        ref=source.ref,
+        ref=line.ref,
         skills_root=source.skills_root,
         skill_name=skill_name,
+        skill_prefixes=line.skill_prefixes,
     )
 
 
-def discovered_declaration_identity(skill: DiscoveredSkill) -> PackageDeclarationIdentity:
+def discovered_declaration_identity(
+    skill: DiscoveredSkill,
+    line: LineDeclaration,
+) -> PackageDeclarationIdentity:
     return PackageDeclarationIdentity(
         source_id=skill.source_id,
         repository_id=skill.repository_id,
@@ -1103,6 +1184,7 @@ def discovered_declaration_identity(skill: DiscoveredSkill) -> PackageDeclaratio
         ref=skill.ref,
         skills_root=skill.skills_root,
         skill_name=skill.skill_name,
+        skill_prefixes=line.skill_prefixes,
     )
 
 
@@ -1594,7 +1676,7 @@ def load_trusted_head_json(relative_path: str, context: str) -> dict[str, Any]:
 
 def load_trusted_previous_manifest() -> Manifest:
     value = load_trusted_head_json("federation.json", "federation manifest")
-    if is_exact_int(value.get("schemaVersion"), 2):
+    if is_exact_int(value.get("schemaVersion"), 3):
         return load_manifest_from_value(value, "HEAD:federation.json")
     require_exact_keys(value, {"schemaVersion", "sources"}, "HEAD:federation.json legacy bootstrap")
     if not is_exact_int(value["schemaVersion"], 1) or type(value["sources"]) is not list or value["sources"] != []:
@@ -1604,7 +1686,7 @@ def load_trusted_previous_manifest() -> Manifest:
 
 def load_trusted_previous_lock(manifest: Manifest) -> LockState:
     value = load_trusted_head_json("federation.lock.json", "federation lock")
-    if is_exact_int(value.get("schemaVersion"), 2):
+    if is_exact_int(value.get("schemaVersion"), 3):
         return load_lock_from_value(value, manifest, "HEAD:federation.lock.json")
     require_exact_keys(
         value,
@@ -1747,7 +1829,7 @@ def prove_committed_local_state() -> CommittedLocalProof:
     manifest = load_manifest_from_value(manifest_value, "HEAD/current federation.json")
     lock = load_lock_from_value(lock_value, manifest, "HEAD/current federation.lock.json")
     if lock_bytes != render_lock(lock):
-        fail("committed federation.lock.json is not in deterministic schema-v2 rendering")
+        fail("committed federation.lock.json is not in deterministic schema-v3 rendering")
 
     committed_names = list_committed_skill_targets(head_before)
     if set(committed_names) != set(lock.skills):
@@ -1805,13 +1887,19 @@ def load_trusted_previous_publications(
         source = previous_sources.get(entry.source_id)
         if source is None:
             fail(f"trusted previous lock skill {skill_name} has unknown sourceId {entry.source_id}")
-        if not skill_matches_source_prefix(source, skill_name):
-            fail(f"trusted previous lock skill no longer matches accepted source prefix: {skill_name}")
+        line = source_line_for_ref(source, entry.line_ref)
+        if line is None:
+            fail(
+                f"trusted previous lock skill {skill_name} has lineRef that is not an accepted line: "
+                f"{entry.line_ref}"
+            )
+        if not skill_matches_line_prefixes(line, skill_name):
+            fail(f"trusted previous lock skill no longer matches accepted line prefixes: {skill_name}")
         package = enumerate_committed_package(skill_name)
         if package.digest != entry.content_sha256:
             fail(f"trusted HEAD package digest does not match trusted previous lock: {skill_name}")
         publications[skill_name] = PreviousPublication(
-            declaration=declaration_identity(source, skill_name),
+            declaration=declaration_identity(source, line, skill_name),
             lock_entry=entry,
             package=package,
         )
@@ -1850,7 +1938,7 @@ def validate_desired_publication_state(manifest: Manifest, desired: DesiredPubli
         "desired federation lock",
     )
     if parsed_lock != desired.lock:
-        fail("desired federation lock does not round-trip through schema-v2 validation")
+        fail("desired federation lock does not round-trip through schema-v3 validation")
     for name, package in desired.packages.items():
         entry = desired.lock.skills[name]
         if package.name != name or package.digest != entry.content_sha256:
@@ -1862,13 +1950,15 @@ def build_desired_publication_state(
     manifest: Manifest,
     previous_manifest: Manifest,
     previous_lock: LockState,
-    bound_sources: dict[str, BoundSource],
+    bound_sources: dict[tuple[str, str], BoundSource],
     discovered: tuple[DiscoveredSkill, ...],
 ) -> DesiredPublicationState:
     validate_stable_identity_continuity(previous_manifest, manifest)
-    expected_source_ids = set(manifest.by_source_id)
-    if set(bound_sources) != expected_source_ids:
-        fail("R03 bound source set must exactly cover all candidate manifest sources")
+    expected_bindings = {
+        (source.source_id, line.ref) for source in manifest.sources for line in source.lines
+    }
+    if set(bound_sources) != expected_bindings:
+        fail("R03 bound source set must exactly cover all candidate (source, line) bindings")
     previous_publications = load_trusted_previous_publications(previous_manifest, previous_lock)
     desired_entries: dict[str, LockEntry] = {}
     desired_packages: dict[str, Package] = {}
@@ -1879,28 +1969,35 @@ def build_desired_publication_state(
         source = manifest.by_source_id.get(skill.source_id)
         if source is None:
             fail(f"discovered skill references unknown candidate sourceId: {skill.source_id}")
+        line = source_line_for_ref(source, skill.ref)
+        if line is None:
+            fail(f"discovered skill references unknown candidate line ref: {skill.skill_name}")
         if (
             skill.repository_id != source.repository_id
             or skill.repository != source.repository
-            or skill.ref != source.ref
             or skill.skills_root != source.skills_root
         ):
             fail(f"discovered skill declaration does not match accepted candidate source: {skill.skill_name}")
-        if not skill_matches_source_prefix(source, skill.skill_name):
-            fail(f"discovered skill no longer matches candidate source prefix: {skill.skill_name}")
-        bound_source = bound_sources.get(skill.source_id)
+        if not skill_matches_line_prefixes(line, skill.skill_name):
+            fail(f"discovered skill no longer matches candidate line prefixes: {skill.skill_name}")
+        bound_source = bound_sources.get((skill.source_id, skill.ref))
         if bound_source is None:
-            fail(f"discovered skill is missing successfully bound source: {skill.skill_name}")
-        if bound_source.source != source or skill.resolved_commit != bound_source.commit:
+            fail(f"discovered skill is missing successfully bound source line: {skill.skill_name}")
+        if (
+            bound_source.source != source
+            or bound_source.line != line
+            or skill.resolved_commit != bound_source.commit
+        ):
             fail(f"discovered skill is not anchored to its successfully bound source commit: {skill.skill_name}")
         if skill.package.name != skill.skill_name:
             fail(f"discovered package name does not match discovered skill name: {skill.skill_name}")
 
         previous = previous_publications.get(skill.skill_name)
-        current_identity = discovered_declaration_identity(skill)
+        current_identity = discovered_declaration_identity(skill, line)
         if previous is None:
             desired_entry = LockEntry(
                 source_id=skill.source_id,
+                line_ref=skill.ref,
                 resolved_commit=skill.resolved_commit,
                 content_sha256=skill.package.digest,
             )
@@ -1910,6 +2007,7 @@ def build_desired_publication_state(
         elif skill.package.digest != previous.lock_entry.content_sha256:
             desired_entry = LockEntry(
                 source_id=skill.source_id,
+                line_ref=skill.ref,
                 resolved_commit=skill.resolved_commit,
                 content_sha256=skill.package.digest,
             )
@@ -1917,6 +2015,7 @@ def build_desired_publication_state(
         elif previous.declaration != current_identity:
             desired_entry = LockEntry(
                 source_id=skill.source_id,
+                line_ref=skill.ref,
                 resolved_commit=skill.resolved_commit,
                 content_sha256=previous.lock_entry.content_sha256,
             )
@@ -1933,6 +2032,7 @@ def build_desired_publication_state(
             elif access.result is HistoricalCommitResult.DEFINITIVELY_MISSING:
                 desired_entry = LockEntry(
                     source_id=previous.lock_entry.source_id,
+                    line_ref=previous.lock_entry.line_ref,
                     resolved_commit=skill.resolved_commit,
                     content_sha256=previous.lock_entry.content_sha256,
                 )
@@ -1960,12 +2060,12 @@ def validate_empty_pre_r03_state(manifest: Manifest, lock: LockState) -> None:
     if manifest.sources:
         fail("nonempty federation state requires later C02 bounded phases")
     if lock.published_source_ids or lock.skills:
-        fail("empty federation candidate must have an empty schema-v2 publication lock")
+        fail("empty federation candidate must have an empty schema-v3 publication lock")
     targets = list_worktree_skill_targets()
     if targets:
         fail("empty federation candidate must not contain generated skills/** targets")
     if LOCK_PATH.read_bytes() != render_lock(lock):
-        fail("federation.lock.json is not in deterministic schema-v2 rendering")
+        fail("federation.lock.json is not in deterministic schema-v3 rendering")
 
 
 def atomic_write_file(path: Path, data: bytes, *, mode: int = 0o644) -> None:
@@ -2289,15 +2389,18 @@ def verify_published_upstream(initial_proof: CommittedLocalProof) -> None:
             source = initial_proof.manifest.by_source_id.get(source_id)
             if source is None:
                 fail(f"published lock owner disappeared from committed manifest: {source_id}")
-            bound_source = bind_source_snapshot(network_root, source)
             owned_names = sorted(
                 [name for name, entry in initial_proof.lock.skills.items() if entry.source_id == source_id],
                 key=lambda value: value.encode("utf-8"),
             )
             for name in owned_names:
                 entry = initial_proof.lock.skills[name]
-                if not skill_matches_source_prefix(source, name):
-                    fail(f"published lock skill no longer matches accepted source prefix: {name}")
+                line = source_line_for_ref(source, entry.line_ref)
+                if line is None:
+                    fail(f"published lock skill has unknown lineRef: {name}")
+                if not skill_matches_line_prefixes(line, name):
+                    fail(f"published lock skill no longer matches accepted line prefixes: {name}")
+                bound_source = bind_source_snapshot(network_root, source, line)
                 access = retrieve_historical_commit(network_root, bound_source, entry.resolved_commit)
                 if access.result is HistoricalCommitResult.DEFINITIVELY_MISSING:
                     fail(f"published locked commit is definitively missing from accepted repository: {name}")

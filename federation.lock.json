@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "contentDigestAlgorithm": "sha256-file-manifest-v1",
   "publishedSourceIds": [
     "swifql-swifql"
@@ -7,11 +7,13 @@
   "skills": {
     "swifql-custom-extensions": {
       "sourceId": "swifql-swifql",
+      "lineRef": "refs/heads/master",
       "resolvedCommit": "bf48f298f7bc2e5567c786b8bf71cbfc3ff1ac33",
       "contentSha256": "d1f69b310f11ad597c9bcb5af36ba0a242ef1ba6eec3692b09ee427b58dab288"
     },
     "swifql-query-building": {
       "sourceId": "swifql-swifql",
+      "lineRef": "refs/heads/master",
       "resolvedCommit": "bf48f298f7bc2e5567c786b8bf71cbfc3ff1ac33",
       "contentSha256": "5303faf1b7698fe99944287f4c1e9fa3783176021e254f19b3b7566a1c62b8db"
     }
