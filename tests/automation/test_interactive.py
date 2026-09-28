@@ -799,6 +799,27 @@ class InteractiveTests(unittest.TestCase):
         self.assertFalse(any("patch:201" in item.body for item in fake.created))
         event_file.unlink(missing_ok=True)
 
+    def test_app_bot_issue_comment_triggers_are_ignored(self):
+        fake = ProductionAddClient()
+        event_file = Path(tempfile.mktemp(prefix="c03-bot-issue-event-"))
+        event_file.write_text(json.dumps({
+            "action": "created",
+            "issue": {"number": 7, "pull_request": {}},
+            "comment": {"id": 900, "user": {"login": APP.bot_login, "type": "Bot"}},
+        }), encoding="utf-8")
+        environment = {
+            "GITHUB_REPOSITORY": "swiftstream/skills",
+            "FEDERATION_GITHUB_TOKEN": "token",
+            "FEDERATION_APP_SLUG": APP.slug,
+            "FEDERATION_EVENT_PATH": str(event_file),
+            "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
+        }
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.dict(os.environ, environment, clear=False):
+            self.assertEqual(main(["interactive"]), 0)
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.dispatches, [])
+        event_file.unlink(missing_ok=True)
+
     def test_controller_logs_only_validated_graphql_diagnostics(self):
         environment = {
             "GITHUB_REPOSITORY": "swiftstream/skills",

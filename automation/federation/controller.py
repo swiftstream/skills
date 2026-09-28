@@ -2083,21 +2083,25 @@ def _event_pull_number(path: str | None) -> int | None:
     return None
 
 
-def _event_trigger(path: str | None) -> tuple[str | None, int | None]:
-    """Return the event kind and immutable human issue-comment ID, if any."""
+def _event_trigger(path: str | None) -> tuple[str | None, int | None, str | None]:
+    """Return the event kind, immutable issue-comment ID, and comment author login if any."""
     if not path:
-        return None, None
+        return None, None, None
     try:
         value = c02.decode_json(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
-        return None, None
+        return None, None, None
     if type(value) is not dict:
-        return None, None
+        return None, None, None
     event_name = value.get("action") if type(value.get("action")) is str else None
     comment_value = value.get("comment")
     if type(comment_value) is dict and type(comment_value.get("id")) is int and comment_value["id"] > 0:
-        return "issue_comment", comment_value["id"]
-    return event_name, None
+        author_login = None
+        user_value = comment_value.get("user")
+        if type(user_value) is dict and type(user_value.get("login")) is str:
+            author_login = user_value["login"]
+        return "issue_comment", comment_value["id"], author_login
+    return event_name, None, None
 
 
 def _trigger_result(evidence: Iterable[Any], triggering_comment_id: int) -> tuple[str, bool]:
@@ -2182,7 +2186,10 @@ def main(argv: list[str] | None = None) -> int:
         controller = R02Controller(client, repository, app, candidate_builder=C02CandidateBuilder(client, repository, trusted_checkout_sha=trusted_checkout_sha), environ=env)
         number_text = env.get("FEDERATION_WAKE_PULL_NUMBER")
         number = int(number_text) if number_text and number_text.isdigit() else _event_pull_number(env.get("FEDERATION_EVENT_PATH"))
-        event_kind, triggering_comment_id = _event_trigger(env.get("FEDERATION_EVENT_PATH"))
+        event_kind, triggering_comment_id, triggering_comment_author = _event_trigger(env.get("FEDERATION_EVENT_PATH"))
+        if event_kind == "issue_comment" and triggering_comment_author == app.bot_login:
+            # App-authored result/anchor comments must never re-enter as PATCH triggers.
+            return 0
         if args.command == "reconcile":
             hint = env.get("FEDERATION_RECONCILE_REPOSITORY_ID")
             controller.reconcile_all() if hint is None or hint == "" else controller.reconcile(hint)
