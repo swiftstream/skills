@@ -1,0 +1,87 @@
+name: Add source — how to start
+description: Guide for registering a new repository. Issues are not federation requests; you must open a PR.
+title: "[guide] Add federation source"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Add a federation source
+
+        **Issues are not federation requests.** The federation state machine accepts only a pull request in this repository whose head contains one `.federation-request` file.
+
+        1. Read [How to Add a Repository](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-ADD.md).
+        2. Prepare skill packages with [How to Prepare a Source](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-PREPARE-SOURCE.md).
+        3. Create a **central** request branch in `swiftstream/skills` (fork heads fail closed in Wave 1) containing exactly one regular file `.federation-request` with content `add-source` and a final newline.
+        4. Open a pull request using the **Add federation source** template and keep the exact body grammar below.
+
+        **Open the PR template:**
+        https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=add-source.md
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Exact PR body grammar (ADD)
+
+        ```text
+        Repository URL:
+        https://github.com/OWNER/REPO
+
+        Description:
+        <optional value>
+
+        Branch:
+        <optional value>
+
+        Skills root:
+        <optional value>
+
+        Skill prefixes:
+        <optional comma-separated value>
+        ```
+
+        After the App creates the immutable RequestAnchor, the body and repository URL are immutable. Refine mutable fields only with a comment whose first non-empty line is exactly `Federation PATCH`.
+
+  - type: checkboxes
+    id: ack
+    attributes:
+      label: Acknowledgement
+      description: Confirm this issue is guidance only.
+      options:
+        - label: I understand this issue is not a federation request and I will open a pull request with the exact body grammar.
+          required: true
+
+  - type: input
+    id: repository-url
+    attributes:
+      label: Repository URL (for your copy/paste only)
+      description: Optional. Copy this into your PR body. It is not parsed from this issue.
+      placeholder: https://github.com/OWNER/REPO
+
+  - type: textarea
+    id: grammar-copy
+    attributes:
+      label: Draft PR body (optional copy buffer)
+      description: Optional. Assemble the PR body here if it helps, then copy it into the pull request. This issue body is never used as a request.
+      value: |
+        Repository URL:
+        https://github.com/OWNER/REPO
+
+        Description:
+        <optional value>
+
+        Branch:
+        <optional value>
+
+        Skills root:
+        <optional value>
+
+        Skill prefixes:
+        <optional comma-separated value>
+
+  - type: markdown
+    attributes:
+      value: |
+        When you are ready, open the pull request template:
+        https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=add-source.md
+
+        Maintainers review and merge trust/configuration PRs manually. Ordinary skill content changes after registration do not need this request.

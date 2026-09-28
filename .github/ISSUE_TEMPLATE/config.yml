@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Add federation source (PR template)
+    url: https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=add-source.md
+    about: Open the Add source pull request template. Federation requests are pull requests only.
+  - name: Update federation source (PR template)
+    url: https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=update-source.md
+    about: Open the Update source pull request template. Federation requests are pull requests only.
+  - name: Remove federation source (PR template)
+    url: https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=remove-source.md
+    about: Open the Remove source pull request template. Federation requests are pull requests only.
+  - name: Repository mechanics and how-to guides
+    url: https://github.com/swiftstream/skills/blob/main/docs/MECHANICS.md
+    about: Canonical federation mechanics. Human guides live in docs/HOW-TO-*.md.

@@ -1,0 +1,84 @@
+name: Update source — how to start
+description: Guide for changing a registered source. Issues are not federation requests; you must open a PR.
+title: "[guide] Update federation source"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Update a registered federation source
+
+        **Issues are not federation requests.** Open a pull request in this repository with one `.federation-request` file whose content is `update-source` and a final newline.
+
+        1. Read [How to Update a Registered Repository](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-UPDATE.md).
+        2. Use this only for description, branch, skills root, prefixes, or repository locator (same `repositoryId`). Ordinary skill content changes do not need a registry PR.
+        3. Create a central request branch (fork heads fail closed) and open the **Update federation source** PR template.
+
+        **Open the PR template:**
+        https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=update-source.md
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Exact PR body grammar (UPDATE)
+
+        ```text
+        Repository URL:
+        https://github.com/OWNER/REPO
+
+        Description:
+        <optional value>
+
+        Branch:
+        <optional value>
+
+        Skills root:
+        <optional value>
+
+        Skill prefixes:
+        <optional comma-separated value>
+        ```
+
+        Mutable fields may be refined with `Federation PATCH` comments before/after anchoring rules as implemented; the initial body and repository URL are immutable after the RequestAnchor. Prefix ownership reserves the first hyphen-delimited root namespace globally.
+
+  - type: checkboxes
+    id: ack
+    attributes:
+      label: Acknowledgement
+      description: Confirm this issue is guidance only.
+      options:
+        - label: I understand this issue is not a federation request and I will open a pull request with the exact body grammar.
+          required: true
+
+  - type: input
+    id: repository-url
+    attributes:
+      label: Repository URL (for your copy/paste only)
+      description: Optional. Must identify the same accepted repository identity for rename/transfer.
+      placeholder: https://github.com/OWNER/REPO
+
+  - type: textarea
+    id: grammar-copy
+    attributes:
+      label: Draft PR body (optional copy buffer)
+      description: Optional copy buffer for the pull request body only.
+      value: |
+        Repository URL:
+        https://github.com/OWNER/REPO
+
+        Description:
+        <optional value>
+
+        Branch:
+        <optional value>
+
+        Skills root:
+        <optional value>
+
+        Skill prefixes:
+        <optional comma-separated value>
+
+  - type: markdown
+    attributes:
+      value: |
+        Ready? Use the update PR template:
+        https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=update-source.md

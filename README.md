@@ -25,6 +25,19 @@ The complete federation, trust, publication, naming, failure, and automation mod
 - **[Update a registered repository](docs/HOW-TO-UPDATE.md)** — change its description, branch, skills root, prefixes, or verified GitHub location.
 - **[Remove a repository](docs/HOT-TO-REMOVE.md)** — revoke source trust and automatically remove its generated skills from the collection.
 
+### Start on GitHub
+
+Federation trust and configuration changes are pull requests in this repository. Issues are for guidance and questions only.
+
+| I want to… | Open |
+| --- | --- |
+| Register a new repository | [Add federation source](https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=add-source.md) |
+| Change a registered repository | [Update federation source](https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=update-source.md) |
+| Revoke a registered repository | [Remove federation source](https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=remove-source.md) |
+| Ask a question | [Open a help issue](https://github.com/swiftstream/skills/issues/new?template=question-help.yml) |
+
+Each request needs a **central** request branch (not a fork in Wave 1) containing exactly one `.federation-request` file (`add-source`, `update-source`, or `remove-source`, with a final newline) and the exact body grammar from the matching template. After registration, ordinary skill content changes publish through polling and do not need another registry PR.
+
 Ordinary skill additions, edits, and removals do not require a registry PR. Once a source is registered, its current prefix-matching skills are discovered from the accepted source tree and published through validated automation. After a source is accepted in central `federation.json`, central scheduled polling (about every 15 minutes) reconciles its current source state and publication. A maintainer can manually dispatch reconciliation sooner; a normal source change may otherwise take until the next successful poll to appear centrally.
 
 ## Installation
