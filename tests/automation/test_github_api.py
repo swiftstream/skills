@@ -621,7 +621,7 @@ class GitHubAPITests(unittest.TestCase):
         self.assertEqual(len(rest_calls), 4)
 
     def test_issue_comment_retry_predicate_is_exact_string_and_exact_type(self):
-        source = Path("/Users/imike/Development/SwiftStream/skills/automation/federation/github_api.py").read_text(encoding="utf-8")
+        source = (Path(__file__).resolve().parents[2] / "automation/federation/github_api.py").read_text(encoding="utf-8")
         start = source.index("def list_issue_comments(")
         end = source.index("\n    def create_issue_comment(", start)
         body = source[start:end]
