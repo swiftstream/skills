@@ -308,6 +308,12 @@ def _bounded_reason(reason: str) -> str:
     return value[:160]
 
 
+def _bounded_error_reason(error: BaseException) -> str:
+    name = type(error).__name__
+    message = _bounded_reason(str(error))
+    return f"{name}:{message}"
+
+
 def read_public_source_metadata(repository: str) -> PublicSourceMetadata:
     """Read source metadata through C02's public transport, never App auth."""
     try:
@@ -2306,7 +2312,7 @@ def main(argv: list[str] | None = None) -> int:
                     anchor = next(iter(_anchor_candidates(comments)), None)
                     identity = anchor.comment.database_id if anchor is not None else None
                 if identity is not None:
-                    _post_bounded_result(client, repository, number, comments, kind=result_kind, identity=identity, result="PROPOSAL_BLOCKED", reason=type(error).__name__)
+                    _post_bounded_result(client, repository, number, comments, kind=result_kind, identity=identity, result="PROPOSAL_BLOCKED", reason=_bounded_error_reason(error))
             except Exception:
                 pass
         if isinstance(error, GraphQLError):

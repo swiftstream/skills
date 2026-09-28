@@ -291,6 +291,13 @@ class FinalizerTests(unittest.TestCase):
         self.assertNotIn("FEDERATION_NO_BYPASS_PROOF_V2", finalizer)
         self.assertNotIn("FEDERATION_RULESET_ID", finalizer)
 
+    def test_state_finalize_workflow_queues_pending_runs_and_never_cancels_in_progress(self):
+        finalizer = (ROOT / ".github/workflows/federation-state-finalize.yml").read_text()
+        self.assertIn("group: swiftstream-skills-federation-state-finalizer", finalizer)
+        self.assertIn("cancel-in-progress: false", finalizer)
+        self.assertIn("queue: max", finalizer)
+        self.assertNotIn("cancel-in-progress: true", finalizer)
+
     def test_merge_result_distinguishes_non_merge_without_accepting_malformed_data(self):
         class Transport:
             def __init__(self, value):

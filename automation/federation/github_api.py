@@ -30,6 +30,8 @@ _GRAPHQL_ERROR_TYPE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _GRAPHQL_ERROR_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 _GRAPHQL_GENERIC_DIAGNOSTIC = "GRAPHQL:UNKNOWN:unknown-path"
 _GRAPHQL_DIAGNOSTIC_MAX_BYTES = 512
+_ISSUE_COMMENT_COMPOSITE_RACE = "issue comment REST authority changed during composite read"
+_ISSUE_COMMENT_COMPOSITE_MAX_ATTEMPTS = 3
 
 UPDATE_REFS_MUTATION = """mutation FederationUpdateRefs($repositoryId: ID!, $refUpdates: [RefUpdate!]!) {
   updateRefs(input: {repositoryId: $repositoryId, refUpdates: $refUpdates}) {
@@ -1102,22 +1104,31 @@ class GitHubClient:
                 enriched[record.node_id] = self._parse_issue_comment_graphql_node(returned[record.node_id], record)
         return tuple(enriched[record.node_id] for record in records)
 
+    def _list_issue_comments_composite(self, owner: str, name: str, number: int, max_pages: int, max_records: int) -> tuple[IssueComment, ...]:
+        rest_a = self._read_issue_comment_rest_snapshot(owner, name, number, max_pages, max_records)
+        if not rest_a:
+            rest_b = self._read_issue_comment_rest_snapshot(owner, name, number, max_pages, max_records)
+            if rest_a != rest_b:
+                raise InvalidResponseError(_ISSUE_COMMENT_COMPOSITE_RACE)
+            return ()
+        enriched = self._enrich_issue_comment_snapshot(rest_a)
+        rest_b = self._read_issue_comment_rest_snapshot(owner, name, number, max_pages, max_records)
+        if rest_a != rest_b:
+            raise InvalidResponseError(_ISSUE_COMMENT_COMPOSITE_RACE)
+        return enriched
+
     def list_issue_comments(self, repository: str, number: int, *, max_pages: int = 100, max_records: int = 10_000) -> tuple[IssueComment, ...]:
         owner, name = self._owner_repo(repository)
         if type(number) is not int or type(number) is bool or number <= 0:
             raise GitHubAPIError("issue number must be positive")
         max_pages, max_records = self._validate_comment_bounds(max_pages, max_records)
-        rest_a = self._read_issue_comment_rest_snapshot(owner, name, number, max_pages, max_records)
-        if not rest_a:
-            rest_b = self._read_issue_comment_rest_snapshot(owner, name, number, max_pages, max_records)
-            if rest_a != rest_b:
-                raise InvalidResponseError("issue comment REST authority changed during composite read")
-            return ()
-        enriched = self._enrich_issue_comment_snapshot(rest_a)
-        rest_b = self._read_issue_comment_rest_snapshot(owner, name, number, max_pages, max_records)
-        if rest_a != rest_b:
-            raise InvalidResponseError("issue comment REST authority changed during composite read")
-        return enriched
+        for attempt in range(_ISSUE_COMMENT_COMPOSITE_MAX_ATTEMPTS):
+            try:
+                return self._list_issue_comments_composite(owner, name, number, max_pages, max_records)
+            except InvalidResponseError as error:
+                if str(error) != _ISSUE_COMMENT_COMPOSITE_RACE or attempt == _ISSUE_COMMENT_COMPOSITE_MAX_ATTEMPTS - 1:
+                    raise
+        raise InvalidResponseError(_ISSUE_COMMENT_COMPOSITE_RACE)
 
     def create_issue_comment(self, repository: str, number: int, body: str) -> IssueComment:
         owner, name = self._owner_repo(repository)

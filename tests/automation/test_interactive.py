@@ -850,6 +850,75 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(non_graphql, "C03-R02 controller blocked: R02Error\n")
         self.assertNotIn("user-secret-sentinel", non_graphql)
 
+    def test_proposal_blocked_reason_contains_bounded_error_message(self):
+        fake = FakeClient()
+        anchor = self.anchor()
+        fake.comments.append(comment(50, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot"))
+        environment = {
+            "GITHUB_REPOSITORY": "swiftstream/skills",
+            "FEDERATION_GITHUB_TOKEN": "token",
+            "FEDERATION_APP_SLUG": APP.slug,
+            "FEDERATION_WAKE_PULL_NUMBER": "7",
+            "FEDERATION_TRUSTED_CHECKOUT_SHA": "c" * 40,
+        }
+        error = R02Error("operator-why-sentinel")
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(
+            controller_module, "resolve_app_identity", return_value=APP
+        ), patch.object(controller_module.R02Controller, "current_accepted_main", side_effect=error), patch.dict(
+            os.environ, environment, clear=True
+        ):
+            self.assertEqual(main(["interactive"]), 1)
+        blocked = [item for item in fake.created if "PROPOSAL_BLOCKED" in item.body]
+        self.assertEqual(len(blocked), 1)
+        self.assertIn("R02Error", blocked[0].body)
+        self.assertIn("operator-why-sentinel", blocked[0].body)
+        self.assertIn("R02Error:operator-why-sentinel", blocked[0].body)
+
+    def test_proposal_blocked_reason_bounds_extremely_long_error_message(self):
+        fake = FakeClient()
+        anchor = self.anchor()
+        fake.comments.append(comment(50, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot"))
+        environment = {
+            "GITHUB_REPOSITORY": "swiftstream/skills",
+            "FEDERATION_GITHUB_TOKEN": "token",
+            "FEDERATION_APP_SLUG": APP.slug,
+            "FEDERATION_WAKE_PULL_NUMBER": "7",
+            "FEDERATION_TRUSTED_CHECKOUT_SHA": "c" * 40,
+        }
+        long_message = "x" * 400 + " Traceback File \"" + "y" * 40
+        error = R02Error(long_message)
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(
+            controller_module, "resolve_app_identity", return_value=APP
+        ), patch.object(controller_module.R02Controller, "current_accepted_main", side_effect=error), patch.dict(
+            os.environ, environment, clear=True
+        ):
+            self.assertEqual(main(["interactive"]), 1)
+        blocked = [item for item in fake.created if "PROPOSAL_BLOCKED" in item.body]
+        self.assertEqual(len(blocked), 1)
+        body = blocked[0].body
+        self.assertIn("R02Error:", body)
+        self.assertLessEqual(len(body), 512)
+        self.assertNotIn("Traceback", body)
+        self.assertNotIn('File "', body)
+
+    def test_proposal_blocked_reason_retains_exception_type_name(self):
+        from automation.federation.controller import _bounded_error_reason
+
+        class EmptyMessageError(Exception):
+            pass
+
+        empty = EmptyMessageError("")
+        self.assertEqual(_bounded_error_reason(empty), "EmptyMessageError:")
+
+        long_error = R02Error("z" * 200)
+        bounded = _bounded_error_reason(long_error)
+        self.assertTrue(bounded.startswith("R02Error:"))
+        self.assertLessEqual(len(bounded), len("R02Error:") + 160)
+        self.assertEqual(bounded, f"R02Error:{'z' * 160}")
+
+        short_error = R02Error("why")
+        self.assertEqual(_bounded_error_reason(short_error), "R02Error:why")
+
     def test_workflows_have_exact_triggers_pins_and_no_pr_head_execution(self):
         for name in ("federation-interactive.yml", "federation-trusted-validation.yml", "federation-state-finalize.yml"):
             text = (ROOT / ".github/workflows" / name).read_text()
