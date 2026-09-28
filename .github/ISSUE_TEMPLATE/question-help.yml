@@ -1,0 +1,57 @@
+name: Question or help
+description: Ask about federation setup, prefixes, or troubleshooting. Not a request channel.
+title: "[help] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Question / help
+
+        Use this for setup questions or troubleshooting. **Do not use issues to submit federation requests.**
+
+        Start here:
+
+        - [Repository Mechanics](https://github.com/swiftstream/skills/blob/main/docs/MECHANICS.md)
+        - [How to Prepare a Source](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-PREPARE-SOURCE.md)
+        - [How to Add](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-ADD.md) · [Update](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-UPDATE.md) · [Remove](https://github.com/swiftstream/skills/blob/main/docs/HOT-TO-REMOVE.md)
+        - [Federation Operations](https://github.com/swiftstream/skills/blob/main/docs/FEDERATION-OPERATIONS.md)
+
+        For an actual request, open the matching PR template:
+        [Add](https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=add-source.md) ·
+        [Update](https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=update-source.md) ·
+        [Remove](https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=remove-source.md)
+
+  - type: dropdown
+    id: topic
+    attributes:
+      label: Topic
+      description: Helps maintainers route the question.
+      options:
+        - Preparing skill packages
+        - Add / update / remove source
+        - Prefix ownership or naming
+        - Interactive PATCH / proposal state
+        - Publication timing / reconcile
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: What do you need help with?
+      description: Include repository URL and what you already tried. Do not paste secrets.
+      placeholder: |
+        I am trying to ...
+        Repository: https://github.com/OWNER/REPO
+        Already read: ...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: ack
+    attributes:
+      label: Acknowledgement
+      options:
+        - label: I understand this issue is not a federation request and will not advance trust/configuration by itself.
+          required: true

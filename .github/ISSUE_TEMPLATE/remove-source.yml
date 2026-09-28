@@ -1,0 +1,66 @@
+name: Remove source — how to start
+description: Guide for revoking a registered source. Issues are not federation requests; you must open a PR.
+title: "[guide] Remove federation source"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Remove a federation source
+
+        **Issues are not federation requests.** Open a pull request with one `.federation-request` file whose content is `remove-source` and a final newline.
+
+        1. Read [How to Remove a Registered Repository](https://github.com/swiftstream/skills/blob/main/docs/HOT-TO-REMOVE.md).
+        2. Removal is an explicit trust decision and never auto-merges.
+        3. The bot prepares one atomic removal (registry + owned lock/skills/catalog). No later cleanup PR is required.
+
+        **Open the PR template:**
+        https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=remove-source.md
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Exact PR body grammar (REMOVE)
+
+        ```text
+        Repository URL:
+        https://github.com/OWNER/REPO
+
+        Reason:
+        <optional value>
+        ```
+
+        REMOVE does not accept mutable PATCH fields. To drop only one skill while keeping the repository registered, remove/rename that prefix-matching package in the source repository instead.
+
+  - type: checkboxes
+    id: ack
+    attributes:
+      label: Acknowledgement
+      description: Confirm this issue is guidance only.
+      options:
+        - label: I understand this issue is not a federation request and I will open a pull request with the exact body grammar.
+          required: true
+
+  - type: input
+    id: repository-url
+    attributes:
+      label: Repository URL (for your copy/paste only)
+      description: Optional copy buffer only.
+      placeholder: https://github.com/OWNER/REPO
+
+  - type: textarea
+    id: grammar-copy
+    attributes:
+      label: Draft PR body (optional copy buffer)
+      description: Optional copy buffer for the pull request body only.
+      value: |
+        Repository URL:
+        https://github.com/OWNER/REPO
+
+        Reason:
+        <optional value>
+
+  - type: markdown
+    attributes:
+      value: |
+        Ready? Use the remove PR template:
+        https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=remove-source.md
