@@ -391,6 +391,9 @@ class InteractiveTests(unittest.TestCase):
                     return None
                 return super().read_optional_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
 
+            def list_pull_request_files(self, repository, number):
+                return ({"filename": "docs/README.md"},)
+
         for command in ("interactive", "trusted-validation"):
             with self.subTest(command=command):
                 fake = UnrelatedClient()
@@ -406,7 +409,13 @@ class InteractiveTests(unittest.TestCase):
                 self.assertEqual(fake.created, [])
                 self.assertEqual(fake.ref_calls, [])
                 self.assertEqual(fake.dispatches, [])
-                self.assertEqual(fake.checks, [])
+                if command == "interactive":
+                    self.assertEqual(fake.checks, [])
+                    self.assertEqual(fake.check_objects, [])
+                else:
+                    self.assertEqual(len(fake.check_objects), 1)
+                    self.assertEqual(fake.check_objects[0].conclusion, "skipped")
+                    self.assertNotEqual(fake.check_objects[0].conclusion, "success")
 
     def test_c05_hostile_environment_uses_verified_git_exact_env_and_restores_parent(self):
         fake = ProductionAddClient()

@@ -459,6 +459,40 @@ class FinalizerTests(unittest.TestCase):
         controller.finalize_one_machine_pr = lambda _authority: self.fail("manual path must not call machine merge")
         self.assertTrue(callable(controller.finalize_one_machine_pr))
 
+    def test_production_finalizer_creates_missing_check_and_publishes_success(self):
+        client, controller, _source, authority = self._production_finalizer_fixture()
+        created = []
+
+        def create_check_run(self, repository, name, head_sha, **kwargs):
+            output = kwargs.get("output") or {}
+            text = output.get("text") if isinstance(output, dict) else output
+            check = CheckRun(50, name, head_sha, "completed", kwargs.get("conclusion"), 77, text)
+            self.checks = list(self.checks) + [check]
+            created.append(check)
+            return check
+
+        client.create_check_run = create_check_run.__get__(client, type(client))
+        client.checks = []
+        self.assertEqual(controller.finalize_one_machine_pr(authority), "merged")
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].conclusion, "success")
+        self.assertEqual(created[0].name, TRUSTED_VALIDATION_NAME)
+        self.assertEqual(created[0].app_id, 77)
+        self.assertEqual(created[0].head_sha, "d" * 40)
+        self.assertEqual(client.merge_calls, [(41, "d" * 40)])
+
+    def test_production_finalizer_missing_check_wrong_app_still_blocks(self):
+        client, controller, _source, authority = self._production_finalizer_fixture()
+        head = "d" * 40
+        main = "a" * 40
+        valid_text = f"class=machine-publication; head={head}; accepted_base={main}; sourceId=demo; repositoryId=99; result=READY"
+        wrong_app_success = CheckRun(9, TRUSTED_VALIDATION_NAME, head, "completed", "success", 88, valid_text)
+        client.checks = [wrong_app_success]
+        self.assertEqual(controller.finalize_one_machine_pr(authority), "check-recovery-dispatched")
+        self.assertEqual(client.merge_calls, [])
+        self.assertEqual([item.app_id for item in client.checks], [88])
+        self.assertTrue(all(item.app_id != 77 for item in client.checks))
+
 
 if __name__ == "__main__":
     unittest.main()

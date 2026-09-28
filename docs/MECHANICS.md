@@ -467,6 +467,8 @@ Generated `federation.lock.json`, `skills/**`, and the README catalog are global
 
 Manual ADD/UPDATE/REMOVE trust/configuration PRs remain human-merge decisions. Their exact current base and deterministic consequences must be revalidated before a maintainer merges them.
 
+The App-owned `federation/trusted-validation` check is written only by trusted central automation code. A non-finalizer validation writer may create or update that check with non-success evidence only. The globally serialized finalizer may create the check when it is missing and publish `success` only after final candidate revalidation and proof that the authority snapshot is still current for the exact PR head SHA and the exact accepted central base SHA. Exactly one App-owned check with that name may exist per head; duplicates fail closed.
+
 ## 10. Unknown and empty reconciliation inputs
 
 An unknown targeted repository ID, an empty accepted registry, or a source that disappears during a poll produces bounded NOOP/current-state behavior. These paths must not alter `federation.json`, reserve prefixes, create onboarding trust, or create generated packages by themselves.
@@ -1197,6 +1199,8 @@ When request/source files must be inspected, trusted central validator code read
 
 Untrusted values passed to trusted validators/processes remain validated data arguments and must not become executable command syntax.
 
+Creating the missing App-owned trusted-validation check is part of the trusted finalizer path already authorized to publish that check. It is not a separate administrative side channel, does not mint credentials, and must not be reachable from PR head bytes, comments, or skill package code.
+
 ### 30.2 Wave 1 live-distribution invariant
 
 Wave 1 uses the central repository's default-branch HEAD as the live distribution state.
@@ -1238,6 +1242,10 @@ SUPERSEDED -> updated or closed in favor of current state
 An intentionally open trust/configuration PR means a human decision or interactive proposal is still pending.
 
 A same-repository initial manual request must also not become permanently stranded merely because trusted central `main` advanced after the request was opened. On every `main` push, trusted main-advance automation re-enumerates open requests from current GitHub authority. Main-advance normalization and interactive RequestAnchor creation are serialized by the shared `swiftstream-skills-federation-manual-authority` GitHub Actions concurrency group. Both workflows disable in-progress cancellation and use `queue: max`, so authority-bearing runs wait rather than replacing an older pending run. The only creation-capable controller path is interactive anchor establishment; finalizer and validation paths require an existing anchor and fail closed if it disappears. An anchored request therefore cannot cross the no-anchor/update-branch authority window without first releasing or acquiring that same lock. A stale initial marker-only ADD/UPDATE/REMOVE request may then be brought forward with GitHub's exact-head `update-branch` CAS after validation against its recorded historical base; the resulting `synchronize` event resumes the ordinary interactive pipeline. Stale requests that have already acquired an immutable anchor are not silently rebased by this recovery rule and remain subject to their normal exact-base revalidation/recovery semantics. Unrelated maintenance PRs with neither marker nor anchor do not enter the federation state machine.
+
+### 32.1 Marker-less maintenance evidence
+
+Pull requests with neither a request marker nor a RequestAnchor are outside the federation state machine. When the ruleset requires the App-owned trusted validation context, trusted automation publishes non-success App evidence only: `skipped` for same-repository maintenance diffs that touch no privileged federation path, and `failure` otherwise (forks, privileged paths, or empty scope). `success` is reserved for finalizer-grade validated federation candidates and is never emitted for unrelated or marker-less heads.
 
 ## 33. Eventual consistency model
 

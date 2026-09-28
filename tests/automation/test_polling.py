@@ -176,6 +176,26 @@ class PollingTests(unittest.TestCase):
         self.assertIn("reconcile_all", controller)
         self.assertIn("FEDERATION_RECONCILE_REPOSITORY_ID", controller)
 
+    def test_markerless_maintenance_scope_allows_docs_only(self):
+        from automation.federation.controller import markerless_maintenance_scope
+        self.assertEqual(markerless_maintenance_scope(["docs/README.md"]), "MAINTENANCE_SCOPE_OK")
+        self.assertEqual(markerless_maintenance_scope(["docs/README.md", "docs/OTHER.md"]), "MAINTENANCE_SCOPE_OK")
+
+    def test_markerless_maintenance_scope_blocks_privileged_paths(self):
+        from automation.federation.controller import markerless_maintenance_scope
+        for paths in (
+            ["automation/x.py"],
+            ["federation.json"],
+            [".github/workflows/y.yml"],
+            ["skills/z/SKILL.md"],
+            ["federation.lock.json"],
+            ["docs/MECHANICS.md"],
+            [],
+            ["docs/README.md", "automation/x.py"],
+        ):
+            with self.subTest(paths=paths):
+                self.assertEqual(markerless_maintenance_scope(paths), "OUT_OF_FEDERATION_SCOPE")
+
 
 if __name__ == "__main__":
     unittest.main()
