@@ -29,13 +29,19 @@ body:
         <optional value>
 
         Branch:
-        <optional value>
+        <optional single-line value>
 
         Skills root:
         <optional value>
 
         Skill prefixes:
         <optional comma-separated value>
+
+        Publication lines:
+        <optional; full replacement; refs/heads/...=prefix[,prefix...]; ...>
+
+        Dropped publication lines:
+        <UPDATE only when omitting accepted lines; comma-separated full refs>
         ```
 
         Mutable fields may be refined with `Federation PATCH` comments before/after anchoring rules as implemented; the initial body and repository URL are immutable after the RequestAnchor. Prefix ownership reserves the first hyphen-delimited root namespace globally.
@@ -76,6 +82,12 @@ body:
 
         Skill prefixes:
         <optional comma-separated value>
+
+        Publication lines:
+        <optional; full replacement; refs/heads/...=prefix[,prefix...]; ...>
+
+        Dropped publication lines:
+        <UPDATE only when omitting accepted lines; comma-separated full refs>
 
   - type: markdown
     attributes:

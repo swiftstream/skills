@@ -38,7 +38,7 @@ Federation trust and configuration changes are pull requests in this repository.
 
 Each request needs a **central** request branch (not a fork in Wave 1) containing exactly one `.federation-request` file (`add-source`, `update-source`, or `remove-source`, with a final newline) and the exact body grammar from the matching template. After registration, ordinary skill content changes publish through polling and do not need another registry PR.
 
-> **Multi-major products** (for example a stable `release/4` line and a `main` line): today one source binds one branch `ref`. A multi-line proposal is researched and awaiting an explicit decision; until then, register one line or coordinate prefixes with maintainers. See [Repository Mechanics](docs/MECHANICS.md).
+> **Multi-major products** (for example a stable `release/4` line and a `main` line): one source can declare multiple **publication lines** with disjoint prefixes (`vapor4`, `vapor5`). Use `Publication lines:` in the ADD/UPDATE body. See [How to Add](docs/HOW-TO-ADD.md) and [Repository Mechanics](docs/MECHANICS.md).
 
 Ordinary skill additions, edits, and removals do not require a registry PR. Once a source is registered, its current prefix-matching skills are discovered from the accepted source tree and published through validated automation. After a source is accepted in central `federation.json`, central scheduled polling (about every 15 minutes) reconciles its current source state and publication. A maintainer can manually dispatch reconciliation sooner; a normal source change may otherwise take until the next successful poll to appear centrally.
 

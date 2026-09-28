@@ -31,6 +31,43 @@ Skill prefixes:
 
 The repository URL must resolve to the **same** accepted `repositoryId`. A different repository is not silently treated as the same source.
 
+## Publication lines
+
+UPDATE may add, remove, or change publication lines. The proposed `Publication lines:` value is a **full replacement** of the accepted line set (not a merge).
+
+### Dropped publication lines
+
+When the proposal omits one or more accepted lines, the request must name each omitted ref in `Dropped publication lines:` (comma-separated full refs).
+
+```text
+Repository URL:
+https://github.com/vapor/vapor
+
+Description:
+Server-side Swift web framework.
+
+Skills root:
+.agent/skills
+
+Publication lines:
+refs/heads/main=vapor5
+
+Dropped publication lines:
+refs/heads/release/4
+```
+
+Fail-closed drop rules:
+
+- Only UPDATE may use `Dropped publication lines`. ADD with drops is invalid.
+- Named drops must equal exactly `(accepted refs − proposed refs)`.
+- A named drop that is still proposed is invalid.
+- Dropping the last remaining line is invalid; use remove-source instead.
+- Replacing ref A with ref B is a drop of A plus an add of B; name A.
+- Changing a line's prefixes without changing its ref is not a drop.
+- The drop set is evaluated on the final folded request after PATCH.
+
+Generated lock/package/catalog consequences for dropped lines are removed in the same atomic UPDATE.
+
 ## Refining the proposal
 
 Comments whose first non-empty line is exactly `Federation PATCH` may refine mutable fields before anchoring. After the RequestAnchor exists, the initial body and repository URL are immutable.

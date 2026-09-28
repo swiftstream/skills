@@ -20,7 +20,7 @@ class ControllerCoreTests(unittest.TestCase):
         self.assertEqual(classify_request(title="anything", anchor=anchor), RequestClass.RECONCILE)
 
     def test_c02_adapter_and_phase_boundary(self):
-        manifest = parse_c02_manifest({"schemaVersion": 2, "sources": []})
+        manifest = parse_c02_manifest({"schemaVersion": 3, "sources": []})
         self.assertEqual(manifest.sources, ())
         controller = R01Controller()
         with self.assertRaises(PhaseNotImplementedError):
@@ -59,8 +59,8 @@ class ControllerCoreTests(unittest.TestCase):
 
     def test_c02_adapter_is_reused_without_duplicate_semantics(self):
         with patch("automation.federation.controller.c02.load_manifest_from_value", return_value=object()) as loader:
-            self.assertIs(parse_c02_manifest({"schemaVersion": 2, "sources": []}), loader.return_value)
-            loader.assert_called_once_with({"schemaVersion": 2, "sources": []}, "candidate federation.json")
+            self.assertIs(parse_c02_manifest({"schemaVersion": 3, "sources": []}), loader.return_value)
+            loader.assert_called_once_with({"schemaVersion": 3, "sources": []}, "candidate federation.json")
 
     def test_r02_plus_live_methods_are_explicitly_phase_blocked(self):
         controller = R01Controller()
@@ -104,6 +104,89 @@ class ControllerCoreTests(unittest.TestCase):
         self.assertFalse(
             any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) for node in module.body[guard_index + 1:])
         )
+
+    def test_c02_source_candidate_builds_multi_line_source(self):
+        from automation.federation.controller import c02_source_candidate
+        from automation.federation.request_model import parse_request_body, RequestClass
+
+        body = (
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Publication lines:\nrefs/heads/release/4=vapor4; refs/heads/main=vapor5\n"
+        )
+        request = parse_request_body(RequestClass.ADD, body)
+        empty = parse_c02_manifest({"schemaVersion": 3, "sources": []})
+        candidate = c02_source_candidate(
+            request,
+            empty,
+            source_id="vapor-vapor",
+            repository_id=1,
+            default_branch="main",
+            default_description="Framework",
+            default_prefixes=("vapor5",),
+        )
+        self.assertEqual(len(candidate.sources), 1)
+        self.assertEqual([line.ref for line in candidate.sources[0].lines], ["refs/heads/main", "refs/heads/release/4"])
+        self.assertEqual(candidate.sources[0].lines[0].skill_prefixes, ("vapor5",))
+        self.assertEqual(candidate.sources[0].lines[1].skill_prefixes, ("vapor4",))
+
+    def test_update_replaces_full_line_set(self):
+        from automation.federation.controller import c02_source_candidate
+        from automation.federation.request_model import parse_request_body, RequestClass
+
+        accepted = parse_c02_manifest(
+            {
+                "schemaVersion": 3,
+                "sources": [
+                    {
+                        "sourceId": "vapor-vapor",
+                        "repository": "vapor/vapor",
+                        "repositoryId": 1,
+                        "skillsRoot": "skills",
+                        "description": "Framework",
+                        "lines": [
+                            {"ref": "refs/heads/main", "skillPrefixes": ["vapor5"]},
+                            {"ref": "refs/heads/release/4", "skillPrefixes": ["vapor4"]},
+                        ],
+                    }
+                ],
+            }
+        )
+        body = (
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Publication lines:\nrefs/heads/main=vapor5\n"
+            "Dropped publication lines:\nrefs/heads/release/4\n"
+        )
+        request = parse_request_body(RequestClass.UPDATE, body)
+        candidate = c02_source_candidate(
+            request,
+            accepted,
+            source_id="vapor-vapor",
+            repository_id=1,
+            default_branch="main",
+            default_description="Framework",
+            default_prefixes=("vapor5",),
+        )
+        self.assertEqual(len(candidate.sources[0].lines), 1)
+        self.assertEqual(candidate.sources[0].lines[0].ref, "refs/heads/main")
+        self.assertEqual(candidate.sources[0].lines[0].skill_prefixes, ("vapor5",))
+
+    def test_manifest_value_emits_schema_v3_lines(self):
+        from automation.federation.controller import manifest_value
+        from scripts import federate as c02
+
+        source = c02.SourceDeclaration(
+            "demo",
+            "Owner/Repo",
+            99,
+            "skills",
+            "Demo",
+            (c02.LineDeclaration("refs/heads/main", ("demo",)),),
+        )
+        value = manifest_value(c02.Manifest((source,)))
+        self.assertEqual(value["schemaVersion"], 3)
+        self.assertEqual(value["sources"][0]["lines"], [{"ref": "refs/heads/main", "skillPrefixes": ["demo"]}])
+        self.assertNotIn("ref", value["sources"][0])
+        self.assertNotIn("skillPrefixes", value["sources"][0])
 
 
 if __name__ == "__main__":

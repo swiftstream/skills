@@ -82,7 +82,7 @@ class ReconcileTests(unittest.TestCase):
                 self.states.append((number, state))
 
         client = ManualClient()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U_bot", "app[bot]"))
         controller._accepted_sources = lambda _main=None: (source,) if accepted else ()
         return client, controller, source
@@ -105,7 +105,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_changed_source_uses_zero_before_oid_and_global_finalizer_wake(self):
         client = ReconcileClient()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         candidate = ProposalCandidate("d" * 40, client.main, ("README.md", "federation.lock.json"), RequestClass.MACHINE_PUBLICATION, "demo", 99)
         builder = type("Builder", (), {"machine_candidate": lambda _self, base, source_id: candidate})()
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U", "app[bot]"), candidate_builder=builder)
@@ -127,7 +127,7 @@ class ReconcileTests(unittest.TestCase):
             validate_machine_generated_scope(Trees(), "swiftstream/skills", "b" * 40, "h" * 40)
 
     def _controller_with_source(self, client, source=None, builder=None):
-        source = source or c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = source or c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U", "app[bot]"), candidate_builder=builder)
         controller._accepted_sources = lambda _main=None: (source,)
         return controller, source
@@ -150,7 +150,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_reconcile_never_uses_wake_hint_as_source_authority(self):
         client = ReconcileClient()
-        source = c02.SourceDeclaration("real", "Owner/Repo", 99, "refs/heads/main", "skills", ("real",), "Real")
+        source = c02.SourceDeclaration("real", "Owner/Repo", 99, "skills", "Real", (c02.LineDeclaration("refs/heads/main", ("real",)),))
         candidate = ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "real", 99)
         builder = type("Builder", (), {"machine_candidate": lambda _self, base, source_id: candidate})()
         controller, _ = self._controller_with_source(client, source, builder)
@@ -159,7 +159,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_reconcile_candidate_identity_failure_is_bounded_fail(self):
         client = ReconcileClient()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         builder = type("Builder", (), {"machine_candidate": lambda _self, base, source_id: (_ for _ in ()).throw(R02Error("identity"))})()
         controller, _ = self._controller_with_source(client, source, builder)
         result = controller.reconcile(99)
@@ -186,7 +186,7 @@ class ReconcileTests(unittest.TestCase):
                 self.refs.extend(updates)
 
         client = CASClient()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         candidates = [ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99), ProposalCandidate("e" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)]
         seen = []
         class Builder:
@@ -218,7 +218,7 @@ class ReconcileTests(unittest.TestCase):
                 raise RefCASConflict("always loses")
 
         client = AlwaysCAS()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         candidate = ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)
         controller, _ = self._controller_with_source(client, source, type("Builder", (), {"machine_candidate": lambda _self, base, source_id: candidate})())
         result = controller.reconcile(99)
@@ -231,7 +231,7 @@ class ReconcileTests(unittest.TestCase):
             def get_ref_oid(self, repository, branch):
                 return self.main if branch == "main" else "d" * 40
         client = Matching()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         candidate = ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)
         controller, _ = self._controller_with_source(client, source, type("Builder", (), {"machine_candidate": lambda _self, base, source_id: candidate})())
         self.assertEqual(controller.reconcile(99).outcome, "CHANGED")
@@ -244,25 +244,45 @@ class ReconcileTests(unittest.TestCase):
             self.assertIn(f"{field}={value}", output["text"])
         self.assertNotIn("token", json.dumps(output).lower())
 
+    def test_machine_publication_uses_lineRef_in_lock(self):
+        lock = c02.LockState(
+            ("demo",),
+            {
+                "demo-skill": c02.LockEntry(
+                    source_id="demo",
+                    line_ref="refs/heads/main",
+                    resolved_commit="a" * 40,
+                    content_sha256="b" * 64,
+                )
+            },
+        )
+        rendered = json.loads(c02.render_lock(lock).decode("utf-8"))
+        self.assertEqual(rendered["schemaVersion"], 3)
+        self.assertEqual(rendered["skills"]["demo-skill"]["lineRef"], "refs/heads/main")
+
+    def test_fixture_manifests_use_schema_v3(self):
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        self.assertEqual(source.lines[0].ref, "refs/heads/main")
+        self.assertFalse(hasattr(source, "ref"))
+        self.assertFalse(hasattr(source, "skill_prefixes"))
+
     def test_trusted_manifest_read_is_capsule_bound_and_parent_environment_restored(self):
         client = ReconcileClient()
         client.main = c02.head_commit_oid()
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U", "app[bot]"))
         original = dict(os.environ)
         hostile = {"PATH": "/attacker", "GIT_DIR": "/attacker/repo", "HOME": "/attacker/home", "TMPDIR": "/attacker/tmp", "HTTPS_PROXY": "http://attacker.invalid", "FEDERATION_GITHUB_TOKEN": "secret"}
-        with patch.dict(os.environ, hostile, clear=False):
+        with patch.dict(os.environ, hostile, clear=False), patch.object(c02, "load_trusted_previous_manifest", return_value=c02.Manifest(())):
             sources = controller._accepted_sources(client.main)
         self.assertIsInstance(sources, tuple)
-        for item in sources:
-            self.assertTrue(item.source_id)
-            self.assertTrue(item.repository_id)
+        self.assertEqual(sources, ())
         self.assertEqual(dict(os.environ), original)
 
     def test_machine_source_scope_rejects_federation_docs_scripts_automation_and_unrelated_roots(self):
         for path in ("federation.json", "docs/x", "scripts/x", ".github/x", "automation/x", "other/x"):
             with self.subTest(path=path):
                 client = ReconcileClient()
-                source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+                source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
                 candidate = ProposalCandidate("d" * 40, "a" * 40, (path,), RequestClass.MACHINE_PUBLICATION, "demo", 99)
                 class Builder:
                     def __init__(self):
@@ -325,7 +345,7 @@ class ReconcileTests(unittest.TestCase):
                     entries = (GitTreeEntry("federation.json", "100644", "blob", "3" * 40), GitTreeEntry("README.md", "100644", "blob", "2" * 40))
                 return "t" * 40, entries
         client = OwnedInvalid()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         candidate = ProposalCandidate("e" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)
         controller, _ = self._controller_with_source(client, source, type("Builder", (), {"machine_candidate": lambda _self, base, source_id: candidate})())
         result = controller.reconcile(99)
@@ -346,7 +366,7 @@ class ReconcileTests(unittest.TestCase):
             def update_pull_request_state(self, repository, number, *, state):
                 self.states.append((number, state))
         client = WrongApp()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         controller, _ = self._controller_with_source(client, source, None)
         self.assertEqual(controller._machine_prs(client.main, client.get_repository_metadata("swiftstream/skills"), (source,))["demo"], [])
         self.assertEqual(client.states, [])
@@ -411,7 +431,7 @@ class ReconcileTests(unittest.TestCase):
     def test_machine_validation_rejects_stale_base_before_candidate_validation(self):
         client = ReconcileClient()
         client.pr = PullRequestMetadata(7, "", "U", "app[bot]", "d" * 40, "b" * 40, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False)
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         called = []
         builder = type("Builder", (), {"validate_machine_head": lambda _self, *args: called.append(args) or (True, "ok")})()
         controller, _ = self._controller_with_source(client, source, builder)
@@ -488,7 +508,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_reconcile_guard_runs_before_machine_pr_comment_and_close(self):
         client = ReconcileClient()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         controller, _ = self._controller_with_source(client, source, None)
         controller.candidate_builder = type("Builder", (), {"machine_candidate": lambda _self, _base, _source_id: ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)})()
         controller._machine_prs = lambda _main, _repository, _sources: {"demo": [MachinePRAuthority(7, "demo", 99, "d" * 40, False, "bad") ]}
@@ -561,14 +581,14 @@ class ReconcileTests(unittest.TestCase):
                 self.updated_branches.append((number, expected_head_sha))
 
         client = MainAdvanceClient()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U_bot", "app[bot]"))
         controller._accepted_sources = lambda _main=None: (source,)
         controller._machine_prs = lambda _main, _repository, _sources: machine or {"demo": []}
         return client, controller
 
     def test_main_advance_owned_machine_pr_uses_manifest_repository_id_and_one_coalesced_wake(self):
-        source = c02.SourceDeclaration("real", "Owner/Repo", 123, "refs/heads/main", "skills", ("real",), "Real")
+        source = c02.SourceDeclaration("real", "Owner/Repo", 123, "skills", "Real", (c02.LineDeclaration("refs/heads/main", ("real",)),))
         authority = MachinePRAuthority(41, "real", 123, "d" * 40)
         client, controller = self._main_advance_controller((source,), {"real": [authority]})
         result = controller.main_advance()
@@ -579,8 +599,8 @@ class ReconcileTests(unittest.TestCase):
         ])
 
     def test_main_advance_multiple_sources_is_deterministic_and_finalizer_is_coalesced(self):
-        source_b = c02.SourceDeclaration("b", "Owner/B", 2, "refs/heads/main", "skills", ("b",), "B")
-        source_a = c02.SourceDeclaration("a", "Owner/A", 1, "refs/heads/main", "skills", ("a",), "A")
+        source_b = c02.SourceDeclaration("b", "Owner/B", 2, "skills", "B", (c02.LineDeclaration("refs/heads/main", ("b",)),))
+        source_a = c02.SourceDeclaration("a", "Owner/A", 1, "skills", "A", (c02.LineDeclaration("refs/heads/main", ("a",)),))
         machine = {"b": [MachinePRAuthority(2, "b", 2, "b" * 40)], "a": [MachinePRAuthority(1, "a", 1, "a" * 40)]}
         client, controller = self._main_advance_controller((source_b, source_a), machine)
         controller.main_advance()
@@ -609,7 +629,7 @@ class ReconcileTests(unittest.TestCase):
                 return tuple(self.comments)
 
         client = ManualAdvanceClient()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U_bot", "app[bot]"))
         controller._accepted_sources = lambda _main=None: (source,)
         controller._machine_prs = lambda _main, _repository, _sources: {"demo": []}
@@ -753,7 +773,7 @@ class ReconcileTests(unittest.TestCase):
                 return self.comments_by_pr[number]
 
         client = InvalidClient()
-        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "refs/heads/main", "skills", ("demo",), "Demo")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U_bot", "app[bot]"))
         controller._accepted_sources = lambda _main=None: (source,)
         controller._machine_prs = lambda _main, _repository, _sources: {"demo": []}

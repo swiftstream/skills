@@ -100,19 +100,19 @@ Conceptually:
 
 ```json
 {
-  "sourceId": "swifql",
-  "repository": "SwifQL/SwifQL",
+  "sourceId": "vapor-vapor",
+  "repository": "vapor/vapor",
   "repositoryId": 123456789,
-  "ref": "refs/heads/master",
   "skillsRoot": ".agent/skills",
-  "skillPrefixes": [
-    "swifql"
-  ],
-  "description": "SQL query builder and dialect toolkit for Swift."
+  "description": "Server-side Swift web framework.",
+  "lines": [
+    { "ref": "refs/heads/release/4", "skillPrefixes": ["vapor4"] },
+    { "ref": "refs/heads/main", "skillPrefixes": ["vapor5"] }
+  ]
 }
 ```
 
-The exact schema version is implementation-controlled, but the semantics below are canonical.
+Accepted live shape is `schemaVersion` 3. Source-level `ref` and `skillPrefixes` are removed; each source declares one or more **publication lines**. The exact schema version is implementation-controlled, but the semantics below are canonical.
 
 ### 4.1 `sourceId`
 
@@ -151,16 +151,19 @@ It may change after an explicitly reviewed repository transfer or rename.
 
 A redirect alone is not sufficient authority to silently rewrite this field. A locator change is a trust/configuration update and therefore requires a manual registry PR.
 
-### 4.4 `ref`
+### 4.4 Publication line `ref`
 
-`ref` is the canonical source branch as a full branch ref, for example:
+Each publication line has its own canonical source ref as a full branch ref under `refs/heads/**`, for example:
 
 ```text
 refs/heads/master
 refs/heads/main
+refs/heads/release/4
 ```
 
-Changing the canonical branch is a trust/configuration change and requires a manual registry PR.
+A source may declare one or more publication lines so one repository can publish multiple major/maintenance lines with disjoint public prefixes. Adding, removing, or changing a line (its `ref` or its `skillPrefixes`) is a trust/configuration change and requires a manual registry PR with atomic generated consequences.
+
+Source-side tags (`refs/tags/**`) are not accepted as federation line refs in this wave.
 
 ### 4.5 `skillsRoot`
 
@@ -194,7 +197,7 @@ Changing `skillsRoot` is a trust/configuration change and requires a manual regi
 
 ### 4.6 `skillPrefixes`
 
-A source may own one or more public skill prefixes.
+Each publication line may own one or more public skill prefixes. Prefix ownership is global by root namespace (first hyphen component) across the entire federation, **including across multiple publication lines of the same source**. Two lines of one source therefore must not share a root namespace.
 
 Examples of meaningful multiple ownership:
 
@@ -205,14 +208,16 @@ Examples of meaningful multiple ownership:
 ]
 ```
 
-or:
+or multi-major lines (distinct roots):
 
 ```json
-"skillPrefixes": [
-  "swifql",
-  "swifql2"
+"lines": [
+  { "ref": "refs/heads/release/4", "skillPrefixes": ["vapor4"] },
+  { "ref": "refs/heads/main", "skillPrefixes": ["vapor5"] }
 ]
 ```
+
+`vapor4` and `vapor5` are allowed (roots `vapor4` / `vapor5`). `vapor-4` and `vapor-5` conflict (shared root `vapor`).
 
 A configured prefix selects public skill names matching:
 
@@ -306,10 +311,10 @@ That is intentional.
 A registered source defines:
 
 ```text
-repository + repositoryId + ref + skillsRoot + skillPrefixes
+repository + repositoryId + skillsRoot + lines[](ref + skillPrefixes)
 ```
 
-The federation engine discovers the current public skill set from the actual Git tree at the resolved source commit.
+The federation engine discovers the current public skill set **per publication line** from the actual Git tree at that line's resolved commit, filtered by that line's `skillPrefixes`. Public skill names remain globally unique package keys.
 
 ### 5.1 Discovery boundary
 
@@ -422,11 +427,11 @@ resolvedCommit old -> current retrievable commit
 
 This is a provenance-maintenance transition, not semantic package churn.
 
-When the registered source declaration intentionally changes, for example `skillsRoot` or canonical `ref`, the new declaration must obtain new provenance even when package content happens to be byte-identical.
+When the registered source declaration intentionally changes — for example `skillsRoot`, a publication line's `ref`, or a line's `skillPrefixes` — that line must obtain new provenance even when package content happens to be byte-identical. Unchanged sibling publication lines are not re-anchored solely because a sibling line declaration changed.
 
 ### 7.3 Lock ownership
 
-Because individual skills are discovered dynamically rather than enumerated in `federation.json`, every lock entry must be unambiguously associated with its registered source identity.
+Because individual skills are discovered dynamically rather than enumerated in `federation.json`, every lock entry must be unambiguously associated with its registered source identity and publication line.
 
 Conceptually:
 
@@ -434,13 +439,16 @@ Conceptually:
 {
   "skills": {
     "swifql-query-building": {
-      "sourceId": "swifql",
+      "sourceId": "swifql-swifql",
+      "lineRef": "refs/heads/master",
       "resolvedCommit": "0123456789abcdef0123456789abcdef01234567",
       "contentSha256": "..."
     }
   }
 }
 ```
+
+`lineRef` is the publication-line ref whose accepted configuration produced the package.
 
 The exact lock schema remains versioned and deterministic.
 
@@ -778,7 +786,11 @@ Description
 Branch
 Skills root
 Skill prefixes
+Publication lines
+Dropped publication lines
 ```
+
+An UPDATE may add, remove, or change publication lines. The proposed line set is a **full replacement** of the accepted line set, not a merge. When the proposal omits one or more accepted lines, the request must name each omitted ref in `Dropped publication lines` (in addition to the full proposed lines list) or the proposal is invalid. Dropping the last remaining line is invalid; use the removal flow instead. Drop-one-line is UPDATE (not REMOVE), and generated consequences include only the dropped line's packages/lock/catalog content in the same atomic diff.
 
 After every accepted update the bot:
 

@@ -34,12 +34,37 @@ class RequestClass(Enum):
 
 
 _BODY_FIELDS: dict[RequestClass, tuple[str, ...]] = {
-    RequestClass.ADD: ("Repository URL:", "Description:", "Branch:", "Skills root:", "Skill prefixes:"),
-    RequestClass.UPDATE: ("Repository URL:", "Description:", "Branch:", "Skills root:", "Skill prefixes:"),
+    RequestClass.ADD: (
+        "Repository URL:",
+        "Description:",
+        "Branch:",
+        "Skills root:",
+        "Skill prefixes:",
+        "Publication lines:",
+        "Dropped publication lines:",
+    ),
+    RequestClass.UPDATE: (
+        "Repository URL:",
+        "Description:",
+        "Branch:",
+        "Skills root:",
+        "Skill prefixes:",
+        "Publication lines:",
+        "Dropped publication lines:",
+    ),
     RequestClass.REMOVE: ("Repository URL:", "Reason:"),
     RequestClass.RECONCILE: ("Repository URL:",),
 }
-_REQUEST_KEYS = ("Repository URL", "Description", "Branch", "Skills root", "Skill prefixes", "Reason")
+_REQUEST_KEYS = (
+    "Repository URL",
+    "Description",
+    "Branch",
+    "Skills root",
+    "Skill prefixes",
+    "Publication lines",
+    "Dropped publication lines",
+    "Reason",
+)
 
 
 def _fail(message: str) -> None:
@@ -83,7 +108,7 @@ def _parse_blocks(body: str, allowed: tuple[str, ...], context: str) -> dict[str
         value = lines[index + 1]
         if "\n" in value or "\r" in value or "\x00" in value:
             _fail(f"multiline value in {context} field: {label!r}")
-        values[label[:-1]] = value if value != "" else None
+        values[label[:-1]] = value
         index += 2
     present = [label for label in allowed if f"{label}"[:-1] in values]
     actual_order = [line for line in lines if line in allowed]
@@ -195,6 +220,200 @@ def _canonical_prefix_tuple(value: tuple[str, ...] | None) -> tuple[str, ...] | 
     return tuple(result)
 
 
+@dataclass(frozen=True)
+class PublicationLineRequest:
+    ref: str
+    skill_prefixes: tuple[str, ...]
+
+
+def _canonical_publication_line(value: Any) -> PublicationLineRequest:
+    if type(value) is not dict:
+        _fail("Publication lines item must be an object")
+    if set(value) != {"ref", "skillPrefixes"}:
+        _fail("Publication lines item has invalid exact keys")
+    try:
+        ref = validate_trusted_ref(value["ref"])
+    except (c02.FederationError, WorkspaceError) as error:
+        _fail(str(error))
+    prefixes = _canonical_prefix_tuple(
+        tuple(value["skillPrefixes"])
+        if type(value["skillPrefixes"]) is list
+        else value["skillPrefixes"]
+    )
+    if prefixes is None or not prefixes:
+        _fail("Publication lines item skillPrefixes must be a nonempty array")
+    return PublicationLineRequest(ref=ref, skill_prefixes=prefixes)
+
+
+def _publication_lines(value: str | None) -> tuple[PublicationLineRequest, ...] | None:
+    if value is None:
+        return None
+    if value == "":
+        _fail("Publication lines cannot be empty")
+    items = value.split(";")
+    if not items or any(item.strip(" ") == "" for item in items):
+        _fail("Publication lines contains an empty item")
+    lines: list[PublicationLineRequest] = []
+    root_namespaces: set[str] = set()
+    seen_refs: set[str] = set()
+    seen_prefixes: set[str] = set()
+    for item in items:
+        piece = item.strip(" ")
+        if "=" not in piece:
+            _fail("Publication lines item must use ref=prefix[,prefix...] syntax")
+        ref_text, prefix_text = piece.split("=", 1)
+        if not ref_text or not prefix_text:
+            _fail("Publication lines item must use ref=prefix[,prefix...] syntax")
+        try:
+            ref = validate_trusted_ref(ref_text)
+        except (c02.FederationError, WorkspaceError) as error:
+            _fail(str(error))
+        if ref in seen_refs:
+            _fail(f"Publication lines contains duplicate ref: {ref}")
+        seen_refs.add(ref)
+        prefixes = _prefixes(prefix_text)
+        if prefixes is None or not prefixes:
+            _fail("Publication lines item skillPrefixes must be nonempty")
+        for prefix in prefixes:
+            if prefix in seen_prefixes:
+                _fail(f"Publication lines contains duplicate skill prefix: {prefix}")
+            seen_prefixes.add(prefix)
+            root = prefix.split("-", 1)[0]
+            if root in root_namespaces:
+                _fail(f"Publication lines contains duplicate root namespace: {root}")
+            root_namespaces.add(root)
+        lines.append(PublicationLineRequest(ref=ref, skill_prefixes=prefixes))
+    return tuple(lines)
+
+
+def _dropped_publication_lines(value: str | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if value == "":
+        _fail("Dropped publication lines cannot be empty")
+    items = value.split(",")
+    refs: list[str] = []
+    for item in items:
+        piece = item.strip(" ")
+        if not piece:
+            _fail("Dropped publication lines contains an empty item")
+        try:
+            ref = validate_trusted_ref(piece)
+        except (c02.FederationError, WorkspaceError) as error:
+            _fail(str(error))
+        if ref in refs:
+            _fail(f"Dropped publication lines contains duplicate ref: {ref}")
+        refs.append(ref)
+    return tuple(refs)
+
+
+def _require_single_line_match(
+    branch: str | None,
+    prefixes: tuple[str, ...] | None,
+    lines: tuple[PublicationLineRequest, ...],
+) -> None:
+    if branch is None and prefixes is None:
+        return
+    matches: list[PublicationLineRequest] = []
+    for line in lines:
+        if branch is not None and line.ref != branch:
+            continue
+        if prefixes is not None and line.skill_prefixes != prefixes:
+            continue
+        matches.append(line)
+    if len(matches) != 1:
+        _fail("Branch/Skill prefixes alongside Publication lines must match exactly one listed line")
+
+
+def resolve_publication_lines(
+    request: "Request",
+    *,
+    default_branch: str,
+    default_prefixes: tuple[str, ...],
+    existing_refs: tuple[str, ...] | None = None,
+) -> tuple[PublicationLineRequest, ...]:
+    if request.publication_lines is not None:
+        return request.publication_lines
+    if request.branch is None and request.skill_prefixes is None and existing_refs is not None:
+        # UPDATE with no line fields keeps the accepted line set unchanged.
+        raise _KeepExistingLines(existing_refs)
+    branch = request.branch or default_branch
+    try:
+        branch = validate_trusted_ref(
+            branch if branch.startswith("refs/heads/") else f"refs/heads/{branch}"
+        )
+    except (c02.FederationError, WorkspaceError) as error:
+        _fail(str(error))
+    prefixes = request.skill_prefixes if request.skill_prefixes is not None else default_prefixes
+    if not prefixes:
+        _fail("resolved publication line requires nonempty skill prefixes")
+    return (PublicationLineRequest(ref=branch, skill_prefixes=tuple(prefixes)),)
+
+
+class _KeepExistingLines(Exception):
+    def __init__(self, refs: tuple[str, ...]) -> None:
+        self.refs = refs
+
+
+def proposed_line_refs(
+    request: "Request",
+    *,
+    default_branch: str,
+    default_prefixes: tuple[str, ...],
+    existing_refs: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    try:
+        lines = resolve_publication_lines(
+            request,
+            default_branch=default_branch,
+            default_prefixes=default_prefixes,
+            existing_refs=existing_refs,
+        )
+    except _KeepExistingLines as keep:
+        return keep.refs
+    return tuple(line.ref for line in lines)
+
+
+def validate_drop_set(
+    request_class: RequestClass,
+    request: "Request",
+    *,
+    accepted_line_refs: tuple[str, ...],
+    proposed_refs: tuple[str, ...],
+) -> None:
+    named_drops = request.dropped_publication_lines
+    proposed_set = set(proposed_refs)
+
+    if named_drops is None:
+        if request_class is RequestClass.ADD:
+            return
+        missing = set(accepted_line_refs) - proposed_set
+        if missing:
+            _fail(
+                "UPDATE that omits accepted publication lines must name each drop in "
+                "Dropped publication lines: " + ", ".join(sorted(missing))
+            )
+        return
+
+    if request_class is not RequestClass.UPDATE:
+        _fail("Dropped publication lines is only valid on UPDATE requests")
+    if not proposed_set:
+        _fail("Dropping the last remaining publication line is invalid; use remove-source")
+    named = set(named_drops)
+    still_proposed = named & proposed_set
+    if still_proposed:
+        _fail(
+            "Dropped publication lines cannot include refs still proposed: "
+            + ", ".join(sorted(still_proposed))
+        )
+    expected = set(accepted_line_refs) - proposed_set
+    if named != expected:
+        _fail(
+            "Dropped publication lines must equal exactly the accepted refs omitted from the "
+            f"proposed set (expected {sorted(expected)!r}, got {sorted(named)!r})"
+        )
+
+
 def _validate_anchor_request(request_class: RequestClass, request: "Request") -> None:
     if type(request) is not Request:
         _fail("anchor initialRequest must be a Request")
@@ -205,15 +424,62 @@ def _validate_anchor_request(request_class: RequestClass, request: "Request") ->
     _anchor_branch(request.branch)
     _skills_root(request.skills_root)
     _canonical_prefix_tuple(request.skill_prefixes)
+    if request.publication_lines is not None:
+        for line in request.publication_lines:
+            _canonical_publication_line({"ref": line.ref, "skillPrefixes": list(line.skill_prefixes)})
+        refs = [line.ref for line in request.publication_lines]
+        if len(set(refs)) != len(refs):
+            _fail("anchor Publication lines contains duplicate refs")
+        roots: set[str] = set()
+        seen_prefixes: set[str] = set()
+        for line in request.publication_lines:
+            for prefix in line.skill_prefixes:
+                if prefix in seen_prefixes:
+                    _fail("anchor Publication lines contains duplicate skill prefixes")
+                seen_prefixes.add(prefix)
+                root = prefix.split("-", 1)[0]
+                if root in roots:
+                    _fail("anchor Publication lines contains duplicate root namespaces")
+                roots.add(root)
+        _require_single_line_match(request.branch, request.skill_prefixes, request.publication_lines)
+    if request.dropped_publication_lines is not None:
+        for ref in request.dropped_publication_lines:
+            try:
+                validate_trusted_ref(ref)
+            except (c02.FederationError, WorkspaceError) as error:
+                _fail(str(error))
     _optional_text(request.reason, "Reason")
     if request_class in {RequestClass.ADD, RequestClass.UPDATE}:
         if request.reason is not None:
             _fail("ADD/UPDATE anchors cannot contain Reason")
+        if request_class is RequestClass.ADD and request.dropped_publication_lines is not None:
+            _fail("ADD anchors cannot contain Dropped publication lines")
     elif request_class is RequestClass.REMOVE:
-        if any(getattr(request, name) is not None for name in ("description", "branch", "skills_root", "skill_prefixes")):
+        if any(
+            getattr(request, name) is not None
+            for name in (
+                "description",
+                "branch",
+                "skills_root",
+                "skill_prefixes",
+                "publication_lines",
+                "dropped_publication_lines",
+            )
+        ):
             _fail("REMOVE anchors cannot contain mutable ADD/UPDATE fields")
     elif request_class is RequestClass.RECONCILE:
-        if any(getattr(request, name) is not None for name in ("description", "branch", "skills_root", "skill_prefixes", "reason")):
+        if any(
+            getattr(request, name) is not None
+            for name in (
+                "description",
+                "branch",
+                "skills_root",
+                "skill_prefixes",
+                "publication_lines",
+                "dropped_publication_lines",
+                "reason",
+            )
+        ):
             _fail("RECONCILE anchors cannot contain mutable request fields")
     else:
         _fail("anchor requestClass must be a human request class")
@@ -227,6 +493,8 @@ class Request:
     branch: str | None = None
     skills_root: str | None = None
     skill_prefixes: tuple[str, ...] | None = None
+    publication_lines: tuple[PublicationLineRequest, ...] | None = None
+    dropped_publication_lines: tuple[str, ...] | None = None
     reason: str | None = None
 
     def as_anchor_value(self) -> dict[str, Any]:
@@ -236,6 +504,14 @@ class Request:
             "Branch": self.branch,
             "Skills root": self.skills_root,
             "Skill prefixes": list(self.skill_prefixes) if self.skill_prefixes is not None else None,
+            "Publication lines": (
+                [{"ref": line.ref, "skillPrefixes": list(line.skill_prefixes)} for line in self.publication_lines]
+                if self.publication_lines is not None
+                else None
+            ),
+            "Dropped publication lines": (
+                list(self.dropped_publication_lines) if self.dropped_publication_lines is not None else None
+            ),
             "Reason": self.reason,
         }
 
@@ -244,17 +520,39 @@ def parse_request_body(request_class: RequestClass, body: str) -> Request:
     if request_class not in _BODY_FIELDS:
         _fail("machine or unrelated classes do not have a human request body")
     values = _parse_blocks(body, _BODY_FIELDS[request_class], "request body")
+    for key in ("Description", "Branch", "Skills root", "Skill prefixes", "Reason"):
+        if values.get(key) == "":
+            values[key] = None
+    if values.get("Publication lines") == "":
+        _fail("Publication lines cannot be empty")
+    if values.get("Dropped publication lines") == "":
+        _fail("Dropped publication lines cannot be empty")
     repository = _repository_url(values.get("Repository URL"))
     description = _optional_text(values.get("Description"), "Description")
     branch = _branch(values.get("Branch"))
     skills_root = _skills_root(values.get("Skills root"))
     prefixes = _prefixes(values.get("Skill prefixes"))
+    publication_lines = _publication_lines(values.get("Publication lines"))
+    dropped = _dropped_publication_lines(values.get("Dropped publication lines"))
     reason = _optional_text(values.get("Reason"), "Reason")
     if request_class is RequestClass.REMOVE:
         return Request(request_class, repository, reason=reason)
     if request_class is RequestClass.RECONCILE:
         return Request(request_class, repository)
-    return Request(request_class, repository, description, branch, skills_root, prefixes)
+    if publication_lines is not None:
+        _require_single_line_match(branch, prefixes, publication_lines)
+    if request_class is RequestClass.ADD and dropped is not None:
+        _fail("Dropped publication lines is only valid on UPDATE requests")
+    return Request(
+        request_class,
+        repository,
+        description,
+        branch,
+        skills_root,
+        prefixes,
+        publication_lines,
+        dropped,
+    )
 
 
 @dataclass(frozen=True)
@@ -269,14 +567,31 @@ def parse_patch(comment: str) -> Patch | None:
         return None
     sentinel_index = next(index for index, line in enumerate(lines) if line != "")
     remainder = "\n".join(lines[sentinel_index + 1 :])
-    values = _parse_blocks(remainder, ("Description:", "Branch:", "Skills root:", "Skill prefixes:"), "PATCH")
+    values = _parse_blocks(
+        remainder,
+        (
+            "Description:",
+            "Branch:",
+            "Skills root:",
+            "Skill prefixes:",
+            "Publication lines:",
+            "Dropped publication lines:",
+        ),
+        "PATCH",
+    )
     if not values:
         _fail("PATCH must contain at least one field")
+    for key in ("Description", "Branch", "Skills root", "Skill prefixes", "Reason"):
+        if values.get(key) == "":
+            values[key] = None
     return Patch({key: value for key, value in values.items()})
 
 
 def apply_patch(request: Request, patch: Patch) -> Request:
     assignments: dict[str, Any] = {}
+    for key in ("Description", "Branch", "Skills root", "Skill prefixes"):
+        if key in patch.assignments and patch.assignments[key] == "":
+            patch.assignments[key] = None
     if "Description" in patch.assignments:
         assignments["description"] = _optional_text(patch.assignments["Description"], "Description")
     if "Branch" in patch.assignments:
@@ -285,7 +600,22 @@ def apply_patch(request: Request, patch: Patch) -> Request:
         assignments["skills_root"] = _skills_root(patch.assignments["Skills root"])
     if "Skill prefixes" in patch.assignments:
         assignments["skill_prefixes"] = _prefixes(patch.assignments["Skill prefixes"])
-    return replace(request, **assignments)
+    if "Publication lines" in patch.assignments:
+        if patch.assignments["Publication lines"] == "":
+            _fail("Publication lines cannot be empty")
+        assignments["publication_lines"] = _publication_lines(patch.assignments["Publication lines"])
+    if "Dropped publication lines" in patch.assignments:
+        if patch.assignments["Dropped publication lines"] == "":
+            _fail("Dropped publication lines cannot be empty")
+        assignments["dropped_publication_lines"] = _dropped_publication_lines(
+            patch.assignments["Dropped publication lines"]
+        )
+    proposed = replace(request, **assignments)
+    if proposed.publication_lines is not None:
+        _require_single_line_match(
+            proposed.branch, proposed.skill_prefixes, proposed.publication_lines
+        )
+    return proposed
 
 
 @dataclass(frozen=True)
@@ -381,7 +711,7 @@ class RequestAnchor:
 
     def as_value(self) -> dict[str, Any]:
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "prNumber": self.pr_number,
             "requestClass": self.request_class.name.lower(),
             "originalAuthorId": self.original_author_id,
@@ -398,8 +728,9 @@ class RequestAnchor:
 def _request_from_anchor_value(request_class: RequestClass, value: dict[str, Any]) -> Request:
     if set(value) != set(_REQUEST_KEYS):
         _fail("initialRequest has invalid exact keys")
-    scalar_keys = {"Repository URL", "Description", "Branch", "Skills root", "Reason"}
-    if any(value[key] is not None and type(value[key]) is not str for key in scalar_keys):
+    if any(value[key] is not None and type(value[key]) is not str for key in (
+        "Repository URL", "Description", "Branch", "Skills root", "Reason"
+    )):
         _fail("initialRequest values have invalid types")
     prefixes_value = value["Skill prefixes"]
     if prefixes_value is not None and (type(prefixes_value) is not list or any(type(item) is not str for item in prefixes_value)):
@@ -414,6 +745,21 @@ def _request_from_anchor_value(request_class: RequestClass, value: dict[str, Any
         if len(set(prefixes_value)) != len(prefixes_value):
             _fail("initialRequest.Skill prefixes contains duplicates")
         anchor_prefixes = tuple(prefixes_value)
+    publication_value = value["Publication lines"]
+    publication_lines: tuple[PublicationLineRequest, ...] | None = None
+    if publication_value is not None:
+        if type(publication_value) is not list or not publication_value:
+            _fail("initialRequest.Publication lines must be a nonempty array or null")
+        parsed_lines: list[PublicationLineRequest] = []
+        for item in publication_value:
+            parsed_lines.append(_canonical_publication_line(item))
+        publication_lines = tuple(parsed_lines)
+    dropped_value = value["Dropped publication lines"]
+    dropped: tuple[str, ...] | None = None
+    if dropped_value is not None:
+        if type(dropped_value) is not list or any(type(item) is not str for item in dropped_value):
+            _fail("initialRequest.Dropped publication lines must be an array of strings or null")
+        dropped = tuple(dropped_value)
     request = Request(
         request_class,
         _repository_url(value["Repository URL"]),
@@ -421,6 +767,8 @@ def _request_from_anchor_value(request_class: RequestClass, value: dict[str, Any
         _anchor_branch(value["Branch"]),
         _skills_root(value["Skills root"]),
         anchor_prefixes,
+        publication_lines,
+        dropped,
         _optional_text(value["Reason"], "Reason"),
     )
     _validate_anchor_request(request_class, request)
@@ -446,8 +794,14 @@ def parse_anchor(text: str) -> RequestAnchor:
     expected = {"schemaVersion", "prNumber", "requestClass", "originalAuthorId", "originalAuthorLogin", "initialBodySha256", "initialRequest"}
     if set(value) != expected:
         _fail("anchor has invalid exact keys")
-    if type(value["schemaVersion"]) is not int or type(value["schemaVersion"]) is bool or value["schemaVersion"] != 1:
-        _fail("anchor schemaVersion must be exact integer 1")
+    schema_version = value["schemaVersion"]
+    if type(schema_version) is not int or type(schema_version) is bool:
+        _fail("anchor schemaVersion must be an exact integer")
+    if schema_version != 2:
+        _fail(
+            "anchor schemaVersion must be exact integer 2 after multi-line versioning cutover; "
+            "reopen the request under the Publication lines grammar"
+        )
     try:
         request_class = next(item for item in _BODY_FIELDS if item.name.lower() == value["requestClass"])
     except (StopIteration, TypeError):

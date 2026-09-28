@@ -16,13 +16,16 @@ Description:
 <optional value>
 
 Branch:
-<optional value>
+<optional single-line value>
 
 Skills root:
 <optional value>
 
 Skill prefixes:
 <optional comma-separated value>
+
+Publication lines:
+<optional multi-major; refs/heads/...=prefix[,prefix...]; ...>
 ```
 
 The App creates one immutable RequestAnchor before removing the marker. After

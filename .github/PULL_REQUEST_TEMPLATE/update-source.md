@@ -16,14 +16,24 @@ Description:
 <optional value>
 
 Branch:
-<optional value>
+<optional single-line value>
 
 Skills root:
 <optional value>
 
 Skill prefixes:
 <optional comma-separated value>
+
+Publication lines:
+<optional; full replacement of accepted lines; refs/heads/...=prefix[,prefix...]; ...>
+
+Dropped publication lines:
+<UPDATE only when omitting accepted lines; comma-separated full refs>
 ```
+
+When the proposal omits one or more accepted publication lines, each omitted
+ref must be named in `Dropped publication lines`. Dropping the last remaining
+line is invalid (use remove-source).
 
 The repository URL and initial body are immutable after the App creates its
 single immutable RequestAnchor. Body edits are not PATCH operations. Refine

@@ -34,10 +34,20 @@ from automation.federation.controller import (
     trusted_c02_execution,
 )
 import automation.federation.controller as controller_module
+from contextlib import contextmanager
 from scripts import federate as c02
 from automation.federation.github_api import GraphQLError, RefCASConflict
 from automation.federation.github_api import CheckRun, GitCommitMetadata, GitObject, GitTreeEntry, IssueComment, PullRequestMetadata, RepositoryMetadata
 from automation.federation.request_model import RequestClass, body_sha256, parse_request_body, RequestAnchor
+
+
+@contextmanager
+def trusted_previous_patches():
+    """Pin accepted-base loaders to empty schema-v3 authority (HEAD may still be v2)."""
+    with patch.object(c02, "load_trusted_previous_manifest", return_value=c02.Manifest(())), patch.object(
+        c02, "load_trusted_previous_lock", lambda manifest: c02.LockState((), {})
+    ):
+        yield
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -118,8 +128,8 @@ class ProductionAddClient(FakeClient):
         self.main_oid = c02.head_commit_oid()
         self.central_node_id = "R_central_graphql"
         self.blobs = {
-            "manifest": b'{"schemaVersion": 2, "sources": []}\n',
-            "lock": b'{"schemaVersion": 2, "contentDigestAlgorithm": "sha256-file-manifest-v1", "publishedSourceIds": [], "skills": {}}\n',
+            "manifest": b'{"schemaVersion": 3, "sources": []}\n',
+            "lock": b'{"schemaVersion": 3, "contentDigestAlgorithm": "sha256-file-manifest-v1", "publishedSourceIds": [], "skills": {}}\n',
             "readme": (ROOT / "README.md").read_bytes(),
         }
         self.candidate_head = "d" * 40
@@ -262,7 +272,7 @@ class ProductionAddClient(FakeClient):
             raise AssertionError(f"unexpected source URL: {url}")
         return c02.HttpResponse(200, url, body)
 
-    def source_branch_fetcher(self, repo_path, source):
+    def source_branch_fetcher(self, repo_path, source, ref):
         # Fixture only has refs/heads/main; live registry sources may use other refs
         # (e.g. SwifQL master). Always fetch the fixture main tip and report that SHA.
         subprocess.run(["git", "-C", str(repo_path), "fetch", "--no-tags", "--force", str(self.source_bare), "refs/heads/main"], check=True)
@@ -373,7 +383,7 @@ class InteractiveTests(unittest.TestCase):
             "FEDERATION_WAKE_PULL_NUMBER": "7",
             "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
         }
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["interactive"]), 0)
         self.assertEqual(fake.marker_read, ("swiftstream/skills", "a" * 40, ".federation-request", "100644"))
         self.assertEqual(fake.asserted_repository_id, fake.central_node_id)
@@ -404,7 +414,7 @@ class InteractiveTests(unittest.TestCase):
                     "FEDERATION_WAKE_PULL_NUMBER": "7",
                     "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
                 }
-                with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.dict(os.environ, environment, clear=False):
+                with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.dict(os.environ, environment, clear=False):
                     self.assertEqual(main([command]), 0)
                 self.assertEqual(fake.created, [])
                 self.assertEqual(fake.ref_calls, [])
@@ -439,7 +449,7 @@ class InteractiveTests(unittest.TestCase):
             "FEDERATION_WAKE_PULL_NUMBER": "7",
             "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
         }
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.dict(os.environ, environment, clear=False):
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["trusted-validation"]), 0)
         self.assertEqual(len(fake.check_objects), 1)
         self.assertEqual(fake.check_objects[0].conclusion, "failure")
@@ -504,7 +514,7 @@ class InteractiveTests(unittest.TestCase):
             "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
             **hostile,
         }
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", c02.git_fetch_configured_branch), patch.object(c02, "repository_git_url", lambda repository: fake.source_bare.as_uri()), patch.object(controller_module.subprocess, "run", capture_run), patch.dict(os.environ, environment, clear=False):
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", c02.git_fetch_configured_branch), patch.object(c02, "repository_git_url", lambda repository: fake.source_bare.as_uri()), patch.object(controller_module.subprocess, "run", capture_run), patch.dict(os.environ, environment, clear=False):
             expected_environment = dict(os.environ)
             self.assertEqual(main(["interactive"]), 0)
             self.assertEqual(dict(os.environ), expected_environment)
@@ -562,7 +572,7 @@ class InteractiveTests(unittest.TestCase):
                     return b"update-source\n"
                 return super().read_optional_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
 
-        source = c02.SourceDeclaration("owner-repo", "Owner/Repo", 99, "refs/heads/main", "skills", ("swiftstream",), "A source repository")
+        source = c02.SourceDeclaration("owner-repo", "Owner/Repo", 99, "skills", "A source repository", (c02.LineDeclaration("refs/heads/main", ("swiftstream",)),))
         previous_manifest = c02.Manifest((source,))
         previous_lock = c02.LockState((source.source_id,), {})
         fake = UpdateClient()
@@ -573,7 +583,7 @@ class InteractiveTests(unittest.TestCase):
             "FEDERATION_WAKE_PULL_NUMBER": "7",
             "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
         }
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", c02.git_fetch_configured_branch), patch.object(c02, "repository_git_url", lambda repository: fake.source_bare.as_uri()), patch.object(c02, "load_trusted_previous_manifest", return_value=previous_manifest), patch.object(c02, "load_trusted_previous_lock", return_value=previous_lock), patch.dict(os.environ, environment, clear=False):
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", c02.git_fetch_configured_branch), patch.object(c02, "repository_git_url", lambda repository: fake.source_bare.as_uri()), patch.object(c02, "load_trusted_previous_manifest", return_value=previous_manifest), patch.object(c02, "load_trusted_previous_lock", return_value=previous_lock), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["interactive"]), 0)
         self.assertEqual(fake.ref_calls[0].before_oid, fake.marker_head)
         self.assertEqual(fake.created_commit[2], [fake.main_oid])
@@ -589,7 +599,7 @@ class InteractiveTests(unittest.TestCase):
             "FEDERATION_WAKE_PULL_NUMBER": "7",
             "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
         }
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["interactive"]), 0)
             first_ref_count = len(fake.ref_calls)
             first_commit = fake.created_commit
@@ -681,7 +691,7 @@ class InteractiveTests(unittest.TestCase):
         fake = ProductionAddClient()
         fake.current_pr = replace(fake.current_pr, base_oid="e" * 40)
         environment = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["interactive"]), 1)
         self.assertEqual(fake.ref_calls, [])
 
@@ -793,7 +803,7 @@ class InteractiveTests(unittest.TestCase):
             "FEDERATION_EVENT_PATH": str(event_file),
             "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
         }
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["interactive"]), 0)
         self.assertTrue(any(f"patch:{trigger_id}" in item.body for item in fake.created))
         self.assertFalse(any("patch:201" in item.body for item in fake.created))
@@ -814,7 +824,7 @@ class InteractiveTests(unittest.TestCase):
             "FEDERATION_EVENT_PATH": str(event_file),
             "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
         }
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.dict(os.environ, environment, clear=False):
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["interactive"]), 0)
         self.assertEqual(fake.created, [])
         self.assertEqual(fake.dispatches, [])
@@ -862,7 +872,7 @@ class InteractiveTests(unittest.TestCase):
             "FEDERATION_TRUSTED_CHECKOUT_SHA": "c" * 40,
         }
         error = R02Error("operator-why-sentinel")
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(
             controller_module, "resolve_app_identity", return_value=APP
         ), patch.object(controller_module.R02Controller, "current_accepted_main", side_effect=error), patch.dict(
             os.environ, environment, clear=True
@@ -887,7 +897,7 @@ class InteractiveTests(unittest.TestCase):
         }
         long_message = "x" * 400 + " Traceback File \"" + "y" * 40
         error = R02Error(long_message)
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(
             controller_module, "resolve_app_identity", return_value=APP
         ), patch.object(controller_module.R02Controller, "current_accepted_main", side_effect=error), patch.dict(
             os.environ, environment, clear=True

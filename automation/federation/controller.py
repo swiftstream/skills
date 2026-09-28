@@ -47,6 +47,9 @@ from .request_model import (
     parse_anchor,
     parse_request_body,
     parse_patch,
+    proposed_line_refs,
+    resolve_publication_lines,
+    validate_drop_set,
     verify_anchor_integrity,
 )
 from .workspace import validate_trusted_ref
@@ -917,20 +920,54 @@ def _machine_branch(source_id: str) -> str:
 def manifest_value(manifest: c02.Manifest) -> dict[str, Any]:
     """Serialize a C02 Manifest without introducing a second validator."""
     return {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "sources": [
             {
                 "sourceId": source.source_id,
                 "repository": source.repository,
                 "repositoryId": source.repository_id,
-                "ref": source.ref,
                 "skillsRoot": source.skills_root,
-                "skillPrefixes": list(source.skill_prefixes),
                 "description": source.description,
+                "lines": [
+                    {
+                        "ref": line.ref,
+                        "skillPrefixes": list(line.skill_prefixes),
+                    }
+                    for line in source.lines
+                ],
             }
             for source in manifest.sources
         ],
     }
+
+
+def _lines_from_request(
+    request: Request,
+    *,
+    default_branch: str,
+    default_prefixes: tuple[str, ...],
+    existing: c02.SourceDeclaration | None,
+) -> tuple[c02.LineDeclaration, ...]:
+    if request.publication_lines is not None:
+        lines = tuple(
+            c02.LineDeclaration(ref=line.ref, skill_prefixes=tuple(sorted(line.skill_prefixes)))
+            for line in request.publication_lines
+        )
+        return tuple(sorted(lines, key=lambda item: item.ref))
+    if request.branch is None and request.skill_prefixes is None and existing is not None:
+        return existing.lines
+    fallback_branch = default_branch
+    if request.branch is None and existing is not None and existing.lines:
+        fallback_branch = existing.lines[0].ref
+    resolved = resolve_publication_lines(
+        request,
+        default_branch=fallback_branch,
+        default_prefixes=default_prefixes,
+    )
+    return tuple(
+        c02.LineDeclaration(ref=line.ref, skill_prefixes=tuple(sorted(line.skill_prefixes)))
+        for line in sorted(resolved, key=lambda item: item.ref)
+    )
 
 
 def c02_source_candidate(
@@ -949,36 +986,37 @@ def c02_source_candidate(
         if existing is not None:
             raise R02Error("ADD sourceId is already accepted")
         repository = request.repository_url.removeprefix("https://github.com/")
-        value = {
-            "sourceId": source_id,
-            "repository": repository,
-            "repositoryId": repository_id,
-            "ref": request.branch or f"refs/heads/{default_branch}",
-            "skillsRoot": request.skills_root or "skills",
-            "skillPrefixes": list(request.skill_prefixes or default_prefixes),
-            "description": request.description or default_description,
-        }
+        lines = _lines_from_request(
+            request,
+            default_branch=default_branch if default_branch.startswith("refs/heads/") else f"refs/heads/{default_branch}",
+            default_prefixes=default_prefixes,
+            existing=None,
+        )
         candidate_sources = list(accepted_manifest.sources) + [c02.SourceDeclaration(
-            source_id=value["sourceId"],
-            repository=value["repository"],
-            repository_id=value["repositoryId"],
-            ref=value["ref"],
-            skills_root=value["skillsRoot"],
-            skill_prefixes=tuple(value["skillPrefixes"]),
-            description=value["description"],
+            source_id=source_id,
+            repository=repository,
+            repository_id=repository_id,
+            skills_root=request.skills_root or "skills",
+            description=request.description or default_description,
+            lines=lines,
         )]
     elif request.request_class is RequestClass.UPDATE:
         if existing is None or existing.repository_id != repository_id:
             raise R02Error("UPDATE must resolve exactly one accepted source identity")
+        lines = _lines_from_request(
+            request,
+            default_branch=default_branch,
+            default_prefixes=default_prefixes,
+            existing=existing,
+        )
         candidate_sources = [source for source in accepted_manifest.sources if source.source_id != source_id]
         candidate_sources.append(c02.SourceDeclaration(
             source_id=source_id,
             repository=request.repository_url.removeprefix("https://github.com/"),
             repository_id=repository_id,
-            ref=request.branch or existing.ref,
             skills_root=request.skills_root or existing.skills_root,
-            skill_prefixes=request.skill_prefixes or existing.skill_prefixes,
             description=request.description or existing.description,
+            lines=lines,
         ))
     elif request.request_class is RequestClass.REMOVE:
         if existing is None or existing.repository_id != repository_id:
@@ -986,15 +1024,17 @@ def c02_source_candidate(
         candidate_sources = [source for source in accepted_manifest.sources if source.source_id != source_id]
     else:
         raise R02Error("only ADD/UPDATE/REMOVE have an R02 manifest candidate")
-    return c02.load_manifest_from_value({"schemaVersion": 2, "sources": [
+    return c02.load_manifest_from_value({"schemaVersion": 3, "sources": [
         {
             "sourceId": source.source_id,
             "repository": source.repository,
             "repositoryId": source.repository_id,
-            "ref": source.ref,
             "skillsRoot": source.skills_root,
-            "skillPrefixes": list(source.skill_prefixes),
             "description": source.description,
+            "lines": [
+                {"ref": line.ref, "skillPrefixes": list(line.skill_prefixes)}
+                for line in source.lines
+            ],
         } for source in sorted(candidate_sources, key=lambda item: item.source_id)
     ]}, "R02 candidate federation.json")
 
@@ -1055,13 +1095,15 @@ class C02CandidateBuilder:
     def _validate_add_source(self, source: c02.SourceDeclaration) -> None:
         if self._capsule_temp_root is None:
             raise R02Error("C02 source validation requires the trusted execution capsule")
-        bound = c02.bind_source_snapshot(
-            self._capsule_temp_root,
-            source,
-            http_get=SOURCE_HTTP_GET,
-            branch_fetcher=SOURCE_BRANCH_FETCHER,
-        )
-        c02.discover_public_skills(bound)
+        for line in source.lines:
+            bound = c02.bind_source_snapshot(
+                self._capsule_temp_root,
+                source,
+                line,
+                http_get=SOURCE_HTTP_GET,
+                branch_fetcher=SOURCE_BRANCH_FETCHER,
+            )
+            c02.discover_public_skills(bound)
 
     def _plan(self, request: Request, request_class: RequestClass, accepted_base_sha: str) -> tuple[dict[str, tuple[str, bytes]], dict[str, tuple[str, str, str]], str | None, int | None]:
         if self._capsule_temp_root is None:
@@ -1083,7 +1125,33 @@ class C02CandidateBuilder:
             if existing is None:
                 raise R02Error("request repositoryId does not identify one accepted source")
             source_id = existing.source_id
-        prefixes = request.skill_prefixes or (existing.skill_prefixes if existing else (_derived_source_id(_source_locator(request).split("/", 1)[-1]),))
+        accepted_line_refs = tuple(line.ref for line in existing.lines) if existing is not None else ()
+        default_prefixes = (
+            request.skill_prefixes
+            or (
+                tuple(prefix for line in existing.lines for prefix in line.skill_prefixes)
+                if existing is not None
+                else (_derived_source_id(_source_locator(request).split("/", 1)[-1]),)
+            )
+        )
+        try:
+            proposed_refs = proposed_line_refs(
+                request,
+                default_branch=source_repo.default_branch,
+                default_prefixes=default_prefixes,
+                existing_refs=accepted_line_refs if existing is not None else None,
+            )
+        except RequestModelError as error:
+            raise R02Error(str(error)) from None
+        try:
+            validate_drop_set(
+                request_class,
+                request,
+                accepted_line_refs=accepted_line_refs,
+                proposed_refs=proposed_refs,
+            )
+        except RequestModelError as error:
+            raise R02Error(str(error)) from None
         candidate_manifest = c02_source_candidate(
             request,
             accepted_manifest,
@@ -1091,7 +1159,7 @@ class C02CandidateBuilder:
             repository_id=source_repo.repository_id,
             default_branch=source_repo.default_branch,
             default_description=source_repo.description or "Federated source repository",
-            default_prefixes=tuple(prefixes),
+            default_prefixes=tuple(default_prefixes),
         )
         if request_class is RequestClass.ADD:
             self._validate_add_source(candidate_manifest.sources[-1])
