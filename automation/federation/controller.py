@@ -2244,6 +2244,15 @@ def main(argv: list[str] | None = None) -> int:
                     client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
                 else:
                     if not _anchor_candidates(comments) and read_optional_request_marker(client, repository, initial_pr.head_oid) is None:
+                        try:
+                            require_same_repository_head(initial_pr, repository)
+                        except ForkHeadError:
+                            result = TrustedValidationResult(
+                                "failure",
+                                bounded_check_output(RequestClass.UNRELATED, initial_pr.head_oid, accepted_main, reason="OUT_OF_FEDERATION_SCOPE"),
+                            )
+                            controller.publish_validation_result(result)
+                            return 0
                         files = client.list_pull_request_files(repository, number)
                         paths = tuple(item.get("filename") for item in files if type(item) is dict and type(item.get("filename")) is str)
                         scope = markerless_maintenance_scope(paths)
