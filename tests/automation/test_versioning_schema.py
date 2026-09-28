@@ -293,6 +293,36 @@ class VersioningSchemaTests(unittest.TestCase):
         self.assertNotEqual(identity_main, changed_main)
         self.assertEqual(identity_release, c02.declaration_identity(changed, changed.lines[1], "beta-one"))
 
+    def test_one_line_tip_move_publishes_only_that_line_packages(self):
+        # Tip move on one line must not force sibling provenance changes: the
+        # sibling's declaration identity is independent of the other line's tip.
+        source = c02.SourceDeclaration(
+            "demo",
+            "Owner/Repo",
+            99,
+            "skills",
+            "Demo",
+            (
+                c02.LineDeclaration("refs/heads/main", ("alpha",)),
+                c02.LineDeclaration("refs/heads/release/1", ("beta",)),
+            ),
+        )
+        main_line, release_line = source.lines
+        # Declaration identity keys on line ref + prefixes + skill name, not tip
+        # commit: a tip move alone does not re-anchor. Sibling identity is untouched.
+        identity_main = c02.declaration_identity(source, main_line, "alpha-one")
+        identity_release = c02.declaration_identity(source, release_line, "beta-one")
+        self.assertEqual(identity_main.ref, "refs/heads/main")
+        self.assertEqual(identity_release.ref, "refs/heads/release/1")
+        self.assertEqual(identity_main.skill_prefixes, ("alpha",))
+        self.assertEqual(identity_release.skill_prefixes, ("beta",))
+        self.assertNotEqual(identity_main, identity_release)
+        # Only packages matching the moving line's prefixes publish from that line.
+        self.assertTrue(c02.skill_matches_line_prefixes(main_line, "alpha-one"))
+        self.assertFalse(c02.skill_matches_line_prefixes(main_line, "beta-one"))
+        self.assertTrue(c02.skill_matches_line_prefixes(release_line, "beta-one"))
+        self.assertFalse(c02.skill_matches_line_prefixes(release_line, "alpha-one"))
+
     def test_migration_shape_maps_swifql_single_line_and_lineRef(self):
         # Migration map: v2 top-level ref/skillPrefixes -> one lines[] entry; lock lineRef = old ref.
         v2_source = {
