@@ -9,7 +9,7 @@ body:
 
         **Issues are not federation requests.** Open a pull request with one `.federation-request` file whose content is `remove-source` and a final newline.
 
-        1. Read [How to Remove a Registered Repository](https://github.com/swiftstream/skills/blob/main/docs/HOT-TO-REMOVE.md).
+        1. Read [How to Remove a Registered Repository](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-REMOVE.md).
         2. Removal is an explicit trust decision and never auto-merges.
         3. The bot prepares one atomic removal (registry + owned lock/skills/catalog). No later cleanup PR is required.
 

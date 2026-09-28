@@ -1,14 +1,41 @@
 # How to Update a Registered Repository
 
-Use an **Update federation source** pull request for a registered source's description, branch, skills root, prefixes, or repository locator. Ordinary skill content changes do not need a registry PR.
+Change a registered source's **description, branch, skills root, prefixes, or GitHub locator** (same stable `repositoryId` after rename/transfer).
 
-The central App-writable request branch contains one `.federation-request` file whose complete content is `update-source`; fork heads fail closed. The bot resolves the URL and requires the same stable GitHub `repositoryId` for a rename or transfer. A different repository is not silently treated as the same source.
+**Ordinary skill content changes do not need a registry PR.** Once registered, add/edit/remove public packages in the source repository and let polling publish them.
 
-Structured comments beginning with the exact line `Federation PATCH` may refine fields before anchoring. The initial body and repository URL are immutable after anchoring. Every accepted proposal is revalidated against the exact current accepted central main and includes all deterministic trust/configuration consequences in one diff.
+Updates are explicit **trust/configuration** decisions and never auto-merge.
 
-Prefix ownership is global by the first hyphen-delimited root namespace. A configured `foo-bar` publishes `foo-bar-*` but reserves `foo` against other `foo-*` prefixes.
+## Request
 
-An update PR never auto-merges. A maintainer manually merges the complete current-base transition, which may include:
+On a central branch in `swiftstream/skills`, add exactly one `.federation-request` file whose content is exactly `update-source` plus a final newline (fork heads fail closed).
+
+Open the [Update federation source PR template](https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=update-source.md) with the exact body grammar:
+
+```text
+Repository URL:
+https://github.com/SomeOrg/SomeRepo
+
+Description:
+<optional value>
+
+Branch:
+<optional value>
+
+Skills root:
+<optional value>
+
+Skill prefixes:
+<optional comma-separated value>
+```
+
+The repository URL must resolve to the **same** accepted `repositoryId`. A different repository is not silently treated as the same source.
+
+## Refining the proposal
+
+Comments whose first non-empty line is exactly `Federation PATCH` may refine mutable fields before anchoring. After the RequestAnchor exists, the initial body and repository URL are immutable.
+
+Every accepted proposal is revalidated against the exact current accepted central `main` and includes **all** deterministic consequences in one atomic diff:
 
 ```text
 federation.json
@@ -17,8 +44,19 @@ skills/**
 the generated README Skill Store section
 ```
 
-Central polling then reconciles the current source. Source repositories require no notifier workflow, federation secret, OIDC setup, wake URL, signing key, or central credential. A normal source change may take until the next successful approximately 15-minute poll; a maintainer may manually dispatch reconciliation for all sources or one accepted repository ID.
+A maintainer manually merges that complete transition. There is no later cleanup PR.
 
-For a configuration-independent refresh, use the technical **Reconcile federation source** request. An unknown repository ID is a bounded NOOP and cannot onboard a source. Outcomes are `NOOP`, `CHANGED`, or `FAIL`.
+## Prefix reminder
 
-The current architecture remains: source and PR bytes are data, trusted central code executes the C02-backed `scripts/federate.py` engine, manual trust decisions remain human-merge decisions, and only the exact current-state/App/check/CAS-protected serialized finalizer may auto-merge machine publication.
+Prefix ownership is global by the first hyphen-delimited root namespace. A configured `foo-bar` publishes `foo-bar-*` but reserves the root `foo` against other `foo-*` prefixes. Distinct major-line roots such as `vapor4` and `vapor5` are allowed; `vapor` and `vapor5` conflict.
+
+## After merge
+
+Central polling reconciles the current source. A normal change may wait until the next successful ~15-minute poll; a maintainer can dispatch reconciliation sooner for all sources or one accepted repository ID.
+
+## Related
+
+- [HOW-TO-ADD.md](HOW-TO-ADD.md) — first-time registration
+- [HOW-TO-REMOVE.md](HOW-TO-REMOVE.md) — revoke trust
+- [FEDERATION-OPERATIONS.md](FEDERATION-OPERATIONS.md) — operator view
+- [MECHANICS.md](MECHANICS.md) — atomic update rules (§17)

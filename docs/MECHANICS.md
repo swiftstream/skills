@@ -72,7 +72,7 @@ docs/
   MECHANICS.md
   HOW-TO-ADD.md
   HOW-TO-UPDATE.md
-  HOT-TO-REMOVE.md
+  HOW-TO-REMOVE.md
 
 skills/
   <generated-public-skill>/
@@ -1441,7 +1441,7 @@ The concise user-facing procedures live in:
 - [`HOW-TO-PREPARE-SOURCE.md`](HOW-TO-PREPARE-SOURCE.md)
 - [`HOW-TO-ADD.md`](HOW-TO-ADD.md)
 - [`HOW-TO-UPDATE.md`](HOW-TO-UPDATE.md)
-- [`HOT-TO-REMOVE.md`](HOT-TO-REMOVE.md)
+- [`HOW-TO-REMOVE.md`](HOW-TO-REMOVE.md)
 
 Those guides explain how to use the system. This document defines how the system itself works.
 

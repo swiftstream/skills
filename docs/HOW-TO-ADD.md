@@ -1,47 +1,86 @@
 # How to Add a Repository
 
-Use this flow when a repository is not yet registered in `swiftstream/skills`.
-Prepare its directory-package skills with [HOW-TO-PREPARE-SOURCE.md](HOW-TO-PREPARE-SOURCE.md), then open an **Add federation source** pull request.
+Register a source repository so its public Agent Skills appear in the Swift Stream Skills collection.
 
-Adding a repository is an explicit trust/configuration decision. The onboarding PR never auto-merges; a maintainer reviews and merges it manually.
+**Before you start:** package the skills in the source repo with [HOW-TO-PREPARE-SOURCE.md](HOW-TO-PREPARE-SOURCE.md). Each public skill must be a direct child package under your skills root with a valid `SKILL.md`.
 
-## Request fields
+Adding a repository is an explicit **trust** decision. The onboarding pull request never auto-merges — a maintainer reviews and merges it.
 
-The central App-writable request branch contains one `.federation-request` file whose complete content is `add-source`. Fork heads fail closed. The request body contains:
+## 1. Prepare the request
+
+Wave 1 accepts only a **central** request head in `swiftstream/skills` (fork heads fail closed). On a branch of this repository, add exactly one regular file:
+
+```text
+.federation-request
+```
+
+whose complete content is exactly `add-source` plus a final newline.
+
+## 2. Open the PR with the exact body grammar
+
+Use the [Add federation source PR template](https://github.com/swiftstream/skills/compare/main...main?quick_pull=1&template=add-source.md), or copy this grammar exactly:
 
 ```text
 Repository URL:
 https://github.com/SomeOrg/SomeRepo
 
 Description:
-<optional>
+<optional one-line description>
 
 Branch:
-<optional>
+<optional; defaults to the repository default branch>
 
 Skills root:
-.agents/skills
+.agent/skills
 
 Skill prefixes:
 foo, fdb
 ```
 
-The URL is immutable for the PR. The bot resolves it to a stable GitHub `repositoryId`; that identity can belong to only one accepted source. Branches become canonical `refs/heads/...` refs. Prefix ownership reserves the first hyphen-delimited root namespace globally, even though matching uses the full configured `<prefix>-` string.
+### Field notes
 
-The source repository requires no federation notifier workflow, secret, OIDC setup, wake URL, signing key, or central credential.
+| Field | Meaning |
+| --- | --- |
+| **Repository URL** | Exact `https://github.com/OWNER/REPO` (no `.git`, no trailing slash, no query). Immutable after anchoring. Resolved to a stable `repositoryId` that can belong to only one accepted source. |
+| **Description** | Optional. Shown in the generated Skill Store catalog. |
+| **Branch** | Optional. Canonicalized to a full `refs/heads/...` ref. |
+| **Skills root** | Directory in the source repo that holds public skill packages (for example `.agent/skills`). |
+| **Skill prefixes** | Comma-separated public namespace prefixes. Matching uses the full `prefix-...` string. Ownership reserves the **first hyphen-delimited root** globally (`foo-bar` reserves `foo`, so `foo-baz` conflicts). |
 
-## Review and refine
+You do **not** list individual skills. Federation discovers public packages under the skills root whose names match an accepted prefix.
 
-The bot reports the repository, immutable identity, source ID, description, canonical ref, skills root, prefixes, discovered public skills, and the exact `federation.json` proposal. Review the file diff as well as the comment.
+The source repository needs no federation notifier workflow, secret, OIDC setup, wake URL, signing key, or central credential.
 
-Before anchoring, fields may be refined with comments beginning on the exact line `Federation PATCH`. After anchoring, the initial body and repository URL are immutable; invalid patches leave the last valid proposal in place. The bot revalidates the complete proposal and current central base after every accepted patch.
+## 3. Review and refine
 
-Public skills are direct-child packages beneath `skillsRoot` whose names match an accepted prefix and whose `SKILL.md` and package tree pass validation. Individual skills are not listed in the request.
+The bot posts a proposal comment with the resolved repository identity, source ID, canonical ref, skills root, prefixes, discovered public skills, and the exact `federation.json` change. Review both the comment and the file diff.
 
-## Manual merge and first publication
+To change mutable fields before the App creates the immutable RequestAnchor, reply with a comment whose first non-empty line is exactly:
 
-The finalizer binds validation to the exact current PR head and accepted central base. It also preserves App-owned check identity, generated-scope, current-state, and CAS protections. A maintainer manually merges the onboarding PR; the trust decision is never auto-merged.
+```text
+Federation PATCH
+```
 
-After that merge, central polling reconciles the source and may create the generated publication PR containing `skills/**`, `federation.lock.json`, and the generated README catalog. Normal source changes may appear after the next successful approximately 15-minute poll, or sooner after a maintainer manually dispatches reconciliation. Central uses `scripts/federate.py` as the sole semantic federation engine.
+followed only by allowed field blocks (`Description`, `Branch`, `Skills root`, `Skill prefixes`). After anchoring, the initial body and repository URL are immutable. Invalid patches leave the last valid proposal in place.
 
-Wave 1 uses default-branch HEAD. No tags, releases, or real `gh skill publish` run is a maintainer policy, not a runtime anti-admin scanner.
+## 4. Merge and first publication
+
+A maintainer manually merges the onboarding PR. After merge, central polling (about every 15 minutes) reconciles the source and may open a generated publication PR containing `skills/**`, `federation.lock.json`, and the generated README catalog. That machine PR can auto-merge after validation and finalization.
+
+You can also trigger reconciliation sooner from the Actions tab (`Federation reconcile`).
+
+## Troubleshooting
+
+| Symptom | What to do |
+| --- | --- |
+| `PROPOSAL_BLOCKED` on the PR | Read the bot comment reason (exception type + bounded message). Fix the request body or source package state, then re-run or PATCH. |
+| `InvalidResponseError` … *issue comment REST authority changed during composite read* | Transient comment-read race. Re-dispatch `federation-interactive.yml` for that PR. Recent hardening retries this race automatically. |
+| Fork head rejected | Wave 1 is central-repo request heads only. Open the branch in `swiftstream/skills`. |
+| Skills not discovered | Check package layout in [HOW-TO-PREPARE-SOURCE.md](HOW-TO-PREPARE-SOURCE.md) and that names match your prefixes. |
+
+## Related
+
+- [HOW-TO-PREPARE-SOURCE.md](HOW-TO-PREPARE-SOURCE.md) — package layout and public vs local skills
+- [HOW-TO-UPDATE.md](HOW-TO-UPDATE.md) — change a registered source
+- [HOW-TO-REMOVE.md](HOW-TO-REMOVE.md) — revoke a source
+- [MECHANICS.md](MECHANICS.md) — full trust and publication model

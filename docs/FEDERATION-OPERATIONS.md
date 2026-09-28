@@ -1,6 +1,8 @@
 # Federation Operations
 
-This is the current operator guide for the simplified C03 federation. Central `swiftstream/skills` polls accepted sources about every 15 minutes through `.github/workflows/federation-reconcile.yml`. A maintainer may dispatch the same workflow with no `repository_id` to reconcile all accepted sources, or with one accepted repository ID to reconcile one source.
+Operator guide for the simplified C03 federation.
+
+Central `swiftstream/skills` polls accepted sources about every 15 minutes through `.github/workflows/federation-reconcile.yml`. A maintainer may dispatch the same workflow with no `repository_id` to reconcile all accepted sources, or with one accepted repository ID to reconcile one source.
 
 ## Normal flow
 
@@ -25,12 +27,44 @@ There is no Ed25519 proof, keyring, signing, or key-rotation ceremony. There is 
 
 Default-branch HEAD is the distribution state. No tags, releases, or real `gh skill publish` execution is a maintainer policy until a later release policy is separately designed. This policy is not a runtime anti-admin scanner.
 
+## Workflows
+
+| Workflow | Purpose |
+| --- | --- |
+| `federation-reconcile.yml` | Scheduled / manual source reconciliation |
+| `federation-interactive.yml` | ADD/UPDATE/REMOVE/RECONCILE request PRs + PATCH comments |
+| `federation-trusted-validation.yml` | Independent candidate validation (non-green writer) |
+| `federation-state-finalize.yml` | Globally serialized finalizer (single writer; queues pending runs) |
+| `federation-main-advance.yml` | Open-request normalization when `main` advances |
+
 ## Troubleshooting
 
-- Empty accepted registry: all-source reconciliation is a clean bounded NOOP.
-- Unknown targeted repository ID: reconciliation is a bounded NOOP and cannot onboard anything.
-- Source changes not visible: wait for the next successful poll or manually dispatch the workflow.
-- Machine PR blocked or closed: inspect the bounded controller result and fix the current source/package state; the next poll recomputes from current authority.
-- Manual ADD/UPDATE/REMOVE PR: correct the proposal and have a maintainer merge it; these trust decisions never auto-merge.
+| Symptom | Cause | Action |
+| --- | --- | --- |
+| Empty accepted registry | No sources yet | All-source reconciliation is a clean bounded NOOP |
+| Unknown targeted repository ID | Not in `federation.json` | Bounded NOOP; cannot onboard. Use add-source |
+| Source changes not visible | Poll lag | Wait for the next successful poll or dispatch reconcile |
+| Machine PR blocked or closed | Validation fail | Read the bounded controller comment; fix source/package state; next poll recomputes |
+| Manual ADD/UPDATE/REMOVE PR stuck open | Trust decision pending | Correct the proposal; maintainer merges. Never auto-merges |
+| `PROPOSAL_BLOCKED` | Interactive controller error | Reason is `TypeName:bounded-message`. Fix body/PATCH or source state |
+| `InvalidResponseError` *issue comment REST authority changed during composite read* | Comment composite-read race | Automatically retried (bounded). If permanent, re-dispatch `federation-interactive.yml` |
+| `Federation state finalizer` cancelled | Concurrency replace (legacy) | Pending runs now queue (`queue: max`). Re-dispatch finalize if still stuck |
+| Marker-less maintenance PR check `failure`/`skipped` | Outside request state machine | Expected for privileged paths; use a one-shot App attestation or admin merge per policy |
 
-Do not run live publication, source onboarding, GitHub mutation, or release/tag operations as part of local validation.
+## Validation and check evidence
+
+- The App-owned check name is `federation/trusted-validation` (App `4834068`).
+- A non-finalizer validation writer may create/update that check with **non-success** evidence only.
+- The serialized finalizer may create a missing check and publish `success` only after final candidate revalidation against the exact PR head SHA and accepted central base SHA.
+- Marker-less maintenance: `skipped` for non-privileged same-repo diffs, `failure` otherwise. Never `success`.
+
+## Security boundaries
+
+- PR heads, comments, source files, and source metadata are **untrusted data**.
+- Privileged automation executes trusted central code only (`scripts/federate.py` + automation validators).
+- Generic validation must not execute scripts/binaries from federated skill packages.
+
+## Related
+
+- [MECHANICS.md](MECHANICS.md) — canonical state machines
+- [HOW-TO-ADD.md](HOW-TO-ADD.md) · [HOW-TO-UPDATE.md](HOW-TO-UPDATE.md) · [HOW-TO-REMOVE.md](HOW-TO-REMOVE.md)

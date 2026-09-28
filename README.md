@@ -23,7 +23,7 @@ The complete federation, trust, publication, naming, failure, and automation mod
 - **[Prepare a source repository](docs/HOW-TO-PREPARE-SOURCE.md)** — migrate legacy skill files into canonical `<skill-name>/SKILL.md` packages and classify public versus local skills; a source repository needs no federation notifier workflow, federation secret, OIDC setup, wake URL, signing key, or central credential.
 - **[Add a repository](docs/HOW-TO-ADD.md)** — register a new source, choose its skills root and public namespace prefixes, then let federation discover its skills automatically.
 - **[Update a registered repository](docs/HOW-TO-UPDATE.md)** — change its description, branch, skills root, prefixes, or verified GitHub location.
-- **[Remove a repository](docs/HOT-TO-REMOVE.md)** — revoke source trust and automatically remove its generated skills from the collection.
+- **[Remove a repository](docs/HOW-TO-REMOVE.md)** — revoke source trust and automatically remove its generated skills from the collection.
 
 ### Start on GitHub
 
@@ -37,6 +37,8 @@ Federation trust and configuration changes are pull requests in this repository.
 | Ask a question | [Open a help issue](https://github.com/swiftstream/skills/issues/new?template=question-help.yml) |
 
 Each request needs a **central** request branch (not a fork in Wave 1) containing exactly one `.federation-request` file (`add-source`, `update-source`, or `remove-source`, with a final newline) and the exact body grammar from the matching template. After registration, ordinary skill content changes publish through polling and do not need another registry PR.
+
+> **Multi-major products** (for example a stable `release/4` line and a `main` line): today one source binds one branch `ref`. A multi-line proposal is researched and awaiting an explicit decision; until then, register one line or coordinate prefixes with maintainers. See [Repository Mechanics](docs/MECHANICS.md).
 
 Ordinary skill additions, edits, and removals do not require a registry PR. Once a source is registered, its current prefix-matching skills are discovered from the accepted source tree and published through validated automation. After a source is accepted in central `federation.json`, central scheduled polling (about every 15 minutes) reconciles its current source state and publication. A maintainer can manually dispatch reconciliation sooner; a normal source change may otherwise take until the next successful poll to appear centrally.
 
