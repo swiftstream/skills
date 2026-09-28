@@ -13,7 +13,7 @@ body:
 
         - [Repository Mechanics](https://github.com/swiftstream/skills/blob/main/docs/MECHANICS.md)
         - [How to Prepare a Source](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-PREPARE-SOURCE.md)
-        - [How to Add](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-ADD.md) · [Update](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-UPDATE.md) · [Remove](https://github.com/swiftstream/skills/blob/main/docs/HOT-TO-REMOVE.md)
+        - [How to Add](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-ADD.md) · [Update](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-UPDATE.md) · [Remove](https://github.com/swiftstream/skills/blob/main/docs/HOW-TO-REMOVE.md)
         - [Federation Operations](https://github.com/swiftstream/skills/blob/main/docs/FEDERATION-OPERATIONS.md)
 
         For an actual request, open the matching PR template:
