@@ -51,7 +51,7 @@ The catalog below is generated from accepted `federation.json` source metadata a
 
 ### [SwifQL/SwifQL](https://github.com/SwifQL/SwifQL)
 
-A strongly typed, declarative, composable Swift SQL\-building library\.
+A strongly typed, declarative, composable Swift SQL query\-building library\.
 
 | Skill | Description |
 | --- | --- |

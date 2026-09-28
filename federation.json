@@ -10,7 +10,7 @@
       "skillPrefixes": [
         "swifql"
       ],
-      "description": "A strongly typed, declarative, composable Swift SQL-building library."
+      "description": "A strongly typed, declarative, composable Swift SQL query-building library."
     }
   ]
 }
