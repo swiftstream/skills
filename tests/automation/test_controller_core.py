@@ -188,6 +188,56 @@ class ControllerCoreTests(unittest.TestCase):
         self.assertNotIn("ref", value["sources"][0])
         self.assertNotIn("skillPrefixes", value["sources"][0])
 
+    def test_update_drop_one_line_is_atomic_with_generated_removal(self):
+        from automation.federation.controller import c02_source_candidate
+        from automation.federation.request_model import parse_request_body, RequestClass
+        from scripts import federate as c02
+
+        accepted = parse_c02_manifest(
+            {
+                "schemaVersion": 3,
+                "sources": [
+                    {
+                        "sourceId": "vapor-vapor",
+                        "repository": "vapor/vapor",
+                        "repositoryId": 1,
+                        "skillsRoot": "skills",
+                        "description": "Framework",
+                        "lines": [
+                            {"ref": "refs/heads/main", "skillPrefixes": ["vapor5"]},
+                            {"ref": "refs/heads/release/4", "skillPrefixes": ["vapor4"]},
+                        ],
+                    }
+                ],
+            }
+        )
+        body = (
+            "Repository URL:\nhttps://github.com/vapor/vapor\n"
+            "Publication lines:\nrefs/heads/main=vapor5\n"
+            "Dropped publication lines:\nrefs/heads/release/4\n"
+        )
+        request = parse_request_body(RequestClass.UPDATE, body)
+        candidate = c02_source_candidate(
+            request,
+            accepted,
+            source_id="vapor-vapor",
+            repository_id=1,
+            default_branch="main",
+            default_description="Framework",
+            default_prefixes=("vapor5",),
+        )
+        source = candidate.sources[0]
+        proposed_refs = {line.ref for line in source.lines}
+        self.assertEqual(proposed_refs, {"refs/heads/main"})
+        # Dropped line packages cannot reappear: discovery is line-prefix filtered.
+        remaining = source.lines[0]
+        self.assertTrue(c02.skill_matches_line_prefixes(remaining, "vapor5-query"))
+        self.assertFalse(c02.skill_matches_line_prefixes(remaining, "vapor4-query"))
+        # Full candidate scope is only the proposed lines (generated removal is the
+        # absence of dropped-line packages/lock/catalog in this same desired state).
+        for line in source.lines:
+            self.assertNotEqual(line.ref, "refs/heads/release/4")
+
 
 if __name__ == "__main__":
     unittest.main()
