@@ -58,14 +58,6 @@ A strongly typed, declarative, composable Swift SQL query\-building library\.
 | swifql\-custom\-extensions | Create downstream custom SwifQL functions, fluent helpers, structural continuations, custom clause ownership, or reusable extension libraries\. Use in consuming apps or packages, not for modifying SwifQL's built\-in source, functions, builders, dialects, or renderer\. |
 | swifql\-query\-building | Build, translate, review, or prepare SQL in downstream Swift code that imports SwifQL\. Use for application or package query construction and preparation, not for changing SwifQL's own builders, functions, dialect implementation, renderer, or core source\. |
 
-### [swiftstream/UIKitUltra](https://github.com/swiftstream/UIKitUltra)
-
-🏰 Declarative UIKit with LivePreview for iOS9\+ \(best alternative to SwiftUI\)
-
-| Skill | Description |
-| --- | --- |
-| uikitultra\-visual\-ui\-diagnostics | Diagnose rendered UIKitUltra UI defects using objective screenshots/recordings, temporary non\-layout\-affecting visual markers, and native UIKit/AppKit geometry\. Use when visibility, clipping, viewport reach, hierarchy ownership, scrolling, resize, or actual rendered boundaries are ambiguous from source/logs/tests alone\. |
-
 <!-- END FEDERATED SKILLS CATALOG -->
 
 ## How it works

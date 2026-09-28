@@ -11,17 +11,6 @@
         "swifql"
       ],
       "description": "A strongly typed, declarative, composable Swift SQL query-building library."
-    },
-    {
-      "sourceId": "swiftstream-uikitultra",
-      "repository": "swiftstream/UIKitUltra",
-      "repositoryId": 194542895,
-      "ref": "refs/heads/master",
-      "skillsRoot": ".agent/skills",
-      "skillPrefixes": [
-        "uikitultra"
-      ],
-      "description": "🏰 Declarative UIKit with LivePreview for iOS9+ (best alternative to SwiftUI)"
     }
   ]
 }
