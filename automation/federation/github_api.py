@@ -9,7 +9,7 @@ import re
 import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Literal, Mapping, Protocol
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -67,6 +67,52 @@ PULL_REQUEST_ROUTING_AFTER_QUERY = """query FederationPullRequestRoutingAfter($o
       baseRefName
       lastEditedAt
       includesCreatedEdit
+    }
+  }
+}"""
+
+ISSUE_ROUTING_BEFORE_QUERY = """query FederationIssueRoutingBefore($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    issueOrPullRequest(number: $number) {
+      __typename
+      ... on Issue {
+        id
+        number
+        lastEditedAt
+        includesCreatedEdit
+        closed
+      }
+      ... on PullRequest {
+        id
+        number
+        lastEditedAt
+        includesCreatedEdit
+        closed
+      }
+    }
+  }
+}"""
+
+ISSUE_ROUTING_AFTER_QUERY = """query FederationIssueRoutingAfter($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    issueOrPullRequest(number: $number) {
+      __typename
+      ... on Issue {
+        id
+        number
+        lastEditedAt
+        includesCreatedEdit
+        closed
+      }
+      ... on PullRequest {
+        id
+        number
+        lastEditedAt
+        includesCreatedEdit
+        closed
+      }
     }
   }
 }"""
@@ -300,6 +346,20 @@ class PullRequestMetadata:
 
 
 @dataclass(frozen=True)
+class IssueMetadata:
+    number: int
+    database_id: int
+    node_id: str
+    body: str
+    state: Literal["open", "closed"]
+    author_id: str
+    author_login: str
+    last_edited_at: str | None
+    includes_created_edit: bool
+    is_pull_request: bool
+
+
+@dataclass(frozen=True)
 class _PullRequestRoutingSnapshot:
     number: int
     head_oid: str
@@ -308,6 +368,32 @@ class _PullRequestRoutingSnapshot:
     base_ref: str
     last_edited_at: str | None
     includes_created_edit: bool
+
+
+@dataclass(frozen=True)
+class _IssueRoutingSnapshot:
+    typename: str
+    node_id: str
+    number: int
+    last_edited_at: str | None
+    includes_created_edit: bool
+    closed: bool
+
+    @property
+    def is_pull_request(self) -> bool:
+        return self.typename == "PullRequest"
+
+
+@dataclass(frozen=True)
+class _IssueRESTDetail:
+    number: int
+    database_id: int
+    node_id: str
+    body: str
+    state: str
+    author_id: str
+    author_login: str
+    is_pull_request: bool
 
 
 @dataclass(frozen=True)
@@ -581,6 +667,8 @@ class GitHubClient:
         if type(document) is not str or document not in {
             PULL_REQUEST_ROUTING_BEFORE_QUERY,
             PULL_REQUEST_ROUTING_AFTER_QUERY,
+            ISSUE_ROUTING_BEFORE_QUERY,
+            ISSUE_ROUTING_AFTER_QUERY,
             PULL_REQUEST_BODY_FALLBACK_QUERY,
             ISSUE_COMMENT_NODES_QUERY,
             APP_QUERY,
@@ -864,6 +952,112 @@ class GitHubClient:
             rest.base_repository,
             before.last_edited_at,
             before.includes_created_edit,
+        )
+
+    @staticmethod
+    def _parse_issue_routing(data: Mapping[str, Any], repository: str, number: int) -> _IssueRoutingSnapshot:
+        if type(data) is not dict or set(data) != {"repository"} or type(data.get("repository")) is not dict:
+            raise InvalidResponseError("Issue routing response has invalid repository shape")
+        repo = data["repository"]
+        if _bounded_text(repo.get("nameWithOwner"), "repository.nameWithOwner") != repository:
+            raise InvalidResponseError("Issue routing repository does not match requested repository")
+        item = repo.get("issueOrPullRequest")
+        if type(item) is not dict:
+            raise InvalidResponseError("Issue routing union member is missing or null")
+        typename = item.get("__typename")
+        if type(typename) is not str or typename not in {"Issue", "PullRequest"}:
+            raise InvalidResponseError("Issue routing union member type is unknown")
+        expected_fields = {"__typename", "id", "number", "lastEditedAt", "includesCreatedEdit", "closed"}
+        if set(item) != expected_fields:
+            raise InvalidResponseError("Issue routing union member has invalid exact fields")
+        returned_number = item.get("number")
+        if type(returned_number) is not int or type(returned_number) is bool or returned_number != number:
+            raise InvalidResponseError("Issue routing number does not match requested number")
+        includes_created_edit = item.get("includesCreatedEdit")
+        closed = item.get("closed")
+        last_edited_at = item.get("lastEditedAt")
+        if type(includes_created_edit) is not bool:
+            raise InvalidResponseError("Issue.includesCreatedEdit must be boolean")
+        if type(closed) is not bool:
+            raise InvalidResponseError("Issue.closed must be boolean")
+        if last_edited_at is not None:
+            _parse_github_timestamp(last_edited_at, "Issue.lastEditedAt")
+        return _IssueRoutingSnapshot(
+            typename,
+            _bounded_text(item.get("id"), "Issue.node_id"),
+            returned_number,
+            last_edited_at,
+            includes_created_edit,
+            closed,
+        )
+
+    @classmethod
+    def _parse_issue_rest_detail(cls, value: Any, number: int) -> _IssueRESTDetail:
+        if type(value) is not dict:
+            raise InvalidResponseError("Issue REST response must be an object")
+        returned_number = value.get("number")
+        if type(returned_number) is not int or type(returned_number) is bool or returned_number != number:
+            raise InvalidResponseError("Issue REST number does not match requested number")
+        body = cls._body_text(value.get("body"), "Issue REST body")
+        state = value.get("state")
+        if type(state) is not str or state not in {"open", "closed"}:
+            raise InvalidResponseError("Issue REST state must be exactly open or closed")
+        user = value.get("user")
+        if type(user) is not dict:
+            raise InvalidResponseError("Issue REST author metadata is missing or malformed")
+        if "pull_request" in value and type(value["pull_request"]) is not dict:
+            raise InvalidResponseError("Issue REST pull_request discriminator is malformed")
+        return _IssueRESTDetail(
+            returned_number,
+            _positive_id(value.get("id"), "Issue.id"),
+            _bounded_text(value.get("node_id"), "Issue.node_id"),
+            body,
+            state,
+            _bounded_text(user.get("node_id"), "Issue.author.node_id"),
+            _bounded_text(user.get("login"), "Issue.author.login"),
+            "pull_request" in value,
+        )
+
+    def get_issue_metadata(self, repository: str, number: int) -> IssueMetadata:
+        owner, name = self._owner_repo(repository)
+        if type(number) is not int or type(number) is bool or number <= 0:
+            raise GitHubAPIError("Issue number must be positive")
+        variables = {"owner": owner, "name": name, "number": number}
+        before = self._parse_issue_routing(
+            self._graphql(ISSUE_ROUTING_BEFORE_QUERY, variables, operation="issueRoutingBefore"),
+            repository,
+            number,
+        )
+        rest = self._parse_issue_rest_detail(
+            self.request_json("GET", ["repos", owner, name, "issues", str(number)]),
+            number,
+        )
+        after = self._parse_issue_routing(
+            self._graphql(ISSUE_ROUTING_AFTER_QUERY, variables, operation="issueRoutingAfter"),
+            repository,
+            number,
+        )
+        if before != after:
+            raise InvalidResponseError("Issue routing authority changed during composite read")
+        if (rest.number, rest.node_id, rest.is_pull_request) != (
+            before.number,
+            before.node_id,
+            before.is_pull_request,
+        ):
+            raise InvalidResponseError("Issue REST identity/type does not match routing authority")
+        if (rest.state == "closed") != before.closed:
+            raise InvalidResponseError("Issue REST lifecycle state does not match routing authority")
+        return IssueMetadata(
+            rest.number,
+            rest.database_id,
+            rest.node_id,
+            rest.body,
+            rest.state,
+            rest.author_id,
+            rest.author_login,
+            before.last_edited_at,
+            before.includes_created_edit,
+            before.is_pull_request,
         )
 
     @classmethod

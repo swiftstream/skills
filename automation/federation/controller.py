@@ -10,6 +10,7 @@ import re
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
@@ -153,6 +154,35 @@ class PublicSourceMetadata:
     full_name: str
     default_branch: str
     description: str | None
+
+
+class IssueSourceIdentityKind(Enum):
+    PROPOSED = "proposed"
+    ACCEPTED = "accepted"
+
+
+@dataclass(frozen=True)
+class IssueSourceAuthority:
+    request_class: RequestClass
+    source_id: str
+    source_repository_id: int
+    source_canonical_full_name: str
+    source_identity_kind: IssueSourceIdentityKind
+    source_default_branch: str
+    source_description: str | None
+
+    def __post_init__(self) -> None:
+        if self.request_class not in MANUAL_CLASSES:
+            raise R02Error("Issue source authority requires ADD, UPDATE, or REMOVE")
+        if type(self.source_identity_kind) is not IssueSourceIdentityKind:
+            raise R02Error("Issue source identity kind must use the closed authority enum")
+        expected_kind = (
+            IssueSourceIdentityKind.PROPOSED
+            if self.request_class is RequestClass.ADD
+            else IssueSourceIdentityKind.ACCEPTED
+        )
+        if self.source_identity_kind is not expected_kind:
+            raise R02Error("Issue source identity kind does not match request class")
 
 
 @dataclass(frozen=True)
@@ -1056,6 +1086,58 @@ def _derived_source_id(repository: str) -> str:
         raise R02Error("source repository cannot produce a deterministic sourceId") from None
 
 
+def resolve_issue_source_authority(
+    request: Request,
+    request_class: RequestClass,
+    accepted_manifest: c02.Manifest,
+    source_metadata: PublicSourceMetadata,
+) -> IssueSourceAuthority:
+    """Resolve stable source identity once for Issue preflight and C02 planning."""
+    if type(request) is not Request:
+        raise R02Error("source authority requires a validated Request")
+    if request.request_class is not request_class:
+        raise R02Error("request class does not match validated Request")
+    if request_class not in MANUAL_CLASSES:
+        raise R02Error("Issue source authority does not support this request class")
+    if not isinstance(accepted_manifest, c02.Manifest):
+        raise R02Error("source authority requires a validated accepted manifest")
+    if type(source_metadata) is not PublicSourceMetadata:
+        raise R02Error("source authority requires already-read public source metadata")
+
+    locator = _source_locator(request)
+    if source_metadata.full_name.lower() != locator.lower():
+        raise R02Error("resolved source repository identity does not match requested locator")
+
+    if request_class is RequestClass.ADD:
+        source_id = _derived_source_id(locator)
+        if (
+            source_id in accepted_manifest.by_source_id
+            or source_metadata.repository_id in accepted_manifest.by_repository_id
+        ):
+            raise R02Error("ADD source identity is already accepted")
+        identity_kind = IssueSourceIdentityKind.PROPOSED
+    else:
+        matches = tuple(
+            source
+            for source in accepted_manifest.sources
+            if source.repository_id == source_metadata.repository_id
+        )
+        if len(matches) != 1:
+            raise R02Error("request repositoryId does not identify exactly one accepted source")
+        source_id = matches[0].source_id
+        identity_kind = IssueSourceIdentityKind.ACCEPTED
+
+    return IssueSourceAuthority(
+        request_class=request_class,
+        source_id=source_id,
+        source_repository_id=source_metadata.repository_id,
+        source_canonical_full_name=source_metadata.full_name,
+        source_identity_kind=identity_kind,
+        source_default_branch=source_metadata.default_branch,
+        source_description=source_metadata.description,
+    )
+
+
 class C02CandidateBuilder:
     """Production adapter that delegates manifest/package/catalog semantics to C02."""
 
@@ -1111,20 +1193,10 @@ class C02CandidateBuilder:
         _repository, _ = self._current_base(accepted_base_sha)
         accepted_manifest, accepted_lock, accepted_readme, tree = self._central_state(accepted_base_sha)
         source_repo = read_public_source_metadata(_source_locator(request))
-        if source_repo.full_name.lower() != _source_locator(request).lower():
-            raise R02Error("resolved source repository identity does not match requested locator")
-        source_id: str
-        existing: c02.SourceDeclaration | None
-        if request_class is RequestClass.ADD:
-            source_id = _derived_source_id(_source_locator(request))
-            existing = accepted_manifest.by_source_id.get(source_id)
-            if existing is not None or source_repo.repository_id in accepted_manifest.by_repository_id:
-                raise R02Error("ADD source identity is already accepted")
-        else:
-            existing = accepted_manifest.by_repository_id.get(source_repo.repository_id)
-            if existing is None:
-                raise R02Error("request repositoryId does not identify one accepted source")
-            source_id = existing.source_id
+        authority = resolve_issue_source_authority(request, request_class, accepted_manifest, source_repo)
+        source_id = authority.source_id
+        source_repository_id = authority.source_repository_id
+        existing = accepted_manifest.by_source_id.get(source_id)
         accepted_line_refs = tuple(line.ref for line in existing.lines) if existing is not None else ()
         default_prefixes = (
             request.skill_prefixes
@@ -1156,14 +1228,14 @@ class C02CandidateBuilder:
             request,
             accepted_manifest,
             source_id=source_id,
-            repository_id=source_repo.repository_id,
-            default_branch=source_repo.default_branch,
-            default_description=source_repo.description or "Federated source repository",
+            repository_id=source_repository_id,
+            default_branch=authority.source_default_branch,
+            default_description=authority.source_description or "Federated source repository",
             default_prefixes=tuple(default_prefixes),
         )
         if request_class is RequestClass.ADD:
             self._validate_add_source(candidate_manifest.sources[-1])
-            return {"federation.json": ("100644", _manifest_bytes(candidate_manifest))}, tree, source_id, source_repo.repository_id
+            return {"federation.json": ("100644", _manifest_bytes(candidate_manifest))}, tree, source_id, source_repository_id
 
         bound_sources, discovered = c02.discover_manifest_skills(
             self._capsule_temp_root,
@@ -1197,7 +1269,7 @@ class C02CandidateBuilder:
         for path, (mode, object_type, _sha) in tree.items():
             if path.startswith("skills/") and object_type == "blob" and path not in desired_files:
                 desired_files[path] = ("", b"")
-        return desired_files, tree, source_id, source_repo.repository_id
+        return desired_files, tree, source_id, source_repository_id
 
     def __call__(self, request: Request, request_class: RequestClass, accepted_base_sha: str, head_sha: str) -> ProposalCandidate:
         with trusted_c02_execution() as temp_root:

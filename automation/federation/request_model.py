@@ -65,6 +65,45 @@ _REQUEST_KEYS = (
     "Dropped publication lines",
     "Reason",
 )
+_ISSUE_HEADING_TO_FIELD = {
+    "### Federation request type": None,
+    "### Repository URL": "Repository URL",
+    "### Description": "Description",
+    "### Branch": "Branch",
+    "### Skills root": "Skills root",
+    "### Skill prefixes": "Skill prefixes",
+    "### Publication lines": "Publication lines",
+    "### Dropped publication lines": "Dropped publication lines",
+    "### Reason": "Reason",
+}
+_ISSUE_HEADINGS_BY_CLASS: dict[RequestClass, tuple[str, ...]] = {
+    RequestClass.ADD: (
+        "### Federation request type",
+        "### Repository URL",
+        "### Description",
+        "### Branch",
+        "### Skills root",
+        "### Skill prefixes",
+        "### Publication lines",
+    ),
+    RequestClass.UPDATE: (
+        "### Federation request type",
+        "### Repository URL",
+        "### Description",
+        "### Branch",
+        "### Skills root",
+        "### Skill prefixes",
+        "### Publication lines",
+        "### Dropped publication lines",
+    ),
+    RequestClass.REMOVE: (
+        "### Federation request type",
+        "### Repository URL",
+        "### Reason",
+    ),
+}
+_ISSUE_EMPTY_RESPONSE = "_No response_"
+_ISSUE_UNSUPPORTED_EMPTY_ALIASES = frozenset({"No response", "_no response_", "none", "null"})
 
 
 def _fail(message: str) -> None:
@@ -553,6 +592,111 @@ def parse_request_body(request_class: RequestClass, body: str) -> Request:
         publication_lines,
         dropped,
     )
+
+
+def parse_issue_request_body(body: str) -> Request:
+    """Adapt one rendered Issue Form body to the existing strict Request grammar.
+
+    Only the visible Markdown headings and their single-line values carry
+    authority. Form IDs, titles, labels, and event metadata are outside this
+    body-only API.
+    """
+    if type(body) is not str:
+        _fail("Issue request body must be a string")
+    lines = _normalized_lines(body, "Issue request body")
+    if any(c02.contains_control(line) for line in lines):
+        _fail("Issue request body contains unsupported control data")
+
+    def skip_separators(index: int) -> int:
+        while index < len(lines) and lines[index] == "":
+            index += 1
+        return index
+
+    cursor = skip_separators(0)
+    first_heading = "### Federation request type"
+    if cursor >= len(lines) or lines[cursor] != first_heading:
+        _fail("Issue request must begin with the exact Federation request type heading")
+    cursor = skip_separators(cursor + 1)
+    if cursor >= len(lines):
+        _fail("Issue request type value is missing")
+    request_type = lines[cursor]
+    try:
+        request_class = next(
+            item
+            for item in (RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE)
+            if item.value == request_type
+        )
+    except StopIteration:
+        _fail("Issue request type is unsupported")
+    cursor += 1
+
+    expected_headings = _ISSUE_HEADINGS_BY_CLASS[request_class]
+    values: dict[str, str] = {}
+    seen_headings = {first_heading}
+    for heading in expected_headings[1:]:
+        cursor = skip_separators(cursor)
+        if cursor >= len(lines):
+            _fail(f"Issue request is missing heading: {heading}")
+        actual_heading = lines[cursor]
+        if actual_heading.startswith("### "):
+            if actual_heading not in _ISSUE_HEADING_TO_FIELD:
+                _fail(f"Issue request contains an unknown heading: {actual_heading!r}")
+            if actual_heading in seen_headings:
+                _fail(f"Issue request contains a duplicate heading: {actual_heading!r}")
+            if actual_heading != heading:
+                _fail("Issue request headings are out of order")
+        elif actual_heading != heading:
+            _fail(f"Issue request contains free-form authority prose: {actual_heading!r}")
+        seen_headings.add(heading)
+        cursor = skip_separators(cursor + 1)
+        if cursor >= len(lines):
+            _fail(f"Issue request value is missing for heading: {heading}")
+        value = lines[cursor]
+        if value.startswith("### "):
+            if value not in _ISSUE_HEADING_TO_FIELD:
+                _fail(f"Issue request contains an unknown heading: {value!r}")
+            if value in seen_headings:
+                _fail(f"Issue request contains a duplicate heading: {value!r}")
+            _fail(f"Issue request value is missing for heading: {heading}")
+        field = _ISSUE_HEADING_TO_FIELD[heading]
+        if field is None:
+            _fail("Issue request type heading cannot be parsed as an optional field")
+        values[field] = value
+        cursor += 1
+
+    cursor = skip_separators(cursor)
+    if cursor < len(lines):
+        extra = lines[cursor]
+        if extra.startswith("### "):
+            if extra not in _ISSUE_HEADING_TO_FIELD:
+                _fail(f"Issue request contains an unknown heading: {extra!r}")
+            if extra in seen_headings:
+                _fail(f"Issue request contains a duplicate heading: {extra!r}")
+            _fail("Issue request contains an unexpected heading")
+        _fail(f"Issue request contains free-form authority prose: {extra!r}")
+
+    if values["Repository URL"] == _ISSUE_EMPTY_RESPONSE:
+        _fail("Repository URL cannot use the Issue Form no-response value")
+    optional_fields = (
+        "Description",
+        "Branch",
+        "Skills root",
+        "Skill prefixes",
+        "Publication lines",
+        "Dropped publication lines",
+        "Reason",
+    )
+    request_fields = [("Repository URL", values["Repository URL"])]
+    for field in optional_fields:
+        value = values.get(field)
+        if value is None or value == _ISSUE_EMPTY_RESPONSE:
+            continue
+        if value in _ISSUE_UNSUPPORTED_EMPTY_ALIASES:
+            _fail(f"{field} uses an unsupported Issue Form empty-value alias")
+        if field in values:
+            request_fields.append((field, value))
+    canonical_body = "".join(f"{field}:\n{value}\n" for field, value in request_fields)
+    return parse_request_body(request_class, canonical_body)
 
 
 @dataclass(frozen=True)

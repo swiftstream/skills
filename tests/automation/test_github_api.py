@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 from automation.federation.github_api import (
     GRAPHQL_ENDPOINT,
+    ISSUE_ROUTING_AFTER_QUERY,
+    ISSUE_ROUTING_BEFORE_QUERY,
     ISSUE_COMMENT_NODES_QUERY,
     PULL_REQUEST_BODY_FALLBACK_QUERY,
     PULL_REQUEST_ROUTING_AFTER_QUERY,
@@ -16,6 +18,7 @@ from automation.federation.github_api import (
     ZERO_OID,
     GitHubClient,
     GitHubAPIError,
+    IssueMetadata,
     GitTreeEntry,
     GraphQLError,
     HttpResponse,
@@ -92,6 +95,76 @@ class PullMetadataTransport:
                 raise AssertionError(query)
             return HttpResponse(200, url, json.dumps(payload, separators=(",", ":")).encode())
         if url == REST_BASE_URL + "/repos/swiftstream/skills/pulls/7":
+            return HttpResponse(200, url, json.dumps(self.rest, separators=(",", ":")).encode())
+        raise AssertionError((method, url))
+
+
+def _issue_routing_payload(
+    *,
+    repository="swiftstream/skills",
+    typename="Issue",
+    number=7,
+    node_id="I_node",
+    last_edited_at=None,
+    includes_created_edit=False,
+    closed=False,
+):
+    return {"data": {"repository": {
+        "nameWithOwner": repository,
+        "issueOrPullRequest": {
+            "__typename": typename,
+            "id": node_id,
+            "number": number,
+            "lastEditedAt": last_edited_at,
+            "includesCreatedEdit": includes_created_edit,
+            "closed": closed,
+        },
+    }}}
+
+
+def _issue_rest_payload(
+    *,
+    body="Issue body",
+    number=7,
+    database_id=700,
+    node_id="I_node",
+    state="open",
+    author_id="U_author",
+    author_login="alice",
+    is_pull_request=False,
+):
+    value = {
+        "number": number,
+        "id": database_id,
+        "node_id": node_id,
+        "body": body,
+        "state": state,
+        "user": {"node_id": author_id, "login": author_login},
+    }
+    if is_pull_request:
+        value["pull_request"] = {"url": "https://api.github.com/repos/swiftstream/skills/pulls/7"}
+    return value
+
+
+class IssueMetadataTransport:
+    def __init__(self, *, before=None, rest=None, after=None):
+        self.before = _issue_routing_payload() if before is None else before
+        self.rest = _issue_rest_payload() if rest is None else rest
+        self.after = _issue_routing_payload() if after is None else after
+        self.calls = []
+
+    def request(self, method, url, headers, body, timeout):
+        self.calls.append((method, url, headers, body, timeout))
+        if url == GRAPHQL_ENDPOINT:
+            query = json.loads(body)["query"]
+            if query == ISSUE_ROUTING_BEFORE_QUERY:
+                payload = self.before
+            elif query == ISSUE_ROUTING_AFTER_QUERY:
+                payload = self.after
+            else:
+                raise AssertionError(query)
+            return HttpResponse(200, url, json.dumps(payload, separators=(",", ":")).encode())
+        if url == REST_BASE_URL + "/repos/swiftstream/skills/issues/7":
             return HttpResponse(200, url, json.dumps(self.rest, separators=(",", ":")).encode())
         raise AssertionError((method, url))
 
@@ -734,6 +807,252 @@ class GitHubAPITests(unittest.TestCase):
         self.assertNotIn(repository_id, payload["query"])
         self.assertNotIn(update.name, payload["query"])
         self.assertEqual(payload["variables"]["repositoryId"], repository_id)
+
+    def test_issue_metadata_normal_order_and_complete_contract(self):
+        before = _issue_routing_payload(
+            last_edited_at="2026-09-10T00:00:00Z", includes_created_edit=True
+        )
+        transport = IssueMetadataTransport(before=before, after=before)
+        metadata = GitHubClient("token", transport).get_issue_metadata("swiftstream/skills", 7)
+
+        self.assertEqual(_call_signature(transport.calls), [
+            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_BEFORE_QUERY),
+            ("GET", REST_BASE_URL + "/repos/swiftstream/skills/issues/7", None),
+            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_AFTER_QUERY),
+        ])
+        self.assertEqual(metadata, IssueMetadata(
+            number=7,
+            database_id=700,
+            node_id="I_node",
+            body="Issue body",
+            state="open",
+            author_id="U_author",
+            author_login="alice",
+            last_edited_at="2026-09-10T00:00:00Z",
+            includes_created_edit=True,
+            is_pull_request=False,
+        ))
+
+    def test_issue_metadata_preserves_pull_request_discriminator(self):
+        routing = _issue_routing_payload(typename="PullRequest")
+        rest = _issue_rest_payload(is_pull_request=True)
+        transport = IssueMetadataTransport(before=routing, rest=rest, after=routing)
+        metadata = GitHubClient(None, transport).get_issue_metadata("swiftstream/skills", 7)
+        self.assertTrue(metadata.is_pull_request)
+        self.assertEqual(_call_signature(transport.calls), [
+            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_BEFORE_QUERY),
+            ("GET", REST_BASE_URL + "/repos/swiftstream/skills/issues/7", None),
+            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_AFTER_QUERY),
+        ])
+
+    def test_issue_metadata_routing_drift_rejects_each_authority_field(self):
+        for field, changed in (
+            ("__typename", "PullRequest"),
+            ("id", "I_other"),
+            ("number", 8),
+            ("lastEditedAt", "2026-09-10T00:00:00Z"),
+            ("includesCreatedEdit", True),
+            ("closed", True),
+        ):
+            with self.subTest(field=field):
+                after = _issue_routing_payload()
+                after["data"]["repository"]["issueOrPullRequest"][field] = changed
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(after=after)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+        edited = "2026-09-10T00:00:00Z"
+        for before_value, after_value in ((None, edited), (edited, None)):
+            with self.subTest(before_value=before_value, after_value=after_value):
+                before = _issue_routing_payload(last_edited_at=before_value)
+                after = _issue_routing_payload(last_edited_at=after_value)
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(before=before, after=after)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+    def test_issue_metadata_rejects_malformed_or_timezone_naive_routing_timestamps(self):
+        cases = (
+            ("before malformed", "before", "bad"),
+            ("after timezone-naive", "after", "2026-09-10T00:00:00"),
+        )
+        for label, operation, timestamp in cases:
+            with self.subTest(case=label):
+                before = _issue_routing_payload()
+                after = _issue_routing_payload()
+                if operation == "before":
+                    before["data"]["repository"]["issueOrPullRequest"]["lastEditedAt"] = timestamp
+                else:
+                    after["data"]["repository"]["issueOrPullRequest"]["lastEditedAt"] = timestamp
+                transport = IssueMetadataTransport(before=before, after=after)
+
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, transport).get_issue_metadata("swiftstream/skills", 7)
+
+                expected_calls = 1 if operation == "before" else 3
+                self.assertEqual(len(transport.calls), expected_calls)
+                if operation == "after":
+                    self.assertEqual(
+                        _call_signature(transport.calls),
+                        [
+                            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_BEFORE_QUERY),
+                            ("GET", REST_BASE_URL + "/repos/swiftstream/skills/issues/7", None),
+                            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_AFTER_QUERY),
+                        ],
+                    )
+
+    def test_issue_metadata_lifecycle_routing_race_fails_in_both_directions(self):
+        cases = (
+            ("open_to_closed", False, True, "open"),
+            ("closed_to_open", True, False, "closed"),
+        )
+        for label, before_closed, after_closed, rest_state in cases:
+            with self.subTest(race=label):
+                before = _issue_routing_payload(closed=before_closed)
+                after = _issue_routing_payload(closed=after_closed)
+                rest = _issue_rest_payload(state=rest_state)
+                transport = IssueMetadataTransport(before=before, rest=rest, after=after)
+
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, transport).get_issue_metadata("swiftstream/skills", 7)
+
+                self.assertEqual(
+                    [call[0:2] for call in transport.calls],
+                    [
+                        ("POST", GRAPHQL_ENDPOINT),
+                        ("GET", REST_BASE_URL + "/repos/swiftstream/skills/issues/7"),
+                        ("POST", GRAPHQL_ENDPOINT),
+                    ],
+                )
+
+    def test_issue_metadata_routing_snapshots_require_known_exact_union(self):
+        malformed = (
+            {"data": {"repository": {"nameWithOwner": "swiftstream/skills", "issueOrPullRequest": None}}},
+            _issue_routing_payload(typename="Unknown"),
+            _issue_routing_payload(typename=[]),
+            _issue_routing_payload(repository="other/skills"),
+            _issue_routing_payload(number=8),
+            _issue_routing_payload(includes_created_edit=1),
+            _issue_routing_payload(closed=0),
+        )
+        for before in malformed:
+            with self.subTest(before=before), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, IssueMetadataTransport(before=before)).get_issue_metadata(
+                    "swiftstream/skills", 7
+                )
+
+    def test_issue_metadata_rest_identity_type_and_state_must_match_graphql(self):
+        cases = (
+            ("number", 8),
+            ("node_id", "I_other"),
+            ("state", "OPEN"),
+            ("state", "merged"),
+            ("pull_request", None),
+        )
+        for field, changed in cases:
+            with self.subTest(field=field, changed=changed):
+                rest = _issue_rest_payload()
+                rest[field] = changed
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(rest=rest)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+        for typename, is_pull_request in (("Issue", True), ("PullRequest", False)):
+            with self.subTest(typename=typename, is_pull_request=is_pull_request):
+                routing = _issue_routing_payload(typename=typename)
+                rest = _issue_rest_payload(is_pull_request=is_pull_request)
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(before=routing, after=routing, rest=rest)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+        for state, closed in (("closed", False), ("open", True)):
+            with self.subTest(state=state, closed=closed):
+                routing = _issue_routing_payload(closed=closed)
+                rest = _issue_rest_payload(state=state)
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(before=routing, after=routing, rest=rest)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+    def test_issue_metadata_rejects_missing_or_malformed_rest_author_and_identity(self):
+        cases = (
+            ("id", None),
+            ("id", True),
+            ("id", 0),
+            ("node_id", None),
+            ("user", None),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                rest = _issue_rest_payload()
+                rest[field] = value
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(rest=rest)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+        for field, value in (("node_id", ""), ("login", 1)):
+            with self.subTest(author_field=field, value=value):
+                rest = _issue_rest_payload()
+                rest["user"][field] = value
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(rest=rest)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+    def test_issue_metadata_requires_non_null_valid_bounded_utf8_body(self):
+        for label, body in (
+            ("missing", None),
+            ("int", 1),
+            ("list", []),
+            ("object", {}),
+            ("oversized", "x" * 16_385),
+            ("invalid-utf8", "\ud800"),
+        ):
+            with self.subTest(body=label), self.assertRaises(InvalidResponseError):
+                rest = _issue_rest_payload(body=body)
+                if label == "missing":
+                    rest.pop("body")
+                GitHubClient(None, IssueMetadataTransport(rest=rest)).get_issue_metadata(
+                    "swiftstream/skills", 7
+                )
+
+        accepted = "é" * 8_192
+        metadata = GitHubClient(None, IssueMetadataTransport(rest=_issue_rest_payload(body=accepted))).get_issue_metadata(
+            "swiftstream/skills", 7
+        )
+        self.assertEqual(metadata.body, accepted)
+
+    def test_issue_routing_documents_are_fixed_queries_in_explicit_allowlist(self):
+        for document in (ISSUE_ROUTING_BEFORE_QUERY, ISSUE_ROUTING_AFTER_QUERY):
+            self.assertTrue(document.startswith("query FederationIssueRouting"))
+            self.assertNotIn("mutation", document)
+            for field in ("nameWithOwner", "issueOrPullRequest(number: $number)", "__typename",
+                          "... on Issue", "... on PullRequest", "lastEditedAt", "includesCreatedEdit", "closed"):
+                self.assertIn(field, document)
+        transport = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, b'{"data":{"repository":{}}}'))
+        client = GitHubClient(None, transport)
+        variables = {"owner": 'swiftstream"} mutation { deleteRepository(id: "x") {',
+                     "name": "skills", "number": 7}
+        for document in (ISSUE_ROUTING_BEFORE_QUERY, ISSUE_ROUTING_AFTER_QUERY):
+            client._graphql(document, variables)
+        self.assertEqual(len(transport.calls), 2)
+        for call, document in zip(transport.calls, (ISSUE_ROUTING_BEFORE_QUERY, ISSUE_ROUTING_AFTER_QUERY)):
+            payload = json.loads(call[3])
+            self.assertEqual(payload, {"query": document, "variables": variables})
+            self.assertNotIn(variables["owner"], payload["query"])
+        with self.assertRaises(GitHubAPIError):
+            client._graphql("query Untrusted { repository { nameWithOwner } }", {})
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_issue_metadata_rejects_invalid_request_before_network(self):
+        transport = IssueMetadataTransport()
+        for number in (0, -1, True, "7"):
+            with self.subTest(number=number), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).get_issue_metadata("swiftstream/skills", number)
+        self.assertEqual(transport.calls, [])
 
     def test_pull_metadata_normal_order_and_complete_contract(self):
         transport = PullMetadataTransport()

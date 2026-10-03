@@ -4,11 +4,183 @@ import unittest
 from unittest.mock import patch
 
 import automation.federation.controller as controller_module
-from automation.federation.controller import PhaseNotImplementedError, R01Controller, classify_request, parse_c02_manifest
+from automation.federation.controller import (
+    C02CandidateBuilder,
+    IssueSourceAuthority,
+    IssueSourceIdentityKind,
+    PhaseNotImplementedError,
+    PublicSourceMetadata,
+    R01Controller,
+    R02Error,
+    classify_request,
+    parse_c02_manifest,
+    resolve_issue_source_authority,
+)
 from automation.federation.request_model import CommentEvent, RequestClass, RequestAnchor, parse_request_body, body_sha256
+from scripts import federate as c02
 
 
 class ControllerCoreTests(unittest.TestCase):
+    @staticmethod
+    def source_request(request_class, repository_url="https://github.com/Owner/Repo"):
+        if request_class is RequestClass.REMOVE:
+            body = f"Repository URL:\n{repository_url}\nReason:\nretire\n"
+        else:
+            body = f"Repository URL:\n{repository_url}\n"
+        return parse_request_body(request_class, body)
+
+    @staticmethod
+    def accepted_manifest(source_id="accepted-source", repository="Owner/Repo", repository_id=41):
+        return parse_c02_manifest(
+            {
+                "schemaVersion": 3,
+                "sources": [
+                    {
+                        "sourceId": source_id,
+                        "repository": repository,
+                        "repositoryId": repository_id,
+                        "skillsRoot": "skills",
+                        "description": "Accepted source",
+                        "lines": [{"ref": "refs/heads/main", "skillPrefixes": [source_id]}],
+                    }
+                ],
+            }
+        )
+
+    def test_add_issue_source_authority_binds_proposed_source_identity(self):
+        request = self.source_request(RequestClass.ADD)
+        metadata = PublicSourceMetadata(99, "owner/repo", "main", "Source description")
+        authority = resolve_issue_source_authority(request, RequestClass.ADD, c02.Manifest(()), metadata)
+        self.assertEqual(authority, IssueSourceAuthority(
+            RequestClass.ADD,
+            "owner-repo",
+            99,
+            "owner/repo",
+            IssueSourceIdentityKind.PROPOSED,
+            "main",
+            "Source description",
+        ))
+        with self.assertRaises(AttributeError):
+            authority.source_id = "changed"
+
+    def test_add_issue_source_authority_rejects_source_id_collision(self):
+        accepted = self.accepted_manifest(source_id="owner-repo", repository="Elsewhere/Repo", repository_id=100)
+        with self.assertRaises(R02Error):
+            resolve_issue_source_authority(
+                self.source_request(RequestClass.ADD),
+                RequestClass.ADD,
+                accepted,
+                PublicSourceMetadata(99, "Owner/Repo", "main", None),
+            )
+
+    def test_add_issue_source_authority_rejects_repository_id_collision(self):
+        accepted = self.accepted_manifest(source_id="other-source", repository="Elsewhere/Repo", repository_id=99)
+        with self.assertRaises(R02Error):
+            resolve_issue_source_authority(
+                self.source_request(RequestClass.ADD),
+                RequestClass.ADD,
+                accepted,
+                PublicSourceMetadata(99, "Owner/Repo", "main", None),
+            )
+
+    def test_update_issue_source_authority_selects_accepted_source_by_repository_id(self):
+        accepted = self.accepted_manifest(source_id="accepted-source", repository_id=41)
+        authority = resolve_issue_source_authority(
+            self.source_request(RequestClass.UPDATE),
+            RequestClass.UPDATE,
+            accepted,
+            PublicSourceMetadata(41, "owner/repo", "release", "Current metadata"),
+        )
+        self.assertEqual(authority.source_id, "accepted-source")
+        self.assertEqual(authority.source_repository_id, 41)
+        self.assertEqual(authority.source_identity_kind, IssueSourceIdentityKind.ACCEPTED)
+
+    def test_remove_issue_source_authority_selects_accepted_source_by_repository_id(self):
+        accepted = self.accepted_manifest(source_id="accepted-source", repository_id=41)
+        authority = resolve_issue_source_authority(
+            self.source_request(RequestClass.REMOVE),
+            RequestClass.REMOVE,
+            accepted,
+            PublicSourceMetadata(41, "Owner/Repo", "main", None),
+        )
+        self.assertEqual(authority.source_id, "accepted-source")
+        self.assertEqual(authority.source_identity_kind, IssueSourceIdentityKind.ACCEPTED)
+
+    def test_update_and_remove_unknown_repository_id_are_blocked(self):
+        accepted = self.accepted_manifest(repository_id=41)
+        for request_class in (RequestClass.UPDATE, RequestClass.REMOVE):
+            with self.subTest(request_class=request_class), self.assertRaises(R02Error):
+                resolve_issue_source_authority(
+                    self.source_request(request_class),
+                    request_class,
+                    accepted,
+                    PublicSourceMetadata(42, "Owner/Repo", "main", None),
+                )
+
+    def test_issue_source_authority_rejects_canonical_name_mismatch(self):
+        with self.assertRaises(R02Error):
+            resolve_issue_source_authority(
+                self.source_request(RequestClass.ADD),
+                RequestClass.ADD,
+                c02.Manifest(()),
+                PublicSourceMetadata(99, "owner/different", "main", None),
+            )
+
+    def test_issue_source_authority_rejects_class_mismatch_and_unsupported_class(self):
+        accepted = c02.Manifest(())
+        add_request = self.source_request(RequestClass.ADD)
+        with self.assertRaises(R02Error):
+            resolve_issue_source_authority(
+                add_request,
+                RequestClass.UPDATE,
+                accepted,
+                PublicSourceMetadata(99, "Owner/Repo", "main", None),
+            )
+        reconcile = parse_request_body(RequestClass.RECONCILE, "Repository URL:\nhttps://github.com/Owner/Repo\n")
+        with self.assertRaises(R02Error):
+            resolve_issue_source_authority(
+                reconcile,
+                RequestClass.RECONCILE,
+                accepted,
+                PublicSourceMetadata(99, "Owner/Repo", "main", None),
+            )
+        with self.assertRaises(R02Error):
+            IssueSourceAuthority(
+                RequestClass.ADD,
+                "owner-repo",
+                99,
+                "Owner/Repo",
+                "proposed",
+                "main",
+                None,
+            )
+
+    def test_c02_candidate_planning_uses_shared_issue_source_resolver(self):
+        request = parse_request_body(
+            RequestClass.ADD,
+            "Repository URL:\nhttps://github.com/Owner/Repo\n"
+            "Description:\nA source\nBranch:\nmain\nSkills root:\nskills\nSkill prefixes:\nfoo\n",
+        )
+        accepted = c02.Manifest(())
+        metadata = PublicSourceMetadata(99, "owner/repo", "main", "Source description")
+        builder = C02CandidateBuilder(object(), "swiftstream/skills", trusted_checkout_sha="a" * 40)
+        builder._capsule_temp_root = Path(".")
+        with (
+            patch.object(builder, "_current_base", return_value=(None, "a" * 40)),
+            patch.object(builder, "_central_state", return_value=(accepted, None, b"", {})),
+            patch.object(builder, "_validate_add_source"),
+            patch.object(controller_module, "read_public_source_metadata", return_value=metadata),
+            patch.object(
+                controller_module,
+                "resolve_issue_source_authority",
+                wraps=resolve_issue_source_authority,
+            ) as shared_resolver,
+        ):
+            desired, _tree, source_id, repository_id = builder._plan(request, RequestClass.ADD, "a" * 40)
+        shared_resolver.assert_called_once_with(request, RequestClass.ADD, accepted, metadata)
+        self.assertEqual((source_id, repository_id), ("owner-repo", 99))
+        self.assertEqual(set(desired), {"federation.json"})
+
     def test_authority_and_structural_classification(self):
         self.assertEqual(classify_request(marker_content="add-source"), RequestClass.ADD)
         self.assertEqual(classify_request(marker_content="unexpected", head_branch="bot/federation/swifql"), RequestClass.MACHINE_PUBLICATION)

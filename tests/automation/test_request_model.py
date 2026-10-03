@@ -18,6 +18,7 @@ from automation.federation.request_model import (
     body_sha256,
     fold_patch_events,
     parse_anchor,
+    parse_issue_request_body,
     parse_patch,
     parse_request_body,
     proposed_line_refs,
@@ -31,6 +32,195 @@ def add_body(description="A source", branch="main", root="skills", prefixes="swi
 
 
 class RequestModelTests(unittest.TestCase):
+    @staticmethod
+    def issue_body(request_type, fields):
+        sections = [("Federation request type", request_type), *fields]
+        return "\n\n".join(f"### {heading}\n\n{value}" for heading, value in sections) + "\n"
+
+    def test_issue_add_body_maps_to_the_existing_request_model(self):
+        issue_body = self.issue_body(
+            "add-source",
+            [
+                ("Repository URL", "https://github.com/Owner/Repo"),
+                ("Description", "A source"),
+                ("Branch", "main"),
+                ("Skills root", "skills"),
+                ("Skill prefixes", "swifql"),
+                ("Publication lines", "refs/heads/main=swifql"),
+            ],
+        )
+        canonical_body = (
+            "Repository URL:\nhttps://github.com/Owner/Repo\n"
+            "Description:\nA source\n"
+            "Branch:\nmain\n"
+            "Skills root:\nskills\n"
+            "Skill prefixes:\nswifql\n"
+            "Publication lines:\nrefs/heads/main=swifql\n"
+        )
+        self.assertEqual(
+            parse_issue_request_body(issue_body),
+            parse_request_body(RequestClass.ADD, canonical_body),
+        )
+
+    def test_issue_update_body_preserves_publication_and_dropped_lines(self):
+        issue_body = self.issue_body(
+            "update-source",
+            [
+                ("Repository URL", "https://github.com/vapor/vapor"),
+                ("Description", "Framework"),
+                ("Branch", "main"),
+                ("Skills root", "skills"),
+                ("Skill prefixes", "vapor5"),
+                ("Publication lines", "refs/heads/main=vapor5"),
+                ("Dropped publication lines", "refs/heads/release/4"),
+            ],
+        )
+        request = parse_issue_request_body(issue_body)
+        self.assertEqual(request.request_class, RequestClass.UPDATE)
+        self.assertEqual([(line.ref, line.skill_prefixes) for line in request.publication_lines], [("refs/heads/main", ("vapor5",))])
+        self.assertEqual(request.dropped_publication_lines, ("refs/heads/release/4",))
+
+    def test_issue_remove_body_maps_url_and_reason(self):
+        issue_body = self.issue_body(
+            "remove-source",
+            [
+                ("Repository URL", "https://github.com/Owner/Repo"),
+                ("Reason", "retired"),
+            ],
+        )
+        self.assertEqual(
+            parse_issue_request_body(issue_body),
+            parse_request_body(
+                RequestClass.REMOVE,
+                "Repository URL:\nhttps://github.com/Owner/Repo\nReason:\nretired\n",
+            ),
+        )
+
+    def test_issue_no_response_removes_optional_values(self):
+        issue_body = self.issue_body(
+            "add-source",
+            [
+                ("Repository URL", "https://github.com/Owner/Repo"),
+                ("Description", "_No response_"),
+                ("Branch", "_No response_"),
+                ("Skills root", "_No response_"),
+                ("Skill prefixes", "_No response_"),
+                ("Publication lines", "_No response_"),
+            ],
+        )
+        request = parse_issue_request_body(issue_body)
+        self.assertEqual(request, parse_request_body(RequestClass.ADD, "Repository URL:\nhttps://github.com/Owner/Repo\n"))
+
+    def test_issue_no_response_is_rejected_for_request_type_and_repository_url(self):
+        for request_type, url in (("_No response_", "https://github.com/Owner/Repo"), ("add-source", "_No response_")):
+            issue_body = self.issue_body(
+                request_type,
+                [
+                    ("Repository URL", url),
+                    ("Description", "_No response_"),
+                    ("Branch", "_No response_"),
+                    ("Skills root", "_No response_"),
+                    ("Skill prefixes", "_No response_"),
+                    ("Publication lines", "_No response_"),
+                ],
+            )
+            with self.subTest(request_type=request_type, url=url), self.assertRaises(RequestModelError):
+                parse_issue_request_body(issue_body)
+
+    def test_issue_request_type_is_closed_and_excludes_reconcile(self):
+        fields = [
+            ("Repository URL", "https://github.com/Owner/Repo"),
+            ("Description", "_No response_"),
+            ("Branch", "_No response_"),
+            ("Skills root", "_No response_"),
+            ("Skill prefixes", "_No response_"),
+            ("Publication lines", "_No response_"),
+        ]
+        for value in ("reconcile-source", "add", "No response", "_no response_", "none", "null"):
+            with self.subTest(value=value), self.assertRaises(RequestModelError):
+                parse_issue_request_body(self.issue_body(value, fields))
+
+    def test_issue_optional_fields_reject_loose_empty_sentinels(self):
+        for value in ("No response", "_no response_", "none", "null"):
+            fields = [
+                ("Repository URL", "https://github.com/Owner/Repo"),
+                ("Description", value),
+                ("Branch", "_No response_"),
+                ("Skills root", "_No response_"),
+                ("Skill prefixes", "_No response_"),
+                ("Publication lines", "_No response_"),
+            ]
+            with self.subTest(value=value), self.assertRaises(RequestModelError):
+                parse_issue_request_body(self.issue_body("add-source", fields))
+
+    def test_issue_heading_duplicates_unknowns_missing_and_order_are_rejected(self):
+        valid_fields = [
+            ("Repository URL", "https://github.com/Owner/Repo"),
+            ("Description", "source"),
+            ("Branch", "main"),
+            ("Skills root", "skills"),
+            ("Skill prefixes", "foo"),
+            ("Publication lines", "_No response_"),
+        ]
+        valid = self.issue_body("add-source", valid_fields)
+        malformed = (
+            valid.replace("### Repository URL", "### Repository URL", 1).replace(
+                "### Publication lines", "### Repository URL\n\nhttps://github.com/Owner/Repo\n\n### Publication lines", 1
+            ),
+            valid + "\n### Unrecognized field\n\nvalue\n",
+            self.issue_body("remove-source", [("Repository URL", "https://github.com/Owner/Repo")]),
+            self.issue_body("add-source", [valid_fields[0], valid_fields[2], valid_fields[1], *valid_fields[3:]]),
+        )
+        for body in malformed:
+            with self.subTest(body=body), self.assertRaises(RequestModelError):
+                parse_issue_request_body(body)
+
+    def test_issue_body_rejects_multiline_values_and_free_form_prose(self):
+        base = self.issue_body(
+            "add-source",
+            [
+                ("Repository URL", "https://github.com/Owner/Repo"),
+                ("Description", "first line"),
+                ("Branch", "main"),
+                ("Skills root", "skills"),
+                ("Skill prefixes", "foo"),
+                ("Publication lines", "_No response_"),
+            ],
+        )
+        multiline = base.replace("first line\n\n### Branch", "first line\nsecond line\n\n### Branch")
+        prose = base.replace("### Repository URL", "authority prose\n\n### Repository URL", 1)
+        for body in (multiline, prose):
+            with self.subTest(body=body), self.assertRaises(RequestModelError):
+                parse_issue_request_body(body)
+
+    def test_issue_body_bounds_utf8_size_and_rejects_control_data(self):
+        body = self.issue_body(
+            "add-source",
+            [
+                ("Repository URL", "https://github.com/Owner/Repo"),
+                ("Description", "source"),
+                ("Branch", "main"),
+                ("Skills root", "skills"),
+                ("Skill prefixes", "foo"),
+                ("Publication lines", "_No response_"),
+            ],
+        )
+        for invalid in (
+            body.replace("source", "x" * 16_384, 1),
+            body.replace("source", "bad\x00value", 1),
+            body.replace("source", "bad\rvalue", 1),
+            body.replace("source", "bad\tvalue", 1),
+        ):
+            with self.subTest(sample=invalid[:80]), self.assertRaises(RequestModelError):
+                parse_issue_request_body(invalid)
+
+    def test_issue_parser_is_body_only_and_uses_no_form_metadata(self):
+        import inspect
+
+        self.assertEqual(tuple(inspect.signature(parse_issue_request_body).parameters), ("body",))
+        with self.assertRaises(TypeError):
+            parse_issue_request_body("", title="add-source")
+
     def test_all_markers_and_bodies(self):
         for cls in RequestClass:
             if cls in {RequestClass.MACHINE_PUBLICATION, RequestClass.UNRELATED}:
