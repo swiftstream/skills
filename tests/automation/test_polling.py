@@ -77,7 +77,7 @@ class PollingTests(unittest.TestCase):
     def test_reconcile_workflow_is_scheduled_and_manually_targetable(self):
         workflow = (ROOT / ".github/workflows/federation-reconcile.yml").read_text()
         self.assertIn("schedule:", workflow)
-        self.assertIn("cron: '*/15 * * * *'", workflow)
+        self.assertIn("cron: '7,22,37,52 * * * *'", workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("repository_id:", workflow)
         self.assertRegex(workflow, r"repository_id:\n\s+required: false\n\s+type: string")
