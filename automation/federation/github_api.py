@@ -16,6 +16,7 @@ from urllib import request as urlrequest
 
 from scripts import federate as c02
 from automation.federation.workspace import WorkspaceError, validate_trusted_ref
+from automation.federation.request_model import RequestModelError, reserved_issue_branch_number
 
 REST_BASE_URL = "https://api.github.com"
 GRAPHQL_ENDPOINT = "https://api.github.com/graphql"
@@ -50,6 +51,7 @@ PULL_REQUEST_ROUTING_BEFORE_QUERY = """query FederationPullRequestRoutingBefore(
       baseRefOid
       headRefName
       baseRefName
+      isDraft
       lastEditedAt
       includesCreatedEdit
     }
@@ -65,6 +67,7 @@ PULL_REQUEST_ROUTING_AFTER_QUERY = """query FederationPullRequestRoutingAfter($o
       baseRefOid
       headRefName
       baseRefName
+      isDraft
       lastEditedAt
       includesCreatedEdit
     }
@@ -343,6 +346,7 @@ class PullRequestMetadata:
     base_repository: str
     last_edited_at: str | None
     includes_created_edit: bool
+    draft: bool
 
 
 @dataclass(frozen=True)
@@ -366,6 +370,7 @@ class _PullRequestRoutingSnapshot:
     base_oid: str
     head_ref: str
     base_ref: str
+    draft: bool
     last_edited_at: str | None
     includes_created_edit: bool
 
@@ -406,6 +411,7 @@ class _PullRequestRESTDetail:
     base_oid: str
     head_ref: str
     base_ref: str
+    draft: bool
     head_repository_id: str
     head_repository: str
     base_repository_id: str
@@ -843,12 +849,15 @@ class GitHubClient:
             raise InvalidResponseError("pull request routing number does not match requested number")
         if type(pull.get("includesCreatedEdit")) is not bool:
             raise InvalidResponseError("PR.includesCreatedEdit must be boolean")
+        if type(pull.get("isDraft")) is not bool:
+            raise InvalidResponseError("PR.isDraft must be boolean")
         return _PullRequestRoutingSnapshot(
             number,
             GitHubClient._sha(pull.get("headRefOid"), "PR.headRefOid"),
             GitHubClient._sha(pull.get("baseRefOid"), "PR.baseRefOid"),
             _bounded_text(pull.get("headRefName"), "PR.headRefName"),
             _bounded_text(pull.get("baseRefName"), "PR.baseRefName"),
+            pull["isDraft"],
             _optional_iso(pull.get("lastEditedAt"), "PR.lastEditedAt"),
             pull["includesCreatedEdit"],
         )
@@ -876,6 +885,8 @@ class GitHubClient:
         body = None if body_value is None else cls._body_text(body_value, "pull request REST body")
         if type(value.get("user")) is not dict or type(value.get("head")) is not dict or type(value.get("base")) is not dict:
             raise InvalidResponseError("pull request REST identity metadata is incomplete")
+        if type(value.get("draft")) is not bool:
+            raise InvalidResponseError("pull request REST draft must be boolean")
         user = value["user"]
         head = value["head"]
         base = value["base"]
@@ -892,6 +903,7 @@ class GitHubClient:
             cls._sha(base.get("sha"), "PR.base.sha"),
             _bounded_text(head.get("ref"), "PR.head.ref"),
             _bounded_text(base.get("ref"), "PR.base.ref"),
+            value["draft"],
             _bounded_text(head_repo.get("node_id"), "PR.head.repo.node_id"),
             _bounded_text(head_repo.get("full_name"), "PR.head.repo.full_name"),
             _bounded_text(base_repo.get("node_id"), "PR.base.repo.node_id"),
@@ -937,6 +949,8 @@ class GitHubClient:
             before.base_ref,
         ):
             raise InvalidResponseError("pull request REST topology does not match routing authority")
+        if rest.draft != before.draft:
+            raise InvalidResponseError("pull request REST draft does not match routing authority")
         return PullRequestMetadata(
             before.number,
             body,
@@ -952,6 +966,7 @@ class GitHubClient:
             rest.base_repository,
             before.last_edited_at,
             before.includes_created_edit,
+            before.draft,
         )
 
     @staticmethod
@@ -1539,17 +1554,35 @@ class GitHubClient:
             raise GitHubAPIError("workflow inputs must be string data")
         self.request_json("POST", ["repos", owner, name, "actions", "workflows", workflow, "dispatches"], {"ref": ref, "inputs": dict(inputs or {})})
 
-    def list_open_pull_requests(self, repository: str, *, max_pages: int = 100) -> tuple[dict[str, Any], ...]:
+    def list_pull_requests(
+        self, repository: str, *, state: str = "open", max_pages: int = 100,
+    ) -> tuple[dict[str, Any], ...]:
+        if type(state) is not str or state not in {"open", "closed", "all"}:
+            raise GitHubAPIError("pull request state must be open, closed, or all")
+        if type(max_pages) is not int or not 1 <= max_pages <= 100:
+            raise GitHubAPIError("pull request max_pages must be an exact integer from 1 to 100")
         owner, name = self._owner_repo(repository)
         result: list[dict[str, Any]] = []
+        seen_numbers: set[int] = set()
         for page in range(1, max_pages + 1):
-            value = self._request("GET", f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/pulls?state=open&per_page=100&page={page}")
-            if type(value) is not list or any(type(item) is not dict for item in value):
-                raise InvalidResponseError("open PR enumeration is malformed")
+            value = self._request(
+                "GET",
+                f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/pulls?state={state}&per_page=100&page={page}",
+            )
+            if type(value) is not list or len(value) > 100 or any(type(item) is not dict for item in value):
+                raise InvalidResponseError("PR enumeration is malformed")
+            for item in value:
+                number = _positive_id(item.get("number"), "PR.number")
+                if number in seen_numbers:
+                    raise InvalidResponseError("PR enumeration contains duplicate numbers")
+                seen_numbers.add(number)
             result.extend(value)
             if len(value) < 100:
                 return tuple(sorted(result, key=lambda item: _positive_id(item.get("number"), "PR.number")))
-        raise InvalidResponseError("open PR enumeration exceeds bound")
+        raise InvalidResponseError("PR enumeration reached bounded pagination exhaustion")
+
+    def list_open_pull_requests(self, repository: str, *, max_pages: int = 100) -> tuple[dict[str, Any], ...]:
+        return self.list_pull_requests(repository, state="open", max_pages=max_pages)
 
     def create_machine_pull_request(self, repository: str, *, head: str, base: str, title: str, body: str) -> int:
         """Create a bounded machine PR; branch and base are data, never URL/query syntax."""
@@ -1571,6 +1604,50 @@ class GitHubClient:
         if type(value) is not dict:
             raise InvalidResponseError("created machine PR response is malformed")
         return _positive_id(value.get("number"), "created machine PR.number")
+
+    def create_issue_pull_request(self, repository: str, *, head: str, base: str, title: str, body: str) -> int:
+        """Create exactly one nondraft central PR for the reserved Issue branch."""
+        owner, name = self._owner_repo(repository)
+        if type(head) is not str or not head or ":" in head or head.startswith("refs/"):
+            raise GitHubAPIError("Issue PR head must be a reserved short central branch")
+        try:
+            reserved_number = reserved_issue_branch_number(head)
+        except RequestModelError:
+            raise GitHubAPIError("Issue PR head must be an exact reserved Issue branch") from None
+        if reserved_number is None:
+            raise GitHubAPIError("Issue PR head must be an exact reserved Issue branch")
+        try:
+            validate_trusted_ref(f"refs/heads/{head}")
+        except (c02.FederationError, WorkspaceError):
+            raise GitHubAPIError("Issue PR head is not a valid trusted branch") from None
+        if type(base) is not str or base != "main":
+            raise GitHubAPIError("Issue PR base must be exact main")
+        if type(title) is not str:
+            raise GitHubAPIError("Issue PR title is invalid or exceeds its bound")
+        try:
+            title_bytes = title.encode("utf-8")
+        except UnicodeEncodeError:
+            raise GitHubAPIError("Issue PR title is invalid or exceeds its bound") from None
+        if not title or len(title_bytes) > 256 or c02.contains_control(title):
+            raise GitHubAPIError("Issue PR title is invalid or exceeds its bound")
+        if type(body) is not str:
+            raise GitHubAPIError("Issue PR body is invalid or exceeds its bound")
+        try:
+            body_bytes = body.encode("utf-8")
+        except UnicodeEncodeError:
+            raise GitHubAPIError("Issue PR body is invalid or exceeds its bound") from None
+        if (
+            not body or len(body_bytes) > 16_384
+            or any((ord(character) < 0x20 and character != "\n") or ord(character) == 0x7F for character in body)
+        ):
+            raise GitHubAPIError("Issue PR body is invalid or exceeds its bound")
+        value = self.request_json(
+            "POST", ["repos", owner, name, "pulls"],
+            {"title": title, "head": head, "base": base, "body": body, "draft": False},
+        )
+        if type(value) is not dict:
+            raise InvalidResponseError("created Issue PR response is malformed")
+        return _positive_id(value.get("number"), "created Issue PR.number")
 
     def update_pull_request_state(self, repository: str, number: int, *, state: str) -> None:
         owner, name = self._owner_repo(repository)

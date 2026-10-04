@@ -38,6 +38,7 @@ from automation.federation.github_api import (
     UnexpectedStatusError,
     REST_BASE_URL,
 )
+from automation.federation.request_model import RequestClass, parse_request_body, render_request_body
 
 
 class FakeTransport:
@@ -51,21 +52,22 @@ class FakeTransport:
 
 
 def _routing_payload(*, repository="swiftstream/skills", number=7, head_oid="a" * 40, base_oid="b" * 40,
-                     head_ref="proposal", base_ref="main", last_edited_at=None, includes_created_edit=False):
+                     head_ref="proposal", base_ref="main", draft=False, last_edited_at=None, includes_created_edit=False):
     return {"data": {"repository": {"nameWithOwner": repository, "pullRequest": {
         "number": number,
         "headRefOid": head_oid,
         "baseRefOid": base_oid,
         "headRefName": head_ref,
         "baseRefName": base_ref,
+        "isDraft": draft,
         "lastEditedAt": last_edited_at,
         "includesCreatedEdit": includes_created_edit,
     }}}}
 
 
 def _rest_payload(*, body="body", number=7, head_oid="a" * 40, base_oid="b" * 40,
-                  head_ref="proposal", base_ref="main"):
-    return {"number": number, "body": body,
+                  head_ref="proposal", base_ref="main", draft=False):
+    return {"number": number, "body": body, "draft": draft,
             "user": {"login": "alice", "node_id": "U_author"},
             "head": {"sha": head_oid, "ref": head_ref,
                      "repo": {"node_id": "N_head", "full_name": "alice/skills"}},
@@ -1076,6 +1078,41 @@ class GitHubAPITests(unittest.TestCase):
         self.assertEqual(metadata.base_repository, "swiftstream/skills")
         self.assertIsNone(metadata.last_edited_at)
         self.assertFalse(metadata.includes_created_edit)
+        self.assertFalse(metadata.draft)
+
+    def test_pull_draft_is_required_consistent_and_part_of_routing_race_snapshot(self):
+        for value in (True, False):
+            with self.subTest(draft=value):
+                transport = PullMetadataTransport(
+                    before=_routing_payload(draft=value),
+                    rest=_rest_payload(draft=value),
+                    after=_routing_payload(draft=value),
+                )
+                metadata = GitHubClient(None, transport).get_pull_request_metadata("swiftstream/skills", 7)
+                self.assertIs(metadata.draft, value)
+
+        for operation in ("before", "after"):
+            for invalid in (None, 1, "false"):
+                with self.subTest(operation=operation, invalid=invalid):
+                    payload = _routing_payload(draft=invalid)
+                    with self.assertRaises(InvalidResponseError):
+                        GitHubClient(None, PullMetadataTransport(**{operation: payload})).get_pull_request_metadata("swiftstream/skills", 7)
+
+        for invalid in (None, 1, "false"):
+            with self.subTest(rest_draft=invalid):
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, PullMetadataTransport(rest=_rest_payload(draft=invalid))).get_pull_request_metadata("swiftstream/skills", 7)
+        missing = _rest_payload()
+        missing.pop("draft")
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, PullMetadataTransport(rest=missing)).get_pull_request_metadata("swiftstream/skills", 7)
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, PullMetadataTransport(rest=_rest_payload(draft=True))).get_pull_request_metadata("swiftstream/skills", 7)
+
+        before = _routing_payload(draft=False)
+        after = _routing_payload(draft=True)
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, PullMetadataTransport(before=before, after=after)).get_pull_request_metadata("swiftstream/skills", 7)
 
     def test_pull_metadata_null_body_uses_one_exact_fallback_and_preserves_body(self):
         for body in ("", "body from fallback"):
@@ -1096,6 +1133,7 @@ class GitHubAPITests(unittest.TestCase):
         for document in (PULL_REQUEST_ROUTING_BEFORE_QUERY, PULL_REQUEST_ROUTING_AFTER_QUERY):
             self.assertNotIn("body", document)
             self.assertNotIn("author", document)
+            self.assertIn("isDraft", document)
         self.assertIn("body", PULL_REQUEST_BODY_FALLBACK_QUERY)
         self.assertNotIn("author", PULL_REQUEST_BODY_FALLBACK_QUERY)
         old_document = "query FederationPullRequest($owner: String!, $name: String!, $number: Int!) { repository { pullRequest { body author { id } } } }"
@@ -1112,6 +1150,7 @@ class GitHubAPITests(unittest.TestCase):
             ("baseRefName", "other-base"),
             ("lastEditedAt", "2026-09-10T00:00:00Z"),
             ("includesCreatedEdit", True),
+            ("isDraft", True),
         )
         for field, changed in variants:
             with self.subTest(field=field):
@@ -1280,6 +1319,146 @@ class GitHubAPITests(unittest.TestCase):
         with self.assertRaises(InvalidResponseError):
             GitHubClient(None, transport).get_pull_request_metadata("swiftstream/skills", 7)
         self.assertEqual(_call_signature(transport.calls)[1][0:2], ("GET", REST_BASE_URL + "/repos/swiftstream/skills/pulls/7"))
+
+    def test_all_state_pull_request_enumeration_validates_bounds_orders_and_terminates(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, headers, body, timeout))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        for state in ("open", "closed", "all"):
+            transport = PageTransport({1: [{"number": 2}, {"number": 1}]})
+            result = GitHubClient(None, transport).list_pull_requests("swiftstream/skills", state=state)
+            self.assertEqual([item["number"] for item in result], [1, 2])
+            self.assertEqual(
+                transport.calls[0][1],
+                f"{REST_BASE_URL}/repos/swiftstream/skills/pulls?state={state}&per_page=100&page=1",
+            )
+
+        transport = PageTransport({1: [{"number": 2}, {"number": 1}]})
+        self.assertEqual(
+            [item["number"] for item in GitHubClient(None, transport).list_open_pull_requests("swiftstream/skills")],
+            [1, 2],
+        )
+        self.assertIn("?state=open&per_page=100&page=1", transport.calls[0][1])
+
+        for state, pages in (("unknown", 100), ("open", 0), ("open", True), ("open", 101)):
+            transport = PageTransport({1: []})
+            with self.subTest(state=state, max_pages=pages), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).list_pull_requests("swiftstream/skills", state=state, max_pages=pages)
+            self.assertEqual(transport.calls, [])
+
+        full_page = [{"number": number} for number in range(100, 0, -1)]
+        transport = PageTransport({1: full_page})
+        with self.assertRaisesRegex(InvalidResponseError, "bounded pagination exhaustion"):
+            GitHubClient(None, transport).list_pull_requests("swiftstream/skills", state="all", max_pages=1)
+        self.assertEqual(len(transport.calls), 1)
+
+        pages = {1: full_page, 2: [{"number": 102}, {"number": 101}]}
+        transport = PageTransport(pages)
+        result = GitHubClient(None, transport).list_pull_requests("swiftstream/skills", state="closed", max_pages=2)
+        self.assertEqual([item["number"] for item in result], list(range(1, 101)) + [101, 102])
+        self.assertEqual(len(transport.calls), 2)
+        self.assertIn("state=closed&per_page=100&page=2", transport.calls[1][1])
+
+    def test_all_state_pull_request_enumeration_rejects_duplicates_and_malformed_items(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, headers, body, timeout))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        full_page = [{"number": number} for number in range(1, 101)]
+        transport = PageTransport({1: full_page, 2: [{"number": 100}]})
+        with self.assertRaisesRegex(InvalidResponseError, "duplicate"):
+            GitHubClient(None, transport).list_pull_requests("swiftstream/skills", max_pages=2)
+        self.assertEqual(len(transport.calls), 2)
+
+        for malformed in (None, {}, [{"number": True}], [{"number": 0}], [{"number": "7"}], [None]):
+            transport = PageTransport({1: malformed})
+            with self.subTest(malformed=malformed), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).list_pull_requests("swiftstream/skills", max_pages=1)
+
+    def test_issue_pull_request_creation_preserves_canonical_multiline_body_and_draft_false(self):
+        request = parse_request_body(
+            RequestClass.ADD,
+            "Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\nA source\n"
+            "Branch:\nmain\nSkills root:\nskills\nSkill prefixes:\ndemo\n",
+        )
+        body = render_request_body(request)
+        response_url = f"{REST_BASE_URL}/repos/swiftstream/skills/pulls"
+        transport = FakeTransport(HttpResponse(201, response_url, b'{"number":9}'))
+        number = GitHubClient("token", transport).create_issue_pull_request(
+            "swiftstream/skills", head="bot/federation/request/issue-7", base="main", title="Issue request", body=body,
+        )
+        self.assertEqual(number, 9)
+        self.assertEqual(len(transport.calls), 1)
+        method, url, _headers, request_body, _timeout = transport.calls[0]
+        self.assertEqual((method, url), ("POST", response_url))
+        self.assertEqual(json.loads(request_body), {
+            "title": "Issue request",
+            "head": "bot/federation/request/issue-7",
+            "base": "main",
+            "body": body,
+            "draft": False,
+        })
+        self.assertEqual(json.loads(request_body)["body"], body)
+
+    def test_issue_pull_request_creation_rejects_invalid_data_before_transport(self):
+        good = dict(head="bot/federation/request/issue-7", base="main", title="Issue request", body="line one\nline two\n")
+        invalid_heads = (
+            "bot/federation/demo", "owner:bot/federation/request/issue-7",
+            "refs/heads/bot/federation/request/issue-7", "bot/federation/request/issue-01",
+        )
+        for head in invalid_heads:
+            transport = FakeTransport(HttpResponse(201, REST_BASE_URL, b'{"number":9}'))
+            with self.subTest(head=head), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).create_issue_pull_request("swiftstream/skills", **dict(good, head=head))
+            self.assertEqual(transport.calls, [])
+        for base in ("master", "refs/heads/main", "main "):
+            transport = FakeTransport(HttpResponse(201, REST_BASE_URL, b'{"number":9}'))
+            with self.subTest(base=base), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).create_issue_pull_request("swiftstream/skills", **dict(good, base=base))
+            self.assertEqual(transport.calls, [])
+        for body in ("", "x\r\ny", "x\x00y", "x\x7fy", "x\x01y", None):
+            transport = FakeTransport(HttpResponse(201, REST_BASE_URL, b'{"number":9}'))
+            with self.subTest(body=repr(body)), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).create_issue_pull_request("swiftstream/skills", **dict(good, body=body))
+            self.assertEqual(transport.calls, [])
+        for title in ("", "bad\ntitle", "x" * 257, "é" * 129, None):
+            transport = FakeTransport(HttpResponse(201, REST_BASE_URL, b'{"number":9}'))
+            with self.subTest(title=repr(title)[:20]), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).create_issue_pull_request("swiftstream/skills", **dict(good, title=title))
+            self.assertEqual(transport.calls, [])
+
+    def test_issue_pull_request_creation_rejects_oversized_utf8_body_before_transport(self):
+        transport = FakeTransport(HttpResponse(201, REST_BASE_URL, b'{"number":9}'))
+        with self.assertRaises(GitHubAPIError):
+            GitHubClient(None, transport).create_issue_pull_request(
+                "swiftstream/skills", head="bot/federation/request/issue-7", base="main",
+                title="Issue request", body="é" * 8_193,
+            )
+        self.assertEqual(transport.calls, [])
+
+    def test_issue_pull_request_creation_validates_response_number(self):
+        response_url = f"{REST_BASE_URL}/repos/swiftstream/skills/pulls"
+        for value in (None, {}, {"number": 0}, {"number": True}, {"number": "9"}):
+            body = json.dumps(value).encode() if value is not None else b"null"
+            transport = FakeTransport(HttpResponse(201, response_url, body))
+            with self.subTest(value=value), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, transport).create_issue_pull_request(
+                    "swiftstream/skills", head="bot/federation/request/issue-7", base="main",
+                    title="Issue request", body="canonical\nbody\n",
+                )
 
 
 if __name__ == "__main__":

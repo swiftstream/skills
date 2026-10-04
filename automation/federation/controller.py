@@ -37,6 +37,9 @@ from .github_api import (
 )
 from .request_model import (
     ANCHOR_MARKER,
+    ISSUE_REQUEST_ANCHOR_MARKER,
+    ISSUE_INTERNAL_PR_BINDING_MARKER,
+    PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
     REQUEST_MARKER,
     CommentEvent,
@@ -44,6 +47,7 @@ from .request_model import (
     IssuePatchEvent,
     IssueBranchLease,
     IssueRequestAnchor,
+    IssuePRBinding,
     ClaimedHeadMarker,
     PatchFoldResult,
     Request,
@@ -60,12 +64,16 @@ from .request_model import (
     new_carrier_nonce,
     parse_anchor,
     parse_issue_request_anchor,
+    parse_issue_internal_pr_binding,
+    parse_pr_issue_origin_binding,
     parse_issue_branch_lease,
     parse_claimed_head_marker,
     parse_issue_request_body,
     parse_request_body,
+    render_request_body,
     parse_patch,
     proposed_line_refs,
+    reserved_issue_branch_number,
     resolve_publication_lines,
     ISSUE_BRANCH_LEASE_MARKER,
     validate_drop_set,
@@ -148,6 +156,29 @@ class ForkHeadError(R02Error):
 
 class CandidateScopeError(R02Error):
     pass
+
+
+class ReservedIssuePRPendingManagedAuthority(R02Error):
+    """A reserved Issue PR is quarantined until its Wave 04 managed path exists."""
+
+
+_RESERVED_ISSUE_PR_BRANCH_PREFIX = "bot/federation/request/"
+_RESERVED_ISSUE_PR_FULL_REF_PREFIX = f"refs/heads/{_RESERVED_ISSUE_PR_BRANCH_PREFIX}"
+
+
+def _is_reserved_issue_pr_head(head_ref: str) -> bool:
+    """Fail closed for the reserved namespace, including malformed attempts."""
+    try:
+        return reserved_issue_branch_number(head_ref) is not None
+    except RequestModelError:
+        if head_ref.startswith((_RESERVED_ISSUE_PR_BRANCH_PREFIX, _RESERVED_ISSUE_PR_FULL_REF_PREFIX)):
+            return True
+        raise
+
+
+def _raise_if_reserved_issue_pr(pr: PullRequestMetadata) -> None:
+    if _is_reserved_issue_pr_head(pr.head_ref):
+        raise ReservedIssuePRPendingManagedAuthority("reserved Issue PR is quarantined pending Wave 04 managed authority")
 
 
 @dataclass(frozen=True)
@@ -750,6 +781,30 @@ class IssueBranchLeaseComment:
     comment: IssueComment
 
 
+@dataclass(frozen=True)
+class IssuePRBindingState:
+    issue_anchor: IssueAnchorComment
+    lease: IssueBranchLeaseComment
+    binding: IssuePRBinding
+    issue_binding_comment: IssueComment
+    pr_binding_comment: IssueComment
+    pr: PullRequestMetadata
+    pr_issue: IssueMetadata
+
+
+@dataclass(frozen=True)
+class _IssuePRBindingComment:
+    binding: IssuePRBinding
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
+class _IssuePRCandidate:
+    pr: PullRequestMetadata
+    comments: tuple[IssueComment, ...]
+    binding: _IssuePRBindingComment | None
+
+
 def _lease_sha40(value: Any, label: str) -> str:
     if type(value) is not str or not re.fullmatch(r"[0-9a-f]{40}", value):
         raise R02Error(f"{label} is not a canonical Git object SHA")
@@ -1194,6 +1249,578 @@ def create_or_validate_issue_branch_lease(
         raise
     except Exception as error:
         raise R02Error(f"IssueBranchLease creation failed closed: {_bounded_reason(error)}") from None
+
+
+def _issue_pr_authority_fence(comments: Iterable[IssueComment], app: AppIdentity) -> None:
+    allowed = (
+        ISSUE_REQUEST_ANCHOR_MARKER,
+        ISSUE_BRANCH_LEASE_MARKER,
+        ISSUE_INTERNAL_PR_BINDING_MARKER,
+    )
+    reserved_prefix = "<!-- swiftstream-federation-issue-"
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(reserved_prefix):
+            continue
+        if (
+            comment.author_id != app.bot_node_id
+            or comment.author_login != app.bot_login
+            or comment.author_type not in {None, "Bot"}
+            or _issue_comment_edited(comment)
+        ):
+            continue
+        if not any(comment.body.startswith(marker) for marker in allowed):
+            raise R02Error("unrecognized reserved Issue authority marker blocks Wave 03 progression")
+
+
+def _binding_comment_candidates(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    marker: str,
+    parser: Callable[[str], IssuePRBinding],
+    label: str,
+) -> tuple[_IssuePRBindingComment, ...]:
+    found: list[_IssuePRBindingComment] = []
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(marker):
+            continue
+        try:
+            binding = parser(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed {label}: {_bounded_reason(error)}") from None
+        if (
+            comment.author_id != app.bot_node_id
+            or comment.author_login != app.bot_login
+            or comment.author_type not in {None, "Bot"}
+            or _issue_comment_edited(comment)
+        ):
+            raise R02Error(f"{label} authorship/edit integrity is invalid")
+        found.append(_IssuePRBindingComment(binding, comment))
+    if len(found) > 1:
+        raise R02Error(f"duplicate {label} comments block progression")
+    return tuple(found)
+
+
+def _binding_comment_sha256(comment: IssueComment) -> str:
+    try:
+        return hashlib.sha256(comment.body.encode("utf-8")).hexdigest()
+    except (AttributeError, UnicodeEncodeError):
+        raise R02Error("binding provenance comment body is not valid UTF-8 text") from None
+
+
+def _validate_issue_binding_cross_link(
+    binding: IssuePRBinding,
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment,
+    central_repository_node_id: str,
+) -> None:
+    expected = (
+        anchor.anchor.issue_number,
+        anchor.anchor.issue_database_id,
+        anchor.anchor.issue_node_id,
+        anchor.comment.database_id,
+        anchor.anchor.canonical_sha256(),
+        lease.comment.database_id,
+        _binding_comment_sha256(lease.comment),
+        anchor.anchor.source_id,
+        anchor.anchor.source_repository_id,
+        lease.lease.branch_ref,
+        lease.lease.initial_head_sha,
+        "main",
+        central_repository_node_id,
+    )
+    actual = (
+        binding.issue_number,
+        binding.issue_database_id,
+        binding.issue_node_id,
+        binding.issue_request_anchor_comment_database_id,
+        binding.issue_request_anchor_sha256,
+        binding.issue_branch_lease_comment_database_id,
+        binding.issue_branch_lease_sha256,
+        binding.source_id,
+        binding.source_repository_id,
+        binding.branch_ref,
+        binding.initial_head_sha,
+        binding.base_ref,
+        binding.central_repository_node_id,
+    )
+    if actual != expected:
+        raise R02Error("IssuePRBinding does not cross-bind the exact Issue anchor and branch lease")
+
+
+def _read_issue_pr_intake(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+) -> tuple[
+    IssueMetadata,
+    tuple[IssueComment, ...],
+    IssueAnchorComment,
+    IssueBranchLeaseComment,
+    RepositoryMetadata,
+    tuple[_IssuePRBindingComment, ...],
+]:
+    try:
+        issue = client.get_issue_metadata(repository, issue_number)
+        if (
+            type(issue) is not IssueMetadata
+            or issue.number != issue_number
+            or issue.is_pull_request
+            or issue.state != "open"
+        ):
+            raise R02Error("Wave 03 requires the exact open Issue, not a PullRequest")
+        comments = tuple(client.list_issue_comments(repository, issue_number))
+        anchor = validate_unique_issue_anchor(comments, issue, app)
+        leases = _resolve_issue_branch_lease_class(
+            client,
+            repository,
+            comments,
+            app,
+            anchor.anchor,
+            anchor.comment.database_id,
+            central_repository_node_id,
+        )
+        if leases is None:
+            raise R02Error("one canonical IssueBranchLease is required before Wave 03")
+        _fresh_issue_source_authority(source_authority_resolver, anchor.anchor)
+        repo = client.get_repository_metadata(repository)
+        if (
+            type(repo) is not RepositoryMetadata
+            or repo.node_id != central_repository_node_id
+            or repo.full_name != repository
+            or repo.default_branch != "main"
+        ):
+            raise StaleAuthorityError("central repository identity or default branch changed")
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"fresh Issue/lease/repository authority is unavailable: {_bounded_reason(error)}") from None
+
+    _issue_pr_authority_fence(comments, app)
+    binding_comments = _binding_comment_candidates(
+        comments, app, ISSUE_INTERNAL_PR_BINDING_MARKER,
+        parse_issue_internal_pr_binding, "IssueInternalPRBinding",
+    )
+    for item in binding_comments:
+        _validate_issue_binding_cross_link(item.binding, anchor, leases, central_repository_node_id)
+    return issue, comments, anchor, leases, repo, binding_comments
+
+
+def _same_issue_pr_intake(
+    initial: tuple[IssueMetadata, tuple[IssueComment, ...], IssueAnchorComment, IssueBranchLeaseComment, RepositoryMetadata, tuple[_IssuePRBindingComment, ...]],
+    fresh: tuple[IssueMetadata, tuple[IssueComment, ...], IssueAnchorComment, IssueBranchLeaseComment, RepositoryMetadata, tuple[_IssuePRBindingComment, ...]],
+) -> None:
+    if (
+        fresh[2].anchor != initial[2].anchor
+        or fresh[2].comment.database_id != initial[2].comment.database_id
+        or fresh[2].comment.body != initial[2].comment.body
+        or fresh[3].lease != initial[3].lease
+        or fresh[3].comment.database_id != initial[3].comment.database_id
+        or fresh[3].comment.body != initial[3].comment.body
+        or fresh[4].node_id != initial[4].node_id
+        or fresh[4].full_name != initial[4].full_name
+        or fresh[4].default_branch != initial[4].default_branch
+    ):
+        raise StaleAuthorityError("Issue anchor, lease, or central repository changed during Wave 03")
+
+
+def _read_issue_branch_ref(client: GitHubClient, repository: str, short_ref: str) -> str | None:
+    try:
+        return _lease_sha40(client.get_ref_oid(repository, short_ref), "leased Issue branch head")
+    except NotFoundError:
+        return None
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"leased Issue branch ref is unavailable: {_bounded_reason(error)}") from None
+
+
+def _enumerate_issue_pr_candidates(
+    client: GitHubClient,
+    repository: str,
+    short_ref: str,
+    app: AppIdentity,
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment,
+    central_repository_node_id: str,
+) -> tuple[_IssuePRCandidate, ...]:
+    try:
+        raw_items = client.list_pull_requests(repository, state="all")
+        if type(raw_items) not in {tuple, list}:
+            raise R02Error("all-state PR enumeration must return a sequence")
+        seen_numbers: set[int] = set()
+        candidates: list[_IssuePRCandidate] = []
+        for raw in raw_items:
+            if type(raw) is not dict or type(raw.get("number")) is not int or not 1 <= raw["number"] <= 9_223_372_036_854_775_807:
+                raise R02Error("all-state PR enumeration contains an invalid number")
+            number = raw["number"]
+            if number in seen_numbers:
+                raise R02Error("all-state PR enumeration contains duplicate numbers")
+            seen_numbers.add(number)
+            pr = client.get_pull_request_metadata(repository, number)
+            if type(pr) is not PullRequestMetadata or pr.number != number:
+                raise R02Error("composite PR metadata does not match the enumerated PR number")
+            if pr.head_ref == short_ref and pr.head_repository_id != central_repository_node_id:
+                raise R02Error("foreign repository PR collides with the reserved Issue branch name")
+            if pr.head_ref != short_ref or pr.head_repository_id != central_repository_node_id:
+                continue
+            comments = tuple(client.list_issue_comments(repository, number))
+            binding_comments = _binding_comment_candidates(
+                comments, app, PR_ISSUE_ORIGIN_BINDING_MARKER,
+                parse_pr_issue_origin_binding, "PRIssueOriginBinding",
+            )
+            binding_item = binding_comments[0] if binding_comments else None
+            if binding_item is not None:
+                _validate_issue_binding_cross_link(binding_item.binding, anchor, lease, central_repository_node_id)
+                if binding_item.binding.pull_request_number != number:
+                    raise R02Error("PRIssueOriginBinding names a different PR number")
+            candidates.append(_IssuePRCandidate(pr, comments, binding_item))
+        return tuple(candidates)
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"all-state reserved-head PR inventory failed: {_bounded_reason(error)}") from None
+
+
+def _validate_generated_issue_pr(
+    client: GitHubClient,
+    repository: str,
+    number: int,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment,
+) -> tuple[PullRequestMetadata, IssueMetadata, tuple[IssueComment, ...], tuple[_IssuePRBindingComment, ...]]:
+    try:
+        pr = client.get_pull_request_metadata(repository, number)
+        pr_issue = client.get_issue_metadata(repository, number)
+        comments = tuple(client.list_issue_comments(repository, number))
+    except Exception as error:
+        raise StaleAuthorityError(f"generated Issue PR composite state is unavailable: {_bounded_reason(error)}") from None
+    expected_body = render_request_body(anchor.anchor.initial_request)
+    short_ref = lease.lease.branch_ref.removeprefix("refs/heads/")
+    if type(pr) is not PullRequestMetadata or pr.number != number:
+        raise R02Error("reserved-head candidate has invalid composite PR identity")
+    if (
+        pr.author_id != app.bot_node_id
+        or pr.author_login != app.bot_login
+        or pr.head_oid != lease.lease.initial_head_sha
+        or pr.head_ref != short_ref
+        or pr.head_repository_id != central_repository_node_id
+        or pr.head_repository != repository
+        or pr.base_repository_id != central_repository_node_id
+        or pr.base_repository != repository
+        or pr.base_ref != "main"
+        or pr.draft is not False
+        or pr.body != expected_body
+        or pr.last_edited_at is not None
+        or pr.includes_created_edit is not False
+    ):
+        raise R02Error("reserved-head PR is not the exact open nondraft App-generated Issue PR")
+    if (
+        type(pr_issue) is not IssueMetadata
+        or pr_issue.is_pull_request is not True
+        or pr_issue.number != number
+        or type(pr_issue.database_id) is not int
+        or not 1 <= pr_issue.database_id <= 9_223_372_036_854_775_807
+        or type(pr_issue.node_id) is not str
+        or not pr_issue.node_id
+        or c02.contains_control(pr_issue.node_id)
+        or pr_issue.author_id != pr.author_id
+        or pr_issue.author_login != pr.author_login
+        or pr_issue.state != "open"
+        or pr_issue.body != pr.body
+    ):
+        raise R02Error("PR-as-Issue identity/state/body does not match the generated PR")
+    binding_comments = _binding_comment_candidates(
+        comments, app, PR_ISSUE_ORIGIN_BINDING_MARKER,
+        parse_pr_issue_origin_binding, "PRIssueOriginBinding",
+    )
+    return pr, pr_issue, comments, binding_comments
+
+
+def _intended_issue_pr_binding(
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment,
+    pr: PullRequestMetadata,
+    pr_issue: IssueMetadata,
+    central_repository_node_id: str,
+) -> IssuePRBinding:
+    return IssuePRBinding.create(
+        schema_version=1,
+        issue_number=anchor.anchor.issue_number,
+        issue_database_id=anchor.anchor.issue_database_id,
+        issue_node_id=anchor.anchor.issue_node_id,
+        issue_request_anchor_comment_database_id=anchor.comment.database_id,
+        issue_request_anchor_sha256=anchor.anchor.canonical_sha256(),
+        issue_branch_lease_comment_database_id=lease.comment.database_id,
+        issue_branch_lease_sha256=_binding_comment_sha256(lease.comment),
+        source_id=anchor.anchor.source_id,
+        source_repository_id=anchor.anchor.source_repository_id,
+        branch_ref=lease.lease.branch_ref,
+        pull_request_number=pr.number,
+        pull_request_database_id=pr_issue.database_id,
+        pull_request_node_id=pr_issue.node_id,
+        initial_head_sha=lease.lease.initial_head_sha,
+        base_ref="main",
+        central_repository_node_id=central_repository_node_id,
+    )
+
+
+def _require_binding_equals(
+    candidates: tuple[_IssuePRBindingComment, ...],
+    intended: IssuePRBinding,
+    label: str,
+) -> IssueComment | None:
+    if not candidates:
+        return None
+    if candidates[0].binding != intended:
+        raise R02Error(f"existing {label} conflicts with the exact intended IssuePRBinding")
+    return candidates[0].comment
+
+
+def _fresh_issue_pr_binding_snapshot(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+    initial: tuple[IssueMetadata, tuple[IssueComment, ...], IssueAnchorComment, IssueBranchLeaseComment, RepositoryMetadata, tuple[_IssuePRBindingComment, ...]],
+    pr_number: int,
+    intended: IssuePRBinding,
+) -> tuple[IssuePRBindingState | None, tuple[IssueMetadata, tuple[IssueComment, ...], IssueAnchorComment, IssueBranchLeaseComment, RepositoryMetadata, tuple[_IssuePRBindingComment, ...]], PullRequestMetadata, IssueMetadata, tuple[IssueComment, ...], tuple[_IssuePRBindingComment, ...]]:
+    fresh = _read_issue_pr_intake(
+        client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+    )
+    _same_issue_pr_intake(initial, fresh)
+    issue_binding_candidates = fresh[5]
+    short_ref = fresh[3].lease.branch_ref.removeprefix("refs/heads/")
+    if _read_issue_branch_ref(client, repository, short_ref) != fresh[3].lease.initial_head_sha:
+        raise StaleAuthorityError("leased Issue branch ref moved during two-sided binding")
+    _validate_issue_branch_lease_history(client, repository, fresh[2].anchor, fresh[3].lease)
+    candidates = _enumerate_issue_pr_candidates(
+        client, repository, short_ref, app, fresh[2], fresh[3], central_repository_node_id,
+    )
+    if len(candidates) != 1 or candidates[0].pr.number != pr_number:
+        raise StaleAuthorityError("exact generated Issue PR is no longer the sole reserved-head candidate")
+    pr, pr_issue, comments, pr_binding_candidates = _validate_generated_issue_pr(
+        client, repository, pr_number, app, central_repository_node_id, fresh[2], fresh[3],
+    )
+    expected = _intended_issue_pr_binding(fresh[2], fresh[3], pr, pr_issue, central_repository_node_id)
+    if expected != intended:
+        raise StaleAuthorityError("intended IssuePRBinding changed during fresh revalidation")
+    issue_binding_comment = _require_binding_equals(fresh[5], intended, "IssueInternalPRBinding")
+    pr_binding_comment = _require_binding_equals(pr_binding_candidates, intended, "PRIssueOriginBinding")
+    complete = None
+    if issue_binding_comment is not None and pr_binding_comment is not None:
+        complete = IssuePRBindingState(
+            fresh[2], fresh[3], intended, issue_binding_comment, pr_binding_comment, pr, pr_issue,
+        )
+    return complete, fresh, pr, pr_issue, comments, pr_binding_candidates
+
+
+def _write_issue_pr_binding_side(
+    client: GitHubClient,
+    repository: str,
+    number: int,
+    binding: IssuePRBinding,
+    app: AppIdentity,
+    *,
+    issue_side: bool,
+) -> IssueComment:
+    marker = ISSUE_INTERNAL_PR_BINDING_MARKER if issue_side else PR_ISSUE_ORIGIN_BINDING_MARKER
+    parser = parse_issue_internal_pr_binding if issue_side else parse_pr_issue_origin_binding
+    label = "IssueInternalPRBinding" if issue_side else "PRIssueOriginBinding"
+    body = binding.render_issue_binding() if issue_side else binding.render_pr_origin_binding()
+    try:
+        client.create_issue_comment(repository, number, body)
+    except GitHubAPIError as error:
+        try:
+            comments = tuple(client.list_issue_comments(repository, number))
+        except Exception as read_error:
+            raise StaleAuthorityError(
+                f"ambiguous {label} POST and target surface could not be diagnosed: {_bounded_reason(read_error)}"
+            ) from None
+        candidates = _binding_comment_candidates(comments, app, marker, parser, label)
+        if candidates and candidates[0].binding != binding:
+            raise R02Error(f"conflicting {label} evidence appeared after ambiguous POST") from None
+        raise StaleAuthorityError(
+            f"ambiguous {label} POST; stop this invocation and reread on a later invocation: {_bounded_reason(error)}"
+        ) from None
+    try:
+        comments = tuple(client.list_issue_comments(repository, number))
+    except Exception as error:
+        raise StaleAuthorityError(f"persisted {label} could not be reread: {_bounded_reason(error)}") from None
+    candidates = _binding_comment_candidates(comments, app, marker, parser, label)
+    if not candidates or candidates[0].binding != binding:
+        raise StaleAuthorityError(f"persisted {label} is absent or differs from the exact intended payload")
+    return candidates[0].comment
+
+
+def create_or_recover_issue_pr_binding(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+) -> IssuePRBindingState:
+    """Expose exactly the historical leased head, recover one exact PR, and persist its immutable two-sided binding."""
+    if type(issue_number) is not int or not 1 <= issue_number <= 9_223_372_036_854_775_807:
+        raise R02Error("Issue number must be a positive signed-64 integer")
+    if not callable(source_authority_resolver):
+        raise R02Error("a fresh Issue source-authority resolver is required")
+    initial = _read_issue_pr_intake(
+        client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+    )
+    issue, _comments, anchor, lease, _repo, issue_binding_candidates = initial
+    short_ref = lease.lease.branch_ref.removeprefix("refs/heads/")
+    if lease.lease.branch_ref != issue_branch_ref(issue_number):
+        raise R02Error("canonical IssueBranchLease ref does not match the requested Issue")
+
+    # Revalidate every authority input immediately before the ref ownership inventory.
+    fresh = _read_issue_pr_intake(
+        client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+    )
+    _same_issue_pr_intake(initial, fresh)
+    issue_binding_candidates = fresh[5]
+    inventory = _enumerate_issue_pr_candidates(
+        client, repository, short_ref, app, anchor, lease, central_repository_node_id,
+    )
+    if len(inventory) > 1:
+        raise R02Error("duplicate exact reserved-head PR candidates block Wave 03")
+    if issue_binding_candidates and not inventory:
+        raise R02Error("IssueInternalPRBinding points to a missing reserved-head PR")
+    if issue_binding_candidates and inventory and issue_binding_candidates[0].binding.pull_request_number != inventory[0].pr.number:
+        raise R02Error("IssueInternalPRBinding PR number disagrees with reserved-head candidate")
+
+    current_ref = _read_issue_branch_ref(client, repository, short_ref)
+    if current_ref is None:
+        if issue_binding_candidates:
+            raise R02Error("an existing IssuePRBinding cannot recreate an absent leased ref")
+        if inventory or any(candidate.binding is not None for candidate in inventory):
+            raise R02Error("an existing reserved-head PR/binding blocks recreation of an absent leased ref")
+        exact_create = RefUpdate(
+            name=lease.lease.branch_ref,
+            before_oid=ZERO_OID,
+            after_oid=lease.lease.initial_head_sha,
+            force=False,
+        )
+        try:
+            client.update_refs(central_repository_node_id, [exact_create])
+        except RefCASConflict as error:
+            if _read_issue_branch_ref(client, repository, short_ref) != lease.lease.initial_head_sha:
+                raise StaleAuthorityError(f"leased ref CAS conflicted without exact readback recovery: {_bounded_reason(error)}") from None
+        except GitHubAPIError as error:
+            if _read_issue_branch_ref(client, repository, short_ref) != lease.lease.initial_head_sha:
+                raise StaleAuthorityError(f"ambiguous leased ref CAS did not read back the exact lease head: {_bounded_reason(error)}") from None
+        if _read_issue_branch_ref(client, repository, short_ref) != lease.lease.initial_head_sha:
+            raise StaleAuthorityError("leased ref create did not read back the exact initialHeadSha")
+    elif current_ref != lease.lease.initial_head_sha:
+        raise R02Error("leased Issue branch is already owned by a different head")
+
+    # The historical lease remains valid even when current main has advanced.
+    _validate_issue_branch_lease_history(client, repository, anchor.anchor, lease.lease)
+    after_ref = _read_issue_pr_intake(
+        client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+    )
+    _same_issue_pr_intake(initial, after_ref)
+    issue_binding_candidates = after_ref[5]
+    if _read_issue_branch_ref(client, repository, short_ref) != lease.lease.initial_head_sha:
+        raise StaleAuthorityError("leased Issue ref changed after exact create/recovery")
+    inventory = _enumerate_issue_pr_candidates(
+        client, repository, short_ref, app, anchor, lease, central_repository_node_id,
+    )
+    if len(inventory) > 1:
+        raise R02Error("duplicate exact reserved-head PR candidates block Wave 03")
+    if issue_binding_candidates and not inventory:
+        raise R02Error("IssueInternalPRBinding points to a missing reserved-head PR")
+
+    created_number: int | None = None
+    create_error: GitHubAPIError | None = None
+    if not inventory:
+        before_create = _read_issue_pr_intake(
+            client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+        )
+        _same_issue_pr_intake(initial, before_create)
+        issue_binding_candidates = before_create[5]
+        if before_create[5]:
+            raise R02Error("IssueInternalPRBinding appeared before PR creation")
+        if _read_issue_branch_ref(client, repository, short_ref) != lease.lease.initial_head_sha:
+            raise StaleAuthorityError("leased ref changed before exact Issue PR creation")
+        _validate_issue_branch_lease_history(client, repository, anchor.anchor, lease.lease)
+        latest_inventory = _enumerate_issue_pr_candidates(
+            client, repository, short_ref, app, anchor, lease, central_repository_node_id,
+        )
+        if len(latest_inventory) > 1:
+            raise R02Error("duplicate exact reserved-head PR candidates block Issue PR creation")
+        if latest_inventory:
+            inventory = latest_inventory
+        else:
+            title = f"Federation request #{issue_number}: {anchor.anchor.request_class.value}"
+            body = render_request_body(anchor.anchor.initial_request)
+            try:
+                created_number = client.create_issue_pull_request(
+                    repository, head=short_ref, base="main", title=title, body=body,
+                )
+            except GitHubAPIError as error:
+                create_error = error
+            inventory = _enumerate_issue_pr_candidates(
+                client, repository, short_ref, app, anchor, lease, central_repository_node_id,
+            )
+            if len(inventory) != 1:
+                if len(inventory) > 1:
+                    raise R02Error("PR create response recovery found duplicate reserved-head candidates")
+                reason = _bounded_reason(create_error) if create_error is not None else "successful response had no exact candidate"
+                raise StaleAuthorityError(f"Issue PR create did not recover one exact candidate; no same-invocation retry: {reason}") from None
+            if created_number is not None and inventory[0].pr.number != created_number:
+                raise R02Error("created PR number does not match the sole exact reserved-head candidate")
+    if len(inventory) != 1:
+        raise R02Error("exactly one all-state reserved-head PR candidate is required")
+    pr_number = inventory[0].pr.number
+    if issue_binding_candidates and issue_binding_candidates[0].binding.pull_request_number != pr_number:
+        raise R02Error("IssueInternalPRBinding PR number disagrees with its candidate")
+
+    pr, pr_issue, _pr_comments, pr_binding_candidates = _validate_generated_issue_pr(
+        client, repository, pr_number, app, central_repository_node_id, anchor, lease,
+    )
+    intended = _intended_issue_pr_binding(anchor, lease, pr, pr_issue, central_repository_node_id)
+    issue_binding_comment = _require_binding_equals(issue_binding_candidates, intended, "IssueInternalPRBinding")
+    pr_binding_comment = _require_binding_equals(pr_binding_candidates, intended, "PRIssueOriginBinding")
+    # Ordered repair: when both are missing, persist the Issue side first.
+    for issue_side in (True, False):
+        fresh_result = _fresh_issue_pr_binding_snapshot(
+            client, repository, issue_number, app, central_repository_node_id,
+            source_authority_resolver, initial, pr_number, intended,
+        )
+        complete, fresh, fresh_pr, fresh_pr_issue, fresh_pr_comments, fresh_pr_bindings = fresh_result
+        if complete is not None:
+            return complete
+        if issue_side:
+            present = _require_binding_equals(fresh[5], intended, "IssueInternalPRBinding")
+            if present is not None:
+                continue
+            _write_issue_pr_binding_side(
+                client, repository, issue_number, intended, app, issue_side=True,
+            )
+        else:
+            present = _require_binding_equals(fresh_pr_bindings, intended, "PRIssueOriginBinding")
+            if present is not None:
+                continue
+            _write_issue_pr_binding_side(
+                client, repository, pr_number, intended, app, issue_side=False,
+            )
+
+    final = _fresh_issue_pr_binding_snapshot(
+        client, repository, issue_number, app, central_repository_node_id,
+        source_authority_resolver, initial, pr_number, intended,
+    )[0]
+    if final is None:
+        raise StaleAuthorityError("final cross-validation did not find the exact complete two-sided IssuePRBinding")
+    return final
 
 
 def capture_snapshot(pr: PullRequestMetadata, comments: Iterable[IssueComment], anchor: AnchorComment) -> RequestSnapshot:
@@ -2477,6 +3104,7 @@ class R02Controller:
     def anchor_and_reconstruct_existing(self, pr_number: int, request_class: RequestClass, semantic_validator: Callable[[Request], bool] | None = None) -> tuple[PullRequestMetadata, AnchorComment, PatchFoldResult, tuple[IssueComment, ...]]:
         pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
         require_same_repository_head(pr, self.central_repository)
+        _raise_if_reserved_issue_pr(pr)
         comments = self.client.list_issue_comments(self.central_repository, pr.number)
         anchor = validate_unique_anchor(comments, pr, request_class, self.app)
         return pr, anchor, reconstruct_from_github(self.client, self.central_repository, pr, anchor, comments, semantic_validator), comments
@@ -2484,6 +3112,7 @@ class R02Controller:
     def interactive_anchor_and_reconstruct(self, pr_number: int, request_class: RequestClass, semantic_validator: Callable[[Request], bool] | None = None) -> tuple[PullRequestMetadata, AnchorComment, PatchFoldResult, tuple[IssueComment, ...]]:
         pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
         require_same_repository_head(pr, self.central_repository)
+        _raise_if_reserved_issue_pr(pr)
         comments = self.client.list_issue_comments(self.central_repository, pr.number)
         if not _anchor_candidates(comments):
             create_anchor_once(self.client, self.central_repository, pr, request_class, self.app, comments)
@@ -2493,6 +3122,9 @@ class R02Controller:
         return pr, anchor, reconstruct_from_github(self.client, self.central_repository, pr, anchor, comments, semantic_validator), comments
 
     def interactive_proposal(self, pr_number: int, request_class: RequestClass, accepted_base_sha: str, request_ref: str, *, semantic_validator: Callable[[Request], bool] | None = None) -> ProposalCandidate:
+        pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+        require_same_repository_head(pr, self.central_repository)
+        _raise_if_reserved_issue_pr(pr)
         if request_class not in MANUAL_CLASSES:
             raise R02Error("interactive proposal class is not an R02 manual class")
         if self.candidate_builder is None:
@@ -2550,6 +3182,7 @@ class R02Controller:
 
     def trusted_validation(self, pr_number: int, accepted_base_sha: str, candidate_check: Callable[[], tuple[bool, str]], *, expected_head_sha: str | None = None, allow_success: bool = False) -> TrustedValidationResult:
         pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+        _raise_if_reserved_issue_pr(pr)
         if expected_head_sha is not None and pr.head_oid != expected_head_sha:
             return TrustedValidationResult("failure", bounded_check_output(RequestClass.UNRELATED, expected_head_sha, accepted_base_sha, reason="VALIDATION_HEAD_CHANGED"))
         try:
@@ -2846,6 +3479,10 @@ class R02Controller:
                     or pr.base_ref != repository.default_branch
                 ):
                     continue
+                if _is_reserved_issue_pr_head(pr.head_ref):
+                    # Wave 04 owns normalization for Issue-managed PRs, regardless
+                    # of binding completeness or whether this base is stale.
+                    continue
                 comments = self.client.list_issue_comments(self.central_repository, number)
                 anchors = _anchor_candidates(comments)
                 if pr.base_oid != current_main:
@@ -2883,6 +3520,8 @@ class R02Controller:
         if type(number) is not int or number <= 0:
             raise R02Error("finalizer PR summary has an invalid number")
         pr = self.client.get_pull_request_metadata(self.central_repository, number)
+        if _is_reserved_issue_pr_head(pr.head_ref):
+            return
         comments = self.client.list_issue_comments(self.central_repository, number)
         anchors = _anchor_candidates(comments)
         if len(anchors) != 1 or anchors[0].anchor.request_class not in MANUAL_CLASSES:
@@ -3005,6 +3644,7 @@ def main(argv: list[str] | None = None) -> int:
     number: int | None = None
     result_kind = "proposal"
     result_identity: int | None = None
+    reserved_issue_pr = False
     fresh_wake_dispatched = False
 
     def wake_fresh_finalizer() -> None:
@@ -3042,6 +3682,10 @@ def main(argv: list[str] | None = None) -> int:
             if number is None:
                 raise R02Error("authoritative PR number is unavailable")
             if args.command == "interactive":
+                initial_pr = client.get_pull_request_metadata(repository, number)
+                if _is_reserved_issue_pr_head(initial_pr.head_ref):
+                    reserved_issue_pr = True
+                    raise ReservedIssuePRPendingManagedAuthority("reserved Issue PR is quarantined pending Wave 04 managed authority")
                 comments = client.list_issue_comments(repository, number)
                 anchors = _anchor_candidates(comments)
                 if anchors:
@@ -3087,6 +3731,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 _repo, accepted_main = controller.current_accepted_main()
                 initial_pr = client.get_pull_request_metadata(repository, number)
+                if _is_reserved_issue_pr_head(initial_pr.head_ref):
+                    reserved_issue_pr = True
+                    raise ReservedIssuePRPendingManagedAuthority("reserved Issue PR is quarantined pending Wave 04 managed authority")
                 comments = client.list_issue_comments(repository, number)
                 if not _anchor_candidates(comments) and _MACHINE_BRANCH_RE.fullmatch(initial_pr.head_ref):
                     result = controller.trusted_machine_validation(number, accepted_main, expected_head_sha=initial_pr.head_oid)
@@ -3141,7 +3788,7 @@ def main(argv: list[str] | None = None) -> int:
                 wake_fresh_finalizer()
             except Exception:
                 pass
-        if args.command == "interactive" and client is not None and number is not None:
+        if args.command == "interactive" and client is not None and number is not None and not reserved_issue_pr:
             try:
                 comments = client.list_issue_comments(repository, number)
                 identity = result_identity

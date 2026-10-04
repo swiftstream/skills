@@ -12,6 +12,7 @@ from automation.federation.controller import (
     DuplicateAnchorError,
     IssueAnchorComment,
     IssueBranchLeaseComment,
+    IssuePRBindingState,
     IssueSourceAuthority,
     IssueSourceIdentityKind,
     PhaseNotImplementedError,
@@ -22,6 +23,7 @@ from automation.federation.controller import (
     classify_request,
     create_or_validate_issue_anchor,
     create_or_validate_issue_branch_lease,
+    create_or_recover_issue_pr_binding,
     parse_c02_manifest,
     reconstruct_issue_from_github,
     resolve_issue_source_authority,
@@ -30,9 +32,12 @@ from automation.federation.controller import (
 from automation.federation.request_model import (
     ISSUE_REQUEST_ANCHOR_MARKER,
     ISSUE_BRANCH_LEASE_MARKER,
+    ISSUE_INTERNAL_PR_BINDING_MARKER,
+    PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
     CommentEvent,
     IssueRequestAnchor,
+    IssuePRBinding,
     IssueBranchLease,
     RequestClass,
     RequestAnchor,
@@ -40,15 +45,23 @@ from automation.federation.request_model import (
     parse_request_body,
     parse_issue_request_body,
     parse_issue_branch_lease,
+    parse_issue_internal_pr_binding,
+    parse_pr_issue_origin_binding,
     issue_branch_ref,
+    render_request_body,
 )
 from automation.federation.github_api import (
+    GitHubAPIError,
     GitCommitMetadata,
     GitObject,
     GitTreeEntry,
     IssueComment,
     IssueMetadata,
+    NotFoundError,
+    PullRequestMetadata,
+    RefCASConflict,
     RepositoryMetadata,
+    ZERO_OID,
 )
 from scripts import federate as c02
 
@@ -1015,6 +1028,629 @@ class IssueBranchLeaseControllerTests(unittest.TestCase):
                 self.assertEqual(client.commit_calls, [])
                 self.assertEqual(client.comment_writes, [])
                 self.assertEqual(client.forbidden_calls, [])
+
+class IssuePRBindingControllerTests(unittest.TestCase):
+    APP = IssueBranchLeaseControllerTests.APP
+    CENTRAL_REPOSITORY = IssueBranchLeaseControllerTests.CENTRAL_REPOSITORY
+    CENTRAL_NODE_ID = IssueBranchLeaseControllerTests.CENTRAL_NODE_ID
+
+    class Client(IssueBranchLeaseControllerTests.Client):
+        APP = IssueBranchLeaseControllerTests.APP
+        CENTRAL_REPOSITORY = IssueBranchLeaseControllerTests.CENTRAL_REPOSITORY
+        CENTRAL_NODE_ID = IssueBranchLeaseControllerTests.CENTRAL_NODE_ID
+
+        def __init__(
+            self,
+            issue,
+            anchor_comment,
+            *,
+            ref_write_error=None,
+            persist_ref_on_error=True,
+            pr_create_error_after_persist=None,
+            persist_pr_on_error=True,
+            ambiguous_binding_side=None,
+            persist_ambiguous_binding=True,
+            **kwargs,
+        ):
+            super().__init__(issue, anchor_comment, **kwargs)
+            self.current_ref = None
+            self.ref_reads = []
+            self.ref_writes = []
+            self.ref_write_error = ref_write_error
+            self.persist_ref_on_error = persist_ref_on_error
+            self.pull_requests = {}
+            self.pull_request_issues = {}
+            self.pr_comments = {}
+            self.pr_create_calls = []
+            self.pr_create_error_after_persist = pr_create_error_after_persist
+            self.persist_pr_on_error = persist_pr_on_error
+            self.pr_create_number = 81
+            self.binding_posts = []
+            self.ambiguous_binding_side = ambiguous_binding_side
+            self.persist_ambiguous_binding = persist_ambiguous_binding
+            self.next_comment_database_id = 2000
+            self.after_binding_callback = None
+            self.current_main_sha = IssueBranchLeaseControllerTests.BASE_SHA
+            self.binding_anchor = None
+            self.binding_lease = None
+            self.update_branch_calls = []
+            self.state_updates = []
+
+        def get_ref_oid(self, repository, branch):
+            self.ref_reads.append(branch)
+            if branch == "main":
+                return self.current_main_sha
+            expected_short = issue_branch_ref(self.issue.number).removeprefix("refs/heads/")
+            if branch != expected_short:
+                raise AssertionError(f"unexpected ref read: {branch}")
+            if self.current_ref is None:
+                raise NotFoundError("ref not found")
+            return self.current_ref
+
+        def update_refs(self, repository_id, updates):
+            self.ref_writes.append((repository_id, tuple(updates)))
+            update = updates[0]
+            if (
+                repository_id != self.CENTRAL_NODE_ID
+                or len(updates) != 1
+                or update.name != issue_branch_ref(self.issue.number)
+                or update.before_oid != ZERO_OID
+                or update.after_oid != self.current_head
+                or update.force is not False
+            ):
+                raise AssertionError("Wave 03 requires exact ZERO_OID -> lease.initialHeadSha force=false CAS")
+            if self.ref_write_error is not None:
+                if self.persist_ref_on_error:
+                    self.current_ref = update.after_oid
+                raise self.ref_write_error
+            if self.current_ref is not None:
+                raise RefCASConflict("branch already exists")
+            self.current_ref = update.after_oid
+
+        def get_issue_metadata(self, repository, number):
+            if number == self.issue.number:
+                return self.issue
+            return self.pull_request_issues[number]
+
+        def list_issue_comments(self, repository, number):
+            if number == self.issue.number:
+                return tuple(self.comments)
+            return tuple(self.pr_comments.get(number, ()))
+
+        def list_pull_requests(self, repository, *, state="open", max_pages=100):
+            if state != "all":
+                raise AssertionError("Wave 03 candidate recovery must enumerate all PR states")
+            return tuple({"number": number} for number in sorted(self.pull_requests))
+
+        def get_pull_request_metadata(self, repository, number):
+            return self.pull_requests[number]
+
+        def add_candidate(self, *, number=81, **changes):
+            anchor = self.binding_anchor
+            lease = self.binding_lease
+            body = render_request_body(anchor.anchor.initial_request)
+            defaults = dict(
+                number=number,
+                body=body,
+                author_id=self.APP.bot_node_id,
+                author_login=self.APP.bot_login,
+                head_oid=lease.lease.initial_head_sha,
+                base_oid=self.current_main_sha,
+                head_ref=lease.lease.branch_ref.removeprefix("refs/heads/"),
+                base_ref="main",
+                head_repository_id=self.CENTRAL_NODE_ID,
+                head_repository=self.CENTRAL_REPOSITORY,
+                base_repository_id=self.CENTRAL_NODE_ID,
+                base_repository=self.CENTRAL_REPOSITORY,
+                last_edited_at=None,
+                includes_created_edit=False,
+                draft=False,
+            )
+            issue_overrides = changes.pop("issue_overrides", {})
+            defaults.update(changes)
+            self.pull_requests[number] = PullRequestMetadata(**defaults)
+            issue_values = dict(
+                number=number,
+                database_id=number * 10,
+                node_id=f"PR_node_{number}",
+                body=defaults["body"],
+                state="open",
+                author_id=defaults["author_id"],
+                author_login=defaults["author_login"],
+                last_edited_at=None,
+                includes_created_edit=False,
+                is_pull_request=True,
+            )
+            issue_values.update(issue_overrides)
+            self.pull_request_issues[number] = IssueMetadata(**issue_values)
+            self.pr_comments.setdefault(number, [])
+
+        def create_issue_pull_request(self, repository, *, head, base, title, body):
+            self.pr_create_calls.append((repository, head, base, title, body))
+            if self.pr_create_error_after_persist is None or self.persist_pr_on_error:
+                self.add_candidate(body=body, base_ref=base, number=self.pr_create_number)
+            if self.pr_create_error_after_persist is not None:
+                raise self.pr_create_error_after_persist
+            return self.pr_create_number
+
+        def create_issue_comment(self, repository, number, body):
+            if body.startswith(ISSUE_BRANCH_LEASE_MARKER):
+                return super().create_issue_comment(repository, number, body)
+            self.binding_posts.append((number, body))
+            issue_side = number == self.issue.number
+            side_name = "issue" if issue_side else "pr"
+            if self.ambiguous_binding_side == side_name:
+                if self.persist_ambiguous_binding:
+                    self._append_binding_comment(number, body, issue_side)
+                raise GitHubAPIError("simulated accepted/lost binding comment response")
+            return self._append_binding_comment(number, body, issue_side)
+
+        def _append_binding_comment(self, number, body, issue_side):
+            self.next_comment_database_id += 1
+            comment = IssueComment(
+                f"IC_binding_{self.next_comment_database_id}", self.next_comment_database_id,
+                body, self.APP.bot_node_id, self.APP.bot_login, "Bot", None, None, None, None, False,
+            )
+            if issue_side:
+                self.comments.append(comment)
+            else:
+                self.pr_comments.setdefault(number, []).append(comment)
+            if self.after_binding_callback is not None:
+                self.after_binding_callback(number, body, issue_side)
+            return comment
+
+        def update_pull_request_branch(self, *args, **kwargs):
+            self.update_branch_calls.append((args, kwargs))
+            self.forbidden_calls.append("update_pull_request_branch")
+            raise AssertionError("Wave 03 must not normalize or update a PR branch")
+
+        def update_pull_request_state(self, *args, **kwargs):
+            self.state_updates.append((args, kwargs))
+            self.forbidden_calls.append("update_pull_request_state")
+            raise AssertionError("Wave 03 must not close or reopen a PR")
+
+    def prepare(self, *, nonce="c" * 64, **client_kwargs):
+        issue, anchor_comment = IssueBranchLeaseControllerTests.setup_anchor()
+        client = self.Client(issue, anchor_comment, **client_kwargs)
+        lease = IssueBranchLeaseControllerTests().create(
+            client, anchor_comment, nonce_factory=lambda: nonce,
+        )
+        client.binding_anchor = anchor_comment
+        client.binding_lease = lease
+        return client, issue, anchor_comment, lease
+
+    def run_binding(self, client, issue_number=7, resolver=None):
+        return create_or_recover_issue_pr_binding(
+            client, self.CENTRAL_REPOSITORY, issue_number, self.APP, self.CENTRAL_NODE_ID,
+            resolver or IssueBranchLeaseControllerTests.resolver(),
+        )
+
+    def prepare_existing(self, **client_kwargs):
+        client, issue, anchor_comment, lease = self.prepare(**client_kwargs)
+        client.current_ref = lease.lease.initial_head_sha
+        client.add_candidate()
+        return client, issue, anchor_comment, lease
+
+    def expected_binding(self, anchor_comment, lease, *, number=81, issue_database_id=None, issue_node_id=None):
+        return IssuePRBinding.create(
+            issue_number=anchor_comment.anchor.issue_number,
+            issue_database_id=anchor_comment.anchor.issue_database_id,
+            issue_node_id=anchor_comment.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=anchor_comment.comment.database_id,
+            issue_request_anchor_sha256=anchor_comment.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=lease.comment.database_id,
+            issue_branch_lease_sha256=hashlib.sha256(lease.comment.body.encode("utf-8")).hexdigest(),
+            source_id=anchor_comment.anchor.source_id,
+            source_repository_id=anchor_comment.anchor.source_repository_id,
+            branch_ref=lease.lease.branch_ref,
+            pull_request_number=number,
+            pull_request_database_id=issue_database_id if issue_database_id is not None else number * 10,
+            pull_request_node_id=issue_node_id if issue_node_id is not None else f"PR_node_{number}",
+            initial_head_sha=lease.lease.initial_head_sha,
+            base_ref="main",
+            central_repository_node_id=self.CENTRAL_NODE_ID,
+        )
+
+    def add_binding_side(
+        self, client, binding, *, issue_side, number=81, body=None,
+        author_id=None, author_login=None, edited=False,
+    ):
+        marker_body = (
+            binding.render_issue_binding() if issue_side else binding.render_pr_origin_binding()
+        ) if body is None else body
+        comment = IssueAnchorControllerTests.comment(
+            marker_body,
+            database_id=client.next_comment_database_id + 1,
+            author_id=self.APP.bot_node_id if author_id is None else author_id,
+            author_login=self.APP.bot_login if author_login is None else author_login,
+            author_type="Bot",
+        )
+        if edited:
+            comment = IssueComment(
+                comment.node_id, comment.database_id, comment.body, comment.author_id,
+                comment.author_login, comment.author_type, "U_editor", "editor", "User",
+                "2026-10-04T12:01:00Z", True,
+            )
+        if issue_side:
+            client.comments.append(comment)
+        else:
+            client.pr_comments.setdefault(number, []).append(comment)
+        client.next_comment_database_id += 1
+        return comment
+
+    def test_no_candidate_creates_exact_lease_ref_and_nondraft_canonical_pr_then_two_bindings(self):
+        client, _issue, anchor_comment, lease = self.prepare()
+        state = self.run_binding(client)
+        self.assertIsInstance(state, IssuePRBindingState)
+        self.assertEqual(client.current_ref, lease.lease.initial_head_sha)
+        self.assertEqual(len(client.ref_writes), 1)
+        repository_id, updates = client.ref_writes[0]
+        self.assertEqual(repository_id, self.CENTRAL_NODE_ID)
+        self.assertEqual(updates, (controller_module.RefUpdate(
+            issue_branch_ref(7), ZERO_OID, lease.lease.initial_head_sha, force=False,
+        ),))
+        self.assertEqual(len(client.pr_create_calls), 1)
+        self.assertEqual(client.pr_create_calls[0], (
+            self.CENTRAL_REPOSITORY,
+            issue_branch_ref(7).removeprefix("refs/heads/"),
+            "main",
+            "Federation request #7: add-source",
+            render_request_body(anchor_comment.anchor.initial_request),
+        ))
+        self.assertEqual([body.splitlines()[0] for _number, body in client.binding_posts], [
+            ISSUE_INTERNAL_PR_BINDING_MARKER,
+            PR_ISSUE_ORIGIN_BINDING_MARKER,
+        ])
+        self.assertEqual(state.binding, parse_issue_internal_pr_binding(client.comments[-1].body))
+        self.assertEqual(state.binding, parse_pr_issue_origin_binding(client.pr_comments[state.pr.number][-1].body))
+        self.assertFalse(state.pr.draft)
+        self.assertEqual(client.update_branch_calls, [])
+        self.assertEqual(client.state_updates, [])
+        self.assertEqual(client.forbidden_calls, [])
+
+    def test_missing_ref_with_open_or_closed_pr_candidate_never_recreates_ref(self):
+        for state in ("open", "closed"):
+            with self.subTest(state=state):
+                client, _issue, _anchor, _lease = self.prepare()
+                overrides = {"issue_overrides": {"state": state}}
+                client.add_candidate(**overrides)
+                with self.assertRaises(R02Error):
+                    self.run_binding(client)
+                self.assertEqual(client.ref_writes, [])
+                self.assertEqual(client.pr_create_calls, [])
+
+    def test_missing_ref_with_pr_side_binding_evidence_never_creates_ref(self):
+        client, _issue, anchor_comment, lease = self.prepare()
+        client.add_candidate()
+        binding = self.expected_binding(anchor_comment, lease)
+        self.add_binding_side(client, binding, issue_side=False)
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(client.ref_writes, [])
+        self.assertEqual(client.pr_create_calls, [])
+
+    def test_exact_preexisting_ref_and_one_open_candidate_are_recovered_without_ref_or_pr_create(self):
+        client, _issue, _anchor, lease = self.prepare_existing()
+        state = self.run_binding(client)
+        self.assertEqual(state.pr.number, 81)
+        self.assertEqual(client.current_ref, lease.lease.initial_head_sha)
+        self.assertEqual(client.ref_writes, [])
+        self.assertEqual(client.pr_create_calls, [])
+
+    def test_foreign_ref_head_blocks_without_overwrite_or_delete(self):
+        client, _issue, _anchor, _lease = self.prepare()
+        client.current_ref = "f" * 40
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(client.current_ref, "f" * 40)
+        self.assertEqual(client.ref_writes, [])
+        self.assertEqual(client.pr_create_calls, [])
+
+    def test_ref_cas_conflict_and_ambiguous_exact_readback_recover_once(self):
+        for error in (RefCASConflict("CAS conflict"), GitHubAPIError("accepted create response lost")):
+            with self.subTest(error=type(error).__name__):
+                client, _issue, _anchor, lease = self.prepare(ref_write_error=error)
+                state = self.run_binding(client)
+                self.assertEqual(state.binding.initial_head_sha, lease.lease.initial_head_sha)
+                self.assertEqual(len(client.ref_writes), 1)
+                self.assertEqual(client.current_ref, lease.lease.initial_head_sha)
+
+    def test_ambiguous_ref_cas_without_exact_readback_never_retries_in_invocation(self):
+        client, _issue, _anchor, _lease = self.prepare(
+            ref_write_error=GitHubAPIError("ref create response lost"),
+            persist_ref_on_error=False,
+        )
+        with self.assertRaises(StaleAuthorityError):
+            self.run_binding(client)
+        self.assertEqual(len(client.ref_writes), 1)
+        self.assertIsNone(client.current_ref)
+        self.assertEqual(client.pr_create_calls, [])
+
+    def test_main_advance_does_not_normalize_or_invalidate_historical_lease(self):
+        client, _issue, _anchor, lease = self.prepare()
+        client.current_main_sha = "2" * 40
+        state = self.run_binding(client)
+        self.assertEqual(state.binding.initial_head_sha, lease.lease.initial_head_sha)
+        self.assertEqual(state.pr.head_oid, lease.lease.initial_head_sha)
+        self.assertEqual(state.pr.base_oid, "2" * 40)
+        self.assertEqual(client.current_ref, lease.lease.initial_head_sha)
+        self.assertEqual(client.ref_writes[0][1][0].after_oid, lease.lease.initial_head_sha)
+        self.assertEqual(client.pr_create_calls[0][2], "main")
+
+    def test_issue_closed_or_source_drift_blocks_before_ref_cas(self):
+        client, issue, _anchor, _lease = self.prepare()
+        client.issue = IssueMetadata(**dict(issue.__dict__, state="closed"))
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(client.ref_writes, [])
+
+        client, _issue, _anchor, _lease = self.prepare()
+        wrong = IssueBranchLeaseControllerTests.resolver(source_id="changed-source")
+        with self.assertRaises(StaleAuthorityError):
+            self.run_binding(client, resolver=wrong)
+        self.assertEqual(client.ref_writes, [])
+
+    def test_duplicate_and_closed_reserved_head_candidates_block_without_replacement(self):
+        client, _issue, _anchor, _lease = self.prepare_existing()
+        client.add_candidate(number=82)
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(client.pr_create_calls, [])
+        self.assertEqual(client.ref_writes, [])
+
+        client, _issue, _anchor, _lease = self.prepare_existing()
+        client.add_candidate(issue_overrides={"state": "closed"})
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(client.pr_create_calls, [])
+        self.assertEqual(client.ref_writes, [])
+
+    def test_foreign_same_name_head_candidate_blocks_instead_of_being_ignored(self):
+        client, _issue, _anchor, _lease = self.prepare()
+        client.add_candidate(head_repository_id="R_fork", head_repository="someone/fork")
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(client.ref_writes, [])
+        self.assertEqual(client.pr_create_calls, [])
+
+    def test_reserved_head_pr_topology_body_author_draft_and_edit_drift_block(self):
+        variants = (
+            {"author_id": "U_other"},
+            {"author_login": "someone[bot]"},
+            {"head_repository": "someone/fork"},
+            {"base_repository_id": "R_other"},
+            {"base_repository": "someone/fork"},
+            {"base_ref": "trunk"},
+            {"head_oid": "e" * 40},
+            {"draft": True},
+            {"body": "different body"},
+            {"last_edited_at": "2026-10-04T12:10:00Z"},
+            {"includes_created_edit": True},
+        )
+        for changes in variants:
+            with self.subTest(changes=changes):
+                client, _issue, _anchor, _lease = self.prepare_existing()
+                client.add_candidate(**changes)
+                with self.assertRaises(R02Error):
+                    self.run_binding(client)
+                self.assertEqual(client.pr_create_calls, [])
+                self.assertEqual(client.ref_writes, [])
+
+    def test_pull_request_issue_identity_state_and_body_must_match_pr(self):
+        variants = (
+            {"is_pull_request": False},
+            {"number": 82},
+            {"database_id": True},
+            {"node_id": ""},
+            {"author_id": "U_other"},
+            {"author_login": "other"},
+            {"state": "closed"},
+            {"body": "different Issue body"},
+        )
+        for changes in variants:
+            with self.subTest(changes=changes):
+                client, _issue, _anchor, _lease = self.prepare_existing()
+                client.add_candidate(issue_overrides=changes)
+                with self.assertRaises(R02Error):
+                    self.run_binding(client)
+                self.assertEqual(client.pr_create_calls, [])
+
+    def test_lost_pr_create_response_recovers_one_exact_candidate_and_absence_blocks_retry(self):
+        client, _issue, _anchor, _lease = self.prepare(
+            pr_create_error_after_persist=GitHubAPIError("accepted PR create response lost"),
+        )
+        state = self.run_binding(client)
+        self.assertEqual(state.pr.number, client.pr_create_number)
+        self.assertEqual(len(client.pr_create_calls), 1)
+
+        client, _issue, _anchor, _lease = self.prepare(
+            pr_create_error_after_persist=GitHubAPIError("PR create response lost"),
+            persist_pr_on_error=False,
+        )
+        with self.assertRaises(StaleAuthorityError):
+            self.run_binding(client)
+        self.assertEqual(len(client.pr_create_calls), 1)
+        self.assertEqual(client.pull_requests, {})
+        self.assertEqual(len(client.ref_writes), 1)
+
+    def test_one_sided_and_complete_bindings_repair_only_the_missing_side(self):
+        client, _issue, anchor_comment, lease = self.prepare_existing()
+        binding = self.expected_binding(anchor_comment, lease)
+        self.add_binding_side(client, binding, issue_side=True)
+        state = self.run_binding(client)
+        self.assertEqual(state.binding, binding)
+        self.assertEqual([body.splitlines()[0] for _number, body in client.binding_posts], [PR_ISSUE_ORIGIN_BINDING_MARKER])
+
+        client, _issue, anchor_comment, lease = self.prepare_existing()
+        binding = self.expected_binding(anchor_comment, lease)
+        self.add_binding_side(client, binding, issue_side=False)
+        state = self.run_binding(client)
+        self.assertEqual(state.binding, binding)
+        self.assertEqual([body.splitlines()[0] for _number, body in client.binding_posts], [ISSUE_INTERNAL_PR_BINDING_MARKER])
+
+        client, _issue, anchor_comment, lease = self.prepare_existing()
+        binding = self.expected_binding(anchor_comment, lease)
+        self.add_binding_side(client, binding, issue_side=True)
+        self.add_binding_side(client, binding, issue_side=False)
+        state = self.run_binding(client)
+        self.assertEqual(state.binding, binding)
+        self.assertEqual(client.binding_posts, [])
+        self.assertEqual(client.ref_writes, [])
+        self.assertEqual(client.pr_create_calls, [])
+
+    def test_malformed_wrong_app_edited_and_duplicate_binding_markers_fail_closed(self):
+        valid_body = ISSUE_INTERNAL_PR_BINDING_MARKER + "\n{}\n"
+        scenarios = ("malformed-issue", "wrong-app-issue", "edited-issue", "duplicate-issue",
+                     "malformed-pr", "wrong-app-pr", "edited-pr", "duplicate-pr")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                client, _issue, anchor_comment, lease = self.prepare_existing()
+                binding = self.expected_binding(anchor_comment, lease)
+                issue_side = scenario.endswith("issue")
+                if scenario.startswith("malformed"):
+                    marker = ISSUE_INTERNAL_PR_BINDING_MARKER if issue_side else PR_ISSUE_ORIGIN_BINDING_MARKER
+                    self.add_binding_side(client, binding, issue_side=issue_side, body=marker + "\n{}\n")
+                elif scenario.startswith("wrong-app"):
+                    self.add_binding_side(client, binding, issue_side=issue_side, author_id="B_other", author_login="other[bot]")
+                elif scenario.startswith("edited"):
+                    self.add_binding_side(client, binding, issue_side=issue_side, edited=True)
+                else:
+                    self.add_binding_side(client, binding, issue_side=issue_side)
+                    self.add_binding_side(client, binding, issue_side=issue_side)
+                with self.assertRaises(R02Error):
+                    self.run_binding(client)
+                self.assertEqual(client.binding_posts, [])
+
+    def test_conflicting_and_opposite_side_binding_payloads_block_without_repair(self):
+        client, _issue, anchor_comment, lease = self.prepare_existing()
+        conflicting = self.expected_binding(anchor_comment, lease, number=82)
+        self.add_binding_side(client, conflicting, issue_side=True)
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(client.binding_posts, [])
+
+        client, _issue, anchor_comment, lease = self.prepare_existing()
+        intended = self.expected_binding(anchor_comment, lease)
+        self.add_binding_side(client, intended, issue_side=True)
+        mismatched_pr_side = self.expected_binding(anchor_comment, lease, issue_database_id=811, issue_node_id="PR_node_wrong")
+        self.add_binding_side(client, mismatched_pr_side, issue_side=False)
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(client.binding_posts, [])
+
+    def test_reserved_unknown_issue_authority_marker_fences_ref_progression(self):
+        client, _issue, _anchor, _lease = self.prepare()
+        comment = IssueAnchorControllerTests.comment(
+            "<!-- swiftstream-federation-issue-cancellation-fence:v1 -->\n{}\n",
+            database_id=1999,
+            author_id=self.APP.bot_node_id,
+            author_login=self.APP.bot_login,
+        )
+        client.comments.append(comment)
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(client.ref_writes, [])
+        self.assertEqual(client.pr_create_calls, [])
+
+    def test_ambiguous_issue_binding_post_never_posts_again_or_writes_opposite_side_same_invocation(self):
+        client, _issue, _anchor, _lease = self.prepare_existing(ambiguous_binding_side="issue")
+        with self.assertRaises(StaleAuthorityError):
+            self.run_binding(client)
+        self.assertEqual(len(client.binding_posts), 1)
+        self.assertEqual(client.binding_posts[0][0], 7)
+        self.assertTrue(client.binding_posts[0][1].startswith(ISSUE_INTERNAL_PR_BINDING_MARKER))
+        self.assertFalse(any(body.startswith(PR_ISSUE_ORIGIN_BINDING_MARKER) for _number, body in client.binding_posts))
+
+        client.ambiguous_binding_side = None
+        state = self.run_binding(client)
+        self.assertEqual(state.binding, parse_issue_internal_pr_binding(client.comments[-1].body))
+        self.assertEqual([body.splitlines()[0] for _number, body in client.binding_posts], [
+            ISSUE_INTERNAL_PR_BINDING_MARKER, PR_ISSUE_ORIGIN_BINDING_MARKER,
+        ])
+
+    def test_ambiguous_pr_binding_post_never_reposts_same_side_and_later_complete_recovery_is_zero_write(self):
+        client, _issue, _anchor, _lease = self.prepare_existing(ambiguous_binding_side="pr")
+        with self.assertRaises(StaleAuthorityError):
+            self.run_binding(client)
+        self.assertEqual([body.splitlines()[0] for _number, body in client.binding_posts], [
+            ISSUE_INTERNAL_PR_BINDING_MARKER, PR_ISSUE_ORIGIN_BINDING_MARKER,
+        ])
+        before = list(client.binding_posts)
+        state = self.run_binding(client)
+        self.assertIsInstance(state, IssuePRBindingState)
+        self.assertEqual(client.binding_posts, before)
+
+    def test_nonpersisted_ambiguous_binding_posts_retry_only_in_later_fresh_invocation(self):
+        client, _issue, _anchor, _lease = self.prepare_existing(
+            ambiguous_binding_side="issue", persist_ambiguous_binding=False,
+        )
+        with self.assertRaises(StaleAuthorityError):
+            self.run_binding(client)
+        self.assertEqual(len(client.binding_posts), 1)
+        self.assertEqual(len(client.comments), 2)
+        client.ambiguous_binding_side = None
+        self.run_binding(client)
+        self.assertEqual([body.splitlines()[0] for _number, body in client.binding_posts], [
+            ISSUE_INTERNAL_PR_BINDING_MARKER,
+            ISSUE_INTERNAL_PR_BINDING_MARKER,
+            PR_ISSUE_ORIGIN_BINDING_MARKER,
+        ])
+
+        client, _issue, _anchor, _lease = self.prepare_existing(
+            ambiguous_binding_side="pr", persist_ambiguous_binding=False,
+        )
+        with self.assertRaises(StaleAuthorityError):
+            self.run_binding(client)
+        self.assertEqual([body.splitlines()[0] for _number, body in client.binding_posts], [
+            ISSUE_INTERNAL_PR_BINDING_MARKER, PR_ISSUE_ORIGIN_BINDING_MARKER,
+        ])
+        client.ambiguous_binding_side = None
+        self.run_binding(client)
+        self.assertEqual([body.splitlines()[0] for _number, body in client.binding_posts], [
+            ISSUE_INTERNAL_PR_BINDING_MARKER,
+            PR_ISSUE_ORIGIN_BINDING_MARKER,
+            PR_ISSUE_ORIGIN_BINDING_MARKER,
+        ])
+
+    def test_head_source_issue_and_final_pr_drift_preserve_binding_evidence_and_block(self):
+        client, _issue, _anchor, _lease = self.prepare_existing()
+        client.after_binding_callback = lambda number, body, issue_side: setattr(client, "current_ref", "e" * 40) if issue_side else None
+        with self.assertRaises(StaleAuthorityError):
+            self.run_binding(client)
+        self.assertTrue(client.comments[-1].body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER))
+        self.assertEqual(len(client.binding_posts), 1)
+
+        client, _issue, _anchor, _lease = self.prepare_existing()
+        client.source_drift = False
+        def dynamic_resolver(request, request_class):
+            source_id = "changed-source" if client.source_drift else "owner-repo"
+            return IssueBranchLeaseControllerTests.resolver(source_id=source_id)(request, request_class)
+        client.after_binding_callback = lambda number, body, issue_side: setattr(client, "source_drift", True) if issue_side else None
+        with self.assertRaises(StaleAuthorityError):
+            self.run_binding(client, resolver=dynamic_resolver)
+        self.assertEqual(len(client.binding_posts), 1)
+        self.assertTrue(client.comments[-1].body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER))
+
+        client, issue, _anchor, _lease = self.prepare_existing()
+        client.after_binding_callback = lambda number, body, issue_side: setattr(
+            client, "issue", IssueMetadata(**dict(issue.__dict__, state="closed")),
+        ) if issue_side else None
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(len(client.binding_posts), 1)
+
+        client, _issue, _anchor, _lease = self.prepare_existing()
+        def drift_after_pr_binding(number, body, issue_side):
+            if not issue_side:
+                pr = client.pull_requests[number]
+                client.pull_requests[number] = PullRequestMetadata(**dict(pr.__dict__, body="post-binding drift"))
+        client.after_binding_callback = drift_after_pr_binding
+        with self.assertRaises(R02Error):
+            self.run_binding(client)
+        self.assertEqual(len(client.binding_posts), 2)
+        self.assertTrue(client.comments[-1].body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER))
+        self.assertTrue(client.pr_comments[81][-1].body.startswith(PR_ISSUE_ORIGIN_BINDING_MARKER))
+
 
 if __name__ == "__main__":
     unittest.main()

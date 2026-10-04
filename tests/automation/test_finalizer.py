@@ -70,7 +70,7 @@ class FinalizerTests(unittest.TestCase):
                 return blob_sha.encode()
 
             def get_pull_request_metadata(self, _repository, _number):
-                return PullRequestMetadata(41, "", "U_bot", "swiftstream-federation[bot]", self.head, self.base, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False)
+                return PullRequestMetadata(41, "", "U_bot", "swiftstream-federation[bot]", self.head, self.base, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False)
 
             def list_check_runs(self, _repository, _head_sha):
                 return tuple(self.checks)

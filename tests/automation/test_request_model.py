@@ -10,11 +10,14 @@ from scripts import federate as c02
 from automation.federation.request_model import (
     ANCHOR_MARKER,
     ISSUE_REQUEST_ANCHOR_MARKER,
+    ISSUE_INTERNAL_PR_BINDING_MARKER,
+    PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
     CommentEvent,
     IssuePatchEvent,
     IssueBranchLease,
     IssueRequestAnchor,
+    IssuePRBinding,
     ClaimedHeadMarker,
     Request,
     RequestAnchor,
@@ -28,6 +31,8 @@ from automation.federation.request_model import (
     CLAIM_GENERATION_PREFIX,
     issue_owner_key,
     issue_branch_ref,
+    reserved_issue_branch_number,
+    render_request_body,
     issue_branch_lease_authority_digest,
     claim_generation_id,
     parse_claimed_head_marker,
@@ -37,6 +42,8 @@ from automation.federation.request_model import (
     parse_issue_request_anchor,
     parse_patch,
     parse_request_body,
+    parse_issue_internal_pr_binding,
+    parse_pr_issue_origin_binding,
     proposed_line_refs,
     validate_drop_set,
 )
@@ -596,6 +603,45 @@ class RequestModelTests(unittest.TestCase):
             parse_anchor(ANCHOR_MARKER + "\n" + json.dumps(value) + "\n")
         self.assertIn("schemaVersion", str(caught.exception))
 
+    def test_issue_pr_request_renderer_roundtrips_only_manual_request_classes(self):
+        requests = (
+            parse_request_body(RequestClass.ADD, add_body()),
+            parse_request_body(
+                RequestClass.UPDATE,
+                "Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\nUpdated\n"
+                "Branch:\nmain\nSkills root:\nskills\nSkill prefixes:\nswifql,docs\n"
+                "Publication lines:\nrefs/heads/main=swifql,docs;refs/heads/stable=apis\n"
+                "Dropped publication lines:\nrefs/heads/old,refs/heads/older\n",
+            ),
+            parse_request_body(RequestClass.REMOVE, "Repository URL:\nhttps://github.com/Owner/Repo\nReason:\nretire\n"),
+        )
+        for request in requests:
+            with self.subTest(request_class=request.request_class):
+                rendered = render_request_body(request)
+                self.assertTrue(rendered.endswith("\n"))
+                self.assertFalse(rendered.endswith("\n\n"))
+                self.assertEqual(parse_request_body(request.request_class, rendered), request)
+                self.assertEqual(render_request_body(parse_request_body(request.request_class, rendered)), rendered)
+        update = render_request_body(requests[1])
+        self.assertIn("Skill prefixes:\nswifql,docs\n", update)
+        self.assertIn("Publication lines:\nrefs/heads/main=swifql,docs;refs/heads/stable=apis\n", update)
+        self.assertIn("Dropped publication lines:\nrefs/heads/old,refs/heads/older\n", update)
+        add = render_request_body(requests[0])
+        self.assertNotIn("Publication lines:", add)
+        self.assertNotIn("Dropped publication lines:", add)
+        remove = render_request_body(requests[2])
+        self.assertEqual(remove, "Repository URL:\nhttps://github.com/Owner/Repo\n\nReason:\nretire\n")
+
+    def test_issue_pr_request_renderer_rejects_non_manual_classes(self):
+        reconcile = parse_request_body(RequestClass.RECONCILE, "Repository URL:\nhttps://github.com/Owner/Repo\n")
+        for request in (
+            reconcile,
+            Request(RequestClass.MACHINE_PUBLICATION, "https://github.com/Owner/Repo"),
+            Request(RequestClass.UNRELATED, "https://github.com/Owner/Repo"),
+        ):
+            with self.subTest(request_class=request.request_class), self.assertRaises(RequestModelError):
+                render_request_body(request)
+
 
 class IssueRequestAnchorModelTests(unittest.TestCase):
     @staticmethod
@@ -794,6 +840,111 @@ class IssueRequestAnchorModelTests(unittest.TestCase):
         pr_anchor = RequestAnchor(1, RequestClass.ADD, "id", "login", "0" * 64, self.request(RequestClass.ADD))
         old = fold_patch_events(pr_anchor, [CommentEvent(2, True, f"{PATCH_SENTINEL}\n\nDescription:\nold-path\n")])
         self.assertEqual(old.request.description, "old-path")
+
+
+class IssuePRBindingModelTests(unittest.TestCase):
+    @staticmethod
+    def values():
+        return {
+            "issue_number": 7,
+            "issue_database_id": 700,
+            "issue_node_id": "I_kwDOIssue",
+            "issue_request_anchor_comment_database_id": 701,
+            "issue_request_anchor_sha256": "a" * 64,
+            "issue_branch_lease_comment_database_id": 702,
+            "issue_branch_lease_sha256": "b" * 64,
+            "source_id": "owner-repo",
+            "source_repository_id": 41,
+            "branch_ref": issue_branch_ref(7),
+            "pull_request_number": 8,
+            "pull_request_database_id": 800,
+            "pull_request_node_id": "PR_kwDOPullRequest",
+            "initial_head_sha": "c" * 40,
+            "base_ref": "main",
+            "central_repository_node_id": "R_kwDOCentral",
+        }
+
+    def test_reserved_issue_branch_classifier_is_exact_and_fail_closed(self):
+        self.assertEqual(reserved_issue_branch_number("bot/federation/request/issue-1"), 1)
+        self.assertEqual(reserved_issue_branch_number("bot/federation/request/issue-9223372036854775807"), 9_223_372_036_854_775_807)
+        for ordinary in ("main", "bot/federation/demo", "refs/heads/ordinary", "bot/federation/requester/issue-1"):
+            with self.subTest(ordinary=ordinary):
+                self.assertIsNone(reserved_issue_branch_number(ordinary))
+        for malformed in (
+            "bot/federation/request/issue-0",
+            "bot/federation/request/issue-01",
+            "bot/federation/request/issue-+1",
+            "bot/federation/request/issue-9223372036854775808",
+            "bot/federation/request/issue-1-junk",
+            "bot/federation/request/issue-",
+            "bot/federation/request/issue-1\n",
+            "refs/heads/bot/federation/request/issue-1",
+        ):
+            with self.subTest(malformed=malformed), self.assertRaises(RequestModelError):
+                reserved_issue_branch_number(malformed)
+
+    def test_two_sided_binding_has_one_canonical_payload_and_exact_artifact_hashes(self):
+        binding = IssuePRBinding.create(**self.values())
+        issue_text = binding.render_issue_binding()
+        pr_text = binding.render_pr_origin_binding()
+        issue_value = json.loads(issue_text.splitlines()[1])
+        pr_value = json.loads(pr_text.splitlines()[1])
+        self.assertEqual(issue_text.splitlines()[0], ISSUE_INTERNAL_PR_BINDING_MARKER)
+        self.assertEqual(pr_text.splitlines()[0], PR_ISSUE_ORIGIN_BINDING_MARKER)
+        self.assertEqual(issue_value, pr_value)
+        self.assertEqual(set(issue_value), {
+            "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+            "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256",
+            "issueBranchLeaseCommentDatabaseId", "issueBranchLeaseSha256", "sourceId",
+            "sourceRepositoryId", "branchRef", "pullRequestNumber", "pullRequestDatabaseId",
+            "pullRequestNodeId", "initialHeadSha", "baseRef", "centralRepositoryNodeId", "bindingId",
+        })
+        payload = dict(issue_value)
+        binding_id = payload.pop("bindingId")
+        canonical_payload = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        self.assertEqual(binding_id, hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest())
+        self.assertEqual(parse_issue_internal_pr_binding(issue_text), binding)
+        self.assertEqual(parse_pr_issue_origin_binding(pr_text), binding)
+        self.assertEqual(binding.issue_comment_sha256(), hashlib.sha256(issue_text.encode("utf-8")).hexdigest())
+        self.assertEqual(binding.pr_comment_sha256(), hashlib.sha256(pr_text.encode("utf-8")).hexdigest())
+        self.assertNotEqual(binding.issue_comment_sha256(), binding.pr_comment_sha256())
+
+    def test_binding_rejects_wrong_relations_ids_nodes_hashes_and_base(self):
+        cases = (
+            {"branch_ref": issue_branch_ref(8)},
+            {"issue_database_id": True},
+            {"pull_request_number": 0},
+            {"pull_request_database_id": "800"},
+            {"issue_node_id": "I:bad"},
+            {"pull_request_node_id": "PR:bad"},
+            {"central_repository_node_id": "R:bad"},
+            {"issue_request_anchor_sha256": "A" * 64},
+            {"issue_branch_lease_sha256": "x" * 64},
+            {"initial_head_sha": "C" * 40},
+            {"base_ref": "trunk"},
+            {"source_id": "Owner/Repo"},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes), self.assertRaises(RequestModelError):
+                IssuePRBinding.create(**dict(self.values(), **changes))
+
+    def test_binding_parsers_reject_noncanonical_json_wrong_marker_and_key_sets(self):
+        binding = IssuePRBinding.create(**self.values())
+        issue_text = binding.render_issue_binding()
+        value = json.loads(issue_text.splitlines()[1])
+        with self.assertRaises(RequestModelError):
+            parse_pr_issue_origin_binding(issue_text)
+        with self.assertRaises(RequestModelError):
+            parse_issue_internal_pr_binding(issue_text.replace("\n", "\r\n"))
+        noncanonical = ISSUE_INTERNAL_PR_BINDING_MARKER + "\n" + json.dumps(value) + "\n"
+        with self.assertRaises(RequestModelError):
+            parse_issue_internal_pr_binding(noncanonical)
+        for changed in (dict(value, extra=True), {key: item for key, item in value.items() if key != "sourceId"}):
+            with self.subTest(changed=changed), self.assertRaises(RequestModelError):
+                parse_issue_internal_pr_binding(
+                    ISSUE_INTERNAL_PR_BINDING_MARKER + "\n"
+                    + json.dumps(changed, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                )
 
 
 class ClaimedHeadAndIssueLeaseModelTests(unittest.TestCase):

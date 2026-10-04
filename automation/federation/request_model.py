@@ -618,6 +618,45 @@ def parse_request_body(request_class: RequestClass, body: str) -> Request:
     )
 
 
+def render_request_body(request: Request) -> str:
+    """Render the canonical existing manual Request grammar for an Issue PR."""
+    if type(request) is not Request or request.request_class not in {
+        RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE,
+    }:
+        _fail("only ADD, UPDATE, or REMOVE requests have a canonical Issue PR body")
+    _validate_anchor_request(request.request_class, request)
+    value_by_field: dict[str, str | None] = {
+        "Repository URL": request.repository_url,
+        "Description": request.description,
+        "Branch": request.branch,
+        "Skills root": request.skills_root,
+        "Skill prefixes": (
+            ",".join(request.skill_prefixes) if request.skill_prefixes is not None else None
+        ),
+        "Publication lines": (
+            ";".join(
+                f"{line.ref}={','.join(line.skill_prefixes)}"
+                for line in request.publication_lines
+            ) if request.publication_lines is not None else None
+        ),
+        "Dropped publication lines": (
+            ",".join(request.dropped_publication_lines)
+            if request.dropped_publication_lines is not None else None
+        ),
+        "Reason": request.reason,
+    }
+    blocks = [
+        f"{label}\n{value_by_field[label[:-1]]}"
+        for label in _BODY_FIELDS[request.request_class]
+        if value_by_field[label[:-1]] is not None
+    ]
+    rendered = "\n\n".join(blocks) + "\n"
+    _check_body_size(rendered, "canonical request body")
+    if parse_request_body(request.request_class, rendered) != request:
+        _fail("canonical request body did not round-trip to the exact Request")
+    return rendered
+
+
 def parse_issue_request_body(body: str) -> Request:
     """Adapt one rendered Issue Form body to the existing strict Request grammar.
 
@@ -1274,6 +1313,221 @@ def issue_branch_ref(issue_number: int) -> str:
     except (c02.FederationError, WorkspaceError) as error:
         _fail(str(error))
     raise AssertionError("unreachable")
+
+
+ISSUE_INTERNAL_PR_BINDING_MARKER = "<!-- swiftstream-federation-issue-pr-binding:v1 -->"
+PR_ISSUE_ORIGIN_BINDING_MARKER = "<!-- swiftstream-federation-pr-issue-origin:v1 -->"
+_ISSUE_PR_BRANCH_PREFIX = "bot/federation/request/"
+_ISSUE_PR_BRANCH_RE = re.compile(r"^bot/federation/request/issue-([1-9][0-9]*)$")
+_ISSUE_PR_BINDING_KEYS = frozenset({
+    "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+    "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256",
+    "issueBranchLeaseCommentDatabaseId", "issueBranchLeaseSha256", "sourceId",
+    "sourceRepositoryId", "branchRef", "pullRequestNumber", "pullRequestDatabaseId",
+    "pullRequestNodeId", "initialHeadSha", "baseRef", "centralRepositoryNodeId",
+    "bindingId",
+})
+
+
+def reserved_issue_branch_number(head_ref: str) -> int | None:
+    """Classify only the exact reserved short head-ref namespace."""
+    if type(head_ref) is not str:
+        _fail("PR head ref must be a string")
+    if head_ref.startswith("refs/heads/" + _ISSUE_PR_BRANCH_PREFIX):
+        _fail("reserved Issue PR head ref must be a short branch name")
+    if not head_ref.startswith(_ISSUE_PR_BRANCH_PREFIX):
+        return None
+    if c02.contains_control(head_ref):
+        _fail("reserved Issue PR head ref contains control data")
+    match = _ISSUE_PR_BRANCH_RE.fullmatch(head_ref)
+    if match is None:
+        _fail("reserved Issue PR head ref is malformed")
+    digits = match.group(1)
+    if len(digits) > 19:
+        _fail("reserved Issue PR number exceeds signed-64 range")
+    number = int(digits)
+    if number > 9_223_372_036_854_775_807:
+        _fail("reserved Issue PR number exceeds signed-64 range")
+    return number
+
+
+def _binding_hash(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class IssuePRBinding:
+    schema_version: int
+    issue_number: int
+    issue_database_id: int
+    issue_node_id: str
+    issue_request_anchor_comment_database_id: int
+    issue_request_anchor_sha256: str
+    issue_branch_lease_comment_database_id: int
+    issue_branch_lease_sha256: str
+    source_id: str
+    source_repository_id: int
+    branch_ref: str
+    pull_request_number: int
+    pull_request_database_id: int
+    pull_request_node_id: str
+    initial_head_sha: str
+    base_ref: str
+    central_repository_node_id: str
+    binding_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("IssuePRBinding schemaVersion must be exact integer 1")
+        for name in (
+            "issue_number", "issue_database_id", "issue_request_anchor_comment_database_id",
+            "issue_branch_lease_comment_database_id", "source_repository_id",
+            "pull_request_number", "pull_request_database_id",
+        ):
+            _issue_positive_int(getattr(self, name), name)
+        for name in ("issue_node_id", "pull_request_node_id", "central_repository_node_id"):
+            text = _issue_bounded_text(getattr(self, name), name, 256)
+            if ":" in text:
+                _fail(f"{name} cannot contain ':'")
+        for name in ("issue_request_anchor_sha256", "issue_branch_lease_sha256"):
+            if type(getattr(self, name)) is not str or not _SHA256_RE.fullmatch(getattr(self, name)):
+                _fail(f"{name} must be lowercase 64-hex")
+        if type(self.initial_head_sha) is not str or not _SHA40_RE.fullmatch(self.initial_head_sha):
+            _fail("initial_head_sha must be lowercase 40-hex")
+        try:
+            c02.validate_source_id(self.source_id)
+        except c02.FederationError:
+            _fail("source_id is invalid")
+        if type(self.branch_ref) is not str or self.branch_ref != issue_branch_ref(self.issue_number):
+            _fail("branch_ref must be the exact Issue branch for issue_number")
+        if type(self.base_ref) is not str or self.base_ref != "main":
+            _fail("base_ref must be exact main")
+        if type(self.binding_id) is not str or not _SHA256_RE.fullmatch(self.binding_id):
+            _fail("binding_id must be lowercase 64-hex")
+        if self.binding_id != _binding_hash(self.as_value(include_binding_id=False)):
+            _fail("binding_id does not match the immutable binding payload")
+
+    def as_value(self, *, include_binding_id: bool = True) -> dict[str, Any]:
+        value = {
+            "schemaVersion": self.schema_version,
+            "issueNumber": self.issue_number,
+            "issueDatabaseId": self.issue_database_id,
+            "issueNodeId": self.issue_node_id,
+            "issueRequestAnchorCommentDatabaseId": self.issue_request_anchor_comment_database_id,
+            "issueRequestAnchorSha256": self.issue_request_anchor_sha256,
+            "issueBranchLeaseCommentDatabaseId": self.issue_branch_lease_comment_database_id,
+            "issueBranchLeaseSha256": self.issue_branch_lease_sha256,
+            "sourceId": self.source_id,
+            "sourceRepositoryId": self.source_repository_id,
+            "branchRef": self.branch_ref,
+            "pullRequestNumber": self.pull_request_number,
+            "pullRequestDatabaseId": self.pull_request_database_id,
+            "pullRequestNodeId": self.pull_request_node_id,
+            "initialHeadSha": self.initial_head_sha,
+            "baseRef": self.base_ref,
+            "centralRepositoryNodeId": self.central_repository_node_id,
+        }
+        if include_binding_id:
+            value["bindingId"] = self.binding_id
+        return value
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        schema_version: int = 1,
+        issue_number: int,
+        issue_database_id: int,
+        issue_node_id: str,
+        issue_request_anchor_comment_database_id: int,
+        issue_request_anchor_sha256: str,
+        issue_branch_lease_comment_database_id: int,
+        issue_branch_lease_sha256: str,
+        source_id: str,
+        source_repository_id: int,
+        branch_ref: str,
+        pull_request_number: int,
+        pull_request_database_id: int,
+        pull_request_node_id: str,
+        initial_head_sha: str,
+        base_ref: str,
+        central_repository_node_id: str,
+    ) -> "IssuePRBinding":
+        value = {
+            "schemaVersion": schema_version,
+            "issueNumber": issue_number,
+            "issueDatabaseId": issue_database_id,
+            "issueNodeId": issue_node_id,
+            "issueRequestAnchorCommentDatabaseId": issue_request_anchor_comment_database_id,
+            "issueRequestAnchorSha256": issue_request_anchor_sha256,
+            "issueBranchLeaseCommentDatabaseId": issue_branch_lease_comment_database_id,
+            "issueBranchLeaseSha256": issue_branch_lease_sha256,
+            "sourceId": source_id,
+            "sourceRepositoryId": source_repository_id,
+            "branchRef": branch_ref,
+            "pullRequestNumber": pull_request_number,
+            "pullRequestDatabaseId": pull_request_database_id,
+            "pullRequestNodeId": pull_request_node_id,
+            "initialHeadSha": initial_head_sha,
+            "baseRef": base_ref,
+            "centralRepositoryNodeId": central_repository_node_id,
+        }
+        return cls(
+            schema_version, issue_number, issue_database_id, issue_node_id,
+            issue_request_anchor_comment_database_id, issue_request_anchor_sha256,
+            issue_branch_lease_comment_database_id, issue_branch_lease_sha256,
+            source_id, source_repository_id, branch_ref, pull_request_number,
+            pull_request_database_id, pull_request_node_id, initial_head_sha,
+            base_ref, central_repository_node_id, _binding_hash(value),
+        )
+
+    def render_issue_binding(self) -> str:
+        return f"{ISSUE_INTERNAL_PR_BINDING_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def render_pr_origin_binding(self) -> str:
+        return f"{PR_ISSUE_ORIGIN_BINDING_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def issue_comment_sha256(self) -> str:
+        return hashlib.sha256(self.render_issue_binding().encode("utf-8")).hexdigest()
+
+    def pr_comment_sha256(self) -> str:
+        return hashlib.sha256(self.render_pr_origin_binding().encode("utf-8")).hexdigest()
+
+
+def _parse_issue_pr_binding(text: str, marker: str) -> IssuePRBinding:
+    lines = _normalized_lines(text, "IssuePRBinding")
+    nonempty = [line for line in lines if line]
+    if len(nonempty) != 2 or nonempty[0] != marker:
+        _fail("IssuePRBinding marker or line shape is invalid")
+    json_line = nonempty[1]
+    try:
+        value = c02.decode_json(json_line)
+    except Exception as error:
+        _fail(f"invalid IssuePRBinding JSON: {error}")
+    if type(value) is not dict or set(value) != _ISSUE_PR_BINDING_KEYS:
+        _fail("IssuePRBinding has invalid exact keys")
+    if type(value.get("schemaVersion")) is not int or value["schemaVersion"] != 1:
+        _fail("IssuePRBinding schemaVersion must be exact integer 1")
+    binding = IssuePRBinding(
+        value["schemaVersion"], value["issueNumber"], value["issueDatabaseId"],
+        value["issueNodeId"], value["issueRequestAnchorCommentDatabaseId"],
+        value["issueRequestAnchorSha256"], value["issueBranchLeaseCommentDatabaseId"],
+        value["issueBranchLeaseSha256"], value["sourceId"], value["sourceRepositoryId"],
+        value["branchRef"], value["pullRequestNumber"], value["pullRequestDatabaseId"],
+        value["pullRequestNodeId"], value["initialHeadSha"], value["baseRef"],
+        value["centralRepositoryNodeId"], value["bindingId"],
+    )
+    if json_line != _canonical_json(binding.as_value()) or text != f"{marker}\n{json_line}\n":
+        _fail("IssuePRBinding representation is not canonical")
+    return binding
+
+
+def parse_issue_internal_pr_binding(text: str) -> IssuePRBinding:
+    return _parse_issue_pr_binding(text, ISSUE_INTERNAL_PR_BINDING_MARKER)
+
+
+def parse_pr_issue_origin_binding(text: str) -> IssuePRBinding:
+    return _parse_issue_pr_binding(text, PR_ISSUE_ORIGIN_BINDING_MARKER)
 
 
 @dataclass(frozen=True)

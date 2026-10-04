@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from automation.federation.controller import (
     AppIdentity,
@@ -14,6 +14,7 @@ from automation.federation.controller import (
     DuplicateAnchorError,
     ForkHeadError,
     R02Error,
+    ReservedIssuePRPendingManagedAuthority,
     StaleAuthorityError,
     allowed_proposal_paths,
     authorized_patch_events,
@@ -56,7 +57,7 @@ BODY = "Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\nA source\n
 
 
 def pr(head="a" * 40, body=BODY, head_repo="swiftstream/skills", author_id="U_author", author_login="alice"):
-    return PullRequestMetadata(7, body, author_id, author_login, head, "b" * 40, "proposal", "main", "7", head_repo, "7", "swiftstream/skills", None, False)
+    return PullRequestMetadata(7, body, author_id, author_login, head, "b" * 40, "proposal", "main", "7", head_repo, "7", "swiftstream/skills", None, False, False)
 
 
 def comment(number, body, author_id="U_author", author_login="alice", author_type="User", editor_id=None, edited=None, created=False):
@@ -334,6 +335,110 @@ class InteractiveTests(unittest.TestCase):
         controller.interactive_anchor_and_reconstruct(7, RequestClass.ADD)
         self.assertEqual(len(fake.created), 1)
 
+    def test_reserved_issue_pr_blocks_legacy_anchor_proposal_validation_and_finalizer_paths(self):
+        class ReservedClient(FakeClient):
+            def __init__(self, branch="bot/federation/request/issue-7"):
+                super().__init__(current_pr=replace(pr(), head_ref=branch))
+                self.comment_reads = 0
+
+            def list_issue_comments(self, repository, number):
+                self.comment_reads += 1
+                return super().list_issue_comments(repository, number)
+
+        fake = ReservedClient()
+        old_anchor = self.anchor(pr_value=fake.current_pr)
+        fake.comments = [comment(100, old_anchor.render(), APP.bot_node_id, APP.bot_login, "Bot")]
+        candidate_builder = Mock()
+        controller = R02Controller(fake, "swiftstream/skills", APP, candidate_builder=candidate_builder)
+        with patch.object(controller_module, "validate_unique_anchor") as validate_anchor, patch.object(
+            controller_module, "create_anchor_once", wraps=controller_module.create_anchor_once
+        ) as create_anchor:
+            with self.assertRaises(ReservedIssuePRPendingManagedAuthority):
+                controller.interactive_anchor_and_reconstruct(7, RequestClass.ADD)
+            with self.assertRaises(ReservedIssuePRPendingManagedAuthority):
+                controller.anchor_and_reconstruct_existing(7, RequestClass.ADD)
+            with self.assertRaises(ReservedIssuePRPendingManagedAuthority):
+                controller.interactive_proposal(7, RequestClass.ADD, fake.main_oid, "refs/heads/topic")
+            with self.assertRaises(ReservedIssuePRPendingManagedAuthority):
+                controller.trusted_validation(7, fake.main_oid, candidate_builder)
+            with patch.object(controller, "current_accepted_main", return_value=(RepositoryMetadata(7, "R_7", "swiftstream/skills", "main"), fake.main_oid)), patch.object(
+                controller, "interactive_proposal"
+            ) as proposal, patch.object(controller, "trusted_validation") as validation, patch.object(
+                controller, "publish_finalizer_result"
+            ) as publish, patch.object(controller, "dispatch_trusted_validation_recovery") as dispatch:
+                controller.finalize_one_manual_pr({"number": 7})
+            proposal.assert_not_called()
+            validation.assert_not_called()
+            publish.assert_not_called()
+            dispatch.assert_not_called()
+        validate_anchor.assert_not_called()
+        create_anchor.assert_not_called()
+        candidate_builder.assert_not_called()
+        self.assertEqual(fake.comment_reads, 0)
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.ref_calls, [])
+
+    def test_reserved_namespace_classifier_is_exact_and_malformed_attempts_are_quarantined(self):
+        class ReservedClient(FakeClient):
+            def __init__(self, branch):
+                super().__init__(current_pr=replace(pr(), head_ref=branch))
+                self.comment_reads = 0
+
+            def list_issue_comments(self, repository, number):
+                self.comment_reads += 1
+                return super().list_issue_comments(repository, number)
+
+        for branch in ("bot/federation/request/issue-7", "bot/federation/request/issue-01", "refs/heads/bot/federation/request/issue-7"):
+            with self.subTest(branch=branch):
+                fake = ReservedClient(branch)
+                controller = R02Controller(fake, "swiftstream/skills", APP)
+                with self.assertRaises(ReservedIssuePRPendingManagedAuthority):
+                    controller.anchor_and_reconstruct_existing(7, RequestClass.ADD)
+                self.assertEqual(fake.comment_reads, 0)
+
+        fake = ReservedClient("bot/federation/requested/issue-7")
+        controller = R02Controller(fake, "swiftstream/skills", APP)
+        with self.assertRaises(DuplicateAnchorError):
+            controller.anchor_and_reconstruct_existing(7, RequestClass.ADD)
+        self.assertEqual(fake.comment_reads, 1)
+
+    def test_live_reserved_issue_pr_commands_fail_before_legacy_mutation(self):
+        class ReservedRuntimeClient(ProductionAddClient):
+            def __init__(self):
+                super().__init__()
+                self.current_pr = replace(self.current_pr, head_ref="bot/federation/request/issue-7")
+                self.comment_reads = 0
+                self.file_reads = 0
+
+            def list_issue_comments(self, repository, number):
+                self.comment_reads += 1
+                return super().list_issue_comments(repository, number)
+
+            def list_pull_request_files(self, repository, number):
+                self.file_reads += 1
+                return super().list_pull_request_files(repository, number)
+
+        for command in ("interactive", "trusted-validation"):
+            with self.subTest(command=command):
+                fake = ReservedRuntimeClient()
+                environment = {
+                    "GITHUB_REPOSITORY": "swiftstream/skills",
+                    "FEDERATION_GITHUB_TOKEN": "token",
+                    "FEDERATION_APP_SLUG": APP.slug,
+                    "FEDERATION_WAKE_PULL_NUMBER": "7",
+                    "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
+                }
+                with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.dict(os.environ, environment, clear=False):
+                    self.assertEqual(main([command]), 1)
+                self.assertEqual(fake.created, [])
+                self.assertEqual(fake.ref_calls, [])
+                self.assertEqual(fake.dispatches, [])
+                self.assertEqual(fake.checks, [])
+                self.assertEqual(fake.check_objects, [])
+                self.assertEqual(fake.comment_reads, 0)
+                if command == "trusted-validation":
+                    self.assertEqual(fake.file_reads, 0)
+
     def test_state_finalizer_cannot_recreate_anchor_after_authority_disappears(self):
         current_pr = replace(pr(), base_oid="c" * 40)
         anchor = self.anchor(pr_value=current_pr)
@@ -360,7 +465,7 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(fake.created, [])
 
     def test_pre_anchor_edit_is_rejected(self):
-        edited_pr = PullRequestMetadata(7, BODY, "U_author", "alice", "a" * 40, "b" * 40, "proposal", "main", "7", "swiftstream/skills", "7", "swiftstream/skills", "2026-01-01", True)
+        edited_pr = PullRequestMetadata(7, BODY, "U_author", "alice", "a" * 40, "b" * 40, "proposal", "main", "7", "swiftstream/skills", "7", "swiftstream/skills", "2026-01-01", True, False)
         with self.assertRaises(R02Error):
             create_anchor_once(FakeClient(edited_pr), "swiftstream/skills", edited_pr, RequestClass.ADD, APP, ())
 

@@ -63,6 +63,7 @@ class ValidationTests(unittest.TestCase):
                     return HttpResponse(200, url, json.dumps({
                         "number": 7,
                         "body": "body",
+                        "draft": False,
                         "user": {"login": "alice", "node_id": "U_author"},
                         "head": {"sha": "a" * 40, "ref": "proposal", "repo": {"node_id": "7", "full_name": "swiftstream/skills"}},
                         "base": {"sha": "b" * 40, "ref": "main", "repo": {"node_id": "7", "full_name": "swiftstream/skills"}},
@@ -73,7 +74,7 @@ class ValidationTests(unittest.TestCase):
                     return HttpResponse(200, url, json.dumps([comment]).encode())
                 payload = json.loads(body)
                 if "FederationPullRequestRoutingBefore" in payload["query"] or "FederationPullRequestRoutingAfter" in payload["query"]:
-                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
+                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "isDraft": False, "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
                 if payload["query"] == ISSUE_COMMENT_NODES_QUERY:
                     self.assert_comment_query(payload)
                     node = {"__typename": "IssueComment", "id": "IC_1", "fullDatabaseId": "1", "body": "comment", "createdAt": "2026-09-10T00:00:00Z", "updatedAt": "2026-09-10T00:00:00Z", "author": {"id": "U_author", "login": "alice", "__typename": "User"}, "editor": None, "lastEditedAt": None, "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
@@ -117,6 +118,7 @@ class ValidationTests(unittest.TestCase):
                     return HttpResponse(200, url, json.dumps({
                         "number": 7,
                         "body": body,
+                        "draft": False,
                         "user": {"login": "alice", "node_id": "U_author"},
                         "head": {"sha": "a" * 40, "ref": "proposal", "repo": {"node_id": "N_head", "full_name": "swiftstream/skills"}},
                         "base": {"sha": "b" * 40, "ref": "main", "repo": {"node_id": "N_base", "full_name": "swiftstream/skills"}},
@@ -127,7 +129,7 @@ class ValidationTests(unittest.TestCase):
                     return HttpResponse(200, url, json.dumps([comment]).encode())
                 payload = json.loads(request_body)
                 if "FederationPullRequestRoutingBefore" in payload["query"] or "FederationPullRequestRoutingAfter" in payload["query"]:
-                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
+                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "isDraft": False, "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
                 if payload["query"] == ISSUE_COMMENT_NODES_QUERY:
                     node = {"__typename": "IssueComment", "id": "IC_anchor", "fullDatabaseId": "1", "body": anchor_body, "createdAt": "2026-09-10T00:00:00Z", "updatedAt": "2026-09-10T00:00:00Z", "author": {"id": "U_bot", "login": "swift-stream-federation", "__typename": "Bot"}, "editor": None, "lastEditedAt": None, "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
                     return HttpResponse(200, url, json.dumps({"data": {"nodes": [node]}}).encode())
@@ -143,7 +145,7 @@ class ValidationTests(unittest.TestCase):
     def _compatibility_fixture(self):
         body = "Repository URL:\nhttps://github.com/example/source\nDescription:\nA source\nBranch:\nmain\nSkills root:\nskills\nSkill prefixes:\nexample\n"
         request = parse_request_body(RequestClass.ADD, body)
-        pr = PullRequestMetadata(7, body, "U_author", "alice", "a" * 40, "b" * 40, "proposal", "main", "N_head", "swiftstream/skills", "N_base", "swiftstream/skills", None, False)
+        pr = PullRequestMetadata(7, body, "U_author", "alice", "a" * 40, "b" * 40, "proposal", "main", "N_head", "swiftstream/skills", "N_base", "swiftstream/skills", None, False, False)
         anchor = RequestAnchor(7, RequestClass.ADD, "U_author", "alice", body_sha256(body), request)
         anchor_comment = IssueComment("IC_anchor", 1, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot", None, None, None, None, False)
         return pr, anchor, AnchorComment(anchor, anchor_comment)
@@ -553,7 +555,7 @@ class ValidationTests(unittest.TestCase):
         class Client:
             def __init__(self, main_oid):
                 self.main_oid = main_oid
-                self.pr = PullRequestMetadata(7, "", "U_a", "alice", head, base, "proposal", "main", "7", "swiftstream/skills", "7", "swiftstream/skills", None, False)
+                self.pr = PullRequestMetadata(7, "", "U_a", "alice", head, base, "proposal", "main", "7", "swiftstream/skills", "7", "swiftstream/skills", None, False, False)
 
             def get_pull_request_metadata(self, repository, number):
                 return self.pr

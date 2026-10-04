@@ -19,7 +19,7 @@ from automation.federation.controller import (
     verify_machine_check_identity,
 )
 from automation.federation.github_api import CheckRun, GitHubClient, GitTreeEntry, HttpResponse, IssueComment, NotFoundError, PullRequestMetadata, RepositoryMetadata, RefCASConflict
-from automation.federation.request_model import ANCHOR_MARKER, RequestClass, RequestAnchor, body_sha256, parse_request_body
+from automation.federation.request_model import ANCHOR_MARKER, IssuePRBinding, RequestClass, RequestAnchor, body_sha256, parse_request_body
 from scripts import federate as c02
 import automation.federation.controller as controller_module
 
@@ -63,7 +63,7 @@ class ReconcileTests(unittest.TestCase):
         class ManualClient(ReconcileClient):
             def __init__(self):
                 super().__init__()
-                self.pr = PullRequestMetadata(7, body, "U_author", "alice", "d" * 40, current, "request", "main", "R_central" if not fork else "R_fork", "swiftstream/skills" if not fork else "someone/fork", "R_central", "swiftstream/skills", "2026-01-01" if edited else None, edited)
+                self.pr = PullRequestMetadata(7, body, "U_author", "alice", "d" * 40, current, "request", "main", "R_central" if not fork else "R_fork", "swiftstream/skills" if not fork else "someone/fork", "R_central", "swiftstream/skills", "2026-01-01" if edited else None, edited, False)
                 self.comments = [] if edited else [anchor_comment]
                 self.states = []
 
@@ -326,7 +326,7 @@ class ReconcileTests(unittest.TestCase):
         class OwnedInvalid(ReconcileClient):
             def __init__(self):
                 super().__init__()
-                self.pr = PullRequestMetadata(7, "", "U", "app[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False)
+                self.pr = PullRequestMetadata(7, "", "U", "app[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False)
                 self.comments = []
                 self.states = []
             def list_open_pull_requests(self, repository):
@@ -357,7 +357,7 @@ class ReconcileTests(unittest.TestCase):
         class WrongApp(ReconcileClient):
             def __init__(self):
                 super().__init__()
-                self.pr = PullRequestMetadata(7, "", "wrong", "other[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False)
+                self.pr = PullRequestMetadata(7, "", "wrong", "other[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False)
                 self.states = []
             def list_open_pull_requests(self, repository):
                 return ({"number": 7},)
@@ -430,7 +430,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_machine_validation_rejects_stale_base_before_candidate_validation(self):
         client = ReconcileClient()
-        client.pr = PullRequestMetadata(7, "", "U", "app[bot]", "d" * 40, "b" * 40, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False)
+        client.pr = PullRequestMetadata(7, "", "U", "app[bot]", "d" * 40, "b" * 40, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False)
         source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         called = []
         builder = type("Builder", (), {"validate_machine_head": lambda _self, *args: called.append(args) or (True, "ok")})()
@@ -557,6 +557,7 @@ class ReconcileTests(unittest.TestCase):
             "base_repository": "swiftstream/skills",
             "last_edited_at": None,
             "includes_created_edit": False,
+            "draft": False,
         }
         values.update(overrides)
         return PullRequestMetadata(**values), comment
@@ -616,7 +617,7 @@ class ReconcileTests(unittest.TestCase):
         class ManualAdvanceClient(ReconcileClient):
             def __init__(self):
                 super().__init__()
-                self.pr = PullRequestMetadata(8, body, "U_author", "alice", "d" * 40, self.main, "request", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False)
+                self.pr = PullRequestMetadata(8, body, "U_author", "alice", "d" * 40, self.main, "request", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False)
                 self.comments = [comment]
 
             def list_open_pull_requests(self, _repository):
@@ -716,6 +717,63 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(client.updated_branches, [(stale_pr.number, stale_pr.head_oid)])
         self.assertEqual(client.dispatches, [])
 
+    def test_main_advance_reserved_issue_pr_is_quarantined_at_current_and_stale_bases(self):
+        binding = IssuePRBinding.create(
+            issue_number=7,
+            issue_database_id=700,
+            issue_node_id="I_7",
+            issue_request_anchor_comment_database_id=701,
+            issue_request_anchor_sha256="1" * 64,
+            issue_branch_lease_comment_database_id=702,
+            issue_branch_lease_sha256="2" * 64,
+            source_id="demo",
+            source_repository_id=99,
+            branch_ref="refs/heads/bot/federation/request/issue-7",
+            pull_request_number=8,
+            pull_request_database_id=800,
+            pull_request_node_id="PR_8",
+            initial_head_sha="d" * 40,
+            base_ref="main",
+            central_repository_node_id="R_central",
+        )
+        issue_binding = IssueComment(
+            "IC_binding", 300, binding.render_issue_binding(), "U_bot", "app[bot]", "Bot",
+            None, None, None, None, False,
+        )
+        pr_binding = IssueComment(
+            "IC_origin", 301, binding.render_pr_origin_binding(), "U_bot", "app[bot]", "Bot",
+            None, None, None, None, False,
+        )
+        comment_states = {
+            "missing": (),
+            "half-issue-side": (issue_binding,),
+            "half-pr-side": (pr_binding,),
+            "complete": (issue_binding, pr_binding),
+        }
+        for base_oid in ("a" * 40, "b" * 40):
+            for binding_state, comments in comment_states.items():
+                with self.subTest(base_oid=base_oid, binding_state=binding_state):
+                    pr_value, _ = self._manual_main_advance_pr(base_oid=base_oid)
+                    reserved_pr = replace(pr_value, head_ref="bot/federation/request/issue-7")
+                    client, controller = self._main_advance_with_prs(
+                        {reserved_pr.number: reserved_pr}, {reserved_pr.number: comments}
+                    )
+                    with patch.object(controller_module, "read_request_marker") as read_marker:
+                        self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+                    read_marker.assert_not_called()
+                    self.assertEqual(client.updated_branches, [])
+                    self.assertEqual(client.dispatches, [])
+
+    def test_main_advance_malformed_reserved_issue_prefix_fails_closed(self):
+        pr_value, _ = self._manual_main_advance_pr(base_oid="b" * 40)
+        malformed_pr = replace(pr_value, head_ref="bot/federation/request/issue-01")
+        client, controller = self._main_advance_with_prs({malformed_pr.number: malformed_pr}, {malformed_pr.number: ()})
+        with patch.object(controller_module, "read_request_marker") as read_marker:
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        read_marker.assert_not_called()
+        self.assertEqual(client.updated_branches, [])
+        self.assertEqual(client.dispatches, [])
+
     def test_main_advance_stale_initial_request_ignores_ordinary_non_request_anchor_comment(self):
         stale_pr, _ = self._manual_main_advance_pr(base_oid="b" * 40)
         compatibility_comment = IssueComment(
@@ -758,8 +816,8 @@ class ReconcileTests(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.prs = {
-                    8: PullRequestMetadata(8, body, "U_author", "alice", "d" * 40, "b" * 40, "request", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False),
-                    9: PullRequestMetadata(9, "", "U", "other[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False),
+                    8: PullRequestMetadata(8, body, "U_author", "alice", "d" * 40, "b" * 40, "request", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False),
+                    9: PullRequestMetadata(9, "", "U", "other[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False),
                 }
                 self.comments_by_pr = {8: (comment,), 9: ()}
 
