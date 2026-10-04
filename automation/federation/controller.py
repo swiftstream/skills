@@ -10,6 +10,7 @@ import re
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
@@ -24,6 +25,7 @@ from .github_api import (
     GitHubClient,
     GraphQLError,
     IssueComment,
+    IssueMetadata,
     InvalidResponseError,
     MergeResult,
     NotFoundError,
@@ -38,6 +40,11 @@ from .request_model import (
     PATCH_SENTINEL,
     REQUEST_MARKER,
     CommentEvent,
+    FoldEvidence,
+    IssuePatchEvent,
+    IssueBranchLease,
+    IssueRequestAnchor,
+    ClaimedHeadMarker,
     PatchFoldResult,
     Request,
     RequestAnchor,
@@ -45,11 +52,22 @@ from .request_model import (
     RequestModelError,
     body_sha256,
     fold_patch_events,
+    fold_issue_patch_events,
+    issue_branch_lease_authority_digest,
+    issue_branch_ref,
+    issue_owner_key,
+    claim_generation_id,
+    new_carrier_nonce,
     parse_anchor,
+    parse_issue_request_anchor,
+    parse_issue_branch_lease,
+    parse_claimed_head_marker,
+    parse_issue_request_body,
     parse_request_body,
     parse_patch,
     proposed_line_refs,
     resolve_publication_lines,
+    ISSUE_BRANCH_LEASE_MARKER,
     validate_drop_set,
     verify_anchor_integrity,
 )
@@ -145,6 +163,12 @@ class AppIdentity:
 @dataclass(frozen=True)
 class AnchorComment:
     anchor: RequestAnchor
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
+class IssueAnchorComment:
+    anchor: IssueRequestAnchor
     comment: IssueComment
 
 
@@ -497,6 +521,679 @@ def reconstruct_from_github(client: GitHubClient, repository: str, pr: PullReque
     if not verify_anchor_integrity(anchor_comment.anchor, pr.body):
         raise R02Error("PR body hash no longer matches immutable RequestAnchor")
     return fold_patch_events(anchor_comment.anchor, authorized_patch_events(client, repository, anchor_comment, comments), semantic_validator)
+
+
+def _issue_anchor_candidates(comments: Iterable[IssueComment]) -> list[IssueAnchorComment]:
+    found: list[IssueAnchorComment] = []
+    for comment in comments:
+        if not comment.body.startswith("<!-- swiftstream-federation-issue-request-anchor:v1 -->"):
+            continue
+        try:
+            anchor = parse_issue_request_anchor(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueRequestAnchor: {_bounded_reason(error)}") from None
+        found.append(IssueAnchorComment(anchor, comment))
+    return found
+
+
+def _validate_issue_source_authority(anchor: IssueRequestAnchor, authority: IssueSourceAuthority) -> None:
+    if type(authority) is not IssueSourceAuthority:
+        raise R02Error("fresh Issue source authority is required")
+    if (
+        authority.request_class is not anchor.request_class
+        or authority.source_id != anchor.source_id
+        or authority.source_repository_id != anchor.source_repository_id
+        or authority.source_canonical_full_name != anchor.source_canonical_full_name
+        or authority.source_identity_kind.value != anchor.source_identity_kind
+    ):
+        raise StaleAuthorityError("Issue source authority changed from immutable IssueRequestAnchor")
+
+
+def validate_unique_issue_anchor(
+    comments: Iterable[IssueComment],
+    issue: IssueMetadata,
+    app: AppIdentity,
+) -> IssueAnchorComment:
+    if type(issue) is not IssueMetadata or issue.is_pull_request:
+        raise R02Error("IssueRequestAnchor requires an Issue metadata snapshot")
+    found = _issue_anchor_candidates(comments)
+    if len(found) != 1:
+        raise DuplicateAnchorError("exactly one immutable IssueRequestAnchor comment is required")
+    item = found[0]
+    anchor, comment = item.anchor, item.comment
+    if (
+        anchor.issue_number != issue.number
+        or anchor.issue_database_id != issue.database_id
+        or anchor.issue_node_id != issue.node_id
+        or anchor.original_author_id != issue.author_id
+    ):
+        raise R02Error("IssueRequestAnchor Issue/requester identity mismatch")
+    if (
+        comment.author_id != app.bot_node_id
+        or comment.author_login != app.bot_login
+        or comment.author_type not in {None, "Bot"}
+    ):
+        raise R02Error("IssueRequestAnchor is not authored by the designated App Bot")
+    if (
+        comment.editor_id is not None
+        or comment.editor_login is not None
+        or comment.editor_type is not None
+        or comment.last_edited_at is not None
+        or comment.includes_created_edit
+    ):
+        raise R02Error("IssueRequestAnchor comment edit-integrity metadata is not immutable")
+    return item
+
+
+def create_or_validate_issue_anchor(
+    client: GitHubClient,
+    repository: str,
+    issue: IssueMetadata,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    source_authority: IssueSourceAuthority | None,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+) -> IssueAnchorComment:
+    """Establish one immutable Issue anchor or validate its exact persisted evidence."""
+    if type(issue) is not IssueMetadata or issue.is_pull_request:
+        raise R02Error("Issue intake requires one Issue metadata snapshot")
+    if not callable(source_authority_resolver):
+        raise R02Error("a fresh Issue source-authority resolver is required")
+    comment_list = list(comments)
+    existing = _issue_anchor_candidates(comment_list)
+    if existing:
+        persisted = validate_unique_issue_anchor(comment_list, issue, app)
+        try:
+            fresh = source_authority_resolver(persisted.anchor.initial_request, persisted.anchor.request_class)
+        except Exception as error:
+            raise StaleAuthorityError(f"fresh Issue source authority is unavailable: {_bounded_reason(error)}") from None
+        _validate_issue_source_authority(persisted.anchor, fresh)
+        return persisted
+
+    if type(source_authority) is not IssueSourceAuthority:
+        raise R02Error("new IssueRequestAnchor requires a validated IssueSourceAuthority")
+    try:
+        initial_request = parse_issue_request_body(issue.body)
+        initial_body_sha256 = body_sha256(issue.body)
+    except RequestModelError as error:
+        raise R02Error(f"Issue request body is invalid: {_bounded_reason(error)}") from None
+    if initial_request.request_class is not source_authority.request_class:
+        raise R02Error("Issue body request class does not match IssueSourceAuthority")
+    _validate_issue_source_authority(
+        IssueRequestAnchor(
+            1,
+            issue.number,
+            issue.database_id,
+            issue.node_id,
+            initial_request.request_class,
+            issue.author_id,
+            issue.author_login,
+            initial_body_sha256,
+            initial_request,
+            source_authority.source_id,
+            source_authority.source_repository_id,
+            source_authority.source_canonical_full_name,
+            source_authority.source_identity_kind.value,
+            issue.last_edited_at,
+            issue.includes_created_edit,
+        ),
+        source_authority,
+    )
+    intended = IssueRequestAnchor(
+        1,
+        issue.number,
+        issue.database_id,
+        issue.node_id,
+        initial_request.request_class,
+        issue.author_id,
+        issue.author_login,
+        initial_body_sha256,
+        initial_request,
+        source_authority.source_id,
+        source_authority.source_repository_id,
+        source_authority.source_canonical_full_name,
+        source_authority.source_identity_kind.value,
+        issue.last_edited_at,
+        issue.includes_created_edit,
+    )
+    client.create_issue_comment(repository, issue.number, intended.render())
+    try:
+        reread_issue = client.get_issue_metadata(repository, issue.number)
+        reread_comments = client.list_issue_comments(repository, issue.number)
+    except Exception as error:
+        raise StaleAuthorityError(f"Issue anchor write could not be re-read: {_bounded_reason(error)}") from None
+    if (
+        reread_issue.number != issue.number
+        or reread_issue.database_id != issue.database_id
+        or reread_issue.node_id != issue.node_id
+        or reread_issue.is_pull_request
+        or reread_issue.author_id != issue.author_id
+    ):
+        raise StaleAuthorityError("Issue identity changed while creating IssueRequestAnchor")
+    try:
+        fresh_source_authority = source_authority_resolver(initial_request, initial_request.request_class)
+    except Exception as error:
+        raise StaleAuthorityError(f"fresh Issue source authority is unavailable after anchoring: {_bounded_reason(error)}") from None
+    _validate_issue_source_authority(intended, fresh_source_authority)
+    persisted = validate_unique_issue_anchor(reread_comments, reread_issue, app)
+    if persisted.anchor != intended:
+        raise StaleAuthorityError("persisted IssueRequestAnchor differs from intended authority")
+    if (
+        reread_issue.body != issue.body
+        or reread_issue.last_edited_at != issue.last_edited_at
+        or reread_issue.includes_created_edit != issue.includes_created_edit
+    ):
+        raise StaleAuthorityError("Issue body/edit metadata changed after the immutable anchor was created")
+    return persisted
+
+
+def _issue_comment_edited(comment: IssueComment) -> bool:
+    return any((
+        comment.editor_id is not None,
+        comment.editor_login is not None,
+        comment.editor_type is not None,
+        comment.last_edited_at is not None,
+        comment.includes_created_edit,
+    ))
+
+
+def _issue_patch_candidate(body: str) -> bool:
+    normalized = body.replace("\r\n", "\n")
+    return next((line for line in normalized.split("\n") if line != ""), None) == PATCH_SENTINEL
+
+
+def authorized_issue_patch_events(
+    client: GitHubClient,
+    repository: str,
+    anchor_comment: IssueAnchorComment,
+    comments: Iterable[IssueComment],
+) -> tuple[IssuePatchEvent, ...]:
+    events: list[IssuePatchEvent] = []
+    anchor_id = anchor_comment.comment.database_id
+    for comment in comments:
+        if comment.database_id <= anchor_id:
+            continue
+        authorized = False
+        if comment.author_type == "User" and comment.author_id is not None and _issue_patch_candidate(comment.body):
+            if comment.author_id == anchor_comment.anchor.original_author_id:
+                authorized = True
+            elif comment.author_login is not None:
+                try:
+                    authorized = client.get_collaborator_permission(repository, comment.author_login) in {"admin", "maintain"}
+                except Exception:
+                    authorized = False
+        try:
+            events.append(IssuePatchEvent(comment.database_id, authorized, _issue_comment_edited(comment), comment.body))
+        except RequestModelError as error:
+            raise R02Error(f"Issue PATCH event is invalid: {_bounded_reason(error)}") from None
+    return tuple(sorted(events, key=lambda item: item.comment_id))
+
+
+def reconstruct_issue_from_github(
+    client: GitHubClient,
+    repository: str,
+    anchor_comment: IssueAnchorComment,
+    comments: Iterable[IssueComment],
+    semantic_validator: Callable[[Request], bool] | None = None,
+) -> PatchFoldResult:
+    """Rebuild effective Issue request from its immutable anchor and later Issue comments."""
+    events = authorized_issue_patch_events(client, repository, anchor_comment, comments)
+    try:
+        return fold_issue_patch_events(anchor_comment.anchor, events, semantic_validator)
+    except RequestModelError as error:
+        raise R02Error(f"Issue PATCH fold failed closed: {_bounded_reason(error)}") from None
+
+
+@dataclass(frozen=True)
+class IssueBranchLeaseComment:
+    lease: IssueBranchLease
+    comment: IssueComment
+
+
+def _lease_sha40(value: Any, label: str) -> str:
+    if type(value) is not str or not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise R02Error(f"{label} is not a canonical Git object SHA")
+    return value
+
+
+def _fresh_issue_source_authority(
+    resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+    anchor: IssueRequestAnchor,
+) -> IssueSourceAuthority:
+    try:
+        authority = resolver(anchor.initial_request, anchor.request_class)
+    except Exception as error:
+        raise StaleAuthorityError(f"fresh Issue source authority is unavailable: {_bounded_reason(error)}") from None
+    _validate_issue_source_authority(anchor, authority)
+    return authority
+
+
+def _lease_repo_snapshot(
+    client: GitHubClient,
+    repository: str,
+    expected_node_id: str,
+) -> tuple[RepositoryMetadata, str]:
+    try:
+        metadata = client.get_repository_metadata(repository)
+        if metadata.node_id != expected_node_id or not metadata.default_branch:
+            raise StaleAuthorityError("central repository identity/default branch changed")
+        branch_sha = _lease_sha40(client.get_ref_oid(repository, metadata.default_branch), "central default-branch head")
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"central repository snapshot is unavailable: {_bounded_reason(error)}") from None
+    return metadata, branch_sha
+
+
+def _lease_tree_snapshot(
+    client: GitHubClient,
+    repository: str,
+    commit_sha: str,
+) -> tuple[Any, str, tuple[Any, ...]]:
+    try:
+        metadata = client.get_commit_metadata(repository, commit_sha)
+        if metadata.sha != commit_sha:
+            raise R02Error("commit metadata identity does not match requested SHA")
+        tree_sha, entries = client.get_commit_tree(repository, commit_sha)
+        if tree_sha != metadata.tree_sha:
+            raise R02Error("commit tree response identity does not match commit metadata")
+        _lease_sha40(tree_sha, "commit tree SHA")
+        return metadata, tree_sha, entries
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"Git commit/tree provenance is unavailable: {_bounded_reason(error)}") from None
+
+
+def _lease_leaf_map(entries: Iterable[Any]) -> dict[str, tuple[str, str, str]]:
+    leaves: dict[str, tuple[str, str, str]] = {}
+    for entry in entries:
+        if entry.object_type == "tree":
+            continue
+        if entry.path in leaves:
+            raise R02Error("Git tree contains duplicate leaf paths")
+        leaves[entry.path] = (entry.mode, entry.object_type, entry.sha)
+    return leaves
+
+
+def _validate_marker_only_tree_delta(
+    base_entries: Iterable[Any],
+    head_entries: Iterable[Any],
+    expected_blob_sha: str,
+) -> None:
+    base = _lease_leaf_map(base_entries)
+    head = _lease_leaf_map(head_entries)
+    changed = {path for path in set(base) | set(head) if base.get(path) != head.get(path)}
+    if changed != {REQUEST_MARKER}:
+        raise R02Error("initial claimed tree must change only .federation-request")
+    if head.get(REQUEST_MARKER) != ("100644", "blob", expected_blob_sha):
+        raise R02Error("initial claimed tree .federation-request entry is not the exact regular blob")
+
+
+def _lease_marker_for(lease: IssueBranchLease) -> ClaimedHeadMarker:
+    return ClaimedHeadMarker(
+        lease.claim_kind,
+        lease.carrier_role,
+        "ISSUE",
+        issue_owner_key(
+            lease.central_repository_node_id,
+            lease.issue_database_id,
+            lease.issue_node_id,
+            lease.issue_number,
+        ),
+        lease.claim_generation_id,
+        lease.carrier_nonce,
+        "INITIAL",
+    )
+
+
+def _expected_deterministic_commit_sha(tree_sha: str, parent_sha: str, message: str, author_date: str) -> str:
+    if type(author_date) is not str or not author_date.endswith("Z"):
+        raise R02Error("claimed commit author date is not deterministic UTC")
+    try:
+        instant = datetime.fromisoformat(author_date[:-1] + "+00:00")
+    except ValueError:
+        raise R02Error("claimed commit author date is malformed") from None
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise R02Error("claimed commit author date lacks a timezone")
+    git_timestamp = f"{int(instant.timestamp())} +0000"
+    body = (
+        f"tree {tree_sha}\nparent {parent_sha}\n"
+        f"author Swift Stream Federation <automation@swiftstream.invalid> {git_timestamp}\n"
+        f"committer Swift Stream Federation <automation@swiftstream.invalid> {git_timestamp}\n\n"
+    ).encode("utf-8") + message.encode("utf-8")
+    return hashlib.sha1(b"commit " + str(len(body)).encode("ascii") + b"\0" + body).hexdigest()
+
+
+def _validate_issue_branch_lease_history(
+    client: GitHubClient,
+    repository: str,
+    anchor: IssueRequestAnchor,
+    lease: IssueBranchLease,
+) -> None:
+    if (
+        lease.issue_number != anchor.issue_number
+        or lease.issue_database_id != anchor.issue_database_id
+        or lease.issue_node_id != anchor.issue_node_id
+        or lease.issue_request_anchor_sha256 != anchor.canonical_sha256()
+        or lease.source_id != anchor.source_id
+        or lease.source_repository_id != anchor.source_repository_id
+        or lease.request_class is not anchor.request_class
+        or lease.branch_ref != issue_branch_ref(anchor.issue_number)
+    ):
+        raise R02Error("IssueBranchLease does not match its immutable IssueRequestAnchor")
+    try:
+        _base, base_tree_sha, base_entries = _lease_tree_snapshot(client, repository, lease.accepted_base_sha)
+        authority_digest = issue_branch_lease_authority_digest(
+            accepted_base_sha=lease.accepted_base_sha,
+            accepted_base_tree_sha=base_tree_sha,
+            branch_ref=lease.branch_ref,
+            central_repository_node_id=lease.central_repository_node_id,
+            owner_key=issue_owner_key(lease.central_repository_node_id, anchor.issue_database_id, anchor.issue_node_id, anchor.issue_number),
+            issue_request_anchor_sha256=anchor.canonical_sha256(),
+            request_class=anchor.request_class,
+            source_canonical_full_name=anchor.source_canonical_full_name,
+            source_id=anchor.source_id,
+            source_identity_kind=anchor.source_identity_kind,
+            source_repository_id=anchor.source_repository_id,
+        )
+        if authority_digest != lease.authority_preimage_digest:
+            raise R02Error("IssueBranchLease authority preimage digest does not recompute")
+        owner_key = issue_owner_key(lease.central_repository_node_id, anchor.issue_database_id, anchor.issue_node_id, anchor.issue_number)
+        generation = claim_generation_id(
+            authority_preimage_digest=authority_digest,
+            carrier_nonce=lease.carrier_nonce,
+            central_repository_node_id=lease.central_repository_node_id,
+            owner_key=owner_key,
+            from_head_sha=lease.accepted_base_sha,
+            from_tree_sha=base_tree_sha,
+        )
+        marker = _lease_marker_for(lease)
+        if generation != lease.claim_generation_id or marker.claim_generation_id != generation:
+            raise R02Error("IssueBranchLease claimed-head generation does not recompute")
+        marker_text = marker.render()
+        if hashlib.sha256(marker_text.encode("utf-8")).hexdigest() != lease.initial_head_marker_digest:
+            raise R02Error("IssueBranchLease marker digest does not match canonical marker")
+        head, head_tree_sha, head_entries = _lease_tree_snapshot(client, repository, lease.initial_head_sha)
+        if head.parents != (lease.accepted_base_sha,) or head.tree_sha != lease.initial_head_tree_sha or head_tree_sha != lease.initial_head_tree_sha:
+            raise R02Error("IssueBranchLease initial commit parent/tree provenance does not match")
+        expected_sha = _expected_deterministic_commit_sha(head.tree_sha, lease.accepted_base_sha, marker_text, head.author_date)
+        if expected_sha != lease.initial_head_sha:
+            raise R02Error("IssueBranchLease commit SHA does not bind the exact claimed-head marker")
+        expected_bytes = (anchor.request_class.value + "\n").encode("utf-8")
+        expected_blob_sha = hashlib.sha1(b"blob " + str(len(expected_bytes)).encode("ascii") + b"\0" + expected_bytes).hexdigest()
+        _validate_marker_only_tree_delta(base_entries, head_entries, expected_blob_sha)
+        readback = client.read_commit_file(repository, lease.initial_head_sha, REQUEST_MARKER, expected_mode="100644")
+        if readback != expected_bytes:
+            raise R02Error("IssueBranchLease .federation-request readback differs from the exact request class bytes")
+        if parse_claimed_head_marker(marker_text) != marker:
+            raise R02Error("IssueBranchLease marker does not parse canonically")
+    except R02Error:
+        raise
+    except Exception as error:
+        raise R02Error(f"IssueBranchLease historical provenance is invalid: {_bounded_reason(error)}") from None
+
+
+def _lease_comment_candidates(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    anchor: IssueRequestAnchor,
+    anchor_comment_database_id: int,
+    central_repository_node_id: str,
+) -> list[IssueBranchLeaseComment]:
+    found: list[IssueBranchLeaseComment] = []
+    for comment in comments:
+        if not comment.body.startswith(ISSUE_BRANCH_LEASE_MARKER):
+            continue
+        try:
+            lease = parse_issue_branch_lease(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueBranchLease comment: {_bounded_reason(error)}") from None
+        if (
+            comment.author_id != app.bot_node_id
+            or comment.author_login != app.bot_login
+            or comment.author_type not in {None, "Bot"}
+            or comment.editor_id is not None
+            or comment.editor_login is not None
+            or comment.editor_type is not None
+            or comment.last_edited_at is not None
+            or comment.includes_created_edit
+        ):
+            raise R02Error("IssueBranchLease comment authorship/edit integrity is invalid")
+        if (
+            lease.issue_number != anchor.issue_number
+            or lease.issue_database_id != anchor.issue_database_id
+            or lease.issue_node_id != anchor.issue_node_id
+            or lease.issue_request_anchor_sha256 != anchor.canonical_sha256()
+            or lease.source_id != anchor.source_id
+            or lease.source_repository_id != anchor.source_repository_id
+            or lease.request_class is not anchor.request_class
+            or lease.branch_ref != issue_branch_ref(anchor.issue_number)
+            or lease.issue_request_anchor_comment_database_id != anchor_comment_database_id
+            or lease.central_repository_node_id != central_repository_node_id
+        ):
+            raise R02Error("IssueBranchLease does not match its immutable IssueRequestAnchor")
+        found.append(IssueBranchLeaseComment(lease, comment))
+    return found
+
+
+def _resolve_issue_branch_lease_class(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    anchor: IssueRequestAnchor,
+    anchor_comment_database_id: int,
+    central_repository_node_id: str,
+) -> IssueBranchLeaseComment | None:
+    candidates = _lease_comment_candidates(comments, app, anchor, anchor_comment_database_id, central_repository_node_id)
+    if not candidates:
+        return None
+    by_payload: dict[str, list[IssueBranchLeaseComment]] = {}
+    for item in candidates:
+        _validate_issue_branch_lease_history(client, repository, anchor, item.lease)
+        by_payload.setdefault(item.lease.render(), []).append(item)
+    if len(by_payload) != 1:
+        raise R02Error("conflicting immutable IssueBranchLease payloads block progression")
+    equivalent = next(iter(by_payload.values()))
+    return min(equivalent, key=lambda item: item.comment.database_id)
+
+
+def _read_issue_anchor_for_lease(
+    client: GitHubClient,
+    repository: str,
+    anchor_comment: IssueAnchorComment,
+    app: AppIdentity,
+) -> tuple[IssueMetadata, tuple[IssueComment, ...], IssueAnchorComment]:
+    try:
+        issue = client.get_issue_metadata(repository, anchor_comment.anchor.issue_number)
+        comments = client.list_issue_comments(repository, anchor_comment.anchor.issue_number)
+    except Exception as error:
+        raise StaleAuthorityError(f"Issue anchor/comment state is unavailable: {_bounded_reason(error)}") from None
+    persisted = validate_unique_issue_anchor(comments, issue, app)
+    if (
+        persisted.anchor != anchor_comment.anchor
+        or persisted.comment.database_id != anchor_comment.comment.database_id
+        or persisted.comment.body != anchor_comment.comment.body
+    ):
+        raise StaleAuthorityError("the supplied IssueRequestAnchor is not the current canonical anchor")
+    return issue, comments, persisted
+
+
+def _validate_new_claimed_commit(
+    client: GitHubClient,
+    repository: str,
+    accepted_base_sha: str,
+    accepted_base_entries: Iterable[Any],
+    created_head_sha: str,
+    created_tree_sha: str,
+    created_blob_sha: str,
+    marker: ClaimedHeadMarker,
+    expected_bytes: bytes,
+    timestamp: str,
+) -> None:
+    metadata, head_tree_sha, head_entries = _lease_tree_snapshot(client, repository, created_head_sha)
+    if metadata.parents != (accepted_base_sha,) or metadata.tree_sha != created_tree_sha or head_tree_sha != created_tree_sha:
+        raise R02Error("created claimed commit parent/tree readback is not exact")
+    if metadata.author_date != timestamp:
+        raise R02Error("created claimed commit timestamp readback is not exact")
+    if _expected_deterministic_commit_sha(created_tree_sha, accepted_base_sha, marker.render(), timestamp) != created_head_sha:
+        raise R02Error("created claimed commit SHA does not bind its exact marker")
+    expected_blob_sha = hashlib.sha1(b"blob " + str(len(expected_bytes)).encode("ascii") + b"\0" + expected_bytes).hexdigest()
+    if created_blob_sha != expected_blob_sha:
+        raise R02Error("created request blob SHA does not bind exact request bytes")
+    _validate_marker_only_tree_delta(accepted_base_entries, head_entries, created_blob_sha)
+    try:
+        file_bytes = client.read_commit_file(repository, created_head_sha, REQUEST_MARKER, expected_mode="100644")
+    except Exception as error:
+        raise R02Error(f"created request blob could not be read back as mode 100644: {_bounded_reason(error)}") from None
+    if file_bytes != expected_bytes:
+        raise R02Error("created request blob readback is not the exact RequestClass line")
+    if parse_claimed_head_marker(marker.render()) != marker:
+        raise R02Error("locally generated claimed-head marker failed exact parser roundtrip")
+
+
+def create_or_validate_issue_branch_lease(
+    client: GitHubClient,
+    repository: str,
+    anchor_comment: IssueAnchorComment,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+    *,
+    nonce_factory: Callable[[], str] | None = None,
+) -> IssueBranchLeaseComment:
+    """Create one unreachable marker-only claim or reuse its immutable historical lease."""
+    if type(anchor_comment) is not IssueAnchorComment:
+        raise R02Error("IssueBranchLease requires one validated IssueRequestAnchor comment")
+    if not callable(source_authority_resolver):
+        raise R02Error("a fresh Issue source-authority resolver is required")
+    try:
+        issue, comments, persisted_anchor = _read_issue_anchor_for_lease(client, repository, anchor_comment, app)
+    except RequestModelError as error:
+        raise R02Error(f"IssueRequestAnchor is invalid: {_bounded_reason(error)}") from None
+    try:
+        canonical = _resolve_issue_branch_lease_class(
+            client, repository, comments, app, persisted_anchor.anchor,
+            persisted_anchor.comment.database_id, central_repository_node_id,
+        )
+    except RequestModelError as error:
+        raise R02Error(f"IssueBranchLease evidence is invalid: {_bounded_reason(error)}") from None
+    try:
+        repo_snapshot, current_main = _lease_repo_snapshot(client, repository, central_repository_node_id)
+    except R02Error:
+        raise
+
+    if canonical is not None:
+        _fresh_issue_source_authority(source_authority_resolver, persisted_anchor.anchor)
+        # A later central-main advance does not rewrite historical lease provenance.
+        return canonical
+
+    _fresh_issue_source_authority(source_authority_resolver, persisted_anchor.anchor)
+    accepted_base_sha = current_main
+    try:
+        base_metadata, accepted_base_tree_sha, accepted_base_entries = _lease_tree_snapshot(client, repository, accepted_base_sha)
+        if base_metadata.sha != accepted_base_sha:
+            raise R02Error("accepted central base commit identity changed")
+        branch_ref = issue_branch_ref(persisted_anchor.anchor.issue_number)
+        owner_key = issue_owner_key(
+            central_repository_node_id,
+            persisted_anchor.anchor.issue_database_id,
+            persisted_anchor.anchor.issue_node_id,
+            persisted_anchor.anchor.issue_number,
+        )
+        nonce = (nonce_factory or new_carrier_nonce)()
+        if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{64}", nonce):
+            raise R02Error("trusted carrier nonce factory did not return 64 lowercase hex")
+        authority_digest = issue_branch_lease_authority_digest(
+            accepted_base_sha=accepted_base_sha,
+            accepted_base_tree_sha=accepted_base_tree_sha,
+            branch_ref=branch_ref,
+            central_repository_node_id=central_repository_node_id,
+            owner_key=owner_key,
+            issue_request_anchor_sha256=persisted_anchor.anchor.canonical_sha256(),
+            request_class=persisted_anchor.anchor.request_class,
+            source_canonical_full_name=persisted_anchor.anchor.source_canonical_full_name,
+            source_id=persisted_anchor.anchor.source_id,
+            source_identity_kind=persisted_anchor.anchor.source_identity_kind,
+            source_repository_id=persisted_anchor.anchor.source_repository_id,
+        )
+        generation = claim_generation_id(
+            authority_preimage_digest=authority_digest,
+            carrier_nonce=nonce,
+            central_repository_node_id=central_repository_node_id,
+            owner_key=owner_key,
+            from_head_sha=accepted_base_sha,
+            from_tree_sha=accepted_base_tree_sha,
+        )
+        marker = ClaimedHeadMarker("ISSUE_BRANCH_LEASE", "ISSUE_ACTIVE", "ISSUE", owner_key, generation, nonce, "INITIAL")
+        expected_bytes = (persisted_anchor.anchor.request_class.value + "\n").encode("utf-8")
+        blob_content = base64.b64encode(expected_bytes).decode("ascii")
+        blob = client.create_blob(repository, blob_content, encoding="base64")
+        blob_sha = _lease_sha40(blob.sha, "created blob SHA")
+        entry = {"path": REQUEST_MARKER, "mode": "100644", "type": "blob", "sha": blob_sha}
+        tree = client.create_tree(repository, accepted_base_tree_sha, [entry])
+        tree_sha = _lease_sha40(tree.sha, "created tree SHA")
+        timestamp = client.bot_commit_timestamp_after(repository, accepted_base_sha)
+        created_head = client.create_commit(repository, marker.render(), tree_sha, [accepted_base_sha], timestamp=timestamp)
+        head_sha = _lease_sha40(created_head.sha, "created commit SHA")
+        _validate_new_claimed_commit(
+            client,
+            repository,
+            accepted_base_sha,
+            accepted_base_entries,
+            head_sha,
+            tree_sha,
+            blob_sha,
+            marker,
+            expected_bytes,
+            timestamp,
+        )
+        lease = IssueBranchLease.create(
+            schema_version=1,
+            issue_number=persisted_anchor.anchor.issue_number,
+            issue_database_id=persisted_anchor.anchor.issue_database_id,
+            issue_node_id=persisted_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=persisted_anchor.comment.database_id,
+            issue_request_anchor_sha256=persisted_anchor.anchor.canonical_sha256(),
+            source_id=persisted_anchor.anchor.source_id,
+            source_repository_id=persisted_anchor.anchor.source_repository_id,
+            central_repository_node_id=central_repository_node_id,
+            branch_ref=branch_ref,
+            accepted_base_sha=accepted_base_sha,
+            carrier_role="ISSUE_ACTIVE",
+            claim_kind="ISSUE_BRANCH_LEASE",
+            claim_generation_id=generation,
+            carrier_nonce=nonce,
+            authority_preimage_digest=authority_digest,
+            initial_head_sha=head_sha,
+            initial_head_tree_sha=tree_sha,
+            initial_head_parent_sha=accepted_base_sha,
+            initial_head_marker_digest=hashlib.sha256(marker.render().encode("utf-8")).hexdigest(),
+            request_class=persisted_anchor.anchor.request_class,
+        )
+        client.create_issue_comment(repository, issue.number, lease.render())
+        try:
+            reread_issue, reread_comments, reread_anchor = _read_issue_anchor_for_lease(client, repository, persisted_anchor, app)
+            persisted_lease = _resolve_issue_branch_lease_class(
+                client, repository, reread_comments, app, reread_anchor.anchor,
+                reread_anchor.comment.database_id, central_repository_node_id,
+            )
+        except (RequestModelError, R02Error) as error:
+            raise StaleAuthorityError(f"persisted IssueBranchLease could not be validated: {_bounded_reason(error)}") from None
+        if persisted_lease is None or persisted_lease.lease != lease:
+            raise StaleAuthorityError("persisted IssueBranchLease differs from the intended immutable lease")
+        _fresh_issue_source_authority(source_authority_resolver, reread_anchor.anchor)
+        final_repo, final_main = _lease_repo_snapshot(client, repository, central_repository_node_id)
+        if final_repo.full_name != repo_snapshot.full_name or final_repo.default_branch != repo_snapshot.default_branch:
+            raise StaleAuthorityError("central repository identity/default branch changed during lease creation")
+        if final_main != accepted_base_sha:
+            raise StaleAuthorityError("central default branch advanced during new IssueBranchLease creation")
+        return persisted_lease
+    except (RequestModelError, R02Error):
+        raise
+    except Exception as error:
+        raise R02Error(f"IssueBranchLease creation failed closed: {_bounded_reason(error)}") from None
 
 
 def capture_snapshot(pr: PullRequestMetadata, comments: Iterable[IssueComment], anchor: AnchorComment) -> RequestSnapshot:

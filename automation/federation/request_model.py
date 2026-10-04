@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
@@ -15,9 +17,31 @@ from automation.federation.workspace import WorkspaceError, validate_trusted_ref
 
 MAX_BODY_BYTES = 16_384
 ANCHOR_MARKER = "<!-- swiftstream-federation-request-anchor:v1 -->"
+ISSUE_REQUEST_ANCHOR_MARKER = "<!-- swiftstream-federation-issue-request-anchor:v1 -->"
 PATCH_SENTINEL = "Federation PATCH"
 REQUEST_MARKER = ".federation-request"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+CLAIMED_HEAD_MARKER_HEADER = "swiftstream-federation-head:v2"
+ISSUE_BRANCH_LEASE_MARKER = "<!-- swiftstream-federation-issue-branch-lease:v1 -->"
+CLAIM_GENERATION_PREFIX = "swiftstream-federation-claim-generation:v1\n"
+ISSUE_BRANCH_LEASE_AUTHORITY_PREFIX = "swiftstream-federation-issue-branch-lease-authority:v1\n"
+_CLAIM_KINDS = frozenset({
+    "ISSUE_BRANCH_LEASE", "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH",
+    "ISSUE_FINALIZATION_EPOCH", "ISSUE_CANCELLATION_FENCE", "MACHINE_REF_CLAIM",
+})
+_CLAIM_ROLES = frozenset({"ISSUE_ACTIVE", "ISSUE_FINALIZING", "ISSUE_CANCEL", "MACHINE_PUBLICATION"})
+_CLAIM_OWNER_KINDS = frozenset({"ISSUE", "MACHINE_SOURCE"})
+_TRANSITION_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_LEASE_KEYS = frozenset({
+    "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+    "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256", "sourceId",
+    "sourceRepositoryId", "centralRepositoryNodeId", "branchRef", "acceptedBaseSha",
+    "carrierRole", "claimKind", "claimGenerationId", "carrierNonce",
+    "authorityPreimageDigest", "initialHeadSha", "initialHeadTreeSha",
+    "initialHeadParentSha", "initialHeadMarkerDigest", "requestClass", "leaseId",
+})
 
 
 class RequestModelError(ValueError):
@@ -963,3 +987,629 @@ def body_sha256(body: str) -> str:
 
 def verify_anchor_integrity(anchor: RequestAnchor, original_body: str) -> bool:
     return body_sha256(original_body) == anchor.initial_body_sha256
+
+
+_ISSUE_REQUEST_ANCHOR_KEYS = frozenset({
+    "schemaVersion",
+    "issueNumber",
+    "issueDatabaseId",
+    "issueNodeId",
+    "requestClass",
+    "originalAuthorId",
+    "originalAuthorLogin",
+    "initialBodySha256",
+    "initialRequest",
+    "sourceId",
+    "sourceRepositoryId",
+    "sourceCanonicalFullName",
+    "sourceIdentityKind",
+    "anchorObservedLastEditedAt",
+    "anchorObservedIncludesCreatedEdit",
+})
+_ISSUE_REQUEST_CLASSES = (RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE)
+_ISSUE_REQUEST_CLASS_VALUES = {item.value: item for item in _ISSUE_REQUEST_CLASSES}
+_ISSUE_IDENTITY_KINDS = frozenset({"proposed", "accepted"})
+
+
+def _canonical_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, UnicodeEncodeError):
+        _fail("authority JSON value cannot be encoded canonically")
+
+
+def _issue_bounded_text(value: Any, label: str, limit: int) -> str:
+    if type(value) is not str or not value or len(value) > limit or c02.contains_control(value):
+        _fail(f"invalid {label}")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        _fail(f"invalid {label}")
+    return value
+
+
+def _issue_positive_int(value: Any, label: str) -> int:
+    if type(value) is not int or not 1 <= value <= 9_223_372_036_854_775_807:
+        _fail(f"{label} must be a positive signed-64 integer")
+    return value
+
+
+def _issue_timestamp(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = _issue_bounded_text(value, "anchorObservedLastEditedAt", 128)
+    try:
+        instant = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+    except ValueError:
+        _fail("anchorObservedLastEditedAt must be timezone-aware ISO-8601")
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        _fail("anchorObservedLastEditedAt must be timezone-aware ISO-8601")
+    return text
+
+
+@dataclass(frozen=True)
+class IssueRequestAnchor:
+    schema_version: int
+    issue_number: int
+    issue_database_id: int
+    issue_node_id: str
+    request_class: RequestClass
+    original_author_id: str
+    original_author_login: str
+    initial_body_sha256: str
+    initial_request: Request
+    source_id: str
+    source_repository_id: int
+    source_canonical_full_name: str
+    source_identity_kind: str
+    anchor_observed_last_edited_at: str | None
+    anchor_observed_includes_created_edit: bool
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("IssueRequestAnchor schemaVersion must be exact integer 1")
+        _issue_positive_int(self.issue_number, "issueNumber")
+        _issue_positive_int(self.issue_database_id, "issueDatabaseId")
+        _issue_bounded_text(self.issue_node_id, "issueNodeId", 256)
+        if type(self.request_class) is not RequestClass or self.request_class not in _ISSUE_REQUEST_CLASSES:
+            _fail("IssueRequestAnchor requestClass must be ADD, UPDATE, or REMOVE")
+        _issue_bounded_text(self.original_author_id, "originalAuthorId", 256)
+        _issue_bounded_text(self.original_author_login, "originalAuthorLogin", 100)
+        if type(self.initial_body_sha256) is not str or not _SHA256_RE.fullmatch(self.initial_body_sha256):
+            _fail("initialBodySha256 must be lowercase 64-hex")
+        _validate_anchor_request(self.request_class, self.initial_request)
+        try:
+            c02.validate_source_id(self.source_id)
+        except c02.FederationError:
+            _fail("sourceId is invalid")
+        _issue_positive_int(self.source_repository_id, "sourceRepositoryId")
+        full_name = _issue_bounded_text(self.source_canonical_full_name, "sourceCanonicalFullName", 256)
+        if full_name.count("/") != 1 or any(not part for part in full_name.split("/")):
+            _fail("sourceCanonicalFullName must contain exactly one owner/name separator")
+        if type(self.source_identity_kind) is not str or self.source_identity_kind not in _ISSUE_IDENTITY_KINDS:
+            _fail("sourceIdentityKind must be proposed or accepted")
+        expected_kind = "proposed" if self.request_class is RequestClass.ADD else "accepted"
+        if self.source_identity_kind != expected_kind:
+            _fail("sourceIdentityKind does not match requestClass")
+        _issue_timestamp(self.anchor_observed_last_edited_at)
+        if type(self.anchor_observed_includes_created_edit) is not bool:
+            _fail("anchorObservedIncludesCreatedEdit must be boolean")
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": self.schema_version,
+            "issueNumber": self.issue_number,
+            "issueDatabaseId": self.issue_database_id,
+            "issueNodeId": self.issue_node_id,
+            "requestClass": self.request_class.value,
+            "originalAuthorId": self.original_author_id,
+            "originalAuthorLogin": self.original_author_login,
+            "initialBodySha256": self.initial_body_sha256,
+            "initialRequest": self.initial_request.as_anchor_value(),
+            "sourceId": self.source_id,
+            "sourceRepositoryId": self.source_repository_id,
+            "sourceCanonicalFullName": self.source_canonical_full_name,
+            "sourceIdentityKind": self.source_identity_kind,
+            "anchorObservedLastEditedAt": self.anchor_observed_last_edited_at,
+            "anchorObservedIncludesCreatedEdit": self.anchor_observed_includes_created_edit,
+        }
+
+    def render(self) -> str:
+        return f"{ISSUE_REQUEST_ANCHOR_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+def parse_issue_request_anchor(text: str) -> IssueRequestAnchor:
+    lines = _normalized_lines(text, "IssueRequestAnchor")
+    if not lines or lines[0] != ISSUE_REQUEST_ANCHOR_MARKER:
+        _fail("IssueRequestAnchor marker is not exact")
+    json_indices = [index for index in range(1, len(lines)) if lines[index] != ""]
+    if len(json_indices) != 1:
+        _fail("IssueRequestAnchor must contain exactly one nonempty JSON line")
+    json_line = lines[json_indices[0]]
+    try:
+        value = c02.decode_json(json_line)
+    except Exception as error:
+        _fail(f"invalid IssueRequestAnchor JSON: {error}")
+    if type(value) is not dict or set(value) != _ISSUE_REQUEST_ANCHOR_KEYS:
+        _fail("IssueRequestAnchor has invalid exact keys")
+    schema_version = value["schemaVersion"]
+    if type(schema_version) is not int or schema_version != 1:
+        _fail("IssueRequestAnchor schemaVersion must be exact integer 1")
+    try:
+        request_class = _ISSUE_REQUEST_CLASS_VALUES[value["requestClass"]]
+    except (KeyError, TypeError):
+        _fail("IssueRequestAnchor requestClass is invalid")
+    request_value = value["initialRequest"]
+    if type(request_value) is not dict:
+        _fail("IssueRequestAnchor initialRequest must be an object")
+    request = _request_from_anchor_value(request_class, request_value)
+    anchor = IssueRequestAnchor(
+        schema_version,
+        value["issueNumber"],
+        value["issueDatabaseId"],
+        value["issueNodeId"],
+        request_class,
+        value["originalAuthorId"],
+        value["originalAuthorLogin"],
+        value["initialBodySha256"],
+        request,
+        value["sourceId"],
+        value["sourceRepositoryId"],
+        value["sourceCanonicalFullName"],
+        value["sourceIdentityKind"],
+        value["anchorObservedLastEditedAt"],
+        value["anchorObservedIncludesCreatedEdit"],
+    )
+    if json_line != _canonical_json(anchor.as_value()) or text != anchor.render():
+        _fail("IssueRequestAnchor representation is not canonical")
+    return anchor
+
+
+@dataclass(frozen=True)
+class IssuePatchEvent:
+    comment_id: int
+    authorized: bool
+    edited: bool
+    body: str
+
+    def __post_init__(self) -> None:
+        if type(self.comment_id) is not int or self.comment_id <= 0:
+            _fail("Issue PATCH comment ID must be a positive exact integer")
+        if type(self.authorized) is not bool or type(self.edited) is not bool:
+            _fail("Issue PATCH authorization/edit flags must be exact booleans")
+        if type(self.body) is not str:
+            _fail("Issue PATCH body must be text")
+        _check_body_size(self.body, "Issue PATCH comment")
+
+
+def _looks_like_patch_candidate(body: str) -> bool:
+    normalized = body.replace("\r\n", "\n")
+    return next((line for line in normalized.split("\n") if line != ""), None) == PATCH_SENTINEL
+
+
+def fold_issue_patch_events(
+    anchor: IssueRequestAnchor,
+    events: Iterable[IssuePatchEvent],
+    semantic_validator: Callable[[Request], bool] | None = None,
+) -> PatchFoldResult:
+    if type(anchor) is not IssueRequestAnchor:
+        _fail("Issue PATCH fold requires an IssueRequestAnchor")
+    event_list = list(events)
+    ids: set[int] = set()
+    for event in event_list:
+        if type(event) is not IssuePatchEvent:
+            _fail("Issue PATCH fold received an invalid event")
+        if event.comment_id in ids:
+            _fail("duplicate Issue PATCH comment ID")
+        ids.add(event.comment_id)
+    current = anchor.initial_request
+    evidence: list[FoldEvidence] = []
+    for event in sorted(event_list, key=lambda item: item.comment_id):
+        try:
+            patch = parse_patch(event.body)
+        except RequestModelError:
+            if _looks_like_patch_candidate(event.body):
+                evidence.append(FoldEvidence(event.comment_id, "invalid"))
+            continue
+        if patch is None:
+            continue
+        if anchor.request_class not in {RequestClass.ADD, RequestClass.UPDATE} or event.edited:
+            evidence.append(FoldEvidence(event.comment_id, "invalid"))
+            continue
+        if not event.authorized:
+            evidence.append(FoldEvidence(event.comment_id, "unauthorized"))
+            continue
+        try:
+            proposed = apply_patch(current, Patch(dict(patch.assignments)))
+            if semantic_validator is not None and not semantic_validator(proposed):
+                evidence.append(FoldEvidence(event.comment_id, "semantic-invalid"))
+                continue
+        except RequestModelError:
+            evidence.append(FoldEvidence(event.comment_id, "invalid"))
+            continue
+        current = proposed
+        evidence.append(FoldEvidence(event.comment_id, "applied"))
+    return PatchFoldResult(current, tuple(evidence))
+
+
+def _lease_sha(value: Any, label: str, *, git: bool = False) -> str:
+    pattern = _SHA40_RE if git else _SHA256_RE
+    if type(value) is not str or not pattern.fullmatch(value):
+        _fail(f"{label} must be lowercase {'40' if git else '64'}-hex")
+    return value
+
+
+def _lease_node_id(value: Any, label: str, *, delimiter_free: bool = False) -> str:
+    text = _issue_bounded_text(value, label, 256)
+    if delimiter_free and ":" in text:
+        _fail(f"{label} cannot contain ':'")
+    return text
+
+
+def _lease_decimal(value: Any, label: str) -> int:
+    return _issue_positive_int(value, label)
+
+
+def issue_owner_key(
+    central_repository_node_id: str,
+    issue_database_id: int,
+    issue_node_id: str,
+    issue_number: int,
+) -> str:
+    central = _lease_node_id(central_repository_node_id, "centralRepositoryNodeId", delimiter_free=True)
+    database_id = _lease_decimal(issue_database_id, "issueDatabaseId")
+    node_id = _lease_node_id(issue_node_id, "issueNodeId", delimiter_free=True)
+    number = _lease_decimal(issue_number, "issueNumber")
+    return f"{central}:{database_id}:{node_id}:{number}"
+
+
+def issue_branch_ref(issue_number: int) -> str:
+    number = _lease_decimal(issue_number, "issueNumber")
+    value = f"refs/heads/bot/federation/request/issue-{number}"
+    try:
+        return validate_trusted_ref(value)
+    except (c02.FederationError, WorkspaceError) as error:
+        _fail(str(error))
+    raise AssertionError("unreachable")
+
+
+@dataclass(frozen=True)
+class ClaimedHeadMarker:
+    claim_kind: str
+    role: str
+    owner_kind: str
+    owner_key: str
+    claim_generation_id: str
+    carrier_nonce: str
+    transition_kind: str
+
+    def __post_init__(self) -> None:
+        if type(self.claim_kind) is not str or self.claim_kind not in _CLAIM_KINDS:
+            _fail("claimed-head marker claimKind is unknown")
+        if type(self.role) is not str or self.role not in _CLAIM_ROLES:
+            _fail("claimed-head marker role is unknown")
+        if type(self.owner_kind) is not str or self.owner_kind not in _CLAIM_OWNER_KINDS:
+            _fail("claimed-head marker ownerKind is unknown")
+        _issue_bounded_text(self.owner_key, "ownerKey", 1_024)
+        _lease_sha(self.claim_generation_id, "claimGenerationId")
+        _lease_sha(self.carrier_nonce, "carrierNonce")
+        if type(self.transition_kind) is not str or not _TRANSITION_RE.fullmatch(self.transition_kind):
+            _fail("claimed-head marker transitionKind is invalid")
+
+    def render(self) -> str:
+        return (
+            f"{CLAIMED_HEAD_MARKER_HEADER}\n"
+            f"claim-kind={self.claim_kind}\n"
+            f"role={self.role}\n"
+            f"owner-kind={self.owner_kind}\n"
+            f"owner-key={self.owner_key}\n"
+            f"generation={self.claim_generation_id}\n"
+            f"nonce={self.carrier_nonce}\n"
+            f"transition={self.transition_kind}\n"
+        )
+
+
+def parse_claimed_head_marker(text: str) -> ClaimedHeadMarker:
+    if type(text) is not str or not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _fail("claimed-head marker must use exact LF-terminated lines")
+    lines = text[:-1].split("\n")
+    expected_labels = (
+        CLAIMED_HEAD_MARKER_HEADER,
+        "claim-kind=", "role=", "owner-kind=", "owner-key=", "generation=", "nonce=", "transition=",
+    )
+    if len(lines) != len(expected_labels) or lines[0] != expected_labels[0]:
+        _fail("claimed-head marker has invalid line count or header")
+    for line, label in zip(lines[1:], expected_labels[1:]):
+        if not line.startswith(label) or len(line) == len(label):
+            _fail("claimed-head marker fields are missing, extra, or out of order")
+    marker = ClaimedHeadMarker(
+        lines[1][len("claim-kind="):], lines[2][len("role="):],
+        lines[3][len("owner-kind="):], lines[4][len("owner-key="):],
+        lines[5][len("generation="):], lines[6][len("nonce="):],
+        lines[7][len("transition="):],
+    )
+    if marker.render() != text:
+        _fail("claimed-head marker is not canonical")
+    return marker
+
+
+def new_carrier_nonce() -> str:
+    """Return a fresh trusted 256-bit nonce for a genuinely new lease."""
+    return secrets.token_hex(32)
+
+
+def issue_branch_lease_authority_digest(
+    *,
+    accepted_base_sha: str,
+    accepted_base_tree_sha: str,
+    branch_ref: str,
+    central_repository_node_id: str,
+    owner_key: str,
+    issue_request_anchor_sha256: str,
+    request_class: RequestClass,
+    source_canonical_full_name: str,
+    source_id: str,
+    source_identity_kind: str,
+    source_repository_id: int,
+) -> str:
+    _lease_sha(accepted_base_sha, "acceptedBaseSha", git=True)
+    _lease_sha(accepted_base_tree_sha, "acceptedBaseTreeSha", git=True)
+    _lease_sha(issue_request_anchor_sha256, "issueRequestAnchorSha256")
+    if type(request_class) is not RequestClass or request_class not in _ISSUE_REQUEST_CLASSES:
+        _fail("requestClass must be ADD, UPDATE, or REMOVE")
+    if type(source_id) is not str:
+        _fail("sourceId is invalid")
+    try:
+        c02.validate_source_id(source_id)
+    except c02.FederationError:
+        _fail("sourceId is invalid")
+    _issue_positive_int(source_repository_id, "sourceRepositoryId")
+    central = _lease_node_id(central_repository_node_id, "centralRepositoryNodeId", delimiter_free=True)
+    owner_text = _issue_bounded_text(owner_key, "issueOwnerKey", 1_024)
+    owner_parts = owner_text.split(":")
+    if len(owner_parts) != 4:
+        _fail("issueOwnerKey must contain exactly four canonical components")
+    owner_central, database_text, issue_node_id, issue_number_text = owner_parts
+    if owner_central != central:
+        _fail("issueOwnerKey centralRepositoryNodeId does not match")
+
+    def parse_owner_decimal(text: str, label: str) -> int:
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", text):
+            _fail(f"{label} must be canonical positive decimal")
+        return _lease_decimal(int(text), label)
+
+    issue_database_id = parse_owner_decimal(database_text, "issueDatabaseId")
+    issue_node_id = _lease_node_id(issue_node_id, "issueNodeId", delimiter_free=True)
+    issue_number = parse_owner_decimal(issue_number_text, "issueNumber")
+    if issue_owner_key(central, issue_database_id, issue_node_id, issue_number) != owner_text:
+        _fail("issueOwnerKey is not canonical")
+
+    branch = _issue_bounded_text(branch_ref, "branchRef", 1_024)
+    if branch != issue_branch_ref(issue_number):
+        _fail("branchRef does not match issueOwnerKey issueNumber")
+    _issue_bounded_text(source_canonical_full_name, "sourceCanonicalFullName", 256)
+    if source_canonical_full_name.count("/") != 1 or any(
+        not part for part in source_canonical_full_name.split("/")
+    ):
+        _fail("sourceCanonicalFullName must contain one owner/name separator")
+    if source_identity_kind not in _ISSUE_IDENTITY_KINDS:
+        _fail("sourceIdentityKind is invalid")
+    value = {
+        "acceptedBaseSha": accepted_base_sha,
+        "acceptedBaseTreeSha": accepted_base_tree_sha,
+        "branchRef": branch_ref,
+        "centralRepositoryNodeId": central,
+        "issueOwnerKey": owner_key,
+        "issueRequestAnchorSha256": issue_request_anchor_sha256,
+        "requestClass": request_class.value,
+        "sourceCanonicalFullName": source_canonical_full_name,
+        "sourceId": source_id,
+        "sourceIdentityKind": source_identity_kind,
+        "sourceRepositoryId": source_repository_id,
+    }
+    return hashlib.sha256((ISSUE_BRANCH_LEASE_AUTHORITY_PREFIX + _canonical_json(value)).encode("utf-8")).hexdigest()
+
+
+def claim_generation_id(
+    *,
+    authority_preimage_digest: str,
+    carrier_nonce: str,
+    central_repository_node_id: str,
+    owner_key: str,
+    from_head_sha: str,
+    from_tree_sha: str,
+    claim_kind: str = "ISSUE_BRANCH_LEASE",
+    role: str = "ISSUE_ACTIVE",
+    owner_kind: str = "ISSUE",
+    transition_kind: str = "INITIAL",
+) -> str:
+    _lease_sha(authority_preimage_digest, "authorityPreimageDigest")
+    _lease_sha(carrier_nonce, "carrierNonce")
+    _lease_sha(from_head_sha, "fromHeadSha", git=True)
+    _lease_sha(from_tree_sha, "fromTreeSha", git=True)
+    central = _lease_node_id(central_repository_node_id, "centralRepositoryNodeId", delimiter_free=True)
+    _issue_bounded_text(owner_key, "ownerKey", 1_024)
+    if type(claim_kind) is not str or claim_kind not in _CLAIM_KINDS:
+        _fail("claimKind is unknown")
+    if type(role) is not str or role not in _CLAIM_ROLES:
+        _fail("role is unknown")
+    if type(owner_kind) is not str or owner_kind not in _CLAIM_OWNER_KINDS:
+        _fail("ownerKind is unknown")
+    if type(transition_kind) is not str or not _TRANSITION_RE.fullmatch(transition_kind):
+        _fail("transitionKind is invalid")
+    value = {
+        "authorityPreimageDigest": authority_preimage_digest,
+        "carrierNonce": carrier_nonce,
+        "centralRepositoryNodeId": central,
+        "claimKind": claim_kind,
+        "fromHeadSha": from_head_sha,
+        "fromTreeSha": from_tree_sha,
+        "ownerKey": owner_key,
+        "ownerKind": owner_kind,
+        "role": role,
+        "transitionKind": transition_kind,
+    }
+    return hashlib.sha256((CLAIM_GENERATION_PREFIX + _canonical_json(value)).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class IssueBranchLease:
+    schema_version: int
+    issue_number: int
+    issue_database_id: int
+    issue_node_id: str
+    issue_request_anchor_comment_database_id: int
+    issue_request_anchor_sha256: str
+    source_id: str
+    source_repository_id: int
+    central_repository_node_id: str
+    branch_ref: str
+    accepted_base_sha: str
+    carrier_role: str
+    claim_kind: str
+    claim_generation_id: str
+    carrier_nonce: str
+    authority_preimage_digest: str
+    initial_head_sha: str
+    initial_head_tree_sha: str
+    initial_head_parent_sha: str
+    initial_head_marker_digest: str
+    request_class: RequestClass
+    lease_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("IssueBranchLease schemaVersion must be exact integer 1")
+        _lease_decimal(self.issue_number, "issueNumber")
+        _lease_decimal(self.issue_database_id, "issueDatabaseId")
+        _lease_node_id(self.issue_node_id, "issueNodeId", delimiter_free=True)
+        _lease_decimal(self.issue_request_anchor_comment_database_id, "issueRequestAnchorCommentDatabaseId")
+        _lease_sha(self.issue_request_anchor_sha256, "issueRequestAnchorSha256")
+        try:
+            c02.validate_source_id(self.source_id)
+        except (TypeError, c02.FederationError):
+            _fail("sourceId is invalid")
+        _lease_decimal(self.source_repository_id, "sourceRepositoryId")
+        _lease_node_id(self.central_repository_node_id, "centralRepositoryNodeId", delimiter_free=True)
+        expected_ref = issue_branch_ref(self.issue_number)
+        if type(self.branch_ref) is not str or self.branch_ref != expected_ref:
+            _fail("branchRef must be the exact reserved Issue branch ref")
+        _lease_sha(self.accepted_base_sha, "acceptedBaseSha", git=True)
+        if self.carrier_role != "ISSUE_ACTIVE":
+            _fail("carrierRole must be ISSUE_ACTIVE")
+        if self.claim_kind != "ISSUE_BRANCH_LEASE":
+            _fail("claimKind must be ISSUE_BRANCH_LEASE")
+        _lease_sha(self.claim_generation_id, "claimGenerationId")
+        _lease_sha(self.carrier_nonce, "carrierNonce")
+        _lease_sha(self.authority_preimage_digest, "authorityPreimageDigest")
+        _lease_sha(self.initial_head_sha, "initialHeadSha", git=True)
+        _lease_sha(self.initial_head_tree_sha, "initialHeadTreeSha", git=True)
+        _lease_sha(self.initial_head_parent_sha, "initialHeadParentSha", git=True)
+        if self.initial_head_parent_sha != self.accepted_base_sha:
+            _fail("initialHeadParentSha must equal acceptedBaseSha")
+        _lease_sha(self.initial_head_marker_digest, "initialHeadMarkerDigest")
+        if type(self.request_class) is not RequestClass or self.request_class not in _ISSUE_REQUEST_CLASSES:
+            _fail("requestClass must be ADD, UPDATE, or REMOVE")
+        _lease_sha(self.lease_id, "leaseId")
+        expected_id = hashlib.sha256(_canonical_json(self._body_without_id()).encode("utf-8")).hexdigest()
+        if self.lease_id != expected_id:
+            _fail("IssueBranchLease leaseId does not match canonical body")
+
+    def _body_without_id(self) -> dict[str, Any]:
+        value = self.as_value()
+        value.pop("leaseId", None)
+        return value
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": self.schema_version,
+            "issueNumber": self.issue_number,
+            "issueDatabaseId": self.issue_database_id,
+            "issueNodeId": self.issue_node_id,
+            "issueRequestAnchorCommentDatabaseId": self.issue_request_anchor_comment_database_id,
+            "issueRequestAnchorSha256": self.issue_request_anchor_sha256,
+            "sourceId": self.source_id,
+            "sourceRepositoryId": self.source_repository_id,
+            "centralRepositoryNodeId": self.central_repository_node_id,
+            "branchRef": self.branch_ref,
+            "acceptedBaseSha": self.accepted_base_sha,
+            "carrierRole": self.carrier_role,
+            "claimKind": self.claim_kind,
+            "claimGenerationId": self.claim_generation_id,
+            "carrierNonce": self.carrier_nonce,
+            "authorityPreimageDigest": self.authority_preimage_digest,
+            "initialHeadSha": self.initial_head_sha,
+            "initialHeadTreeSha": self.initial_head_tree_sha,
+            "initialHeadParentSha": self.initial_head_parent_sha,
+            "initialHeadMarkerDigest": self.initial_head_marker_digest,
+            "requestClass": self.request_class.value,
+            "leaseId": self.lease_id,
+        }
+
+    @classmethod
+    def create(cls, **fields: Any) -> "IssueBranchLease":
+        body = dict(fields)
+        body["lease_id"] = hashlib.sha256(_canonical_json(_lease_fields_to_value(body, include_id=False)).encode("utf-8")).hexdigest()
+        return cls(**body)
+
+    def render(self) -> str:
+        return f"{ISSUE_BRANCH_LEASE_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+def _lease_fields_to_value(fields: Mapping[str, Any], *, include_id: bool) -> dict[str, Any]:
+    key_map = {
+        "schema_version": "schemaVersion", "issue_number": "issueNumber",
+        "issue_database_id": "issueDatabaseId", "issue_node_id": "issueNodeId",
+        "issue_request_anchor_comment_database_id": "issueRequestAnchorCommentDatabaseId",
+        "issue_request_anchor_sha256": "issueRequestAnchorSha256", "source_id": "sourceId",
+        "source_repository_id": "sourceRepositoryId", "central_repository_node_id": "centralRepositoryNodeId",
+        "branch_ref": "branchRef", "accepted_base_sha": "acceptedBaseSha",
+        "carrier_role": "carrierRole", "claim_kind": "claimKind",
+        "claim_generation_id": "claimGenerationId", "carrier_nonce": "carrierNonce",
+        "authority_preimage_digest": "authorityPreimageDigest", "initial_head_sha": "initialHeadSha",
+        "initial_head_tree_sha": "initialHeadTreeSha", "initial_head_parent_sha": "initialHeadParentSha",
+        "initial_head_marker_digest": "initialHeadMarkerDigest", "request_class": "requestClass",
+        "lease_id": "leaseId",
+    }
+    result: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key not in key_map or (key == "lease_id" and not include_id):
+            continue
+        result[key_map[key]] = value.value if isinstance(value, RequestClass) else value
+    return result
+
+
+def parse_issue_branch_lease(text: str) -> IssueBranchLease:
+    if type(text) is not str or not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _fail("IssueBranchLease must use exact LF-terminated lines")
+    lines = text[:-1].split("\n")
+    if len(lines) != 2 or lines[0] != ISSUE_BRANCH_LEASE_MARKER or not lines[1]:
+        _fail("IssueBranchLease marker or JSON line is invalid")
+    try:
+        value = c02.decode_json(lines[1])
+    except Exception as error:
+        _fail(f"invalid IssueBranchLease JSON: {error}")
+    if type(value) is not dict or set(value) != _LEASE_KEYS:
+        _fail("IssueBranchLease has invalid exact keys")
+    try:
+        request_class = _ISSUE_REQUEST_CLASS_VALUES[value["requestClass"]]
+    except (KeyError, TypeError):
+        _fail("IssueBranchLease requestClass is invalid")
+    lease = IssueBranchLease(
+        value["schemaVersion"], value["issueNumber"], value["issueDatabaseId"], value["issueNodeId"],
+        value["issueRequestAnchorCommentDatabaseId"], value["issueRequestAnchorSha256"], value["sourceId"],
+        value["sourceRepositoryId"], value["centralRepositoryNodeId"], value["branchRef"],
+        value["acceptedBaseSha"], value["carrierRole"], value["claimKind"], value["claimGenerationId"],
+        value["carrierNonce"], value["authorityPreimageDigest"], value["initialHeadSha"],
+        value["initialHeadTreeSha"], value["initialHeadParentSha"], value["initialHeadMarkerDigest"],
+        request_class, value["leaseId"],
+    )
+    if lines[1] != _canonical_json(lease.as_value()) or text != lease.render():
+        _fail("IssueBranchLease representation is not canonical")
+    return lease

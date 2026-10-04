@@ -9,16 +9,32 @@ from unittest.mock import patch
 from scripts import federate as c02
 from automation.federation.request_model import (
     ANCHOR_MARKER,
+    ISSUE_REQUEST_ANCHOR_MARKER,
     PATCH_SENTINEL,
     CommentEvent,
+    IssuePatchEvent,
+    IssueBranchLease,
+    IssueRequestAnchor,
+    ClaimedHeadMarker,
     Request,
     RequestAnchor,
     RequestClass,
     RequestModelError,
     body_sha256,
     fold_patch_events,
+    fold_issue_patch_events,
+    CLAIMED_HEAD_MARKER_HEADER,
+    ISSUE_BRANCH_LEASE_MARKER,
+    CLAIM_GENERATION_PREFIX,
+    issue_owner_key,
+    issue_branch_ref,
+    issue_branch_lease_authority_digest,
+    claim_generation_id,
+    parse_claimed_head_marker,
+    parse_issue_branch_lease,
     parse_anchor,
     parse_issue_request_body,
+    parse_issue_request_anchor,
     parse_patch,
     parse_request_body,
     proposed_line_refs,
@@ -580,6 +596,492 @@ class RequestModelTests(unittest.TestCase):
             parse_anchor(ANCHOR_MARKER + "\n" + json.dumps(value) + "\n")
         self.assertIn("schemaVersion", str(caught.exception))
 
+
+class IssueRequestAnchorModelTests(unittest.TestCase):
+    @staticmethod
+    def request(request_class):
+        if request_class is RequestClass.REMOVE:
+            body = "Repository URL:\nhttps://github.com/Owner/Repo\nReason:\nretire\n"
+        else:
+            body = add_body()
+            if request_class is RequestClass.UPDATE:
+                body = body.replace("Repository URL:", "Repository URL:", 1)
+        return parse_request_body(request_class, body)
+
+    @classmethod
+    def anchor(cls, request_class=RequestClass.ADD, **changes):
+        value = dict(
+            schema_version=1,
+            issue_number=7,
+            issue_database_id=700,
+            issue_node_id="I_kwDOIssueNode",
+            request_class=request_class,
+            original_author_id="U_kwDORequester",
+            original_author_login="alice",
+            initial_body_sha256="a" * 64,
+            initial_request=cls.request(request_class),
+            source_id="owner-repo",
+            source_repository_id=41,
+            source_canonical_full_name="Owner/Repo",
+            source_identity_kind="proposed" if request_class is RequestClass.ADD else "accepted",
+            anchor_observed_last_edited_at=None,
+            anchor_observed_includes_created_edit=False,
+        )
+        value.update(changes)
+        return IssueRequestAnchor(**value)
+
+    def test_add_update_remove_exact_render_parse_roundtrip(self):
+        for request_class in (RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE):
+            anchor = self.anchor(request_class)
+            rendered = anchor.render()
+            self.assertEqual(rendered.splitlines()[0], ISSUE_REQUEST_ANCHOR_MARKER)
+            self.assertTrue(rendered.endswith("\n"))
+            self.assertEqual(parse_issue_request_anchor(rendered), anchor)
+
+    def test_canonical_json_exact_key_order_and_digest(self):
+        anchor = self.anchor()
+        rendered = anchor.render()
+        json_line = rendered.splitlines()[1]
+        value = json.loads(json_line)
+        self.assertEqual(set(value), {
+            "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId", "requestClass",
+            "originalAuthorId", "originalAuthorLogin", "initialBodySha256", "initialRequest",
+            "sourceId", "sourceRepositoryId", "sourceCanonicalFullName", "sourceIdentityKind",
+            "anchorObservedLastEditedAt", "anchorObservedIncludesCreatedEdit",
+        })
+        self.assertEqual(list(value), sorted(value))
+        self.assertEqual(anchor.canonical_sha256(), hashlib.sha256(rendered.encode("utf-8")).hexdigest())
+        self.assertEqual(anchor.canonical_sha256(), self.anchor().canonical_sha256())
+        self.assertNotEqual(anchor.canonical_sha256(), self.anchor(issue_number=8).canonical_sha256())
+
+    def test_noncanonical_json_order_whitespace_and_extra_keys_are_rejected(self):
+        anchor = self.anchor()
+        value = anchor.as_value()
+        with self.assertRaises(RequestModelError):
+            parse_issue_request_anchor(ISSUE_REQUEST_ANCHOR_MARKER + "\n" + json.dumps(value) + "\n")
+
+
+        reversed_value = dict(reversed(list(value.items())))
+        with self.assertRaises(RequestModelError):
+            parse_issue_request_anchor(ISSUE_REQUEST_ANCHOR_MARKER + "\n" + json.dumps(reversed_value, separators=(",", ":")) + "\n")
+        for candidate in (dict(value, extra=True), {key: val for key, val in value.items() if key != "sourceId"}):
+            with self.subTest(candidate=candidate), self.assertRaises(RequestModelError):
+                parse_issue_request_anchor(ISSUE_REQUEST_ANCHOR_MARKER + "\n" + json.dumps(candidate, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def test_schema_class_and_source_identity_kinds_are_closed(self):
+        anchor = self.anchor()
+        value = anchor.as_value()
+        for schema in (True, "1", 2):
+            candidate = dict(value, schemaVersion=schema)
+            with self.subTest(schema=schema), self.assertRaises(RequestModelError):
+                parse_issue_request_anchor(ISSUE_REQUEST_ANCHOR_MARKER + "\n" + json.dumps(candidate, sort_keys=True, separators=(",", ":")) + "\n")
+        for request_class in ("reconcile-source", "machine-publication", "unknown"):
+            candidate = dict(value, requestClass=request_class)
+            with self.subTest(request_class=request_class), self.assertRaises(RequestModelError):
+                parse_issue_request_anchor(ISSUE_REQUEST_ANCHOR_MARKER + "\n" + json.dumps(candidate, sort_keys=True, separators=(",", ":")) + "\n")
+        with self.assertRaises(RequestModelError):
+            self.anchor(source_identity_kind="accepted")
+        with self.assertRaises(RequestModelError):
+            self.anchor(RequestClass.UPDATE, source_identity_kind="proposed")
+        with self.assertRaises(RequestModelError):
+            self.anchor(RequestClass.REMOVE, source_identity_kind="proposed")
+
+    def test_integer_boolean_and_bounds_are_strict(self):
+        for field in ("issue_number", "issue_database_id"):
+            for bad in (True, 0, -1, 9_223_372_036_854_775_808):
+                with self.subTest(field=field, bad=bad), self.assertRaises(RequestModelError):
+                    self.anchor(**{field: bad})
+        self.assertEqual(self.anchor(issue_number=9_223_372_036_854_775_807).issue_number, 9_223_372_036_854_775_807)
+
+    def test_node_requester_source_and_full_name_bounds(self):
+        for field, bad in (
+            ("issue_node_id", ""), ("issue_node_id", "x" * 257), ("issue_node_id", "bad\nnode"),
+            ("original_author_id", ""), ("original_author_id", "x" * 257), ("original_author_id", "bad\x00id"),
+            ("original_author_login", ""), ("original_author_login", "x" * 101), ("original_author_login", "bad\tlogin"),
+            ("source_id", "Bad_ID"), ("source_id", ""), ("source_repository_id", True),
+            ("source_repository_id", 0), ("source_canonical_full_name", "owner"),
+            ("source_canonical_full_name", "/repo"), ("source_canonical_full_name", "owner/"),
+            ("source_canonical_full_name", "a/b/c"), ("source_canonical_full_name", "x" * 257),
+            ("source_canonical_full_name", "owner/ba\nd"),
+        ):
+            with self.subTest(field=field, bad=bad), self.assertRaises(RequestModelError):
+                self.anchor(**{field: bad})
+
+    def test_hash_request_class_and_timestamp_invariants(self):
+        with self.assertRaises(RequestModelError):
+            self.anchor(initial_body_sha256="A" * 64)
+        update_request = self.request(RequestClass.UPDATE)
+        with self.assertRaises(RequestModelError):
+            self.anchor(initial_request=update_request)
+        self.assertIsNone(self.anchor(anchor_observed_last_edited_at=None).anchor_observed_last_edited_at)
+        timestamp = "2026-10-04T12:30:00+03:00"
+        self.assertEqual(self.anchor(anchor_observed_last_edited_at=timestamp).anchor_observed_last_edited_at, timestamp)
+        for bad in ("2026-10-04T12:30:00", "not-a-date", "", 3, "x" * 129, "2026-10-04T12:30:00Z\n"):
+            with self.subTest(timestamp=bad), self.assertRaises(RequestModelError):
+                self.anchor(anchor_observed_last_edited_at=bad)
+        with self.assertRaises(RequestModelError):
+            self.anchor(anchor_observed_includes_created_edit=1)
+
+    def test_extra_lines_wrong_marker_body_bound_and_controls_rejected(self):
+        rendered = self.anchor().render()
+        for invalid in (
+            rendered + "extra\n",
+            "wrong marker\n" + rendered.split("\n", 1)[1],
+            rendered.replace("\n", "\n\n", 1),
+            rendered + "x" * 16_400,
+            rendered.replace("Owner/Repo", "Owner/Bad\x00Repo"),
+        ):
+            with self.subTest(sample=invalid[:100]), self.assertRaises(RequestModelError):
+                parse_issue_request_anchor(invalid)
+
+    def test_valid_timestamp_z_and_authority_field_changes_change_digest(self):
+        base = self.anchor(anchor_observed_last_edited_at="2026-10-04T12:30:00Z", anchor_observed_includes_created_edit=True)
+        alternatives = (
+            self.anchor(issue_database_id=701), self.anchor(issue_node_id="I_kwDOOther"),
+            self.anchor(original_author_id="U_kwDOOther"), self.anchor(original_author_login="bob"),
+            self.anchor(initial_body_sha256="b" * 64), self.anchor(source_id="other-source"),
+            self.anchor(source_repository_id=42), self.anchor(source_canonical_full_name="Other/Repo"),
+            self.anchor(anchor_observed_last_edited_at="2026-10-05T12:30:00Z"),
+            self.anchor(anchor_observed_includes_created_edit=True),
+        )
+        self.assertIsNotNone(base.anchor_observed_last_edited_at)
+        self.assertTrue(all(item.canonical_sha256() != self.anchor().canonical_sha256() for item in alternatives))
+
+    def test_issue_patch_event_requires_strict_identity_and_flags(self):
+        for args in ((True, True, False, "x"), (1, 1, False, "x"), (1, True, 0, "x"), (1, True, False, 5), (1, True, False, "x" * 16_385)):
+            with self.subTest(args=args), self.assertRaises(RequestModelError):
+                IssuePatchEvent(*args)
+
+    def test_issue_patch_fold_orders_authorizes_classifies_and_composes(self):
+        anchor = self.anchor()
+        events = [
+            IssuePatchEvent(30, True, False, f"{PATCH_SENTINEL}\n\nBranch:\nrelease\n"),
+            IssuePatchEvent(10, True, False, f"{PATCH_SENTINEL}\n\nDescription:\nfirst\n"),
+            IssuePatchEvent(20, True, False, f"{PATCH_SENTINEL}\n\nDescription:\nsecond\n"),
+        ]
+        folded = fold_issue_patch_events(anchor, events)
+        self.assertEqual(folded.request.description, "second")
+        self.assertEqual(folded.request.branch, "refs/heads/release")
+        self.assertEqual([(item.comment_id, item.kind) for item in folded.evidence], [(10, "applied"), (20, "applied"), (30, "applied")])
+        self.assertEqual(folded, fold_issue_patch_events(anchor, reversed(events)))
+        with self.assertRaises(RequestModelError):
+            fold_issue_patch_events(anchor, [events[0], events[0]])
+
+    def test_issue_patch_fold_invalid_unauthorized_edited_discussion_remove_and_semantics(self):
+        anchor = self.anchor()
+        discussion = IssuePatchEvent(1, True, False, "ordinary comment")
+        invalid = IssuePatchEvent(2, True, False, f"{PATCH_SENTINEL}\n\nUnknown:\nx\n")
+        unauthorized = IssuePatchEvent(3, False, False, f"{PATCH_SENTINEL}\n\nDescription:\nno\n")
+        edited = IssuePatchEvent(4, True, True, f"{PATCH_SENTINEL}\n\nDescription:\nedited\n")
+        semantic = IssuePatchEvent(5, True, False, f"{PATCH_SENTINEL}\n\nBranch:\nblocked\n")
+        folded = fold_issue_patch_events(anchor, [discussion, invalid, unauthorized, edited, semantic], lambda request: request.branch != "refs/heads/blocked")
+        self.assertEqual(folded.request, anchor.initial_request)
+        self.assertEqual([(item.comment_id, item.kind) for item in folded.evidence], [
+            (2, "invalid"), (3, "unauthorized"), (4, "invalid"), (5, "semantic-invalid")
+        ])
+        remove = self.anchor(RequestClass.REMOVE)
+        result = fold_issue_patch_events(remove, [IssuePatchEvent(9, True, False, f"{PATCH_SENTINEL}\n\nDescription:\nx\n")])
+        self.assertEqual(result.evidence[0].kind, "invalid")
+        self.assertEqual(result.request, remove.initial_request)
+
+    def test_repository_url_is_not_patchable_and_existing_pr_fold_is_unchanged(self):
+        anchor = self.anchor()
+        event = IssuePatchEvent(12, True, False, f"{PATCH_SENTINEL}\n\nRepository URL:\nhttps://github.com/Evil/Repo\n")
+        result = fold_issue_patch_events(anchor, [event])
+        self.assertEqual(result.request.repository_url, anchor.initial_request.repository_url)
+        self.assertEqual(result.evidence[0].kind, "invalid")
+        old_request = RequestModelTests()
+        pr_anchor = RequestAnchor(1, RequestClass.ADD, "id", "login", "0" * 64, self.request(RequestClass.ADD))
+        old = fold_patch_events(pr_anchor, [CommentEvent(2, True, f"{PATCH_SENTINEL}\n\nDescription:\nold-path\n")])
+        self.assertEqual(old.request.description, "old-path")
+
+
+class ClaimedHeadAndIssueLeaseModelTests(unittest.TestCase):
+    @staticmethod
+    def marker(**changes):
+        fields = dict(
+            claim_kind="ISSUE_BRANCH_LEASE",
+            role="ISSUE_ACTIVE",
+            owner_kind="ISSUE",
+            owner_key="R_central:700:I_kwDOIssue:7",
+            claim_generation_id="1" * 64,
+            carrier_nonce="2" * 64,
+            transition_kind="INITIAL",
+        )
+        fields.update(changes)
+        return ClaimedHeadMarker(**fields)
+
+    @staticmethod
+    def lease(**changes):
+        fields = dict(
+            schema_version=1,
+            issue_number=7,
+            issue_database_id=700,
+            issue_node_id="I_kwDOIssue",
+            issue_request_anchor_comment_database_id=101,
+            issue_request_anchor_sha256="a" * 64,
+            source_id="owner-repo",
+            source_repository_id=41,
+            central_repository_node_id="R_central",
+            branch_ref="refs/heads/bot/federation/request/issue-7",
+            accepted_base_sha="1" * 40,
+            carrier_role="ISSUE_ACTIVE",
+            claim_kind="ISSUE_BRANCH_LEASE",
+            claim_generation_id="b" * 64,
+            carrier_nonce="c" * 64,
+            authority_preimage_digest="d" * 64,
+            initial_head_sha="e" * 40,
+            initial_head_tree_sha="f" * 40,
+            initial_head_parent_sha="1" * 40,
+            initial_head_marker_digest="9" * 64,
+            request_class=RequestClass.ADD,
+        )
+        fields.update(changes)
+        return IssueBranchLease.create(**fields)
+
+    @staticmethod
+    def authority_fields(**changes):
+        fields = dict(
+            accepted_base_sha="1" * 40,
+            accepted_base_tree_sha="a" * 40,
+            branch_ref="refs/heads/bot/federation/request/issue-7",
+            central_repository_node_id="R_central",
+            owner_key="R_central:700:I_kwDOIssue:7",
+            issue_request_anchor_sha256="b" * 64,
+            request_class=RequestClass.ADD,
+            source_canonical_full_name="Owner/Repo",
+            source_id="owner-repo",
+            source_identity_kind="proposed",
+            source_repository_id=41,
+        )
+        fields.update(changes)
+        return fields
+
+    def authority_digest(self, **changes):
+        return issue_branch_lease_authority_digest(**self.authority_fields(**changes))
+
+    def generation(self, **changes):
+        fields = dict(
+            authority_preimage_digest="3" * 64,
+            carrier_nonce="4" * 64,
+            central_repository_node_id="R_central",
+            owner_key="R_central:700:I_kwDOIssue:7",
+            from_head_sha="1" * 40,
+            from_tree_sha="a" * 40,
+        )
+        fields.update(changes)
+        return claim_generation_id(**fields)
+
+    def test_marker_exact_render_roundtrip_and_excludes_derived_identifiers(self):
+        marker = self.marker()
+        expected = (
+            f"{CLAIMED_HEAD_MARKER_HEADER}\n"
+            "claim-kind=ISSUE_BRANCH_LEASE\nrole=ISSUE_ACTIVE\nowner-kind=ISSUE\n"
+            "owner-key=R_central:700:I_kwDOIssue:7\n"
+            f"generation={'1' * 64}\nnonce={'2' * 64}\ntransition=INITIAL\n"
+        )
+        self.assertEqual(marker.render(), expected)
+        self.assertEqual(parse_claimed_head_marker(expected), marker)
+        for forbidden in ("leaseId", "initialHeadSha", "targetHeadSha", "claimId", "epochId", "fenceId"):
+            self.assertNotIn(forbidden, marker.render())
+
+    def test_marker_strictly_rejects_field_order_unknown_fields_and_bad_values(self):
+        rendered = self.marker().render()
+        invalid = [
+            rendered.replace("claim-kind=ISSUE_BRANCH_LEASE\nrole=ISSUE_ACTIVE", "role=ISSUE_ACTIVE\nclaim-kind=ISSUE_BRANCH_LEASE"),
+            rendered.replace("transition=INITIAL\n", "transition=INITIAL\nextra=x\n"),
+            rendered.replace("owner-kind=ISSUE\n", ""),
+            rendered.replace("claim-kind=ISSUE_BRANCH_LEASE", "claim-kind=FUTURE"),
+            rendered.replace("role=ISSUE_ACTIVE", "role=FUTURE"),
+            rendered.replace("owner-kind=ISSUE", "owner-kind=FUTURE"),
+            rendered.replace("generation=" + "1" * 64, "generation=" + "A" * 64),
+            rendered.replace("nonce=" + "2" * 64, "nonce=" + "2" * 63),
+            rendered.replace("transition=INITIAL", "transition=bad"),
+            rendered.rstrip("\n"),
+        ]
+        for value in invalid:
+            with self.subTest(value=value[:40]), self.assertRaises(RequestModelError):
+                parse_claimed_head_marker(value)
+
+    def test_owner_key_exact_format_and_all_components_bind(self):
+        expected = "R_central:700:I_kwDOIssue:7"
+        self.assertEqual(issue_owner_key("R_central", 700, "I_kwDOIssue", 7), expected)
+        variants = (
+            issue_owner_key("R_other", 700, "I_kwDOIssue", 7),
+            issue_owner_key("R_central", 701, "I_kwDOIssue", 7),
+            issue_owner_key("R_central", 700, "I_kwDOIssue2", 7),
+            issue_owner_key("R_central", 700, "I_kwDOIssue", 8),
+        )
+        self.assertEqual(len(set(variants + (expected,))), 5)
+        for args in (("R:bad", 700, "I_kwDOIssue", 7), ("R_central", True, "I_kwDOIssue", 7),
+                     ("R_central", 700, "I:bad", 7)):
+            with self.subTest(args=args), self.assertRaises(RequestModelError):
+                issue_owner_key(*args)
+        self.assertEqual(issue_branch_ref(7), "refs/heads/bot/federation/request/issue-7")
+
+    def test_authority_digest_matches_canonical_golden_and_each_authority_field(self):
+        fields = self.authority_fields()
+        expected_preimage = (
+            "swiftstream-federation-issue-branch-lease-authority:v1\n"
+            + json.dumps({
+                "acceptedBaseSha": fields["accepted_base_sha"],
+                "acceptedBaseTreeSha": fields["accepted_base_tree_sha"],
+                "branchRef": fields["branch_ref"],
+                "centralRepositoryNodeId": fields["central_repository_node_id"],
+                "issueOwnerKey": fields["owner_key"],
+                "issueRequestAnchorSha256": fields["issue_request_anchor_sha256"],
+                "requestClass": fields["request_class"].value,
+                "sourceCanonicalFullName": fields["source_canonical_full_name"],
+                "sourceId": fields["source_id"],
+                "sourceIdentityKind": fields["source_identity_kind"],
+                "sourceRepositoryId": fields["source_repository_id"],
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        ).encode("utf-8")
+        expected_digest = hashlib.sha256(expected_preimage).hexdigest()
+        self.assertEqual(expected_digest, "1e96e22dfaa8d298c3f0a246d5eac93a92f70c95e9a45eac04e0f09482c21b52")
+        self.assertEqual(self.authority_digest(), expected_digest)
+        self.assertEqual(self.authority_digest(), self.authority_digest())
+        changes = (
+            {"accepted_base_sha": "2" * 40}, {"accepted_base_tree_sha": "b" * 40},
+            {"branch_ref": issue_branch_ref(8), "owner_key": "R_central:700:I_kwDOIssue:8"},
+            {"central_repository_node_id": "R_other", "owner_key": "R_other:700:I_kwDOIssue:7"},
+            {"owner_key": "R_central:701:I_kwDOIssue:7"},
+            {"issue_request_anchor_sha256": "c" * 64},
+            {"request_class": RequestClass.UPDATE, "source_identity_kind": "accepted"},
+            {"source_canonical_full_name": "Other/Repo"},
+            {"source_id": "other-repo"}, {"source_identity_kind": "accepted"},
+            {"source_repository_id": 42},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                self.assertNotEqual(self.authority_digest(**change), self.authority_digest())
+        invalid = (
+            {"branch_ref": "not-a-ref"},
+            {"branch_ref": issue_branch_ref(8)},
+            {"owner_key": "R_central:700:I_kwDOIssue"},
+            {"owner_key": "R_other:700:I_kwDOIssue:7"},
+            {"owner_key": "R_central:0700:I_kwDOIssue:7"},
+            {"source_canonical_full_name": "/Repo"},
+            {"source_canonical_full_name": "Owner/"},
+        )
+        for change in invalid:
+            with self.subTest(invalid_change=change), self.assertRaises(RequestModelError):
+                self.authority_digest(**change)
+        # Nonce and target-head data are deliberately not accepted by this preimage function.
+        with self.assertRaises(TypeError):
+            self.authority_digest(carrier_nonce="f" * 64)
+        with self.assertRaises(TypeError):
+            self.authority_digest(initial_head_sha="e" * 40)
+
+    def test_generation_matches_golden_and_binds_every_generation_semantic(self):
+        fields = dict(
+            authorityPreimageDigest="3" * 64,
+            carrierNonce="4" * 64,
+            centralRepositoryNodeId="R_central",
+            claimKind="ISSUE_BRANCH_LEASE",
+            fromHeadSha="1" * 40,
+            fromTreeSha="a" * 40,
+            ownerKey="R_central:700:I_kwDOIssue:7",
+            ownerKind="ISSUE",
+            role="ISSUE_ACTIVE",
+            transitionKind="INITIAL",
+        )
+        expected = hashlib.sha256((CLAIM_GENERATION_PREFIX + json.dumps(
+            fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )).encode("utf-8")).hexdigest()
+        self.assertEqual(self.generation(), expected)
+        variants = (
+            {"authority_preimage_digest": "5" * 64}, {"carrier_nonce": "6" * 64},
+            {"central_repository_node_id": "R_other"}, {"claim_kind": "ISSUE_HEAD_CLAIM"},
+            {"from_head_sha": "2" * 40}, {"from_tree_sha": "b" * 40},
+            {"owner_key": "R_other:700:I_kwDOIssue:7"}, {"owner_kind": "MACHINE_SOURCE"},
+            {"role": "ISSUE_FINALIZING"}, {"transition_kind": "RETRY"},
+        )
+        for change in variants:
+            with self.subTest(change=change):
+                self.assertNotEqual(self.generation(**change), self.generation())
+        self.assertNotEqual(self.generation(), self.generation(carrier_nonce="5" * 64))
+        with self.assertRaises(TypeError):
+            self.generation(initial_head_sha="e" * 40)
+
+    def test_issue_branch_lease_canonical_roundtrip_keys_digest_and_id(self):
+        lease = self.lease()
+        rendered = lease.render()
+        self.assertTrue(rendered.startswith(ISSUE_BRANCH_LEASE_MARKER + "\n"))
+        self.assertEqual(parse_issue_branch_lease(rendered), lease)
+        value = json.loads(rendered.splitlines()[1])
+        self.assertEqual(set(value), {
+            "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+            "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256", "sourceId",
+            "sourceRepositoryId", "centralRepositoryNodeId", "branchRef", "acceptedBaseSha",
+            "carrierRole", "claimKind", "claimGenerationId", "carrierNonce",
+            "authorityPreimageDigest", "initialHeadSha", "initialHeadTreeSha",
+            "initialHeadParentSha", "initialHeadMarkerDigest", "requestClass", "leaseId",
+        })
+        self.assertEqual(list(value), sorted(value))
+        body = dict(value)
+        lease_id = body.pop("leaseId")
+        self.assertEqual(lease_id, hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False).encode()).hexdigest())
+        self.assertEqual(lease.canonical_sha256(), hashlib.sha256(rendered.encode()).hexdigest())
+        self.assertEqual(lease.canonical_sha256(), self.lease().canonical_sha256())
+
+    def test_issue_branch_lease_rejects_extra_missing_noncanonical_and_mismatched_fields(self):
+        lease = self.lease()
+        base = json.loads(lease.render().splitlines()[1])
+        invalid = []
+        for key, value in (("extra", "x"), ("carrierNonce", "A" * 64), ("carrierRole", "ISSUE_CANCEL"),
+                           ("claimKind", "ISSUE_HEAD_CLAIM"), ("branchRef", "refs/heads/other"),
+                           ("initialHeadParentSha", "2" * 40), ("issueRequestAnchorSha256", "bad"),
+                           ("initialHeadMarkerDigest", "bad"), ("leaseId", "0" * 64),
+                           ("schemaVersion", True)):
+            value = dict(base)
+            value[key] = value.get(key, "x")
+            if key == "extra":
+                value[key] = "x"
+            elif key == "carrierNonce":
+                value[key] = "A" * 64
+            elif key == "carrierRole":
+                value[key] = "ISSUE_CANCEL"
+            elif key == "claimKind":
+                value[key] = "ISSUE_HEAD_CLAIM"
+            elif key == "branchRef":
+                value[key] = "refs/heads/other"
+            elif key == "initialHeadParentSha":
+                value[key] = "2" * 40
+            elif key == "issueRequestAnchorSha256":
+                value[key] = "bad"
+            elif key == "initialHeadMarkerDigest":
+                value[key] = "bad"
+            elif key == "leaseId":
+                value[key] = "0" * 64
+            else:
+                value[key] = True
+            invalid.append(ISSUE_BRANCH_LEASE_MARKER + "\n" + json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+        missing = dict(base)
+        missing.pop("carrierNonce")
+        invalid.append(ISSUE_BRANCH_LEASE_MARKER + "\n" + json.dumps(missing, sort_keys=True, separators=(",", ":")) + "\n")
+        for text in invalid:
+            with self.subTest(text=text[:80]), self.assertRaises(RequestModelError):
+                parse_issue_branch_lease(text)
+
+    def test_changing_lease_authority_fields_changes_lease_id(self):
+        original = self.lease()
+        variants = (
+            {"issue_number": 8, "branch_ref": "refs/heads/bot/federation/request/issue-8"},
+            {"issue_database_id": 701}, {"issue_node_id": "I_other"},
+            {"issue_request_anchor_comment_database_id": 102},
+            {"issue_request_anchor_sha256": "2" * 64}, {"source_id": "other-repo"},
+            {"source_repository_id": 42}, {"central_repository_node_id": "R_other"},
+            {"accepted_base_sha": "2" * 40, "initial_head_parent_sha": "2" * 40},
+            {"claim_generation_id": "2" * 64}, {"carrier_nonce": "2" * 64},
+            {"authority_preimage_digest": "2" * 64}, {"initial_head_sha": "2" * 40},
+            {"initial_head_tree_sha": "2" * 40}, {"initial_head_marker_digest": "2" * 64},
+            {"request_class": RequestClass.UPDATE},
+        )
+        for change in variants:
+            with self.subTest(change=change):
+                self.assertNotEqual(self.lease(**change).lease_id, original.lease_id)
 
 if __name__ == "__main__":
     unittest.main()
