@@ -38,6 +38,8 @@ from .github_api import (
 from .request_model import (
     ANCHOR_MARKER,
     ISSUE_REQUEST_ANCHOR_MARKER,
+    ISSUE_PATCH_PROJECTION_MARKER,
+    ISSUE_HEAD_CLAIM_MARKER,
     ISSUE_INTERNAL_PR_BINDING_MARKER,
     PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
@@ -48,6 +50,8 @@ from .request_model import (
     IssueBranchLease,
     IssueRequestAnchor,
     IssuePRBinding,
+    IssueHeadClaim,
+    IssuePatchProjection,
     ClaimedHeadMarker,
     PatchFoldResult,
     Request,
@@ -55,9 +59,15 @@ from .request_model import (
     RequestClass,
     RequestModelError,
     body_sha256,
+    classify_issue_head_claim_progression,
+    effective_request_digest,
     fold_patch_events,
     fold_issue_patch_events,
     issue_branch_lease_authority_digest,
+    issue_head_claim_authority_digest,
+    issue_patch_projection_evidence_digest,
+    normalize_target_evidence_digest,
+    proposal_target_evidence_digest,
     issue_branch_ref,
     issue_owner_key,
     claim_generation_id,
@@ -67,10 +77,13 @@ from .request_model import (
     parse_issue_internal_pr_binding,
     parse_pr_issue_origin_binding,
     parse_issue_branch_lease,
+    parse_issue_head_claim,
+    parse_issue_patch_projection,
     parse_claimed_head_marker,
     parse_issue_request_body,
     parse_request_body,
     render_request_body,
+    render_patch,
     parse_patch,
     proposed_line_refs,
     reserved_issue_branch_number,
@@ -136,6 +149,33 @@ class StaleAuthorityError(R02Error):
 
 class StaleTrustedCheckoutError(StaleAuthorityError):
     """The trusted code checkout cannot safely evaluate the current main."""
+
+
+class IssueManagedNoSemanticChange(R02Error):
+    """A valid Issue request produces no trust/configuration semantic change."""
+
+    reason = "NO_SEMANTIC_CHANGE"
+
+    def __init__(self, request_class: RequestClass):
+        if type(request_class) is not RequestClass or request_class not in {
+            RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE,
+        }:
+            raise ValueError("Issue-managed no-change requires an exact manual RequestClass")
+        self.request_class = request_class
+        super().__init__(self.reason)
+
+
+@dataclass(frozen=True)
+class IssueManagedRouteResult:
+    outcome: str
+    reason: str
+    request_class: RequestClass
+
+    def __post_init__(self) -> None:
+        if type(self.request_class) is not RequestClass or self.request_class not in {
+            RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE,
+        }:
+            raise ValueError("Issue-managed route result requires an exact manual RequestClass")
 
 
 class DuplicateAnchorError(R02Error):
@@ -297,6 +337,7 @@ RESULT_IDEMPOTENCY_PREFIX = "<!-- swiftstream-federation-result:"
 TRUSTED_VALIDATION_NAME = "federation/trusted-validation"
 FINALIZER_CONCURRENCY_GROUP = "swiftstream-skills-federation-state-finalizer"
 MANUAL_CLASSES = frozenset({RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE})
+_LEGACY_UPDATE_REMOVE_NO_FEDERATION_ERROR = "UPDATE/REMOVE requires an actual federation.json trust/configuration change"
 GENERATED_PREFIXES = ("skills/",)
 MACHINE_GENERATED_FILES = frozenset({"federation.lock.json", "README.md"})
 MACHINE_WORK_LIMIT = 8
@@ -744,6 +785,15 @@ def authorized_issue_patch_events(
     for comment in comments:
         if comment.database_id <= anchor_id:
             continue
+        if type(comment.body) is str and comment.body.startswith(ISSUE_PATCH_PROJECTION_MARKER):
+            continue
+        try:
+            if len(comment.body.encode("utf-8")) > 16_384:
+                # The Issue PATCH authority remains capped at 16 KiB. The only
+                # wider machine comment is a projection and is skipped above.
+                continue
+        except (AttributeError, UnicodeEncodeError):
+            raise R02Error("Issue comment body is not valid UTF-8 text") from None
         authorized = False
         if comment.author_type == "User" and comment.author_id is not None and _issue_patch_candidate(comment.body):
             if comment.author_id == anchor_comment.anchor.original_author_id:
@@ -790,6 +840,13 @@ class IssuePRBindingState:
     pr_binding_comment: IssueComment
     pr: PullRequestMetadata
     pr_issue: IssueMetadata
+
+
+@dataclass(frozen=True)
+class IssueHeadClaimComment:
+    claim: IssueHeadClaim
+    comment: IssueComment
+    active: bool
 
 
 @dataclass(frozen=True)
@@ -1256,6 +1313,8 @@ def _issue_pr_authority_fence(comments: Iterable[IssueComment], app: AppIdentity
         ISSUE_REQUEST_ANCHOR_MARKER,
         ISSUE_BRANCH_LEASE_MARKER,
         ISSUE_INTERNAL_PR_BINDING_MARKER,
+        ISSUE_PATCH_PROJECTION_MARKER,
+        ISSUE_HEAD_CLAIM_MARKER,
     )
     reserved_prefix = "<!-- swiftstream-federation-issue-"
     for comment in comments:
@@ -1307,6 +1366,453 @@ def _binding_comment_sha256(comment: IssueComment) -> str:
         raise R02Error("binding provenance comment body is not valid UTF-8 text") from None
 
 
+def _issue_head_claim_marker(claim: IssueHeadClaim) -> ClaimedHeadMarker:
+    return ClaimedHeadMarker(
+        claim.claim_kind,
+        claim.carrier_role,
+        "ISSUE",
+        issue_owner_key(
+            claim.central_repository_node_id,
+            claim.issue_database_id,
+            claim.issue_node_id,
+            claim.issue_number,
+        ),
+        claim.claim_generation_id,
+        claim.carrier_nonce,
+        claim.transition_kind,
+    )
+
+
+def _issue_head_claim_matches_binding(claim: IssueHeadClaim, state: IssuePRBindingState) -> None:
+    anchor = state.issue_anchor
+    lease = state.lease
+    binding = state.binding
+    expected = (
+        anchor.anchor.issue_number,
+        anchor.anchor.issue_database_id,
+        anchor.anchor.issue_node_id,
+        anchor.comment.database_id,
+        anchor.anchor.canonical_sha256(),
+        lease.comment.database_id,
+        _binding_comment_sha256(lease.comment),
+        binding.binding_id,
+        anchor.anchor.source_id,
+        anchor.anchor.source_repository_id,
+        binding.pull_request_number,
+        binding.pull_request_database_id,
+        binding.pull_request_node_id,
+        binding.central_repository_node_id,
+        binding.branch_ref,
+        anchor.anchor.request_class,
+    )
+    actual = (
+        claim.issue_number,
+        claim.issue_database_id,
+        claim.issue_node_id,
+        claim.issue_request_anchor_comment_database_id,
+        claim.issue_request_anchor_sha256,
+        claim.issue_branch_lease_comment_database_id,
+        claim.issue_branch_lease_sha256,
+        claim.binding_id,
+        claim.source_id,
+        claim.source_repository_id,
+        claim.pull_request_number,
+        claim.pull_request_database_id,
+        claim.pull_request_node_id,
+        claim.central_repository_node_id,
+        claim.branch_ref,
+        claim.request_class,
+    )
+    if actual != expected:
+        raise R02Error("IssueHeadClaim does not bind the immutable Issue/lease/binding identities")
+
+
+def _proposal_tree_evidence(
+    client: GitHubClient,
+    repository: str,
+    base_entries: Iterable[Any],
+    target_entries: Iterable[Any],
+) -> tuple[tuple[str, ...], tuple[dict[str, Any], ...]]:
+    _validate_claimed_regular_tree(base_entries, "accepted proposal base")
+    _validate_claimed_regular_tree(target_entries, "proposal target")
+    base = _lease_leaf_map(base_entries)
+    target = _lease_leaf_map(target_entries)
+    changed_paths = tuple(sorted(path for path in set(base) | set(target) if base.get(path) != target.get(path)))
+    evidence: list[dict[str, Any]] = []
+    for path in changed_paths:
+        present = target.get(path)
+        if present is None:
+            evidence.append({
+                "path": path, "state": "ABSENT", "mode": None, "objectType": None,
+                "blobSha": None, "contentSha256": None,
+            })
+            continue
+        mode, object_type, blob_sha = present
+        if mode not in {"100644", "100755"} or object_type != "blob":
+            raise R02Error("claimed proposal target contains a nonregular tree object")
+        content = client.get_blob(repository, blob_sha)
+        evidence.append({
+            "path": path,
+            "state": "PRESENT",
+            "mode": mode,
+            "objectType": object_type,
+            "blobSha": blob_sha,
+            "contentSha256": hashlib.sha256(content).hexdigest(),
+        })
+    return changed_paths, tuple(evidence)
+
+
+def _validate_claimed_regular_tree(entries: Iterable[Any], label: str) -> None:
+    leaves: set[str] = set()
+    directories: set[str] = set()
+    for item in entries:
+        if item.object_type == "tree" and item.mode == "040000":
+            directories.add(item.path)
+        elif item.object_type == "blob" and item.mode in {"100644", "100755"}:
+            leaves.add(item.path)
+        else:
+            raise R02Error(f"{label} contains a nonregular Git object")
+    expected_directories = {
+        "/".join(path.split("/")[:index])
+        for path in leaves
+        for index in range(1, len(path.split("/")))
+    }
+    if directories != expected_directories:
+        raise R02Error(f"{label} directory structure does not match its regular file paths")
+
+
+def _validate_issue_head_claim_target(
+    client: GitHubClient,
+    repository: str,
+    claim: IssueHeadClaim,
+    lease: IssueBranchLease,
+) -> None:
+    marker = _issue_head_claim_marker(claim)
+    marker_text = marker.render()
+    if parse_claimed_head_marker(marker_text) != marker:
+        raise R02Error("IssueHeadClaim marker does not parse canonically")
+    if hashlib.sha256(marker_text.encode("utf-8")).hexdigest() != claim.marker_digest:
+        raise R02Error("IssueHeadClaim marker digest does not match its stored claim")
+    from_meta, from_tree_sha, _from_entries = _lease_tree_snapshot(client, repository, claim.from_head_sha)
+    if from_meta.sha != claim.from_head_sha or from_tree_sha != claim.from_tree_sha:
+        raise R02Error("IssueHeadClaim from-head tree provenance does not match stored evidence")
+    base_meta, accepted_tree_sha, accepted_entries = _lease_tree_snapshot(client, repository, claim.accepted_base_sha)
+    if base_meta.sha != claim.accepted_base_sha or accepted_tree_sha != claim.accepted_base_tree_sha:
+        raise R02Error("IssueHeadClaim accepted-base tree provenance does not match stored evidence")
+    target_meta, target_tree_sha, target_entries = _lease_tree_snapshot(client, repository, claim.to_head_sha)
+    if (
+        target_meta.sha != claim.to_head_sha
+        or target_meta.parents != (claim.from_head_sha,)
+        or target_meta.tree_sha != claim.to_tree_sha
+        or target_tree_sha != claim.to_tree_sha
+    ):
+        raise R02Error("IssueHeadClaim target commit parent/tree provenance does not match")
+    expected_sha = _expected_deterministic_commit_sha(
+        target_tree_sha, claim.from_head_sha, marker_text, target_meta.author_date,
+    )
+    if expected_sha != claim.to_head_sha:
+        raise R02Error("IssueHeadClaim target SHA does not bind its exact deterministic marker")
+    if claim.transition_kind == "NORMALIZE":
+        if claim.from_head_sha != lease.initial_head_sha:
+            raise R02Error("NORMALIZE IssueHeadClaim must wrap the exact leased initial head")
+        _validate_claimed_regular_tree(accepted_entries, "NORMALIZE accepted base")
+        _validate_claimed_regular_tree(target_entries, "NORMALIZE target")
+        request_bytes = (claim.request_class.value + "\n").encode("utf-8")
+        expected_blob_sha = hashlib.sha1(
+            b"blob " + str(len(request_bytes)).encode("ascii") + b"\0" + request_bytes
+        ).hexdigest()
+        _validate_marker_only_tree_delta(accepted_entries, target_entries, expected_blob_sha)
+        actual_tree = _lease_leaf_map(target_entries)
+        expected = _lease_leaf_map(accepted_entries)
+        expected[REQUEST_MARKER] = ("100644", "blob", expected_blob_sha)
+        if actual_tree != expected:
+            raise R02Error("NORMALIZE target tree is not the exact accepted-base marker shell")
+        marker_file = client.read_commit_file(repository, claim.to_head_sha, REQUEST_MARKER, expected_mode="100644")
+        if marker_file != request_bytes:
+            raise R02Error("NORMALIZE .federation-request readback differs from exact request class bytes")
+        expected_target = normalize_target_evidence_digest(
+            request_class=claim.request_class,
+            request_marker_blob_sha=expected_blob_sha,
+            target_tree_sha=target_tree_sha,
+        )
+    else:
+        _validate_claimed_regular_tree(target_entries, "IssueHeadClaim proposal target")
+        _changed, evidence = _proposal_tree_evidence(client, repository, accepted_entries, target_entries)
+        expected_target = proposal_target_evidence_digest(
+            candidate_tree_sha=target_tree_sha,
+            changed=evidence,
+            candidate_changed_paths=_changed,
+        )
+        if claim.transition_kind in {"PROPOSAL", "PATCH_REGENERATION", "MAIN_ADVANCE"}:
+            if REQUEST_MARKER in _lease_leaf_map(target_entries):
+                raise R02Error("proposal target must remove the transient request marker")
+    if expected_target != claim.target_evidence_digest:
+        raise R02Error("IssueHeadClaim target evidence digest does not match the stored target tree")
+
+
+def _issue_head_claim_comments(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    state: IssuePRBindingState,
+    current_ref: str,
+) -> tuple[IssueHeadClaimComment, ...]:
+    by_generation: dict[str, dict[str, list[tuple[IssueHeadClaim, IssueComment]]]] = {}
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_HEAD_CLAIM_MARKER):
+            continue
+        try:
+            claim = parse_issue_head_claim(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueHeadClaim comment: {_bounded_reason(error)}") from None
+        if (
+            comment.author_id != app.bot_node_id
+            or comment.author_login != app.bot_login
+            or comment.author_type not in {None, "Bot"}
+            or _issue_comment_edited(comment)
+        ):
+            raise R02Error("IssueHeadClaim comment authorship/edit integrity is invalid")
+        _issue_head_claim_matches_binding(claim, state)
+        _validate_issue_head_claim_target(client, repository, claim, state.lease.lease)
+        by_generation.setdefault(claim.claim_generation_id, {}).setdefault(claim.render(), []).append((claim, comment))
+    canonical: list[IssueHeadClaimComment] = []
+    for payloads in by_generation.values():
+        if len(payloads) != 1:
+            raise R02Error("conflicting IssueHeadClaim payloads for one generation block progression")
+        equivalent = next(iter(payloads.values()))
+        claim, comment = min(equivalent, key=lambda item: item[1].database_id)
+        canonical.append(IssueHeadClaimComment(claim, comment, current_ref == claim.to_head_sha))
+    reachable_heads = {state.lease.lease.initial_head_sha}
+    unresolved = list(canonical)
+    while unresolved:
+        advanced = False
+        remaining: list[IssueHeadClaimComment] = []
+        for item in unresolved:
+            claim = item.claim
+            if claim.transition_kind == "NORMALIZE" and claim.from_head_sha != state.lease.lease.initial_head_sha:
+                raise R02Error("NORMALIZE IssueHeadClaim must descend directly from the leased initial head")
+            if claim.from_head_sha in reachable_heads:
+                reachable_heads.add(claim.to_head_sha)
+                advanced = True
+            else:
+                remaining.append(item)
+        if not advanced:
+            raise R02Error("IssueHeadClaim history has a missing or cyclic from-head predecessor")
+        unresolved = remaining
+    return tuple(sorted(canonical, key=lambda item: (item.comment.database_id, item.claim.claim_generation_id)))
+
+
+def _fresh_issue_projection_set(
+    client: GitHubClient,
+    repository: str,
+    issue: IssueMetadata,
+    anchor: IssueAnchorComment,
+    binding: IssuePRBinding,
+    source_comments: Iterable[IssueComment],
+    pr_comments: Iterable[IssueComment],
+    app: AppIdentity,
+    semantic_validator: Callable[[Request], bool] | None,
+    *,
+    require_complete: bool = False,
+) -> tuple[PatchFoldResult, tuple[IssuePatchProjection, ...]]:
+    source_comment_list = tuple(source_comments)
+    pr_comment_list = tuple(pr_comments)
+    events = authorized_issue_patch_events(client, repository, anchor, source_comment_list)
+    try:
+        fold = fold_issue_patch_events(anchor.anchor, events, semantic_validator)
+    except RequestModelError as error:
+        raise R02Error(f"Issue PATCH fold failed closed: {_bounded_reason(error)}") from None
+    by_id = {comment.database_id: comment for comment in source_comment_list}
+    event_by_id = {event.comment_id: event for event in events}
+    expected: dict[int, IssuePatchProjection] = {}
+    for item in fold.evidence:
+        if item.kind != "applied":
+            continue
+        event = event_by_id.get(item.comment_id)
+        source = by_id.get(item.comment_id)
+        if event is None or source is None:
+            raise R02Error("accepted Issue PATCH evidence lost its exact source comment")
+        try:
+            patch = parse_patch(event.body)
+            if patch is None:
+                raise RequestModelError("accepted Issue PATCH evidence is not a PATCH")
+            expected[item.comment_id] = IssuePatchProjection(
+                1,
+                issue.database_id,
+                issue.number,
+                anchor.comment.database_id,
+                source.database_id,
+                _binding_comment_sha256(source),
+                binding.binding_id,
+                patch,
+            )
+        except RequestModelError as error:
+            raise R02Error(f"accepted Issue PATCH cannot render a canonical projection: {_bounded_reason(error)}") from None
+
+    actual: dict[int, set[str]] = {}
+    if any(
+        type(comment.body) is str and comment.body.startswith(ISSUE_PATCH_PROJECTION_MARKER)
+        for comment in source_comment_list
+    ):
+        raise R02Error("IssuePatchProjection comments must be stored on the generated Issue PR")
+    if any(
+        type(comment.body) is str and comment.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        for comment in source_comment_list
+    ):
+        raise R02Error("IssueHeadClaim comments must be stored on the generated Issue PR")
+    for comment in pr_comment_list:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_PATCH_PROJECTION_MARKER):
+            continue
+        try:
+            projection = parse_issue_patch_projection(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssuePatchProjection: {_bounded_reason(error)}") from None
+        if (
+            comment.author_id != app.bot_node_id
+            or comment.author_login != app.bot_login
+            or comment.author_type not in {None, "Bot"}
+            or _issue_comment_edited(comment)
+        ):
+            raise R02Error("IssuePatchProjection comment authorship/edit integrity is invalid")
+        expected_projection = expected.get(projection.issue_comment_id)
+        source = by_id.get(projection.issue_comment_id)
+        if (
+            expected_projection is None
+            or source is None
+            or projection.issue_database_id != issue.database_id
+            or projection.issue_number != issue.number
+            or projection.issue_anchor_comment_id != anchor.comment.database_id
+            or projection.issue_comment_body_sha256 != _binding_comment_sha256(source)
+            or projection.binding_id != binding.binding_id
+            or projection.render() != expected_projection.render()
+        ):
+            raise R02Error("IssuePatchProjection does not match the exact accepted Issue PATCH evidence")
+        actual.setdefault(projection.issue_comment_id, set()).add(projection.render())
+    if any(len(payloads) != 1 for payloads in actual.values()):
+        raise R02Error("conflicting IssuePatchProjection equivalence classes block progression")
+    if require_complete and set(actual) != set(expected):
+        raise StaleAuthorityError("IssuePatchProjection evidence is incomplete after persistence")
+    return fold, tuple(expected[key] for key in sorted(expected))
+
+
+def _synchronize_issue_patch_projections(
+    client: GitHubClient,
+    repository: str,
+    issue: IssueMetadata,
+    anchor: IssueAnchorComment,
+    binding: IssuePRBinding,
+    source_comments: Iterable[IssueComment],
+    pr_comments: Iterable[IssueComment],
+    app: AppIdentity,
+    semantic_validator: Callable[[Request], bool] | None,
+) -> tuple[PatchFoldResult, tuple[IssuePatchProjection, ...], tuple[IssueComment, ...], tuple[IssueComment, ...]]:
+    current_source_comments = tuple(source_comments)
+    current_pr_comments = tuple(pr_comments)
+    fold, expected = _fresh_issue_projection_set(
+        client, repository, issue, anchor, binding,
+        current_source_comments, current_pr_comments, app, semantic_validator,
+    )
+    present = {
+        parse_issue_patch_projection(comment.body).issue_comment_id
+        for comment in current_pr_comments
+        if type(comment.body) is str and comment.body.startswith(ISSUE_PATCH_PROJECTION_MARKER)
+    }
+    for projection in expected:
+        if projection.issue_comment_id in present:
+            continue
+        body = projection.render()
+        try:
+            client.create_issue_patch_projection_comment(repository, binding.pull_request_number, body)
+        except GitHubAPIError as error:
+            try:
+                reread = tuple(client.list_issue_comments(repository, binding.pull_request_number))
+                _fresh_issue_projection_set(
+                    client, repository, issue, anchor, binding,
+                    current_source_comments, reread, app, semantic_validator,
+                    require_complete=True,
+                )
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous IssuePatchProjection POST cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            raise StaleAuthorityError(
+                f"ambiguous IssuePatchProjection POST; stop and reread on a later invocation: {_bounded_reason(error)}"
+            ) from None
+        try:
+            current_pr_comments = tuple(client.list_issue_comments(repository, binding.pull_request_number))
+        except Exception as error:
+            raise StaleAuthorityError(f"IssuePatchProjection write could not be reread: {_bounded_reason(error)}") from None
+        _fresh_issue_projection_set(
+            client, repository, issue, anchor, binding,
+            current_source_comments, current_pr_comments, app, semantic_validator,
+            require_complete=True,
+        )
+    if expected:
+        # The expected set is a frozen accepted-fold snapshot. A source PATCH that
+        # races projection POST is handled by the next fresh invocation.
+        refreshed_issue = client.get_issue_metadata(repository, issue.number)
+        refreshed_source_comments = tuple(client.list_issue_comments(repository, issue.number))
+        refreshed_pr_comments = tuple(client.list_issue_comments(repository, binding.pull_request_number))
+        if (
+            refreshed_issue.number != issue.number
+            or refreshed_issue.database_id != issue.database_id
+            or refreshed_issue.node_id != issue.node_id
+            or refreshed_issue.is_pull_request
+            or refreshed_issue.state != "open"
+        ):
+            raise StaleAuthorityError("source Issue identity/lifecycle changed during projection synchronization")
+        refreshed_anchor = validate_unique_issue_anchor(refreshed_source_comments, refreshed_issue, app)
+        if refreshed_anchor.anchor != anchor.anchor or refreshed_anchor.comment.database_id != anchor.comment.database_id:
+            raise StaleAuthorityError("source Issue anchor changed during projection synchronization")
+        refreshed_fold, refreshed_expected = _fresh_issue_projection_set(
+            client, repository, refreshed_issue, anchor, binding,
+            refreshed_source_comments, refreshed_pr_comments, app, semantic_validator,
+            require_complete=True,
+        )
+        if refreshed_fold != fold or tuple(item.render() for item in refreshed_expected) != tuple(item.render() for item in expected):
+            raise StaleAuthorityError("Issue PATCH state changed during projection synchronization; fresh progression is required")
+        current_source_comments = refreshed_source_comments
+        current_pr_comments = refreshed_pr_comments
+    return fold, expected, current_source_comments, current_pr_comments
+
+
+def _require_semantic_issue_candidate(
+    candidate: ProposalCandidate,
+    request_class: RequestClass,
+    accepted_base_sha: str,
+) -> None:
+    if type(candidate) is not ProposalCandidate:
+        raise R02Error("C02 Issue candidate builder returned an invalid candidate")
+    if candidate.request_class is not request_class or candidate.accepted_base_sha != accepted_base_sha:
+        raise R02Error("C02 Issue candidate class/base does not match the fresh request snapshot")
+    if candidate.commit_sha == accepted_base_sha or not candidate.changed_paths:
+        raise IssueManagedNoSemanticChange(request_class)
+    if request_class in {RequestClass.UPDATE, RequestClass.REMOVE} and "federation.json" not in candidate.changed_paths:
+        raise IssueManagedNoSemanticChange(request_class)
+
+
+def _plan_issue_managed_candidate(
+    candidate_builder: CandidateBuilder,
+    request: Request,
+    request_class: RequestClass,
+    accepted_base_sha: str,
+    head_sha: str,
+) -> ProposalCandidate:
+    try:
+        candidate = candidate_builder(request, request_class, accepted_base_sha, head_sha)
+    except R02Error as error:
+        if (
+            type(error) is R02Error
+            and request_class in {RequestClass.UPDATE, RequestClass.REMOVE}
+            and str(error) == _LEGACY_UPDATE_REMOVE_NO_FEDERATION_ERROR
+        ):
+            raise IssueManagedNoSemanticChange(request_class) from None
+        raise
+    _require_semantic_issue_candidate(candidate, request_class, accepted_base_sha)
+    return candidate
+
+
 def _validate_issue_binding_cross_link(
     binding: IssuePRBinding,
     anchor: IssueAnchorComment,
@@ -1354,6 +1860,8 @@ def _read_issue_pr_intake(
     app: AppIdentity,
     central_repository_node_id: str,
     source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+    *,
+    validate_fresh_source_authority: bool = True,
 ) -> tuple[
     IssueMetadata,
     tuple[IssueComment, ...],
@@ -1384,7 +1892,8 @@ def _read_issue_pr_intake(
         )
         if leases is None:
             raise R02Error("one canonical IssueBranchLease is required before Wave 03")
-        _fresh_issue_source_authority(source_authority_resolver, anchor.anchor)
+        if validate_fresh_source_authority:
+            _fresh_issue_source_authority(source_authority_resolver, anchor.anchor)
         repo = client.get_repository_metadata(repository)
         if (
             type(repo) is not RepositoryMetadata
@@ -1821,6 +2330,155 @@ def create_or_recover_issue_pr_binding(
     if final is None:
         raise StaleAuthorityError("final cross-validation did not find the exact complete two-sided IssuePRBinding")
     return final
+
+
+def _read_managed_issue_pr_binding_state(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+    *,
+    validate_fresh_source_authority: bool = True,
+) -> IssuePRBindingState:
+    intake = _read_issue_pr_intake(
+        client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+        validate_fresh_source_authority=validate_fresh_source_authority,
+    )
+    issue, _issue_comments, anchor, lease, _repo, issue_bindings = intake
+    if not issue_bindings:
+        raise R02Error("IssueInternalPRBinding is required before managed Issue progression")
+    by_payload: dict[str, list[_IssuePRBindingComment]] = {}
+    for item in issue_bindings:
+        by_payload.setdefault(item.binding.render_issue_binding(), []).append(item)
+    if len(by_payload) != 1:
+        raise R02Error("conflicting IssueInternalPRBinding payloads block managed Issue progression")
+    binding_item = min(next(iter(by_payload.values())), key=lambda item: item.comment.database_id)
+    binding = binding_item.binding
+    pr_number = binding.pull_request_number
+    try:
+        pr = client.get_pull_request_metadata(repository, pr_number)
+        pr_issue = client.get_issue_metadata(repository, pr_number)
+        pr_comments = tuple(client.list_issue_comments(repository, pr_number))
+    except Exception as error:
+        raise StaleAuthorityError(f"bound Issue PR state is unavailable: {_bounded_reason(error)}") from None
+    _issue_pr_authority_fence(pr_comments, app)
+    _validate_issue_binding_cross_link(binding, anchor, lease, central_repository_node_id)
+    if (
+        type(pr) is not PullRequestMetadata
+        or pr.number != pr_number
+        or pr.author_id != app.bot_node_id
+        or pr.author_login != app.bot_login
+        or pr.head_ref != lease.lease.branch_ref.removeprefix("refs/heads/")
+        or pr.head_repository_id != central_repository_node_id
+        or pr.head_repository != repository
+        or pr.base_repository_id != central_repository_node_id
+        or pr.base_repository != repository
+        or pr.base_ref != "main"
+        or pr.draft is not False
+        or pr.body != render_request_body(anchor.anchor.initial_request)
+        or pr.last_edited_at is not None
+        or pr.includes_created_edit is not False
+    ):
+        raise R02Error("bound Issue PR immutable identity/body/topology is invalid")
+    if (
+        type(pr_issue) is not IssueMetadata
+        or pr_issue.is_pull_request is not True
+        or pr_issue.number != pr_number
+        or pr_issue.database_id != binding.pull_request_database_id
+        or pr_issue.node_id != binding.pull_request_node_id
+        or pr_issue.author_id != app.bot_node_id
+        or pr_issue.author_login != app.bot_login
+        or pr_issue.state != "open"
+        or pr_issue.body != pr.body
+    ):
+        raise R02Error("bound Issue PR composite identity/lifecycle/body is invalid")
+    pr_binding_candidates = _binding_comment_candidates(
+        pr_comments, app, PR_ISSUE_ORIGIN_BINDING_MARKER,
+        parse_pr_issue_origin_binding, "PRIssueOriginBinding",
+    )
+    if not pr_binding_candidates or any(item.binding != binding for item in pr_binding_candidates):
+        raise R02Error("PRIssueOriginBinding does not match the exact persisted Issue binding")
+    pr_binding_comment = min(pr_binding_candidates, key=lambda item: item.comment.database_id).comment
+    return IssuePRBindingState(
+        anchor, lease, binding, binding_item.comment, pr_binding_comment, pr, pr_issue,
+    )
+
+
+def _require_same_managed_issue_pr_binding(
+    before: IssuePRBindingState,
+    after: IssuePRBindingState,
+) -> None:
+    if (
+        before.issue_anchor.anchor != after.issue_anchor.anchor
+        or before.issue_anchor.comment.database_id != after.issue_anchor.comment.database_id
+        or before.issue_anchor.comment.body != after.issue_anchor.comment.body
+        or before.lease.lease != after.lease.lease
+        or before.lease.comment.database_id != after.lease.comment.database_id
+        or before.lease.comment.body != after.lease.comment.body
+        or before.binding != after.binding
+        or before.issue_binding_comment.database_id != after.issue_binding_comment.database_id
+        or before.issue_binding_comment.body != after.issue_binding_comment.body
+        or before.pr_binding_comment.database_id != after.pr_binding_comment.database_id
+        or before.pr_binding_comment.body != after.pr_binding_comment.body
+    ):
+        raise StaleAuthorityError("Issue/lease/binding identities changed during managed progression")
+
+
+def _validate_managed_issue_head_history(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+) -> tuple[IssuePRBindingState, str, tuple[IssueComment, ...], tuple[IssueHeadClaimComment, ...]]:
+    """Prove the current leased Issue head before consulting fresh mutable PATCH authority."""
+    central = client.get_repository_metadata(repository)
+    state = _read_managed_issue_pr_binding_state(
+        client,
+        repository,
+        issue_number,
+        app,
+        central.node_id,
+        source_authority_resolver,
+        validate_fresh_source_authority=False,
+    )
+    branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
+    current_ref = _read_issue_branch_ref(client, repository, branch_short)
+    if current_ref is None or state.pr.head_oid != current_ref:
+        raise StaleAuthorityError("managed Issue PR head is not the exact current leased-ref head")
+    pr_comments = tuple(client.list_issue_comments(repository, state.binding.pull_request_number))
+    _issue_pr_authority_fence(pr_comments, app)
+    claims = _issue_head_claim_comments(client, repository, pr_comments, app, state, current_ref)
+    active = tuple(item for item in claims if item.active)
+    if len(active) > 1:
+        raise R02Error("multiple distinct IssueHeadClaims are active at the current generated ref")
+    if current_ref != state.lease.lease.initial_head_sha and not active:
+        raise R02Error("current generated Issue head has no valid historical IssueHeadClaim authority")
+    return state, current_ref, pr_comments, claims
+
+
+def _ensure_managed_issue_pr_request_anchor(
+    client: GitHubClient,
+    repository: str,
+    state: IssuePRBindingState,
+    request_class: RequestClass,
+    app: AppIdentity,
+) -> AnchorComment:
+    """Create or reuse the exact immutable PR RequestAnchor handed off from the Issue anchor."""
+    pr = client.get_pull_request_metadata(repository, state.binding.pull_request_number)
+    if pr.number != state.binding.pull_request_number or pr.head_oid != state.pr.head_oid or pr.body != state.pr.body:
+        raise StaleAuthorityError("generated Issue PR head/body changed before RequestAnchor handoff")
+    comments = tuple(client.list_issue_comments(repository, state.binding.pull_request_number))
+    anchor = create_anchor_once(client, repository, pr, request_class, app, comments)
+    if (
+        anchor.anchor.initial_request != state.issue_anchor.anchor.initial_request
+        or anchor.anchor.request_class is not state.issue_anchor.anchor.request_class
+        or anchor.anchor.initial_body_sha256 != body_sha256(render_request_body(state.issue_anchor.anchor.initial_request))
+    ):
+        raise R02Error("generated PR RequestAnchor does not hand off the exact immutable Issue request")
+    return anchor
 
 
 def capture_snapshot(pr: PullRequestMetadata, comments: Iterable[IssueComment], anchor: AnchorComment) -> RequestSnapshot:
@@ -2603,10 +3261,18 @@ class C02CandidateBuilder:
             finally:
                 self._capsule_temp_root = None
         changed = tuple(sorted(path for path, (mode, data) in desired.items() if mode == "" or tree.get(path, (None, None, None))[0:2] != (mode, "blob") or (mode != "" and self.client.get_blob(self.central_repository, tree[path][2]) != data)))
-        if request_class in {RequestClass.UPDATE, RequestClass.REMOVE} and "federation.json" not in changed:
-            raise R02Error("UPDATE/REMOVE requires an actual federation.json trust/configuration change")
         if not changed:
-            return ProposalCandidate(accepted_base_sha, accepted_base_sha, (), request_class, source_id, repository_id, False)
+            return ProposalCandidate(
+                accepted_base_sha,
+                accepted_base_sha,
+                (),
+                request_class,
+                source_id,
+                repository_id,
+                False,
+            )
+        if request_class in {RequestClass.UPDATE, RequestClass.REMOVE} and "federation.json" not in changed:
+            raise R02Error(_LEGACY_UPDATE_REMOVE_NO_FEDERATION_ERROR)
         base_tree, _entries = self.client.get_commit_tree(self.central_repository, accepted_base_sha)
         tree_updates: list[Mapping[str, Any]] = []
         for path in changed:
@@ -2819,6 +3485,25 @@ class R02Controller:
         if repository.full_name != self.central_repository:
             raise StaleAuthorityError("central repository metadata does not bind to configured repository")
         return repository, self.client.get_ref_oid(self.central_repository, repository.default_branch)
+
+    def current_issue_source_authority(self, request: Request, request_class: RequestClass) -> IssueSourceAuthority:
+        """Resolve fresh Issue source identity only from the exact trusted accepted main."""
+        repository, current_main = self.current_accepted_main()
+        if repository.default_branch != "main":
+            raise StaleAuthorityError("managed Issue source authority requires central default branch main")
+        try:
+            with trusted_c02_execution():
+                if c02.head_commit_oid() != current_main:
+                    raise StaleTrustedCheckoutError("TRUSTED_CHECKOUT_CODE_STALE")
+                accepted_manifest = c02.load_trusted_previous_manifest()
+                source_metadata = read_public_source_metadata(_source_locator(request))
+                return resolve_issue_source_authority(
+                    request, request_class, accepted_manifest, source_metadata,
+                )
+        except (StaleTrustedCheckoutError, StaleAuthorityError):
+            raise
+        except Exception as error:
+            raise R02Error(f"fresh Issue source authority is unavailable: {_bounded_reason(error)}") from None
 
     def _accepted_sources(self, current_main: str | None = None) -> tuple[c02.SourceDeclaration, ...]:
         """Read accepted C02 authority only inside the audited capsule.
@@ -3148,6 +3833,422 @@ class R02Controller:
         replace_request_ref_cas(self.client, repository.node_id, request_ref, snapshot.head_oid, candidate)
         return candidate
 
+    def interactive_issue_managed_proposal(
+        self,
+        issue_number: int,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> IssueHeadClaim:
+        """Advance one bound Issue PR through immutable claim, wrapper, and ref-CAS authority."""
+        if not callable(source_authority_resolver):
+            raise R02Error("a fresh Issue source-authority resolver is required")
+        if self.candidate_builder is None:
+            raise R02Error("C02 candidate builder is not configured")
+        state, historical_ref, _historical_pr_comments, _historical_claims = _validate_managed_issue_head_history(
+            self.client,
+            self.central_repository,
+            issue_number,
+            self.app,
+            source_authority_resolver,
+        )
+        request_class = state.issue_anchor.anchor.request_class
+        _ensure_managed_issue_pr_request_anchor(
+            self.client, self.central_repository, state, request_class, self.app,
+        )
+        issue_comments = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+        pr_comments = tuple(self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number))
+        issue = self.client.get_issue_metadata(self.central_repository, issue_number)
+        if issue.state != "open" or issue.is_pull_request:
+            raise R02Error("managed Issue progression requires the exact open source Issue")
+        fold, expected_projections = _fresh_issue_projection_set(
+            self.client,
+            self.central_repository,
+            issue,
+            state.issue_anchor,
+            state.binding,
+            issue_comments,
+            pr_comments,
+            self.app,
+            semantic_validator,
+        )
+        try:
+            fresh_source = source_authority_resolver(fold.request, request_class)
+        except Exception as error:
+            raise StaleAuthorityError(f"fresh ACTIVE_PRE_MERGE Issue source authority is unavailable: {_bounded_reason(error)}") from None
+        _validate_issue_source_authority(state.issue_anchor.anchor, fresh_source)
+
+        repository, current_main = self.current_accepted_main()
+        if repository.node_id != state.binding.central_repository_node_id or repository.default_branch != "main":
+            raise StaleAuthorityError("central repository identity/default branch changed during managed Issue progression")
+        _main_meta, current_main_tree, _main_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, current_main,
+        )
+        branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
+        current_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if current_ref is None or current_ref != historical_ref:
+            raise StaleAuthorityError("bound Issue branch ref is absent")
+        pr = self.client.get_pull_request_metadata(self.central_repository, state.binding.pull_request_number)
+        if pr.head_oid != current_ref or pr.base_oid != current_main:
+            raise StaleAuthorityError("bound Issue PR head/base does not match the fresh ref/main snapshot")
+        pr_comments = tuple(self.client.list_issue_comments(self.central_repository, pr.number))
+        _issue_pr_authority_fence(pr_comments, self.app)
+        verified_fold, verified_projections = _fresh_issue_projection_set(
+            self.client,
+            self.central_repository,
+            issue,
+            state.issue_anchor,
+            state.binding,
+            issue_comments,
+            pr_comments,
+            self.app,
+            semantic_validator,
+        )
+        if (
+            verified_fold != fold
+            or tuple(item.render() for item in verified_projections)
+            != tuple(item.render() for item in expected_projections)
+        ):
+            raise StaleAuthorityError("Issue PATCH/projection snapshot changed before claim progression")
+        historical = _issue_head_claim_comments(
+            self.client, self.central_repository, pr_comments, self.app, state, current_ref,
+        )
+        active = tuple(item for item in historical if item.active)
+        if len(active) > 1:
+            raise R02Error("multiple distinct IssueHeadClaims are active at the same generated ref")
+        pending = tuple(item for item in historical if item.claim.from_head_sha == current_ref and not item.active)
+        if pending:
+            # Crash replay: the stored target/evidence/nonce is authoritative. Do not
+            # rebuild it from mutable PATCH comments or create a second CAS here.
+            replay = min(pending, key=lambda item: item.comment.database_id).claim
+            latest_state = _read_managed_issue_pr_binding_state(
+                self.client, self.central_repository, issue_number, self.app,
+                state.binding.central_repository_node_id, source_authority_resolver,
+            )
+            _require_same_managed_issue_pr_binding(state, latest_state)
+            latest_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            if latest_ref != current_ref or latest_state.pr.head_oid != current_ref:
+                raise StaleAuthorityError("pending IssueHeadClaim ref/PR authority changed before crash replay")
+            state = latest_state
+            self._apply_persisted_issue_head_claim(state, replay, current_ref)
+            return replay
+
+        fold, expected_projections, issue_comments, pr_comments = _synchronize_issue_patch_projections(
+            self.client,
+            self.central_repository,
+            issue,
+            state.issue_anchor,
+            state.binding,
+            issue_comments,
+            pr_comments,
+            self.app,
+            semantic_validator,
+        )
+        try:
+            fresh_source = source_authority_resolver(fold.request, request_class)
+        except Exception as error:
+            raise StaleAuthorityError(f"fresh ACTIVE_PRE_MERGE Issue source authority is unavailable: {_bounded_reason(error)}") from None
+        _validate_issue_source_authority(state.issue_anchor.anchor, fresh_source)
+        projection_digest = issue_patch_projection_evidence_digest(expected_projections)
+        request_digest = effective_request_digest(fold.request)
+
+        # Projection writes do not grant trust authority. Rebind the active ref and
+        # accepted main after those POSTs before choosing a new claimed transition.
+        latest_state = _read_managed_issue_pr_binding_state(
+            self.client, self.central_repository, issue_number, self.app,
+            state.binding.central_repository_node_id, source_authority_resolver,
+        )
+        _require_same_managed_issue_pr_binding(state, latest_state)
+        state = latest_state
+        repository, current_main = self.current_accepted_main()
+        if repository.node_id != state.binding.central_repository_node_id or repository.default_branch != "main":
+            raise StaleAuthorityError("central repository identity/default branch changed during projection synchronization")
+        _main_meta, current_main_tree, main_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, current_main,
+        )
+        try:
+            fresh_source = source_authority_resolver(fold.request, request_class)
+        except Exception as error:
+            raise StaleAuthorityError(f"fresh ACTIVE_PRE_MERGE Issue source authority is unavailable: {_bounded_reason(error)}") from None
+        _validate_issue_source_authority(state.issue_anchor.anchor, fresh_source)
+        current_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if current_ref is None:
+            raise StaleAuthorityError("bound Issue branch ref disappeared during projection synchronization")
+        pr = self.client.get_pull_request_metadata(self.central_repository, state.binding.pull_request_number)
+        if pr.head_oid != current_ref or pr.base_oid != current_main:
+            raise StaleAuthorityError("bound Issue PR/ref/main changed during projection synchronization")
+        pr_comments = tuple(self.client.list_issue_comments(self.central_repository, pr.number))
+        _issue_pr_authority_fence(pr_comments, self.app)
+        verified_fold, verified_projections = _fresh_issue_projection_set(
+            self.client,
+            self.central_repository,
+            issue,
+            state.issue_anchor,
+            state.binding,
+            issue_comments,
+            pr_comments,
+            self.app,
+            semantic_validator,
+            require_complete=True,
+        )
+        if (
+            verified_fold != fold
+            or tuple(item.render() for item in verified_projections)
+            != tuple(item.render() for item in expected_projections)
+        ):
+            raise StaleAuthorityError("Issue PATCH/projection snapshot changed before claim progression")
+        historical = _issue_head_claim_comments(
+            self.client, self.central_repository, pr_comments, self.app, state, current_ref,
+        )
+        active = tuple(item for item in historical if item.active)
+        if len(active) > 1:
+            raise R02Error("multiple distinct IssueHeadClaims are active at the same generated ref")
+        pending = tuple(item for item in historical if item.claim.from_head_sha == current_ref and not item.active)
+        if pending:
+            replay = min(pending, key=lambda item: item.comment.database_id).claim
+            latest_state = _read_managed_issue_pr_binding_state(
+                self.client, self.central_repository, issue_number, self.app,
+                state.binding.central_repository_node_id, source_authority_resolver,
+            )
+            _require_same_managed_issue_pr_binding(state, latest_state)
+            latest_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            if latest_ref != current_ref or latest_state.pr.head_oid != current_ref:
+                raise StaleAuthorityError("pending IssueHeadClaim ref/PR authority changed before crash replay")
+            state = latest_state
+            self._apply_persisted_issue_head_claim(state, replay, current_ref)
+            return replay
+
+        active_claim = active[0].claim if active else None
+        if active_claim is None:
+            if current_ref != state.lease.lease.initial_head_sha:
+                raise StaleAuthorityError("current Issue ref has no active historical IssueHeadClaim authority")
+            transition = (
+                "PROPOSAL"
+                if current_main == state.lease.lease.accepted_base_sha
+                else "NORMALIZE"
+            )
+        else:
+            transition = classify_issue_head_claim_progression(
+                active_claim,
+                fresh_effective_request_digest=request_digest,
+                fresh_patch_projection_evidence_digest=projection_digest,
+                fresh_accepted_base_sha=current_main,
+                fresh_accepted_base_tree_sha=current_main_tree,
+                proposal_exists=active_claim.transition_kind != "NORMALIZE",
+            )
+            if transition is None:
+                return active_claim
+
+        candidate = _plan_issue_managed_candidate(
+            self.candidate_builder, fold.request, request_class, current_main, current_ref,
+        )
+        if candidate.marker_present:
+            raise CandidateScopeError("claimed proposal candidate must remove the transient request marker")
+        validate_proposal_scope(request_class, candidate.changed_paths)
+        candidate_meta, candidate_tree, candidate_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, candidate.commit_sha,
+        )
+        if candidate_meta.parents != (current_main,):
+            raise CandidateScopeError("raw C02 candidate parent must be the exact accepted main")
+        actual_changed, target_entries = _proposal_tree_evidence(
+            self.client, self.central_repository, main_entries, candidate_entries,
+        )
+        if actual_changed != candidate.changed_paths:
+            raise CandidateScopeError("raw C02 candidate tree does not match its exact changed_paths")
+        if REQUEST_MARKER in _lease_leaf_map(candidate_entries):
+            raise CandidateScopeError("raw C02 candidate retains the transient Issue request marker")
+
+        from_meta, from_tree, _from_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, current_ref,
+        )
+        if from_meta.sha != current_ref:
+            raise R02Error("current Issue ref commit identity changed")
+        if transition == "NORMALIZE":
+            request_bytes = (request_class.value + "\n").encode("utf-8")
+            blob = self.client.create_blob(self.central_repository, base64.b64encode(request_bytes).decode("ascii"))
+            expected_blob_sha = hashlib.sha1(
+                b"blob " + str(len(request_bytes)).encode("ascii") + b"\0" + request_bytes
+            ).hexdigest()
+            if blob.sha != expected_blob_sha:
+                raise R02Error("NORMALIZE request marker blob SHA does not bind the exact request class")
+            created_tree_sha = self.client.create_tree(
+                self.central_repository,
+                current_main_tree,
+                [{"path": REQUEST_MARKER, "mode": "100644", "type": "blob", "sha": blob.sha}],
+            ).sha
+            target_tree, target_entries = self.client.get_tree(
+                self.central_repository, created_tree_sha,
+            )
+            if target_tree != created_tree_sha:
+                raise R02Error("NORMALIZE tree readback identity does not match the created tree")
+            _validate_marker_only_tree_delta(main_entries, target_entries, expected_blob_sha)
+            target_digest = normalize_target_evidence_digest(
+                request_class=request_class,
+                request_marker_blob_sha=expected_blob_sha,
+                target_tree_sha=target_tree,
+            )
+        else:
+            target_tree = candidate_tree
+            target_entries = candidate_entries
+            target_digest = proposal_target_evidence_digest(
+                candidate_tree_sha=target_tree,
+                changed=target_entries,
+                candidate_changed_paths=actual_changed,
+            )
+
+        nonce = (nonce_factory or new_carrier_nonce)()
+        if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{64}", nonce):
+            raise R02Error("IssueHeadClaim nonce must be lowercase 256-bit hex")
+        common = dict(
+            schema_version=1,
+            issue_number=state.issue_anchor.anchor.issue_number,
+            issue_database_id=state.issue_anchor.anchor.issue_database_id,
+            issue_node_id=state.issue_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+            issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+            issue_branch_lease_sha256=_binding_comment_sha256(state.lease.comment),
+            binding_id=state.binding.binding_id,
+            source_id=state.issue_anchor.anchor.source_id,
+            source_repository_id=state.issue_anchor.anchor.source_repository_id,
+            pull_request_number=state.binding.pull_request_number,
+            pull_request_database_id=state.binding.pull_request_database_id,
+            pull_request_node_id=state.binding.pull_request_node_id,
+            central_repository_node_id=state.binding.central_repository_node_id,
+            branch_ref=state.binding.branch_ref,
+            request_class=request_class,
+            accepted_base_sha=current_main,
+            accepted_base_tree_sha=current_main_tree,
+            from_head_sha=current_ref,
+            from_tree_sha=from_tree,
+            to_head_sha="0" * 40,
+            to_tree_sha=target_tree,
+            transition_kind=transition,
+            carrier_nonce=nonce,
+            effective_request_digest=request_digest,
+            patch_projection_evidence_digest=projection_digest,
+            target_evidence_digest=target_digest,
+        )
+        prepared = IssueHeadClaim.create(**common)
+        marker_text = _issue_head_claim_marker(prepared).render()
+        timestamp = self.client.bot_commit_timestamp_after(self.central_repository, current_ref)
+        wrapper = self.client.create_commit(
+            self.central_repository, marker_text, target_tree, [current_ref], timestamp=timestamp,
+        )
+        final = IssueHeadClaim.create(**{**common, "to_head_sha": wrapper.sha})
+        _validate_issue_head_claim_target(self.client, self.central_repository, final, state.lease.lease)
+        self._persist_issue_head_claim(state, final)
+        latest_state = _read_managed_issue_pr_binding_state(
+            self.client, self.central_repository, issue_number, self.app,
+            state.binding.central_repository_node_id, source_authority_resolver,
+        )
+        _require_same_managed_issue_pr_binding(state, latest_state)
+        latest_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if latest_ref != current_ref or latest_state.pr.head_oid != current_ref:
+            raise StaleAuthorityError("Issue ref/PR head changed after claim persistence; stored claim remains historical")
+        state = latest_state
+        self._apply_persisted_issue_head_claim(state, final, current_ref)
+        return final
+
+    def validate_issue_managed_head_history(
+        self,
+        issue_number: int,
+    ) -> tuple[IssuePRBindingState, str, tuple[IssueHeadClaimComment, ...]]:
+        """Read-only history/provenance gate for the pre-green trusted-validation route."""
+        state, current_ref, _comments, claims = _validate_managed_issue_head_history(
+            self.client,
+            self.central_repository,
+            issue_number,
+            self.app,
+            lambda _request, _request_class: None,  # Deliberately not used in historical validation.
+        )
+        return state, current_ref, claims
+
+    def interactive_issue_managed_route(
+        self,
+        issue_number: int,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> IssueManagedRouteResult:
+        """Dedicated Wave 04 route boundary; semantic no-change is an exact NOOP."""
+        try:
+            claim = self.interactive_issue_managed_proposal(
+                issue_number,
+                source_authority_resolver,
+                semantic_validator=semantic_validator,
+                nonce_factory=nonce_factory,
+            )
+        except IssueManagedNoSemanticChange as error:
+            return IssueManagedRouteResult("NOOP", error.reason, error.request_class)
+        return IssueManagedRouteResult("CLAIM_READY", claim.transition_kind, claim.request_class)
+
+    def _persist_issue_head_claim(self, state: IssuePRBindingState, claim: IssueHeadClaim) -> IssueHeadClaimComment:
+        body = claim.render()
+        if len(body.encode("utf-8")) > 16_384:
+            raise R02Error("IssueHeadClaim comment exceeds the generic Issue-comment bound")
+        try:
+            self.client.create_issue_comment(self.central_repository, state.binding.pull_request_number, body)
+        except GitHubAPIError as error:
+            try:
+                comments = tuple(self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number))
+                current_ref = _read_issue_branch_ref(
+                    self.client, self.central_repository,
+                    state.binding.branch_ref.removeprefix("refs/heads/"),
+                )
+                _issue_head_claim_comments(self.client, self.central_repository, comments, self.app, state, current_ref or ZERO_OID)
+            except Exception as read_error:
+                raise StaleAuthorityError(f"ambiguous IssueHeadClaim POST could not be diagnosed: {_bounded_reason(read_error)}") from None
+            raise StaleAuthorityError(f"ambiguous IssueHeadClaim POST; stop and reread on a later invocation: {_bounded_reason(error)}") from None
+        try:
+            comments = tuple(self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number))
+            current_ref = _read_issue_branch_ref(
+                self.client, self.central_repository,
+                state.binding.branch_ref.removeprefix("refs/heads/"),
+            )
+            claims = _issue_head_claim_comments(
+                self.client, self.central_repository, comments, self.app, state, current_ref or ZERO_OID,
+            )
+        except Exception as error:
+            raise StaleAuthorityError(f"persisted IssueHeadClaim could not be reread: {_bounded_reason(error)}") from None
+        matches = [item for item in claims if item.claim.render() == body]
+        if not matches:
+            raise StaleAuthorityError("persisted IssueHeadClaim is absent or differs from the exact intended payload")
+        return min(matches, key=lambda item: item.comment.database_id)
+
+    def _apply_persisted_issue_head_claim(
+        self,
+        state: IssuePRBindingState,
+        claim: IssueHeadClaim,
+        expected_ref: str,
+    ) -> None:
+        branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
+        before = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if before == claim.to_head_sha:
+            return
+        if before != expected_ref or before != claim.from_head_sha:
+            raise StaleAuthorityError("persisted IssueHeadClaim lost its exact from-head ref CAS")
+        try:
+            self.client.update_refs(
+                state.binding.central_repository_node_id,
+                [RefUpdate(state.binding.branch_ref, before, claim.to_head_sha, force=False)],
+            )
+        except (RefCASConflict, GitHubAPIError) as error:
+            after = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            try:
+                comments = tuple(self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number))
+                _issue_head_claim_comments(self.client, self.central_repository, comments, self.app, state, after or ZERO_OID)
+            except Exception as read_error:
+                raise StaleAuthorityError(f"ambiguous IssueHeadClaim CAS cannot be diagnosed: {_bounded_reason(read_error)}") from None
+            if after == claim.to_head_sha:
+                return
+            raise StaleAuthorityError(f"IssueHeadClaim CAS did not reach its exact target; claim remains historical: {_bounded_reason(error)}") from None
+        after = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if after != claim.to_head_sha:
+            raise StaleAuthorityError("IssueHeadClaim CAS did not read back the exact target head")
+
     def trusted_machine_validation(self, pr_number: int, accepted_base_sha: str, *, expected_head_sha: str | None = None) -> TrustedValidationResult:
         repository, current_main = self.current_accepted_main()
         if current_main != accepted_base_sha:
@@ -3451,7 +4552,7 @@ class R02Controller:
             return result
         return finalize_manual_trust_sweep(self.client, self.central_repository, process_pr, max_iterations=max_iterations, self_wake=self_wake)
 
-    def main_advance(self) -> str:
+    def main_advance(self) -> str | IssueManagedRouteResult:
         """Wake reconciliation/finalization from current main, never from event text."""
         repository, current_main = self.current_accepted_main()
         sources = self._accepted_sources(current_main)
@@ -3459,6 +4560,7 @@ class R02Controller:
         wake_finalizer = False
         updated_manual = 0
         dispatched: set[str] = set()
+        managed_issue_noop: IssueManagedRouteResult | None = None
         for source_id in sorted(machine):
             if machine[source_id]:
                 source = next(source for source in sources if source.source_id == source_id)
@@ -3480,8 +4582,18 @@ class R02Controller:
                 ):
                     continue
                 if _is_reserved_issue_pr_head(pr.head_ref):
-                    # Wave 04 owns normalization for Issue-managed PRs, regardless
-                    # of binding completeness or whether this base is stale.
+                    # Wave 04 advances only the exact bound Issue head. It never
+                    # asks GitHub to merge main into this reserved branch.
+                    try:
+                        issue_number = reserved_issue_branch_number(pr.head_ref)
+                    except RequestModelError:
+                        continue
+                    if issue_number is not None:
+                        route_result = self.interactive_issue_managed_route(
+                            issue_number, self.current_issue_source_authority,
+                        )
+                        if route_result.outcome == "NOOP":
+                            managed_issue_noop = route_result
                     continue
                 comments = self.client.list_issue_comments(self.central_repository, number)
                 anchors = _anchor_candidates(comments)
@@ -3508,19 +4620,33 @@ class R02Controller:
                 if len(anchors) == 1 and anchors[0].anchor.request_class in MANUAL_CLASSES:
                     validate_unique_anchor(comments, pr, anchors[0].anchor.request_class, self.app)
                     wake_finalizer = True
-            except (GitHubAPIError, R02Error):
+            except (GitHubAPIError, R02Error, RequestModelError):
                 continue
         if wake_finalizer:
             self.client.dispatch_workflow(self.central_repository, "federation-state-finalize.yml", "refs/heads/main", {})
+        if not (dispatched or wake_finalizer or updated_manual) and managed_issue_noop is not None:
+            return managed_issue_noop
         return f"MAIN_ADVANCE_DISPATCHED:{len(dispatched)}" if (dispatched or wake_finalizer or updated_manual) else "MAIN_ADVANCE_NOOP"
 
-    def finalize_one_manual_pr(self, summary: Mapping[str, Any]) -> None:
+    def finalize_one_manual_pr(self, summary: Mapping[str, Any]) -> IssueManagedRouteResult | None:
         """Re-derive one current manual PR; never treats an enumeration hint as authority."""
         number = summary.get("number")
         if type(number) is not int or number <= 0:
             raise R02Error("finalizer PR summary has an invalid number")
         pr = self.client.get_pull_request_metadata(self.central_repository, number)
         if _is_reserved_issue_pr_head(pr.head_ref):
+            try:
+                issue_number = reserved_issue_branch_number(pr.head_ref)
+                if issue_number is not None:
+                    return self.interactive_issue_managed_route(
+                        issue_number, self.current_issue_source_authority,
+                    )
+            except StaleTrustedCheckoutError:
+                raise
+            except (GitHubAPIError, R02Error, RequestModelError):
+                # Reserved Issue PRs remain pre-green; failed recovery cannot
+                # create validation evidence or enter legacy finalization.
+                return
             return
         comments = self.client.list_issue_comments(self.central_repository, number)
         anchors = _anchor_candidates(comments)
@@ -3685,7 +4811,13 @@ def main(argv: list[str] | None = None) -> int:
                 initial_pr = client.get_pull_request_metadata(repository, number)
                 if _is_reserved_issue_pr_head(initial_pr.head_ref):
                     reserved_issue_pr = True
-                    raise ReservedIssuePRPendingManagedAuthority("reserved Issue PR is quarantined pending Wave 04 managed authority")
+                    issue_number = reserved_issue_branch_number(initial_pr.head_ref)
+                    if issue_number is None:
+                        raise ReservedIssuePRPendingManagedAuthority("reserved Issue PR has no exact Issue number")
+                    controller.interactive_issue_managed_route(
+                        issue_number, controller.current_issue_source_authority,
+                    )
+                    return 0
                 comments = client.list_issue_comments(repository, number)
                 anchors = _anchor_candidates(comments)
                 if anchors:
@@ -3729,11 +4861,17 @@ def main(argv: list[str] | None = None) -> int:
                 _post_bounded_result(client, repository, number, updated_comments, kind=result_kind, identity=result_identity, result="PROPOSAL_UPDATED", reason=f"{request_class.value}:{len(candidate.changed_paths)}")
                 client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
             else:
-                _repo, accepted_main = controller.current_accepted_main()
                 initial_pr = client.get_pull_request_metadata(repository, number)
                 if _is_reserved_issue_pr_head(initial_pr.head_ref):
                     reserved_issue_pr = True
-                    raise ReservedIssuePRPendingManagedAuthority("reserved Issue PR is quarantined pending Wave 04 managed authority")
+                    try:
+                        issue_number = reserved_issue_branch_number(initial_pr.head_ref)
+                        if issue_number is not None:
+                            controller.validate_issue_managed_head_history(issue_number)
+                    except (GitHubAPIError, R02Error, RequestModelError):
+                        pass
+                    return 0
+                _repo, accepted_main = controller.current_accepted_main()
                 comments = client.list_issue_comments(repository, number)
                 if not _anchor_candidates(comments) and _MACHINE_BRANCH_RE.fullmatch(initial_pr.head_ref):
                     result = controller.trusted_machine_validation(number, accepted_main, expected_head_sha=initial_pr.head_oid)

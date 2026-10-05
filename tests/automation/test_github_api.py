@@ -37,8 +37,20 @@ from automation.federation.github_api import (
     ServerError,
     UnexpectedStatusError,
     REST_BASE_URL,
+    GitCommitMetadata,
 )
-from automation.federation.request_model import RequestClass, parse_request_body, render_request_body
+from automation.federation.request_model import (
+    MAX_BODY_BYTES,
+    MAX_CANONICAL_PATCH_BYTES,
+    IssuePatchProjection,
+    PATCH_SENTINEL,
+    Patch,
+    RequestClass,
+    parse_patch,
+    parse_request_body,
+    render_patch,
+    render_request_body,
+)
 
 
 class FakeTransport:
@@ -49,6 +61,53 @@ class FakeTransport:
     def request(self, method, url, headers, body, timeout):
         self.calls.append((method, url, headers, body, timeout))
         return self.response
+
+
+def _canonical_projection_at_max_size():
+    def prefix_value(length):
+        count = (length + 65) // 65
+        lengths = [1] * count
+        remaining = length - (count - 1) - count
+        for index in range(count):
+            added = min(63, remaining)
+            lengths[index] += added
+            remaining -= added
+        if remaining or any(size > 64 for size in lengths):
+            raise AssertionError("requested prefix length is not representable")
+        return ",".join(
+            f"p{index}" + "x" * (size - len(f"p{index}"))
+            for index, size in enumerate(lengths)
+        )
+
+    lines = [
+        PATCH_SENTINEL,
+        "Description:", "d",
+        "Branch:", "main",
+        "Skills root:", "skills",
+        "Skill prefixes:", "",
+        "Publication lines:", "refs/heads/main=foo",
+        "Dropped publication lines:", "refs/heads/old",
+    ]
+    raw_size = MAX_BODY_BYTES
+    prefix_length = raw_size - len("\n".join(lines).encode("utf-8"))
+    lines[8] = prefix_value(prefix_length)
+    raw = "\n".join(lines)
+    if len(raw.encode("utf-8")) != raw_size:
+        raise AssertionError("PATCH generator produced the wrong size")
+    patch = parse_patch(raw)
+    canonical = render_patch(patch)
+    if len(canonical.encode("utf-8")) != MAX_CANONICAL_PATCH_BYTES:
+        raise AssertionError("canonical PATCH generator produced the wrong size")
+    return IssuePatchProjection(
+        1,
+        9_223_372_036_854_775_807,
+        7,
+        9_223_372_036_854_775_807,
+        9_223_372_036_854_775_807,
+        "a" * 64,
+        "b" * 64,
+        patch,
+    ).render()
 
 
 def _routing_payload(*, repository="swiftstream/skills", number=7, head_oid="a" * 40, base_oid="b" * 40,
@@ -316,6 +375,61 @@ class GitHubAPITests(unittest.TestCase):
                 b"add-source\n",
             )
 
+    def test_get_tree_reads_tree_sha_without_commit_metadata_and_preserves_strict_parsing(self):
+        tree_sha = "a" * 40
+        url = REST_BASE_URL + f"/repos/swiftstream/skills/git/trees/{tree_sha}?recursive=1"
+        payload = {
+            "sha": tree_sha,
+            "truncated": False,
+            "tree": [
+                {"path": "z-file", "mode": "100644", "type": "blob", "sha": "b" * 40},
+                {"path": "a-dir", "mode": "040000", "type": "tree", "sha": "c" * 40},
+            ],
+        }
+        transport = FakeTransport(HttpResponse(200, url, json.dumps(payload).encode("utf-8")))
+        client = GitHubClient(None, transport)
+        with patch.object(client, "get_commit_metadata", side_effect=AssertionError("tree reads must not request commit metadata")) as metadata:
+            returned_sha, entries = client.get_tree("swiftstream/skills", tree_sha)
+        self.assertEqual(returned_sha, tree_sha)
+        self.assertEqual(entries, (
+            GitTreeEntry("a-dir", "040000", "tree", "c" * 40),
+            GitTreeEntry("z-file", "100644", "blob", "b" * 40),
+        ))
+        metadata.assert_not_called()
+        self.assertEqual([(call[0], call[1]) for call in transport.calls], [("GET", url)])
+
+        invalid_responses = (
+            dict(payload, sha="d" * 40),
+            dict(payload, truncated=True),
+            dict(payload, tree=[{"path": "../escape", "mode": "100644", "type": "blob", "sha": "b" * 40}]),
+            dict(payload, tree=[{"path": "bad-mode", "mode": "100644", "type": "tree", "sha": "b" * 40}]),
+            dict(payload, tree=[
+                {"path": "duplicate", "mode": "100644", "type": "blob", "sha": "b" * 40},
+                {"path": "duplicate", "mode": "100644", "type": "blob", "sha": "c" * 40},
+            ]),
+            dict(payload, tree=[{"path": "bad-sha", "mode": "100644", "type": "blob", "sha": "B" * 40}]),
+        )
+        for invalid in invalid_responses:
+            with self.subTest(response=invalid), self.assertRaises(InvalidResponseError):
+                client = GitHubClient(None, FakeTransport(HttpResponse(200, url, json.dumps(invalid).encode("utf-8"))))
+                client.get_tree("swiftstream/skills", tree_sha)
+
+        invalid_sha_transport = FakeTransport(HttpResponse(200, url, json.dumps(payload).encode("utf-8")))
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, invalid_sha_transport).get_tree("swiftstream/skills", "A" * 40)
+        self.assertEqual(invalid_sha_transport.calls, [])
+
+        commit_sha = "d" * 40
+        delegated = GitHubClient(None, FakeTransport(HttpResponse(200, url, json.dumps(payload).encode("utf-8"))))
+        metadata_value = GitCommitMetadata(commit_sha, tree_sha, (), "2026-10-04T00:00:00Z")
+        with (
+            patch.object(delegated, "get_commit_metadata", return_value=metadata_value) as get_metadata,
+            patch.object(delegated, "get_tree", return_value=(tree_sha, entries)) as get_tree,
+        ):
+            self.assertEqual(delegated.get_commit_tree("swiftstream/skills", commit_sha), (tree_sha, entries))
+        get_metadata.assert_called_once_with("swiftstream/skills", commit_sha)
+        get_tree.assert_called_once_with("swiftstream/skills", tree_sha)
+
     def test_graphql_error_diagnostic_preserves_only_bounded_structure(self):
         text, _ = self._graphql_error({"type": "FORBIDDEN", "path": ["repository", "pullRequest"]})
         self.assertEqual(text, "GRAPHQL:FORBIDDEN:repository.pullRequest")
@@ -498,7 +612,7 @@ class GitHubAPITests(unittest.TestCase):
             ("wrong type id", [dict(valid, id="1")], InvalidResponseError),
             ("bad node", [dict(valid, node_id="")], InvalidResponseError),
             ("bad body", [dict(valid, body=1)], InvalidResponseError),
-            ("oversized body", [dict(valid, body="x" * 16_385)], InvalidResponseError),
+            ("oversized body", [dict(valid, body="x" * 17_409)], InvalidResponseError),
             ("bad created", [dict(valid, created_at="not-time")], InvalidResponseError),
             ("naive created", [dict(valid, created_at="2026-09-10T00:00:00")], InvalidResponseError),
             ("bad updated", [dict(valid, updated_at="not-time")], InvalidResponseError),
@@ -706,6 +820,59 @@ class GitHubAPITests(unittest.TestCase):
         self.assertNotIn("except GraphQLError", body)
         self.assertIn('_ISSUE_COMMENT_COMPOSITE_RACE', body)
         self.assertIn("str(error) != _ISSUE_COMMENT_COMPOSITE_RACE", body)
+
+    def test_projection_comment_api_accepts_16402_canonical_patch_without_widening_generic_writer(self):
+        projection_body = _canonical_projection_at_max_size()
+        self.assertGreater(len(projection_body.encode("utf-8")), 16_384)
+        self.assertEqual(len(projection_body.encode("utf-8")), 16_786)
+        url = REST_BASE_URL + "/repos/swiftstream/skills/issues/8/comments"
+        response_value = {"node_id": "IC_projection", "id": 77, "body": projection_body}
+        transport = FakeTransport(HttpResponse(201, url, json.dumps(response_value).encode("utf-8")))
+        client = GitHubClient("token", transport)
+        with self.assertRaises(GitHubAPIError):
+            client.create_issue_comment("swiftstream/skills", 7, projection_body)
+        self.assertEqual(transport.calls, [])
+
+        created = client.create_issue_patch_projection_comment("swiftstream/skills", 8, projection_body)
+        self.assertEqual(created.body, projection_body)
+        self.assertEqual(len(transport.calls), 1)
+        method, request_url, _headers, body, _timeout = transport.calls[0]
+        self.assertEqual((method, request_url), ("POST", url))
+        self.assertEqual(json.loads(body), {"body": projection_body})
+
+        rest = _clean_rest_comment(1, body=projection_body)
+        node = _graphql_comment_node(rest)
+        comments_transport = CommentsTransport(
+            [_snapshot([rest]), _snapshot([rest])], [_graphql_response([node])],
+        )
+        readback = GitHubClient(None, comments_transport).list_issue_comments("swiftstream/skills", 7)
+        self.assertEqual(len(readback[0].body.encode("utf-8")), 16_786)
+        self.assertEqual(readback[0].body, projection_body)
+
+    def test_projection_comment_writer_rejects_invalid_endpoint_and_noncanonical_body_before_transport(self):
+        transport = FakeTransport(HttpResponse(
+            201,
+            REST_BASE_URL + "/repos/swiftstream/skills/issues/8/comments",
+            b'{"node_id":"IC_1","id":1,"body":"x"}',
+        ))
+        client = GitHubClient(None, transport)
+        for number, body in ((0, _canonical_projection_at_max_size()), (8, "not a projection")):
+            with self.subTest(number=number), self.assertRaises(GitHubAPIError):
+                client.create_issue_patch_projection_comment("swiftstream/skills", number, body)
+        self.assertEqual(transport.calls, [])
+
+    def test_projection_comment_writer_rejects_more_than_17408_bytes_before_transport(self):
+        transport = FakeTransport(HttpResponse(
+            201,
+            REST_BASE_URL + "/repos/swiftstream/skills/issues/8/comments",
+            b'{"node_id":"IC_1","id":1,"body":"x"}',
+        ))
+        client = GitHubClient(None, transport)
+        projection_body = _canonical_projection_at_max_size() + "x" * 623
+        self.assertEqual(len(projection_body.encode("utf-8")), 17_409)
+        with self.assertRaises(GitHubAPIError):
+            client.create_issue_patch_projection_comment("swiftstream/skills", 8, projection_body)
+        self.assertEqual(transport.calls, [])
 
     def test_cas_semantics_and_single_atomic_call(self):
         with self.assertRaises(Exception):

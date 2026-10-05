@@ -11,15 +11,25 @@ from automation.federation.request_model import (
     ANCHOR_MARKER,
     ISSUE_REQUEST_ANCHOR_MARKER,
     ISSUE_INTERNAL_PR_BINDING_MARKER,
+    ISSUE_PATCH_PROJECTION_MARKER,
+    ISSUE_HEAD_CLAIM_MARKER,
     PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
+    MAX_BODY_BYTES,
+    MAX_CANONICAL_PATCH_BYTES,
+    MAX_ISSUE_PATCH_PROJECTION_ENVELOPE_BYTES,
+    MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES,
+    MAX_PATCH_CANONICAL_EXPANSION_BYTES,
     CommentEvent,
     IssuePatchEvent,
+    IssuePatchProjection,
+    IssueHeadClaim,
     IssueBranchLease,
     IssueRequestAnchor,
     IssuePRBinding,
     ClaimedHeadMarker,
     Request,
+    Patch,
     RequestAnchor,
     RequestClass,
     RequestModelError,
@@ -34,13 +44,23 @@ from automation.federation.request_model import (
     reserved_issue_branch_number,
     render_request_body,
     issue_branch_lease_authority_digest,
+    effective_request_digest,
+    issue_patch_projection_evidence_digest,
+    patch_projection_evidence_digest,
+    normalize_target_evidence_digest,
+    proposal_target_evidence_digest,
+    issue_head_claim_authority_digest,
+    classify_issue_head_claim_progression,
     claim_generation_id,
     parse_claimed_head_marker,
     parse_issue_branch_lease,
+    parse_issue_patch_projection,
+    parse_issue_head_claim,
     parse_anchor,
     parse_issue_request_body,
     parse_issue_request_anchor,
     parse_patch,
+    render_patch,
     parse_request_body,
     parse_issue_internal_pr_binding,
     parse_pr_issue_origin_binding,
@@ -52,6 +72,49 @@ from automation.federation.workspace import validate_trusted_ref
 
 def add_body(description="A source", branch="main", root="skills", prefixes="swifql"):
     return f"Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\n{description}\nBranch:\n{branch}\nSkills root:\n{root}\nSkill prefixes:\n{prefixes}\n"
+
+
+def _prefix_value_exact_length(length):
+    count = (length + 65) // 65
+    if count <= 0:
+        raise ValueError("prefix value must be nonempty")
+    lengths = [1] * count
+    remaining = length - (count - 1) - count
+    for index in range(count):
+        added = min(63, remaining)
+        lengths[index] += added
+        remaining -= added
+    if remaining != 0 or any(size > 64 for size in lengths):
+        raise ValueError("requested prefix length is not representable")
+    prefixes = []
+    for index, size in enumerate(lengths):
+        identity = f"p{index}"
+        if len(identity) > size:
+            raise ValueError("generated prefix token is too short")
+        prefixes.append(identity + "x" * (size - len(identity)))
+    value = ",".join(prefixes)
+    if len(value.encode("utf-8")) != length:
+        raise AssertionError("prefix generator produced the wrong length")
+    return value
+
+
+def _patch_body_of_exact_size(size, *, leading_newlines=0):
+    lines = [
+        PATCH_SENTINEL,
+        "Description:", "d",
+        "Branch:", "main",
+        "Skills root:", "skills",
+        "Skill prefixes:", "",
+        "Publication lines:", "refs/heads/main=foo",
+        "Dropped publication lines:", "refs/heads/old",
+    ]
+    empty_prefix_body = "\n".join(lines)
+    prefix_length = size - leading_newlines - len(empty_prefix_body.encode("utf-8"))
+    lines[8] = _prefix_value_exact_length(prefix_length)
+    body = "\n" * leading_newlines + "\n".join(lines)
+    if len(body.encode("utf-8")) != size:
+        raise AssertionError("PATCH generator produced the wrong size")
+    return body
 
 
 class RequestModelTests(unittest.TestCase):
@@ -372,6 +435,233 @@ class RequestModelTests(unittest.TestCase):
             parse_patch(f"{PATCH_SENTINEL}\n\nDescription:\n{'x' * 16385}\n")
         with self.assertRaises(RequestModelError):
             parse_patch(f"{PATCH_SENTINEL}\n\nDescription:\nx\nBranch:\nmain\nDescription:\ny\n")
+
+    def test_patch_render_is_semantic_canonical_and_boundary_domain_is_split(self):
+        patch = parse_patch(
+            f"{PATCH_SENTINEL}\nDescription:\nA description\nBranch:\nmain\n"
+            "Skill prefixes:\nfoo, bar\nPublication lines:\nrefs/heads/main=foo,bar\n"
+            "Dropped publication lines:\nrefs/heads/old"
+        )
+        self.assertIsNotNone(patch)
+        rendered = render_patch(patch)
+        self.assertEqual(
+            rendered,
+            f"{PATCH_SENTINEL}\n\nDescription:\nA description\n\n"
+            "Branch:\nrefs/heads/main\n\nSkill prefixes:\nfoo,bar\n\n"
+            "Publication lines:\nrefs/heads/main=foo,bar\n\n"
+            "Dropped publication lines:\nrefs/heads/old\n",
+        )
+        self.assertEqual(render_patch(parse_patch(rendered)), rendered)
+        clear = parse_patch(f"{PATCH_SENTINEL}\nDescription:\n")
+        self.assertEqual(render_patch(clear), f"{PATCH_SENTINEL}\n\nDescription:\n\n")
+        with self.assertRaises(RequestModelError):
+            render_patch(type(patch)({"Description": "x" * 501}))
+
+        self.assertEqual(MAX_BODY_BYTES, 16_384)
+        self.assertEqual(MAX_PATCH_CANONICAL_EXPANSION_BYTES, 18)
+        self.assertEqual(MAX_CANONICAL_PATCH_BYTES, 16_402)
+        from automation.federation.request_model import _parse_projection_canonical_patch
+
+        for leading_newlines, expected_canonical_size in ((16, 16_386), (0, 16_402)):
+            raw = _patch_body_of_exact_size(MAX_BODY_BYTES, leading_newlines=leading_newlines)
+            accepted = parse_patch(raw)
+            self.assertIsNotNone(accepted)
+            canonical = render_patch(accepted)
+            self.assertEqual(len(raw.encode("utf-8")), MAX_BODY_BYTES)
+            self.assertEqual(len(canonical.encode("utf-8")), expected_canonical_size)
+            self.assertLessEqual(
+                len(canonical.encode("utf-8")),
+                len(raw.encode("utf-8")) + MAX_PATCH_CANONICAL_EXPANSION_BYTES,
+            )
+            with self.subTest(leading_newlines=leading_newlines):
+                self.assertEqual(render_patch(_parse_projection_canonical_patch(canonical)), canonical)
+        with self.assertRaises(RequestModelError):
+            parse_patch(_patch_body_of_exact_size(MAX_CANONICAL_PATCH_BYTES))
+
+    def test_all_patch_field_subsets_obey_the_canonical_expansion_bound(self):
+        fields = (
+            ("Description", "description"),
+            ("Branch", "main"),
+            ("Skills root", "skills"),
+            ("Skill prefixes", "foo,bar"),
+            ("Publication lines", "refs/heads/main=foo,bar"),
+            ("Dropped publication lines", "refs/heads/old"),
+        )
+        for mask in range(1, 1 << len(fields)):
+            selected = [item for index, item in enumerate(fields) if mask & (1 << index)]
+            raw = PATCH_SENTINEL + "\n" + "\n".join(
+                line for field, value in selected for line in (f"{field}:", value)
+            )
+            for target_size in {len(raw.encode("utf-8")), MAX_BODY_BYTES}:
+                sized = "\n" * (target_size - len(raw.encode("utf-8"))) + raw
+                parsed = parse_patch(sized)
+                self.assertIsNotNone(parsed)
+                canonical = render_patch(parsed)
+                canonical_bytes = len(canonical.encode("utf-8"))
+                with self.subTest(mask=mask, target_size=target_size):
+                    self.assertLessEqual(canonical_bytes, target_size + MAX_PATCH_CANONICAL_EXPANSION_BYTES)
+                    self.assertLessEqual(canonical_bytes, MAX_CANONICAL_PATCH_BYTES)
+
+    def test_projection_only_parser_accepts_maximum_canonical_patch_and_projection_bounds(self):
+        from automation.federation.request_model import _parse_projection_canonical_patch
+
+        raw = _patch_body_of_exact_size(MAX_BODY_BYTES)
+        patch = parse_patch(raw)
+        canonical = render_patch(patch)
+        projected_patch = _parse_projection_canonical_patch(canonical)
+        self.assertEqual(len(canonical.encode("utf-8")), MAX_CANONICAL_PATCH_BYTES)
+        self.assertEqual(render_patch(projected_patch), canonical)
+        with self.assertRaises(RequestModelError):
+            parse_patch(canonical)
+
+        maximum_id = 9_223_372_036_854_775_807
+        projection = IssuePatchProjection(
+            1, maximum_id, maximum_id, maximum_id, maximum_id,
+            "a" * 64, "b" * 64, projected_patch,
+        )
+        projection_text = projection.render()
+        envelope, embedded = projection_text.split("\n\n", 1)
+        self.assertEqual(len((envelope + "\n\n").encode("utf-8")), 402)
+        self.assertLessEqual(402, MAX_ISSUE_PATCH_PROJECTION_ENVELOPE_BYTES)
+        self.assertEqual(len(embedded.encode("utf-8")), MAX_CANONICAL_PATCH_BYTES)
+        self.assertEqual(
+            len(projection_text.encode("utf-8")),
+            MAX_CANONICAL_PATCH_BYTES + 402,
+        )
+        self.assertEqual(len(projection_text.encode("utf-8")), 16_804)
+        self.assertLessEqual(
+            len(projection_text.encode("utf-8")),
+            MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES,
+        )
+        self.assertTrue(projection_text.startswith(ISSUE_PATCH_PROJECTION_MARKER + "\n"))
+        self.assertEqual(parse_issue_patch_projection(projection_text), projection)
+
+        oversized_envelope = {
+            "schemaVersion": 1,
+            "issueDatabaseId": 1,
+            "issueNumber": 1,
+            "issueAnchorCommentId": 1,
+            "issueCommentId": 1,
+            "issueCommentBodySha256": "a" * 1_100,
+            "bindingId": "b" * 64,
+        }
+        over_envelope = (
+            ISSUE_PATCH_PROJECTION_MARKER + "\n"
+            + json.dumps(oversized_envelope, sort_keys=True, separators=(",", ":"))
+            + "\n\n" + render_patch(Patch({"Description": "small"}))
+        )
+        with self.assertRaises(RequestModelError):
+            parse_issue_patch_projection(over_envelope)
+        with self.assertRaises(RequestModelError):
+            parse_issue_patch_projection(projection_text + "x" * 605 + "\n")
+
+    def test_frozen_digest_schemas_and_ordering(self):
+        request = parse_request_body(RequestClass.ADD, add_body())
+        expected_request = hashlib.sha256(
+            "swiftstream-federation-effective-request:v1\n".encode()
+            + render_request_body(request).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(effective_request_digest(request), expected_request)
+
+        entries = [
+            {
+                "issueCommentId": 20,
+                "issueCommentBodySha256": "b" * 64,
+                "canonicalPatchSha256": "c" * 64,
+                "projectionSha256": "d" * 64,
+            },
+            {
+                "issueCommentId": 10,
+                "issueCommentBodySha256": "e" * 64,
+                "canonicalPatchSha256": "f" * 64,
+                "projectionSha256": "0" * 64,
+            },
+        ]
+        canonical_entries = sorted(entries, key=lambda item: item["issueCommentId"])
+        expected_projection_digest = hashlib.sha256(
+            (
+                "swiftstream-federation-issue-patch-projection-evidence:v1\n"
+                + json.dumps({"entries": canonical_entries}, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False)
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(patch_projection_evidence_digest(entries), expected_projection_digest)
+        self.assertEqual(patch_projection_evidence_digest(entries), patch_projection_evidence_digest(reversed(entries)))
+        with self.assertRaises(RequestModelError):
+            patch_projection_evidence_digest([entries[0], entries[0]])
+        projected_patch = parse_patch(f"{PATCH_SENTINEL}\nDescription:\nprojected\n")
+        projection = IssuePatchProjection(
+            1, 700, 7, 101, 11, "e" * 64, "f" * 64, projected_patch,
+        )
+        projection_entry = {
+            "issueCommentId": 11,
+            "issueCommentBodySha256": "e" * 64,
+            "canonicalPatchSha256": hashlib.sha256(render_patch(projected_patch).encode()).hexdigest(),
+            "projectionSha256": hashlib.sha256(projection.render().encode()).hexdigest(),
+        }
+        self.assertEqual(
+            issue_patch_projection_evidence_digest([projection]),
+            patch_projection_evidence_digest([projection_entry]),
+        )
+
+        expected_normalize = hashlib.sha256(
+            (
+                "swiftstream-federation-issue-head-normalize-target:v1\n"
+                + json.dumps({
+                    "requestMarkerBlobSha": "1" * 40,
+                    "requestMarkerContentSha256": hashlib.sha256(b"add-source\n").hexdigest(),
+                    "targetTreeSha": "2" * 40,
+                }, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            normalize_target_evidence_digest(
+                request_class=RequestClass.ADD,
+                request_marker_blob_sha="1" * 40,
+                target_tree_sha="2" * 40,
+            ),
+            expected_normalize,
+        )
+
+        changed = [
+            {
+                "path": "skills/a",
+                "state": "PRESENT",
+                "mode": "100644",
+                "objectType": "blob",
+                "blobSha": "3" * 40,
+                "contentSha256": "4" * 64,
+            },
+            {
+                "path": "skills/b",
+                "state": "ABSENT",
+                "mode": None,
+                "objectType": None,
+                "blobSha": None,
+                "contentSha256": None,
+            },
+        ]
+        expected_proposal = hashlib.sha256(
+            (
+                "swiftstream-federation-issue-head-proposal-target:v1\n"
+                + json.dumps({"candidateTreeSha": "5" * 40, "changed": changed},
+                             ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            proposal_target_evidence_digest(
+                candidate_tree_sha="5" * 40,
+                changed=changed,
+                candidate_changed_paths=("skills/a", "skills/b"),
+            ),
+            expected_proposal,
+        )
+        with self.assertRaises(RequestModelError):
+            proposal_target_evidence_digest(
+                candidate_tree_sha="5" * 40,
+                changed=changed,
+                candidate_changed_paths=("skills/b", "skills/a"),
+            )
 
     def test_anchor_round_trip_and_integrity(self):
         body = add_body()
@@ -1233,6 +1523,167 @@ class ClaimedHeadAndIssueLeaseModelTests(unittest.TestCase):
         for change in variants:
             with self.subTest(change=change):
                 self.assertNotEqual(self.lease(**change).lease_id, original.lease_id)
+
+
+class IssueHeadClaimModelTests(unittest.TestCase):
+    @staticmethod
+    def claim_fields(**changes):
+        fields = dict(
+            issue_number=7,
+            issue_database_id=700,
+            issue_node_id="I_kwDOIssue",
+            issue_request_anchor_comment_database_id=101,
+            issue_request_anchor_sha256="a" * 64,
+            issue_branch_lease_comment_database_id=102,
+            issue_branch_lease_sha256="b" * 64,
+            binding_id="c" * 64,
+            source_id="owner-repo",
+            source_repository_id=41,
+            pull_request_number=8,
+            pull_request_database_id=800,
+            pull_request_node_id="PR_kwDOPull",
+            central_repository_node_id="R_central",
+            branch_ref="refs/heads/bot/federation/request/issue-7",
+            request_class=RequestClass.ADD,
+            accepted_base_sha="1" * 40,
+            accepted_base_tree_sha="2" * 40,
+            from_head_sha="3" * 40,
+            from_tree_sha="4" * 40,
+            to_head_sha="5" * 40,
+            to_tree_sha="6" * 40,
+            transition_kind="PROPOSAL",
+            carrier_nonce="7" * 64,
+            effective_request_digest="8" * 64,
+            patch_projection_evidence_digest="9" * 64,
+            target_evidence_digest="0" * 64,
+        )
+        fields.update(changes)
+        return fields
+
+    def claim(self, **changes):
+        return IssueHeadClaim.create(**self.claim_fields(**changes))
+
+    def test_exact_revised_schema_canonical_roundtrip_and_independent_ids(self):
+        claim = self.claim()
+        rendered = claim.render()
+        self.assertTrue(rendered.startswith(ISSUE_HEAD_CLAIM_MARKER + "\n"))
+        self.assertEqual(parse_issue_head_claim(rendered), claim)
+        value = json.loads(rendered.splitlines()[1])
+        self.assertEqual(set(value), {
+            "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+            "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256",
+            "issueBranchLeaseCommentDatabaseId", "issueBranchLeaseSha256", "bindingId",
+            "sourceId", "sourceRepositoryId", "pullRequestNumber", "pullRequestDatabaseId",
+            "pullRequestNodeId", "centralRepositoryNodeId", "branchRef", "requestClass",
+            "acceptedBaseSha", "acceptedBaseTreeSha", "fromHeadSha", "fromTreeSha",
+            "toHeadSha", "toTreeSha", "carrierRole", "claimKind", "claimGenerationId",
+            "transitionKind", "carrierNonce", "effectiveRequestDigest",
+            "patchProjectionEvidenceDigest", "targetEvidenceDigest", "authorityPreimageDigest",
+            "markerDigest", "claimId",
+        })
+        self.assertEqual(list(value), sorted(value))
+        final_without_id = dict(value)
+        claim_id = final_without_id.pop("claimId")
+        self.assertEqual(
+            claim_id,
+            hashlib.sha256(json.dumps(
+                final_without_id, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            ).encode("utf-8")).hexdigest(),
+        )
+        expected_preimage_keys = {
+            "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+            "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256",
+            "issueBranchLeaseCommentDatabaseId", "issueBranchLeaseSha256", "bindingId",
+            "sourceId", "sourceRepositoryId", "pullRequestNumber", "pullRequestDatabaseId",
+            "pullRequestNodeId", "centralRepositoryNodeId", "branchRef", "requestClass",
+            "transitionKind", "acceptedBaseSha", "acceptedBaseTreeSha", "fromHeadSha",
+            "fromTreeSha", "effectiveRequestDigest", "patchProjectionEvidenceDigest",
+            "targetEvidenceDigest",
+        }
+        preimage = claim.authority_preimage_value()
+        self.assertEqual(set(preimage), expected_preimage_keys)
+        expected_authority = hashlib.sha256(
+            (
+                "swiftstream-federation-issue-head-claim-authority:v1\n"
+                + json.dumps(preimage, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False)
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(issue_head_claim_authority_digest(claim), expected_authority)
+        self.assertEqual(claim.authority_preimage_digest, expected_authority)
+        retargeted = self.claim(to_head_sha="f" * 40, to_tree_sha="e" * 40)
+        fresh_nonce = self.claim(carrier_nonce="6" * 64)
+        self.assertEqual(issue_head_claim_authority_digest(retargeted), expected_authority)
+        self.assertEqual(issue_head_claim_authority_digest(fresh_nonce), expected_authority)
+        changed_nested = self.claim(effective_request_digest="5" * 64)
+        self.assertNotEqual(issue_head_claim_authority_digest(changed_nested), expected_authority)
+
+    def test_historical_claim_replays_from_stored_values_and_rejects_tampering(self):
+        historical = self.claim(transition_kind="PROPOSAL")
+        saved = historical.render()
+        later_patch_digest = "d" * 64
+        later_main_sha = "e" * 40
+        later_main_tree = "f" * 40
+        self.assertEqual(parse_issue_head_claim(saved), historical)
+        self.assertEqual(issue_head_claim_authority_digest(historical), historical.authority_preimage_digest)
+        self.assertNotEqual(later_patch_digest, historical.patch_projection_evidence_digest)
+        self.assertNotEqual(later_main_sha, historical.accepted_base_sha)
+        self.assertNotEqual(later_main_tree, historical.accepted_base_tree_sha)
+        for key, replacement in (
+            ("acceptedBaseTreeSha", "e" * 40),
+            ("effectiveRequestDigest", "d" * 64),
+            ("patchProjectionEvidenceDigest", "d" * 64),
+            ("targetEvidenceDigest", "d" * 64),
+        ):
+            value = json.loads(saved.splitlines()[1])
+            value[key] = replacement
+            tampered = ISSUE_HEAD_CLAIM_MARKER + "\n" + json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ) + "\n"
+            with self.subTest(key=key), self.assertRaises(RequestModelError):
+                parse_issue_head_claim(tampered)
+
+    def test_fresh_progression_patch_precedes_main_and_normalize_proposal(self):
+        proposal = self.claim(transition_kind="PROPOSAL")
+        both_changed = classify_issue_head_claim_progression(
+            proposal,
+            fresh_effective_request_digest="d" * 64,
+            fresh_patch_projection_evidence_digest="9" * 64,
+            fresh_accepted_base_sha="e" * 40,
+            fresh_accepted_base_tree_sha="f" * 40,
+            proposal_exists=True,
+        )
+        self.assertEqual(both_changed, "PATCH_REGENERATION")
+        main_changed = classify_issue_head_claim_progression(
+            proposal,
+            fresh_effective_request_digest=proposal.effective_request_digest,
+            fresh_patch_projection_evidence_digest=proposal.patch_projection_evidence_digest,
+            fresh_accepted_base_sha="e" * 40,
+            fresh_accepted_base_tree_sha="f" * 40,
+            proposal_exists=True,
+        )
+        self.assertEqual(main_changed, "MAIN_ADVANCE")
+        normalized = self.claim(transition_kind="NORMALIZE")
+        self.assertEqual(
+            classify_issue_head_claim_progression(
+                normalized,
+                fresh_effective_request_digest=normalized.effective_request_digest,
+                fresh_patch_projection_evidence_digest=normalized.patch_projection_evidence_digest,
+                fresh_accepted_base_sha=normalized.accepted_base_sha,
+                fresh_accepted_base_tree_sha=normalized.accepted_base_tree_sha,
+                proposal_exists=False,
+            ),
+            "PROPOSAL",
+        )
+        self.assertIsNone(classify_issue_head_claim_progression(
+            normalized,
+            fresh_effective_request_digest=normalized.effective_request_digest,
+            fresh_patch_projection_evidence_digest=normalized.patch_projection_evidence_digest,
+            fresh_accepted_base_sha=normalized.accepted_base_sha,
+            fresh_accepted_base_tree_sha=normalized.accepted_base_tree_sha,
+            proposal_exists=True,
+        ))
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@ from automation.federation.controller import (
     ProposalCandidate,
     R02Controller,
     R02Error,
+    IssueManagedRouteResult,
     parse_repository_id_hint,
     validate_machine_generated_scope,
     TrustedValidationResult,
@@ -763,6 +764,33 @@ class ReconcileTests(unittest.TestCase):
                     read_marker.assert_not_called()
                     self.assertEqual(client.updated_branches, [])
                     self.assertEqual(client.dispatches, [])
+
+    def test_main_advance_routes_reserved_issue_head_through_claim_path_without_branch_update(self):
+        pr_value, _ = self._manual_main_advance_pr()
+        reserved_pr = replace(pr_value, head_ref="bot/federation/request/issue-7")
+        client, controller = self._main_advance_with_prs(
+            {reserved_pr.number: reserved_pr}, {reserved_pr.number: ()},
+        )
+        result = IssueManagedRouteResult("CLAIM_READY", "PROPOSAL", RequestClass.ADD)
+        with patch.object(controller, "interactive_issue_managed_route", return_value=result) as route:
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        route.assert_called_once()
+        self.assertEqual(route.call_args.args[0], 7)
+        self.assertIs(route.call_args.args[1].__self__, controller)
+        self.assertEqual(client.updated_branches, [])
+        self.assertEqual(client.dispatches, [])
+
+    def test_main_advance_preserves_exact_managed_noop_result(self):
+        pr_value, _ = self._manual_main_advance_pr()
+        reserved_pr = replace(pr_value, head_ref="bot/federation/request/issue-7")
+        client, controller = self._main_advance_with_prs(
+            {reserved_pr.number: reserved_pr}, {reserved_pr.number: ()},
+        )
+        expected = IssueManagedRouteResult("NOOP", "NO_SEMANTIC_CHANGE", RequestClass.ADD)
+        with patch.object(controller, "interactive_issue_managed_route", return_value=expected):
+            self.assertIs(controller.main_advance(), expected)
+        self.assertEqual(client.updated_branches, [])
+        self.assertEqual(client.dispatches, [])
 
     def test_main_advance_malformed_reserved_issue_prefix_fails_closed(self):
         pr_value, _ = self._manual_main_advance_pr(base_oid="b" * 40)

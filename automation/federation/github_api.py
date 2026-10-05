@@ -16,7 +16,12 @@ from urllib import request as urlrequest
 
 from scripts import federate as c02
 from automation.federation.workspace import WorkspaceError, validate_trusted_ref
-from automation.federation.request_model import RequestModelError, reserved_issue_branch_number
+from automation.federation.request_model import (
+    MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES,
+    RequestModelError,
+    parse_issue_patch_projection,
+    reserved_issue_branch_number,
+)
 
 REST_BASE_URL = "https://api.github.com"
 GRAPHQL_ENDPOINT = "https://api.github.com/graphql"
@@ -740,13 +745,13 @@ class GitHubClient:
             author_date = _parse_github_timestamp(author["date"], "commit.author.date").strftime("%Y-%m-%dT%H:%M:%SZ")
         return GitCommitMetadata(commit, tree_sha, tuple(parents), author_date)
 
-    def get_commit_tree(self, repository: str, commit_sha: str) -> tuple[str, tuple[GitTreeEntry, ...]]:
-        owner, name = self._owner_repo(repository)
-        metadata = self.get_commit_metadata(repository, commit_sha)
-        url = f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/git/trees/{urlparse.quote(metadata.tree_sha)}?recursive=1"
-        value = self._request("GET", url)
+    @classmethod
+    def _parse_tree_response(cls, tree_sha: str, value: Any) -> tuple[str, tuple[GitTreeEntry, ...]]:
+        tree = cls._sha(tree_sha, "tree.sha")
         if type(value) is not dict or type(value.get("tree")) is not list or value.get("truncated") is not False:
             raise InvalidResponseError("Git tree response is truncated or malformed")
+        if "sha" in value and value["sha"] != tree:
+            raise InvalidResponseError("Git tree response identity does not match requested tree")
         entries: list[GitTreeEntry] = []
         for item in value["tree"]:
             if type(item) is not dict:
@@ -766,10 +771,23 @@ class GitHubClient:
                 raise InvalidResponseError("Git tree gitlink mode/type combination is invalid")
             if object_type == "blob" and mode not in {"100644", "100755", "120000"}:
                 raise InvalidResponseError("Git tree blob mode/type combination is invalid")
-            entries.append(GitTreeEntry(path, mode, object_type, self._sha(item.get("sha"), "tree.entry.sha")))
+            entries.append(GitTreeEntry(path, mode, object_type, cls._sha(item.get("sha"), "tree.entry.sha")))
         if len(entries) > 100_000 or len({item.path for item in entries}) != len(entries):
             raise InvalidResponseError("Git tree entry count or identity is invalid")
-        return metadata.tree_sha, tuple(sorted(entries, key=lambda item: item.path.encode("utf-8")))
+        return tree, tuple(sorted(entries, key=lambda item: item.path.encode("utf-8")))
+
+    def get_tree(self, repository: str, tree_sha: str) -> tuple[str, tuple[GitTreeEntry, ...]]:
+        owner, name = self._owner_repo(repository)
+        tree = self._sha(tree_sha, "tree.sha")
+        url = f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/git/trees/{urlparse.quote(tree)}?recursive=1"
+        return self._parse_tree_response(tree, self._request("GET", url))
+
+    def get_commit_tree(self, repository: str, commit_sha: str) -> tuple[str, tuple[GitTreeEntry, ...]]:
+        metadata = self.get_commit_metadata(repository, commit_sha)
+        tree_sha, entries = self.get_tree(repository, metadata.tree_sha)
+        if tree_sha != metadata.tree_sha:
+            raise InvalidResponseError("Git tree response identity does not match commit metadata")
+        return tree_sha, entries
 
     def get_blob(self, repository: str, blob_sha: str) -> bytes:
         owner, name = self._owner_repo(repository)
@@ -869,6 +887,17 @@ class GitHubClient:
         try:
             if len(value.encode("utf-8")) > 16_384:
                 raise InvalidResponseError(f"{label} exceeds 16KiB")
+        except UnicodeEncodeError:
+            raise InvalidResponseError(f"{label} is not valid UTF-8") from None
+        return value
+
+    @staticmethod
+    def _issue_comment_body_text(value: Any, label: str) -> str:
+        if type(value) is not str:
+            raise InvalidResponseError(f"{label} must be a string")
+        try:
+            if len(value.encode("utf-8")) > MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES:
+                raise InvalidResponseError(f"{label} exceeds the Issue comment bound")
         except UnicodeEncodeError:
             raise InvalidResponseError(f"{label} is not valid UTF-8") from None
         return value
@@ -1081,7 +1110,7 @@ class GitHubClient:
             raise InvalidResponseError("issue comment REST record must be an object")
         database_id = _positive_id(value.get("id"), "comment.id")
         node_id = _bounded_text(value.get("node_id"), "comment.node_id")
-        body = cls._body_text(value.get("body"), "comment.body")
+        body = cls._issue_comment_body_text(value.get("body"), "comment.body")
         created_at = _bounded_text(value.get("created_at"), "comment.created_at", 128)
         updated_at = _bounded_text(value.get("updated_at"), "comment.updated_at", 128)
         created_instant = _parse_github_timestamp(created_at, "comment.created_at")
@@ -1221,7 +1250,7 @@ class GitHubClient:
         if database_id != rest.database_id:
             raise InvalidResponseError("comment GraphQL database ID does not match REST")
 
-        body = cls._body_text(value.get("body"), "comment.body")
+        body = cls._issue_comment_body_text(value.get("body"), "comment.body")
         if body != rest.body:
             raise InvalidResponseError("comment body does not match REST")
         created_at = _bounded_text(value.get("createdAt"), "comment.createdAt", 128)
@@ -1350,6 +1379,40 @@ class GitHubClient:
             _bounded_text(value.get("node_id"), "created comment.node_id"),
             _positive_id(value.get("id"), "created comment.id"),
             _bounded_text(value.get("body"), "created comment.body", 16_384),
+            None, None, None, None, None, None, None, False,
+        )
+
+    def create_issue_patch_projection_comment(self, repository: str, number: int, body: str) -> IssueComment:
+        """Create an exact canonical machine projection with its dedicated wider bound."""
+        owner, name = self._owner_repo(repository)
+        if type(number) is not int or type(number) is bool or number <= 0:
+            raise GitHubAPIError("issue number must be positive")
+        if type(body) is not str or not body:
+            raise GitHubAPIError("IssuePatchProjection body must be nonempty text")
+        try:
+            body_bytes = body.encode("utf-8")
+        except UnicodeEncodeError:
+            raise GitHubAPIError("IssuePatchProjection body is not valid UTF-8") from None
+        if len(body_bytes) > MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES:
+            raise GitHubAPIError("IssuePatchProjection body exceeds the bound")
+        try:
+            projection = parse_issue_patch_projection(body)
+        except RequestModelError as error:
+            raise GitHubAPIError("IssuePatchProjection body is not canonical") from error
+        value = self.request_json(
+            "POST",
+            ["repos", owner, name, "issues", str(number), "comments"],
+            {"body": body},
+        )
+        if type(value) is not dict:
+            raise InvalidResponseError("created projection comment must be an object")
+        returned_body = self._issue_comment_body_text(value.get("body"), "created projection comment.body")
+        if returned_body != body:
+            raise InvalidResponseError("created projection comment body differs from the exact canonical payload")
+        return IssueComment(
+            _bounded_text(value.get("node_id"), "created projection comment.node_id"),
+            _positive_id(value.get("id"), "created projection comment.id"),
+            returned_body,
             None, None, None, None, None, None, None, False,
         )
 

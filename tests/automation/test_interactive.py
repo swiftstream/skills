@@ -13,6 +13,8 @@ from automation.federation.controller import (
     CandidateScopeError,
     DuplicateAnchorError,
     ForkHeadError,
+    IssueManagedNoSemanticChange,
+    IssueManagedRouteResult,
     R02Error,
     ReservedIssuePRPendingManagedAuthority,
     StaleAuthorityError,
@@ -350,6 +352,14 @@ class InteractiveTests(unittest.TestCase):
         fake.comments = [comment(100, old_anchor.render(), APP.bot_node_id, APP.bot_login, "Bot")]
         candidate_builder = Mock()
         controller = R02Controller(fake, "swiftstream/skills", APP, candidate_builder=candidate_builder)
+        managed_route_results = []
+        route_impl = controller.interactive_issue_managed_route
+
+        def run_managed_route(*args, **kwargs):
+            result = route_impl(*args, **kwargs)
+            managed_route_results.append(result)
+            return result
+
         with patch.object(controller_module, "validate_unique_anchor") as validate_anchor, patch.object(
             controller_module, "create_anchor_once", wraps=controller_module.create_anchor_once
         ) as create_anchor:
@@ -365,12 +375,26 @@ class InteractiveTests(unittest.TestCase):
                 controller, "interactive_proposal"
             ) as proposal, patch.object(controller, "trusted_validation") as validation, patch.object(
                 controller, "publish_finalizer_result"
-            ) as publish, patch.object(controller, "dispatch_trusted_validation_recovery") as dispatch:
-                controller.finalize_one_manual_pr({"number": 7})
+            ) as publish, patch.object(controller, "dispatch_trusted_validation_recovery") as dispatch, patch.object(
+                controller,
+                "interactive_issue_managed_route",
+                side_effect=run_managed_route,
+            ) as managed_route, patch.object(
+                controller,
+                "interactive_issue_managed_proposal",
+                side_effect=IssueManagedNoSemanticChange(RequestClass.ADD),
+            ):
+                finalizer_result = controller.finalize_one_manual_pr({"number": 7})
             proposal.assert_not_called()
             validation.assert_not_called()
             publish.assert_not_called()
             dispatch.assert_not_called()
+            managed_route.assert_called_once()
+            self.assertEqual(managed_route_results, [IssueManagedRouteResult(
+                "NOOP", "NO_SEMANTIC_CHANGE", RequestClass.ADD,
+            )])
+            self.assertIs(finalizer_result, managed_route_results[0])
+            self.assertIs(finalizer_result.request_class, RequestClass.ADD)
         validate_anchor.assert_not_called()
         create_anchor.assert_not_called()
         candidate_builder.assert_not_called()
@@ -428,8 +452,26 @@ class InteractiveTests(unittest.TestCase):
                     "FEDERATION_WAKE_PULL_NUMBER": "7",
                     "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
                 }
-                with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.dict(os.environ, environment, clear=False):
-                    self.assertEqual(main([command]), 1)
+                with (
+                    patch("automation.federation.controller.GitHubClient", return_value=fake),
+                    trusted_previous_patches(),
+                    patch.object(
+                        R02Controller,
+                        "interactive_issue_managed_route",
+                        return_value=IssueManagedRouteResult("NOOP", "NO_SEMANTIC_CHANGE", RequestClass.ADD),
+                    ) as managed_route,
+                    patch.object(R02Controller, "validate_issue_managed_head_history") as validate_history,
+                    patch.dict(os.environ, environment, clear=False),
+                ):
+                    self.assertEqual(main([command]), 0)
+                self.assertEqual(fake.dispatches, [])
+                if command == "interactive":
+                    managed_route.assert_called_once()
+                    self.assertEqual(managed_route.call_args.args[0], 7)
+                    validate_history.assert_not_called()
+                else:
+                    validate_history.assert_called_once_with(7)
+                    managed_route.assert_not_called()
                 self.assertEqual(fake.created, [])
                 self.assertEqual(fake.ref_calls, [])
                 self.assertEqual(fake.dispatches, [])

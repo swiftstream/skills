@@ -9,19 +9,30 @@ import secrets
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from scripts import federate as c02
 from automation.federation.workspace import WorkspaceError, validate_trusted_ref
 
 MAX_BODY_BYTES = 16_384
+MAX_PATCH_CANONICAL_EXPANSION_BYTES = 18
+MAX_CANONICAL_PATCH_BYTES = MAX_BODY_BYTES + MAX_PATCH_CANONICAL_EXPANSION_BYTES
+MAX_ISSUE_PATCH_PROJECTION_ENVELOPE_BYTES = 1_024
+MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES = 17_408
 ANCHOR_MARKER = "<!-- swiftstream-federation-request-anchor:v1 -->"
 ISSUE_REQUEST_ANCHOR_MARKER = "<!-- swiftstream-federation-issue-request-anchor:v1 -->"
+ISSUE_PATCH_PROJECTION_MARKER = "<!-- swiftstream-federation-issue-patch-projection:v1 -->"
+ISSUE_HEAD_CLAIM_MARKER = "<!-- swiftstream-federation-issue-head-claim:v2 -->"
 PATCH_SENTINEL = "Federation PATCH"
 REQUEST_MARKER = ".federation-request"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+ISSUE_HEAD_CLAIM_AUTHORITY_PREFIX = "swiftstream-federation-issue-head-claim-authority:v1\n"
+EFFECTIVE_REQUEST_DIGEST_PREFIX = "swiftstream-federation-effective-request:v1\n"
+ISSUE_PATCH_PROJECTION_EVIDENCE_PREFIX = "swiftstream-federation-issue-patch-projection-evidence:v1\n"
+NORMALIZE_TARGET_EVIDENCE_PREFIX = "swiftstream-federation-issue-head-normalize-target:v1\n"
+PROPOSAL_TARGET_EVIDENCE_PREFIX = "swiftstream-federation-issue-head-proposal-target:v1\n"
 
 CLAIMED_HEAD_MARKER_HEADER = "swiftstream-federation-head:v2"
 ISSUE_BRANCH_LEASE_MARKER = "<!-- swiftstream-federation-issue-branch-lease:v1 -->"
@@ -134,17 +145,17 @@ def _fail(message: str) -> None:
     raise RequestModelError(message)
 
 
-def _check_body_size(body: str, context: str = "body") -> None:
+def _check_body_size(body: str, context: str = "body", *, max_bytes: int = MAX_BODY_BYTES) -> None:
     try:
         size = len(body.encode("utf-8"))
     except UnicodeEncodeError:
         _fail(f"{context} is not valid UTF-8")
-    if size > MAX_BODY_BYTES:
-        _fail(f"{context} exceeds {MAX_BODY_BYTES} UTF-8 bytes")
+    if size > max_bytes:
+        _fail(f"{context} exceeds {max_bytes} UTF-8 bytes")
 
 
-def _normalized_lines(body: str, context: str) -> list[str]:
-    _check_body_size(body, context)
+def _normalized_lines(body: str, context: str, *, max_bytes: int = MAX_BODY_BYTES) -> list[str]:
+    _check_body_size(body, context, max_bytes=max_bytes)
     if "\x00" in body:
         _fail(f"{context} contains NUL")
     normalized = body.replace("\r\n", "\n")
@@ -153,8 +164,14 @@ def _normalized_lines(body: str, context: str) -> list[str]:
     return normalized.split("\n")
 
 
-def _parse_blocks(body: str, allowed: tuple[str, ...], context: str) -> dict[str, str | None]:
-    lines = _normalized_lines(body, context)
+def _parse_blocks(
+    body: str,
+    allowed: tuple[str, ...],
+    context: str,
+    *,
+    max_bytes: int = MAX_BODY_BYTES,
+) -> dict[str, str | None]:
+    lines = _normalized_lines(body, context, max_bytes=max_bytes)
     values: dict[str, str | None] = {}
     index = 0
     while index < len(lines):
@@ -767,8 +784,18 @@ class Patch:
     assignments: dict[str, Any]
 
 
-def parse_patch(comment: str) -> Patch | None:
-    lines = _normalized_lines(comment, "PATCH comment")
+_PATCH_FIELDS = (
+    "Description",
+    "Branch",
+    "Skills root",
+    "Skill prefixes",
+    "Publication lines",
+    "Dropped publication lines",
+)
+
+
+def _parse_patch(comment: str, *, max_bytes: int) -> Patch | None:
+    lines = _normalized_lines(comment, "PATCH comment", max_bytes=max_bytes)
     first_nonempty = next((line for line in lines if line != ""), None)
     if first_nonempty != PATCH_SENTINEL:
         return None
@@ -776,22 +803,176 @@ def parse_patch(comment: str) -> Patch | None:
     remainder = "\n".join(lines[sentinel_index + 1 :])
     values = _parse_blocks(
         remainder,
-        (
-            "Description:",
-            "Branch:",
-            "Skills root:",
-            "Skill prefixes:",
-            "Publication lines:",
-            "Dropped publication lines:",
-        ),
+        tuple(f"{field}:" for field in _PATCH_FIELDS),
         "PATCH",
+        max_bytes=max_bytes,
     )
     if not values:
         _fail("PATCH must contain at least one field")
-    for key in ("Description", "Branch", "Skills root", "Skill prefixes", "Reason"):
+    for key in ("Description", "Branch", "Skills root", "Skill prefixes"):
         if values.get(key) == "":
             values[key] = None
     return Patch({key: value for key, value in values.items()})
+
+
+def parse_patch(comment: str) -> Patch | None:
+    """Parse a human/source PATCH comment within the unchanged 16 KiB authority."""
+    return _parse_patch(comment, max_bytes=MAX_BODY_BYTES)
+
+
+def render_patch(patch: Patch) -> str:
+    """Render one semantically validated PATCH using the frozen canonical bytes."""
+    if type(patch) is not Patch or type(patch.assignments) is not dict:
+        _fail("PATCH must be a Patch with an exact assignment mapping")
+    if not patch.assignments or set(patch.assignments) - set(_PATCH_FIELDS):
+        _fail("PATCH assignments are empty or contain unknown fields")
+
+    canonical_values: dict[str, str | None] = {}
+    for field in _PATCH_FIELDS:
+        if field not in patch.assignments:
+            continue
+        value = patch.assignments[field]
+        if value is not None and type(value) is not str:
+            _fail(f"PATCH {field} assignment must be a string or null")
+        if field == "Description":
+            normalized = None if value in (None, "") else _optional_text(value, field)
+            canonical_values[field] = normalized
+        elif field == "Branch":
+            normalized = None if value in (None, "") else _branch(value)
+            canonical_values[field] = normalized
+        elif field == "Skills root":
+            normalized = None if value in (None, "") else _skills_root(value)
+            canonical_values[field] = normalized
+        elif field == "Skill prefixes":
+            normalized = None if value in (None, "") else _prefixes(value)
+            canonical_values[field] = ",".join(normalized) if normalized is not None else None
+        elif field == "Publication lines":
+            normalized = _publication_lines(value)
+            if normalized is None:
+                _fail("Publication lines cannot be cleared")
+            canonical_values[field] = ";".join(
+                f"{line.ref}={','.join(line.skill_prefixes)}" for line in normalized
+            )
+        else:
+            normalized = _dropped_publication_lines(value)
+            if normalized is None:
+                _fail("Dropped publication lines cannot be cleared")
+            canonical_values[field] = ",".join(normalized)
+
+    blocks = [
+        f"{field}:\n{canonical_values[field] or ''}"
+        for field in _PATCH_FIELDS
+        if field in canonical_values
+    ]
+    rendered = f"{PATCH_SENTINEL}\n\n" + "\n\n".join(blocks) + "\n"
+    _check_body_size(rendered, "canonical PATCH", max_bytes=MAX_CANONICAL_PATCH_BYTES)
+    reparsed = _parse_patch(rendered, max_bytes=MAX_CANONICAL_PATCH_BYTES)
+    if reparsed != Patch(canonical_values):
+        _fail("canonical PATCH did not round-trip to exact semantic assignments")
+    return rendered
+
+
+def _parse_projection_canonical_patch(comment: str) -> Patch:
+    """Parse the wider canonical PATCH domain for machine projection evidence only."""
+    patch = _parse_patch(comment, max_bytes=MAX_CANONICAL_PATCH_BYTES)
+    if patch is None or render_patch(patch) != comment:
+        _fail("projected PATCH is not the exact semantic canonical representation")
+    return patch
+
+
+@dataclass(frozen=True)
+class IssuePatchProjection:
+    schema_version: int
+    issue_database_id: int
+    issue_number: int
+    issue_anchor_comment_id: int
+    issue_comment_id: int
+    issue_comment_body_sha256: str
+    binding_id: str
+    patch: Patch
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("IssuePatchProjection schemaVersion must be exact integer 1")
+        for name in (
+            "issue_database_id", "issue_number", "issue_anchor_comment_id", "issue_comment_id",
+        ):
+            _issue_positive_int(getattr(self, name), name)
+        for name in ("issue_comment_body_sha256", "binding_id"):
+            if type(getattr(self, name)) is not str or not _SHA256_RE.fullmatch(getattr(self, name)):
+                _fail(f"{name} must be lowercase 64-hex")
+        if type(self.patch) is not Patch:
+            _fail("IssuePatchProjection patch must be a Patch")
+        render_patch(self.patch)
+
+    def envelope_value(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": self.schema_version,
+            "issueDatabaseId": self.issue_database_id,
+            "issueNumber": self.issue_number,
+            "issueAnchorCommentId": self.issue_anchor_comment_id,
+            "issueCommentId": self.issue_comment_id,
+            "issueCommentBodySha256": self.issue_comment_body_sha256,
+            "bindingId": self.binding_id,
+        }
+
+    def render(self) -> str:
+        envelope = f"{ISSUE_PATCH_PROJECTION_MARKER}\n{_canonical_json(self.envelope_value())}\n\n"
+        _check_body_size(
+            envelope,
+            "IssuePatchProjection envelope",
+            max_bytes=MAX_ISSUE_PATCH_PROJECTION_ENVELOPE_BYTES,
+        )
+        rendered = envelope + render_patch(self.patch)
+        _check_body_size(
+            rendered,
+            "IssuePatchProjection comment",
+            max_bytes=MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES,
+        )
+        return rendered
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+def parse_issue_patch_projection(text: str) -> IssuePatchProjection:
+    if type(text) is not str or not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _fail("IssuePatchProjection must use exact LF-terminated lines")
+    _check_body_size(
+        text,
+        "IssuePatchProjection comment",
+        max_bytes=MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES,
+    )
+    lines = text.split("\n", 2)
+    if len(lines) != 3 or lines[0] != ISSUE_PATCH_PROJECTION_MARKER or not lines[1]:
+        _fail("IssuePatchProjection marker or JSON line is invalid")
+    try:
+        value = c02.decode_json(lines[1])
+    except Exception as error:
+        _fail(f"invalid IssuePatchProjection JSON: {error}")
+    exact_keys = {
+        "schemaVersion", "issueDatabaseId", "issueNumber", "issueAnchorCommentId",
+        "issueCommentId", "issueCommentBodySha256", "bindingId",
+    }
+    if type(value) is not dict or set(value) != exact_keys:
+        _fail("IssuePatchProjection has invalid exact keys")
+    envelope = f"{lines[0]}\n{lines[1]}\n\n"
+    _check_body_size(
+        envelope,
+        "IssuePatchProjection envelope",
+        max_bytes=MAX_ISSUE_PATCH_PROJECTION_ENVELOPE_BYTES,
+    )
+    if not lines[2].startswith("\n"):
+        _fail("IssuePatchProjection must separate its envelope from PATCH with one blank line")
+    patch = _parse_projection_canonical_patch(lines[2][1:])
+    projection = IssuePatchProjection(
+        value["schemaVersion"], value["issueDatabaseId"], value["issueNumber"],
+        value["issueAnchorCommentId"], value["issueCommentId"],
+        value["issueCommentBodySha256"], value["bindingId"], patch,
+    )
+    if lines[1] != _canonical_json(projection.envelope_value()) or projection.render() != text:
+        _fail("IssuePatchProjection representation is not canonical")
+    return projection
 
 
 def apply_patch(request: Request, patch: Patch) -> Request:
@@ -1055,6 +1236,139 @@ def _canonical_json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError, UnicodeEncodeError):
         _fail("authority JSON value cannot be encoded canonically")
+
+
+def effective_request_digest(request: Request) -> str:
+    """Hash only the canonical effective Request body, never raw Issue formatting."""
+    return hashlib.sha256(
+        EFFECTIVE_REQUEST_DIGEST_PREFIX.encode("utf-8")
+        + render_request_body(request).encode("utf-8")
+    ).hexdigest()
+
+
+def patch_projection_evidence_digest(entries: Iterable[Mapping[str, Any]]) -> str:
+    """Hash the exact ordered source/projection evidence schema frozen for C1."""
+    exact_keys = {
+        "issueCommentId", "issueCommentBodySha256", "canonicalPatchSha256", "projectionSha256",
+    }
+    normalized: list[dict[str, Any]] = []
+    for entry in entries:
+        if type(entry) is not dict or set(entry) != exact_keys:
+            _fail("PATCH projection evidence entry has invalid exact keys")
+        comment_id = _issue_positive_int(entry["issueCommentId"], "issueCommentId")
+        item: dict[str, Any] = {"issueCommentId": comment_id}
+        for key in ("issueCommentBodySha256", "canonicalPatchSha256", "projectionSha256"):
+            value = entry[key]
+            if type(value) is not str or not _SHA256_RE.fullmatch(value):
+                _fail(f"{key} must be lowercase 64-hex")
+            item[key] = value
+        normalized.append(item)
+    normalized.sort(key=lambda item: item["issueCommentId"])
+    ids = [item["issueCommentId"] for item in normalized]
+    if len(ids) != len(set(ids)):
+        _fail("PATCH projection evidence contains duplicate Issue comment IDs")
+    return hashlib.sha256(
+        (ISSUE_PATCH_PROJECTION_EVIDENCE_PREFIX + _canonical_json({"entries": normalized})).encode("utf-8")
+    ).hexdigest()
+
+
+def issue_patch_projection_evidence_digest(
+    projections: Iterable[IssuePatchProjection],
+) -> str:
+    entries: list[dict[str, Any]] = []
+    for projection in projections:
+        if type(projection) is not IssuePatchProjection:
+            _fail("PATCH projection evidence must contain IssuePatchProjection values")
+        canonical_patch = render_patch(projection.patch).encode("utf-8")
+        rendered_projection = projection.render().encode("utf-8")
+        entries.append({
+            "issueCommentId": projection.issue_comment_id,
+            "issueCommentBodySha256": projection.issue_comment_body_sha256,
+            "canonicalPatchSha256": hashlib.sha256(canonical_patch).hexdigest(),
+            "projectionSha256": hashlib.sha256(rendered_projection).hexdigest(),
+        })
+    return patch_projection_evidence_digest(entries)
+
+
+def normalize_target_evidence_digest(
+    *,
+    request_class: RequestClass,
+    request_marker_blob_sha: str,
+    target_tree_sha: str,
+) -> str:
+    if type(request_class) is not RequestClass or request_class not in _ISSUE_REQUEST_CLASSES:
+        _fail("requestClass must be ADD, UPDATE, or REMOVE")
+    for value, label in (
+        (request_marker_blob_sha, "requestMarkerBlobSha"),
+        (target_tree_sha, "targetTreeSha"),
+    ):
+        if type(value) is not str or not _SHA40_RE.fullmatch(value):
+            _fail(f"{label} must be lowercase 40-hex")
+    value = {
+        "requestMarkerBlobSha": request_marker_blob_sha,
+        "requestMarkerContentSha256": hashlib.sha256(
+            f"{request_class.value}\n".encode("utf-8")
+        ).hexdigest(),
+        "targetTreeSha": target_tree_sha,
+    }
+    return hashlib.sha256(
+        (NORMALIZE_TARGET_EVIDENCE_PREFIX + _canonical_json(value)).encode("utf-8")
+    ).hexdigest()
+
+
+def proposal_target_evidence_digest(
+    *,
+    candidate_tree_sha: str,
+    changed: Iterable[Mapping[str, Any]],
+    candidate_changed_paths: Iterable[str],
+) -> str:
+    if type(candidate_tree_sha) is not str or not _SHA40_RE.fullmatch(candidate_tree_sha):
+        _fail("candidateTreeSha must be lowercase 40-hex")
+    exact_keys = {"path", "state", "mode", "objectType", "blobSha", "contentSha256"}
+    entries: list[dict[str, Any]] = []
+    for entry in changed:
+        if type(entry) is not dict or set(entry) != exact_keys:
+            _fail("proposal target evidence entry has invalid exact keys")
+        path = entry["path"]
+        try:
+            canonical_path = c02.validate_posix_relative_path(path, "proposal evidence path")
+        except c02.FederationError as error:
+            _fail(str(error))
+        if canonical_path != path:
+            _fail("proposal evidence path is not canonical")
+        state = entry["state"]
+        if type(state) is not str or state not in {"PRESENT", "ABSENT"}:
+            _fail("proposal evidence state must be PRESENT or ABSENT")
+        if state == "PRESENT":
+            if type(entry["mode"]) is not str or entry["mode"] not in {"100644", "100755"}:
+                _fail("proposal evidence PRESENT entry must use a regular file mode")
+            if entry["objectType"] != "blob":
+                _fail("proposal evidence PRESENT entry must be a regular blob")
+            if type(entry["blobSha"]) is not str or not _SHA40_RE.fullmatch(entry["blobSha"]):
+                _fail("proposal evidence blobSha must be lowercase 40-hex")
+            if type(entry["contentSha256"]) is not str or not _SHA256_RE.fullmatch(entry["contentSha256"]):
+                _fail("proposal evidence contentSha256 must be lowercase 64-hex")
+        elif any(entry[key] is not None for key in ("mode", "objectType", "blobSha", "contentSha256")):
+            _fail("proposal evidence ABSENT entry must have null object metadata")
+        entries.append({
+            "path": path,
+            "state": state,
+            "mode": entry["mode"],
+            "objectType": entry["objectType"],
+            "blobSha": entry["blobSha"],
+            "contentSha256": entry["contentSha256"],
+        })
+    entries.sort(key=lambda item: item["path"])
+    paths = [entry["path"] for entry in entries]
+    if len(paths) != len(set(paths)):
+        _fail("proposal target evidence contains duplicate paths")
+    candidate_paths = tuple(candidate_changed_paths)
+    if any(type(path) is not str for path in candidate_paths) or tuple(paths) != candidate_paths:
+        _fail("proposal evidence paths must exactly equal candidate.changed_paths")
+    value = {"candidateTreeSha": candidate_tree_sha, "changed": entries}
+    return hashlib.sha256(
+        (PROPOSAL_TARGET_EVIDENCE_PREFIX + _canonical_json(value)).encode("utf-8")
+    ).hexdigest()
 
 
 def _issue_bounded_text(value: Any, label: str, limit: int) -> str:
@@ -1707,6 +2021,439 @@ def claim_generation_id(
         "transitionKind": transition_kind,
     }
     return hashlib.sha256((CLAIM_GENERATION_PREFIX + _canonical_json(value)).encode("utf-8")).hexdigest()
+
+
+_ISSUE_HEAD_CLAIM_TRANSITIONS = frozenset({
+    "NORMALIZE", "PROPOSAL", "PATCH_REGENERATION", "MAIN_ADVANCE",
+})
+_ISSUE_HEAD_CLAIM_KEYS = frozenset({
+    "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+    "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256",
+    "issueBranchLeaseCommentDatabaseId", "issueBranchLeaseSha256", "bindingId",
+    "sourceId", "sourceRepositoryId", "pullRequestNumber", "pullRequestDatabaseId",
+    "pullRequestNodeId", "centralRepositoryNodeId", "branchRef", "requestClass",
+    "acceptedBaseSha", "acceptedBaseTreeSha", "fromHeadSha", "fromTreeSha",
+    "toHeadSha", "toTreeSha", "carrierRole", "claimKind", "claimGenerationId",
+    "transitionKind", "carrierNonce", "effectiveRequestDigest",
+    "patchProjectionEvidenceDigest", "targetEvidenceDigest", "authorityPreimageDigest",
+    "markerDigest", "claimId",
+})
+
+
+def _issue_head_claim_preimage_from_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
+    request_class = fields["request_class"]
+    if type(request_class) is not RequestClass:
+        _fail("IssueHeadClaim requestClass must be ADD, UPDATE, or REMOVE")
+    return {
+        "schemaVersion": fields["schema_version"],
+        "issueNumber": fields["issue_number"],
+        "issueDatabaseId": fields["issue_database_id"],
+        "issueNodeId": fields["issue_node_id"],
+        "issueRequestAnchorCommentDatabaseId": fields["issue_request_anchor_comment_database_id"],
+        "issueRequestAnchorSha256": fields["issue_request_anchor_sha256"],
+        "issueBranchLeaseCommentDatabaseId": fields["issue_branch_lease_comment_database_id"],
+        "issueBranchLeaseSha256": fields["issue_branch_lease_sha256"],
+        "bindingId": fields["binding_id"],
+        "sourceId": fields["source_id"],
+        "sourceRepositoryId": fields["source_repository_id"],
+        "pullRequestNumber": fields["pull_request_number"],
+        "pullRequestDatabaseId": fields["pull_request_database_id"],
+        "pullRequestNodeId": fields["pull_request_node_id"],
+        "centralRepositoryNodeId": fields["central_repository_node_id"],
+        "branchRef": fields["branch_ref"],
+        "requestClass": request_class.value,
+        "transitionKind": fields["transition_kind"],
+        "acceptedBaseSha": fields["accepted_base_sha"],
+        "acceptedBaseTreeSha": fields["accepted_base_tree_sha"],
+        "fromHeadSha": fields["from_head_sha"],
+        "fromTreeSha": fields["from_tree_sha"],
+        "effectiveRequestDigest": fields["effective_request_digest"],
+        "patchProjectionEvidenceDigest": fields["patch_projection_evidence_digest"],
+        "targetEvidenceDigest": fields["target_evidence_digest"],
+    }
+
+
+def _issue_head_claim_authority_digest_from_fields(fields: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        (ISSUE_HEAD_CLAIM_AUTHORITY_PREFIX + _canonical_json(
+            _issue_head_claim_preimage_from_fields(fields)
+        )).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class IssueHeadClaim:
+    schema_version: int
+    issue_number: int
+    issue_database_id: int
+    issue_node_id: str
+    issue_request_anchor_comment_database_id: int
+    issue_request_anchor_sha256: str
+    issue_branch_lease_comment_database_id: int
+    issue_branch_lease_sha256: str
+    binding_id: str
+    source_id: str
+    source_repository_id: int
+    pull_request_number: int
+    pull_request_database_id: int
+    pull_request_node_id: str
+    central_repository_node_id: str
+    branch_ref: str
+    request_class: RequestClass
+    accepted_base_sha: str
+    accepted_base_tree_sha: str
+    from_head_sha: str
+    from_tree_sha: str
+    to_head_sha: str
+    to_tree_sha: str
+    carrier_role: str
+    claim_kind: str
+    claim_generation_id: str
+    transition_kind: str
+    carrier_nonce: str
+    effective_request_digest: str
+    patch_projection_evidence_digest: str
+    target_evidence_digest: str
+    authority_preimage_digest: str
+    marker_digest: str
+    claim_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("IssueHeadClaim schemaVersion must be exact integer 1")
+        for name in (
+            "issue_number", "issue_database_id", "issue_request_anchor_comment_database_id",
+            "issue_branch_lease_comment_database_id", "source_repository_id",
+            "pull_request_number", "pull_request_database_id",
+        ):
+            _issue_positive_int(getattr(self, name), name)
+        for name in ("issue_node_id", "pull_request_node_id", "central_repository_node_id"):
+            _lease_node_id(getattr(self, name), name, delimiter_free=True)
+        for name in (
+            "issue_request_anchor_sha256", "issue_branch_lease_sha256", "binding_id",
+            "claim_generation_id", "carrier_nonce", "effective_request_digest",
+            "patch_projection_evidence_digest", "target_evidence_digest",
+            "authority_preimage_digest", "marker_digest", "claim_id",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not _SHA256_RE.fullmatch(value):
+                _fail(f"{name} must be lowercase 64-hex")
+        try:
+            c02.validate_source_id(self.source_id)
+        except (TypeError, c02.FederationError):
+            _fail("sourceId is invalid")
+        if type(self.branch_ref) is not str or self.branch_ref != issue_branch_ref(self.issue_number):
+            _fail("branchRef must be the exact Issue branch for issueNumber")
+        if type(self.request_class) is not RequestClass or self.request_class not in _ISSUE_REQUEST_CLASSES:
+            _fail("requestClass must be ADD, UPDATE, or REMOVE")
+        for name in (
+            "accepted_base_sha", "accepted_base_tree_sha", "from_head_sha", "from_tree_sha",
+            "to_head_sha", "to_tree_sha",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not _SHA40_RE.fullmatch(value):
+                _fail(f"{name} must be lowercase 40-hex")
+        if self.carrier_role != "ISSUE_ACTIVE":
+            _fail("IssueHeadClaim carrierRole must be ISSUE_ACTIVE")
+        if self.claim_kind != "ISSUE_HEAD_CLAIM":
+            _fail("IssueHeadClaim claimKind must be ISSUE_HEAD_CLAIM")
+        if type(self.transition_kind) is not str or self.transition_kind not in _ISSUE_HEAD_CLAIM_TRANSITIONS:
+            _fail("IssueHeadClaim transitionKind is invalid")
+        fields = self._fields()
+        expected_authority = _issue_head_claim_authority_digest_from_fields(fields)
+        if self.authority_preimage_digest != expected_authority:
+            _fail("IssueHeadClaim authorityPreimageDigest does not match stored immutable evidence")
+        expected_generation = claim_generation_id(
+            authority_preimage_digest=self.authority_preimage_digest,
+            carrier_nonce=self.carrier_nonce,
+            central_repository_node_id=self.central_repository_node_id,
+            owner_key=issue_owner_key(
+                self.central_repository_node_id,
+                self.issue_database_id,
+                self.issue_node_id,
+                self.issue_number,
+            ),
+            from_head_sha=self.from_head_sha,
+            from_tree_sha=self.from_tree_sha,
+            claim_kind=self.claim_kind,
+            role=self.carrier_role,
+            owner_kind="ISSUE",
+            transition_kind=self.transition_kind,
+        )
+        if self.claim_generation_id != expected_generation:
+            _fail("IssueHeadClaim claimGenerationId does not match stored authority")
+        marker = ClaimedHeadMarker(
+            self.claim_kind,
+            self.carrier_role,
+            "ISSUE",
+            issue_owner_key(
+                self.central_repository_node_id,
+                self.issue_database_id,
+                self.issue_node_id,
+                self.issue_number,
+            ),
+            self.claim_generation_id,
+            self.carrier_nonce,
+            self.transition_kind,
+        )
+        expected_marker_digest = hashlib.sha256(marker.render().encode("utf-8")).hexdigest()
+        if self.marker_digest != expected_marker_digest:
+            _fail("IssueHeadClaim markerDigest does not match deterministic marker bytes")
+        expected_claim_id = hashlib.sha256(_canonical_json(self.as_value(include_claim_id=False)).encode("utf-8")).hexdigest()
+        if self.claim_id != expected_claim_id:
+            _fail("IssueHeadClaim claimId does not match canonical final claim JSON")
+
+    def _fields(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "issue_number": self.issue_number,
+            "issue_database_id": self.issue_database_id,
+            "issue_node_id": self.issue_node_id,
+            "issue_request_anchor_comment_database_id": self.issue_request_anchor_comment_database_id,
+            "issue_request_anchor_sha256": self.issue_request_anchor_sha256,
+            "issue_branch_lease_comment_database_id": self.issue_branch_lease_comment_database_id,
+            "issue_branch_lease_sha256": self.issue_branch_lease_sha256,
+            "binding_id": self.binding_id,
+            "source_id": self.source_id,
+            "source_repository_id": self.source_repository_id,
+            "pull_request_number": self.pull_request_number,
+            "pull_request_database_id": self.pull_request_database_id,
+            "pull_request_node_id": self.pull_request_node_id,
+            "central_repository_node_id": self.central_repository_node_id,
+            "branch_ref": self.branch_ref,
+            "request_class": self.request_class,
+            "accepted_base_sha": self.accepted_base_sha,
+            "accepted_base_tree_sha": self.accepted_base_tree_sha,
+            "from_head_sha": self.from_head_sha,
+            "from_tree_sha": self.from_tree_sha,
+            "to_head_sha": self.to_head_sha,
+            "to_tree_sha": self.to_tree_sha,
+            "carrier_role": self.carrier_role,
+            "claim_kind": self.claim_kind,
+            "claim_generation_id": self.claim_generation_id,
+            "transition_kind": self.transition_kind,
+            "carrier_nonce": self.carrier_nonce,
+            "effective_request_digest": self.effective_request_digest,
+            "patch_projection_evidence_digest": self.patch_projection_evidence_digest,
+            "target_evidence_digest": self.target_evidence_digest,
+            "authority_preimage_digest": self.authority_preimage_digest,
+            "marker_digest": self.marker_digest,
+            "claim_id": self.claim_id,
+        }
+
+    def authority_preimage_value(self) -> dict[str, Any]:
+        return _issue_head_claim_preimage_from_fields(self._fields())
+
+    def as_value(self, *, include_claim_id: bool = True) -> dict[str, Any]:
+        value = {
+            "schemaVersion": self.schema_version,
+            "issueNumber": self.issue_number,
+            "issueDatabaseId": self.issue_database_id,
+            "issueNodeId": self.issue_node_id,
+            "issueRequestAnchorCommentDatabaseId": self.issue_request_anchor_comment_database_id,
+            "issueRequestAnchorSha256": self.issue_request_anchor_sha256,
+            "issueBranchLeaseCommentDatabaseId": self.issue_branch_lease_comment_database_id,
+            "issueBranchLeaseSha256": self.issue_branch_lease_sha256,
+            "bindingId": self.binding_id,
+            "sourceId": self.source_id,
+            "sourceRepositoryId": self.source_repository_id,
+            "pullRequestNumber": self.pull_request_number,
+            "pullRequestDatabaseId": self.pull_request_database_id,
+            "pullRequestNodeId": self.pull_request_node_id,
+            "centralRepositoryNodeId": self.central_repository_node_id,
+            "branchRef": self.branch_ref,
+            "requestClass": self.request_class.value,
+            "acceptedBaseSha": self.accepted_base_sha,
+            "acceptedBaseTreeSha": self.accepted_base_tree_sha,
+            "fromHeadSha": self.from_head_sha,
+            "fromTreeSha": self.from_tree_sha,
+            "toHeadSha": self.to_head_sha,
+            "toTreeSha": self.to_tree_sha,
+            "carrierRole": self.carrier_role,
+            "claimKind": self.claim_kind,
+            "claimGenerationId": self.claim_generation_id,
+            "transitionKind": self.transition_kind,
+            "carrierNonce": self.carrier_nonce,
+            "effectiveRequestDigest": self.effective_request_digest,
+            "patchProjectionEvidenceDigest": self.patch_projection_evidence_digest,
+            "targetEvidenceDigest": self.target_evidence_digest,
+            "authorityPreimageDigest": self.authority_preimage_digest,
+            "markerDigest": self.marker_digest,
+        }
+        if include_claim_id:
+            value["claimId"] = self.claim_id
+        return value
+
+    @classmethod
+    def create(cls, **fields: Any) -> "IssueHeadClaim":
+        body = dict(fields)
+        body.setdefault("schema_version", 1)
+        body.setdefault("carrier_role", "ISSUE_ACTIVE")
+        body.setdefault("claim_kind", "ISSUE_HEAD_CLAIM")
+        required = {
+            "schema_version", "issue_number", "issue_database_id", "issue_node_id",
+            "issue_request_anchor_comment_database_id", "issue_request_anchor_sha256",
+            "issue_branch_lease_comment_database_id", "issue_branch_lease_sha256", "binding_id",
+            "source_id", "source_repository_id", "pull_request_number", "pull_request_database_id",
+            "pull_request_node_id", "central_repository_node_id", "branch_ref", "request_class",
+            "accepted_base_sha", "accepted_base_tree_sha", "from_head_sha", "from_tree_sha",
+            "to_head_sha", "to_tree_sha", "carrier_role", "claim_kind", "transition_kind",
+            "carrier_nonce", "effective_request_digest", "patch_projection_evidence_digest",
+            "target_evidence_digest",
+        }
+        if set(body) != required:
+            _fail("IssueHeadClaim.create fields do not match the construction schema")
+        authority = _issue_head_claim_authority_digest_from_fields(body)
+        owner_key = issue_owner_key(
+            body["central_repository_node_id"],
+            body["issue_database_id"],
+            body["issue_node_id"],
+            body["issue_number"],
+        )
+        generation = claim_generation_id(
+            authority_preimage_digest=authority,
+            carrier_nonce=body["carrier_nonce"],
+            central_repository_node_id=body["central_repository_node_id"],
+            owner_key=owner_key,
+            from_head_sha=body["from_head_sha"],
+            from_tree_sha=body["from_tree_sha"],
+            claim_kind=body["claim_kind"],
+            role=body["carrier_role"],
+            owner_kind="ISSUE",
+            transition_kind=body["transition_kind"],
+        )
+        marker = ClaimedHeadMarker(
+            body["claim_kind"], body["carrier_role"], "ISSUE", owner_key,
+            generation, body["carrier_nonce"], body["transition_kind"],
+        )
+        values = dict(body)
+        values["claim_generation_id"] = generation
+        values["authority_preimage_digest"] = authority
+        values["marker_digest"] = hashlib.sha256(marker.render().encode("utf-8")).hexdigest()
+        final_value = {
+            "schemaVersion": values["schema_version"],
+            "issueNumber": values["issue_number"],
+            "issueDatabaseId": values["issue_database_id"],
+            "issueNodeId": values["issue_node_id"],
+            "issueRequestAnchorCommentDatabaseId": values["issue_request_anchor_comment_database_id"],
+            "issueRequestAnchorSha256": values["issue_request_anchor_sha256"],
+            "issueBranchLeaseCommentDatabaseId": values["issue_branch_lease_comment_database_id"],
+            "issueBranchLeaseSha256": values["issue_branch_lease_sha256"],
+            "bindingId": values["binding_id"],
+            "sourceId": values["source_id"],
+            "sourceRepositoryId": values["source_repository_id"],
+            "pullRequestNumber": values["pull_request_number"],
+            "pullRequestDatabaseId": values["pull_request_database_id"],
+            "pullRequestNodeId": values["pull_request_node_id"],
+            "centralRepositoryNodeId": values["central_repository_node_id"],
+            "branchRef": values["branch_ref"],
+            "requestClass": values["request_class"].value,
+            "acceptedBaseSha": values["accepted_base_sha"],
+            "acceptedBaseTreeSha": values["accepted_base_tree_sha"],
+            "fromHeadSha": values["from_head_sha"],
+            "fromTreeSha": values["from_tree_sha"],
+            "toHeadSha": values["to_head_sha"],
+            "toTreeSha": values["to_tree_sha"],
+            "carrierRole": values["carrier_role"],
+            "claimKind": values["claim_kind"],
+            "claimGenerationId": values["claim_generation_id"],
+            "transitionKind": values["transition_kind"],
+            "carrierNonce": values["carrier_nonce"],
+            "effectiveRequestDigest": values["effective_request_digest"],
+            "patchProjectionEvidenceDigest": values["patch_projection_evidence_digest"],
+            "targetEvidenceDigest": values["target_evidence_digest"],
+            "authorityPreimageDigest": values["authority_preimage_digest"],
+            "markerDigest": values["marker_digest"],
+        }
+        values["claim_id"] = hashlib.sha256(_canonical_json(final_value).encode("utf-8")).hexdigest()
+        return cls(**values)
+
+    def render(self) -> str:
+        return f"{ISSUE_HEAD_CLAIM_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+def issue_head_claim_authority_digest(claim: IssueHeadClaim) -> str:
+    if type(claim) is not IssueHeadClaim:
+        _fail("historical authority digest requires an IssueHeadClaim")
+    return _issue_head_claim_authority_digest_from_fields(claim._fields())
+
+
+def parse_issue_head_claim(text: str) -> IssueHeadClaim:
+    if type(text) is not str or not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _fail("IssueHeadClaim must use exact LF-terminated lines")
+    lines = text[:-1].split("\n")
+    if len(lines) != 2 or lines[0] != ISSUE_HEAD_CLAIM_MARKER or not lines[1]:
+        _fail("IssueHeadClaim marker or JSON line is invalid")
+    try:
+        value = c02.decode_json(lines[1])
+    except Exception as error:
+        _fail(f"invalid IssueHeadClaim JSON: {error}")
+    if type(value) is not dict or set(value) != _ISSUE_HEAD_CLAIM_KEYS:
+        _fail("IssueHeadClaim has invalid exact keys")
+    try:
+        request_class = _ISSUE_REQUEST_CLASS_VALUES[value["requestClass"]]
+    except (KeyError, TypeError):
+        _fail("IssueHeadClaim requestClass is invalid")
+    claim = IssueHeadClaim(
+        value["schemaVersion"], value["issueNumber"], value["issueDatabaseId"], value["issueNodeId"],
+        value["issueRequestAnchorCommentDatabaseId"], value["issueRequestAnchorSha256"],
+        value["issueBranchLeaseCommentDatabaseId"], value["issueBranchLeaseSha256"], value["bindingId"],
+        value["sourceId"], value["sourceRepositoryId"], value["pullRequestNumber"],
+        value["pullRequestDatabaseId"], value["pullRequestNodeId"], value["centralRepositoryNodeId"],
+        value["branchRef"], request_class, value["acceptedBaseSha"], value["acceptedBaseTreeSha"],
+        value["fromHeadSha"], value["fromTreeSha"], value["toHeadSha"], value["toTreeSha"],
+        value["carrierRole"], value["claimKind"], value["claimGenerationId"],
+        value["transitionKind"], value["carrierNonce"], value["effectiveRequestDigest"],
+        value["patchProjectionEvidenceDigest"], value["targetEvidenceDigest"],
+        value["authorityPreimageDigest"], value["markerDigest"], value["claimId"],
+    )
+    if lines[1] != _canonical_json(claim.as_value()) or text != claim.render():
+        _fail("IssueHeadClaim representation is not canonical")
+    return claim
+
+
+def classify_issue_head_claim_progression(
+    historical_claim: IssueHeadClaim,
+    *,
+    fresh_effective_request_digest: str,
+    fresh_patch_projection_evidence_digest: str,
+    fresh_accepted_base_sha: str,
+    fresh_accepted_base_tree_sha: str,
+    proposal_exists: bool,
+) -> str | None:
+    """Compare fresh progression authority to an immutable historical active claim."""
+    if type(historical_claim) is not IssueHeadClaim:
+        _fail("fresh progression comparison requires an IssueHeadClaim")
+    for value, label in (
+        (fresh_effective_request_digest, "effectiveRequestDigest"),
+        (fresh_patch_projection_evidence_digest, "patchProjectionEvidenceDigest"),
+    ):
+        if type(value) is not str or not _SHA256_RE.fullmatch(value):
+            _fail(f"fresh {label} must be lowercase 64-hex")
+    for value, label in (
+        (fresh_accepted_base_sha, "acceptedBaseSha"),
+        (fresh_accepted_base_tree_sha, "acceptedBaseTreeSha"),
+    ):
+        if type(value) is not str or not _SHA40_RE.fullmatch(value):
+            _fail(f"fresh {label} must be lowercase 40-hex")
+    if type(proposal_exists) is not bool:
+        _fail("proposal_exists must be boolean")
+    if (
+        fresh_effective_request_digest != historical_claim.effective_request_digest
+        or fresh_patch_projection_evidence_digest != historical_claim.patch_projection_evidence_digest
+    ):
+        return "PATCH_REGENERATION"
+    if (
+        fresh_accepted_base_sha != historical_claim.accepted_base_sha
+        or fresh_accepted_base_tree_sha != historical_claim.accepted_base_tree_sha
+    ):
+        return "MAIN_ADVANCE"
+    if historical_claim.transition_kind == "NORMALIZE" and not proposal_exists:
+        return "PROPOSAL"
+    return None
 
 
 @dataclass(frozen=True)

@@ -1,6 +1,9 @@
 import ast
 import base64
 import hashlib
+import json
+from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -10,6 +13,7 @@ from automation.federation.controller import (
     AppIdentity,
     C02CandidateBuilder,
     DuplicateAnchorError,
+    IssueManagedNoSemanticChange,
     IssueAnchorComment,
     IssueBranchLeaseComment,
     IssuePRBindingState,
@@ -32,35 +36,44 @@ from automation.federation.controller import (
 from automation.federation.request_model import (
     ISSUE_REQUEST_ANCHOR_MARKER,
     ISSUE_BRANCH_LEASE_MARKER,
+    ISSUE_HEAD_CLAIM_MARKER,
     ISSUE_INTERNAL_PR_BINDING_MARKER,
     PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
     CommentEvent,
     IssueRequestAnchor,
+    IssueHeadClaim,
     IssuePRBinding,
     IssueBranchLease,
     RequestClass,
     RequestAnchor,
     body_sha256,
+    classify_issue_head_claim_progression,
     parse_request_body,
     parse_issue_request_body,
     parse_issue_branch_lease,
     parse_issue_internal_pr_binding,
     parse_pr_issue_origin_binding,
     issue_branch_ref,
+    issue_head_claim_authority_digest,
+    effective_request_digest,
+    proposal_target_evidence_digest,
     render_request_body,
 )
 from automation.federation.github_api import (
     GitHubAPIError,
+    GitHubClient,
     GitCommitMetadata,
     GitObject,
     GitTreeEntry,
+    HttpResponse,
     IssueComment,
     IssueMetadata,
     NotFoundError,
     PullRequestMetadata,
     RefCASConflict,
     RepositoryMetadata,
+    REST_BASE_URL,
     ZERO_OID,
 )
 from scripts import federate as c02
@@ -226,6 +239,115 @@ class ControllerCoreTests(unittest.TestCase):
         shared_resolver.assert_called_once_with(request, RequestClass.ADD, accepted, metadata)
         self.assertEqual((source_id, repository_id), ("owner-repo", 99))
         self.assertEqual(set(desired), {"federation.json"})
+
+    def test_issue_managed_no_semantic_change_is_typed_before_transition_for_all_classes(self):
+        accepted_base = "a" * 40
+        for request_class in (RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE):
+            cases = [
+                controller_module.ProposalCandidate(
+                    "b" * 40, accepted_base, (), request_class, "owner-repo", 41, False,
+                ),
+                controller_module.ProposalCandidate(
+                    accepted_base, accepted_base, ("federation.json",), request_class, "owner-repo", 41, False,
+                ),
+            ]
+            if request_class in {RequestClass.UPDATE, RequestClass.REMOVE}:
+                cases.append(controller_module.ProposalCandidate(
+                    "b" * 40, accepted_base, ("README.md",), request_class, "owner-repo", 41, False,
+                ))
+            for candidate in cases:
+                with self.subTest(request_class=request_class, candidate=candidate):
+                    with self.assertRaises(IssueManagedNoSemanticChange) as caught:
+                        controller_module._require_semantic_issue_candidate(candidate, request_class, accepted_base)
+                    self.assertEqual(caught.exception.reason, "NO_SEMANTIC_CHANGE")
+                    self.assertEqual(str(caught.exception), "NO_SEMANTIC_CHANGE")
+                    self.assertIs(caught.exception.request_class, request_class)
+
+    def test_shared_candidate_builder_preserves_legacy_noop_and_update_remove_errors(self):
+        accepted_base = "a" * 40
+        class ReadClient:
+            def __init__(_self, blobs):
+                _self.blobs = blobs
+
+            def get_blob(_self, _repository, blob_sha):
+                return _self.blobs[blob_sha]
+
+            def get_commit_tree(_self, *_args):
+                raise AssertionError("legacy no-diff/no-federation behavior must return before commit reads")
+
+        for request_class in (RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE):
+            with self.subTest(empty_request_class=request_class):
+                same_blob = "b" * 40
+                same_bytes = b"same accepted bytes\n"
+                builder = C02CandidateBuilder(ReadClient({same_blob: same_bytes}), "swiftstream/skills", trusted_checkout_sha=accepted_base)
+                request = self.source_request(request_class)
+                desired = {"federation.json": ("100644", same_bytes)}
+                tree = {"federation.json": ("100644", "blob", same_blob)}
+                with (
+                    patch.object(controller_module, "trusted_c02_execution", return_value=nullcontext(Path("."))),
+                    patch.object(builder, "_plan", return_value=(desired, tree, "owner-repo", 41)),
+                ):
+                    candidate = builder(request, request_class, accepted_base, "c" * 40)
+                self.assertEqual(candidate, controller_module.ProposalCandidate(
+                    accepted_base, accepted_base, (), request_class, "owner-repo", 41, False,
+                ))
+
+        for request_class in (RequestClass.UPDATE, RequestClass.REMOVE):
+            with self.subTest(non_federation_request_class=request_class):
+                old_blob = "d" * 40
+                builder = C02CandidateBuilder(
+                    ReadClient({old_blob: b"old README\n"}),
+                    "swiftstream/skills",
+                    trusted_checkout_sha=accepted_base,
+                )
+                request = self.source_request(request_class)
+                desired = {"README.md": ("100644", b"new README\n")}
+                tree = {"README.md": ("100644", "blob", old_blob)}
+                with (
+                    patch.object(controller_module, "trusted_c02_execution", return_value=nullcontext(Path("."))),
+                    patch.object(builder, "_plan", return_value=(desired, tree, "owner-repo", 41)),
+                    self.assertRaises(R02Error) as caught,
+                ):
+                    builder(request, request_class, accepted_base, "c" * 40)
+                self.assertIs(type(caught.exception), R02Error)
+                self.assertEqual(
+                    str(caught.exception),
+                    "UPDATE/REMOVE requires an actual federation.json trust/configuration change",
+                )
+
+    def test_issue_managed_candidate_planning_translates_only_exact_legacy_error(self):
+        accepted_base = "a" * 40
+        legacy_error = "UPDATE/REMOVE requires an actual federation.json trust/configuration change"
+        for request_class in (RequestClass.UPDATE, RequestClass.REMOVE):
+            with self.subTest(request_class=request_class):
+                def legacy_builder(*_args):
+                    raise R02Error(legacy_error)
+
+                with self.assertRaises(IssueManagedNoSemanticChange) as caught:
+                    controller_module._plan_issue_managed_candidate(
+                        legacy_builder, self.source_request(request_class), request_class,
+                        accepted_base, "b" * 40,
+                    )
+                self.assertIs(caught.exception.request_class, request_class)
+                self.assertEqual(str(caught.exception), "NO_SEMANTIC_CHANGE")
+
+        unrelated = R02Error("unrelated candidate planning failure")
+        with self.assertRaises(R02Error) as caught:
+            controller_module._plan_issue_managed_candidate(
+                lambda *_args: (_ for _ in ()).throw(unrelated),
+                self.source_request(RequestClass.UPDATE), RequestClass.UPDATE,
+                accepted_base, "b" * 40,
+            )
+        self.assertIs(caught.exception, unrelated)
+
+        same_text_subclass = StaleAuthorityError(legacy_error)
+        with self.assertRaises(StaleAuthorityError) as caught:
+            controller_module._plan_issue_managed_candidate(
+                lambda *_args: (_ for _ in ()).throw(same_text_subclass),
+                self.source_request(RequestClass.UPDATE), RequestClass.UPDATE,
+                accepted_base, "b" * 40,
+            )
+        self.assertIs(caught.exception, same_text_subclass)
 
     def test_authority_and_structural_classification(self):
         self.assertEqual(classify_request(marker_content="add-source"), RequestClass.ADD)
@@ -1650,6 +1772,818 @@ class IssuePRBindingControllerTests(unittest.TestCase):
         self.assertEqual(len(client.binding_posts), 2)
         self.assertTrue(client.comments[-1].body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER))
         self.assertTrue(client.pr_comments[81][-1].body.startswith(PR_ISSUE_ORIGIN_BINDING_MARKER))
+
+
+class IssueHeadClaimControllerTests(unittest.TestCase):
+    APP = IssueAnchorControllerTests.APP
+    CENTRAL = IssuePRBindingControllerTests.CENTRAL_REPOSITORY
+    CENTRAL_NODE_ID = IssuePRBindingControllerTests.CENTRAL_NODE_ID
+    BASE_SHA = "a" * 40
+    INITIAL_HEAD_SHA = "b" * 40
+    BASE_TREE_SHA = "d" * 40
+    FROM_TREE_SHA = "c" * 40
+    TARGET_TREE_SHA = "e" * 40
+    AUTHOR_DATE = "2026-10-04T00:00:00Z"
+
+    @staticmethod
+    def _git_blob_sha(data):
+        return hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
+
+    def make_state(self, request_class=RequestClass.ADD):
+        issue = IssueAnchorControllerTests.issue(request_class)
+        anchor_comment, anchor = IssueAnchorControllerTests.persisted(issue, request_class)
+        lease = IssueBranchLease.create(
+            schema_version=1,
+            issue_number=issue.number,
+            issue_database_id=issue.database_id,
+            issue_node_id=issue.node_id,
+            issue_request_anchor_comment_database_id=anchor_comment.database_id,
+            issue_request_anchor_sha256=anchor.canonical_sha256(),
+            source_id=anchor.source_id,
+            source_repository_id=anchor.source_repository_id,
+            central_repository_node_id=self.CENTRAL_NODE_ID,
+            branch_ref=issue_branch_ref(issue.number),
+            accepted_base_sha=self.BASE_SHA,
+            carrier_role="ISSUE_ACTIVE",
+            claim_kind="ISSUE_BRANCH_LEASE",
+            claim_generation_id="1" * 64,
+            carrier_nonce="2" * 64,
+            authority_preimage_digest="3" * 64,
+            initial_head_sha=self.INITIAL_HEAD_SHA,
+            initial_head_tree_sha=self.FROM_TREE_SHA,
+            initial_head_parent_sha=self.BASE_SHA,
+            initial_head_marker_digest="4" * 64,
+            request_class=request_class,
+        )
+        lease_comment = IssueAnchorControllerTests.comment(lease.render(), database_id=101)
+        lease_comment_wrap = IssueBranchLeaseComment(lease, lease_comment)
+        binding = IssuePRBinding.create(
+            schema_version=1,
+            issue_number=issue.number,
+            issue_database_id=issue.database_id,
+            issue_node_id=issue.node_id,
+            issue_request_anchor_comment_database_id=anchor_comment.database_id,
+            issue_request_anchor_sha256=anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=lease_comment.database_id,
+            issue_branch_lease_sha256=hashlib.sha256(lease_comment.body.encode()).hexdigest(),
+            source_id=anchor.source_id,
+            source_repository_id=anchor.source_repository_id,
+            branch_ref=lease.branch_ref,
+            pull_request_number=81,
+            pull_request_database_id=810,
+            pull_request_node_id="PR_node_81",
+            initial_head_sha=lease.initial_head_sha,
+            base_ref="main",
+            central_repository_node_id=self.CENTRAL_NODE_ID,
+        )
+        issue_binding_comment = IssueAnchorControllerTests.comment(
+            binding.render_issue_binding(), database_id=102,
+        )
+        pr_binding_comment = IssueAnchorControllerTests.comment(
+            binding.render_pr_origin_binding(), database_id=103,
+        )
+        body = render_request_body(anchor.initial_request)
+        pr = PullRequestMetadata(
+            81, body, self.APP.bot_node_id, self.APP.bot_login,
+            self.INITIAL_HEAD_SHA, self.BASE_SHA,
+            lease.branch_ref.removeprefix("refs/heads/"), "main",
+            self.CENTRAL_NODE_ID, self.CENTRAL, self.CENTRAL_NODE_ID, self.CENTRAL,
+            None, False, False,
+        )
+        pr_issue = IssueMetadata(
+            81, 810, "PR_node_81", body, "open", self.APP.bot_node_id,
+            self.APP.bot_login, None, False, True,
+        )
+        state = IssuePRBindingState(
+            IssueAnchorComment(anchor, anchor_comment), lease_comment_wrap, binding,
+            issue_binding_comment, pr_binding_comment, pr, pr_issue,
+        )
+        return issue, anchor_comment, anchor, state
+
+    def make_proposal_claim(self, state):
+        old_bytes = b"old federation state\n"
+        new_bytes = b"new federation state\n"
+        old_blob = self._git_blob_sha(old_bytes)
+        new_blob = self._git_blob_sha(new_bytes)
+        evidence = [{
+            "path": "federation.json",
+            "state": "PRESENT",
+            "mode": "100644",
+            "objectType": "blob",
+            "blobSha": new_blob,
+            "contentSha256": hashlib.sha256(new_bytes).hexdigest(),
+        }]
+        target_digest = proposal_target_evidence_digest(
+            candidate_tree_sha=self.TARGET_TREE_SHA,
+            changed=evidence,
+            candidate_changed_paths=("federation.json",),
+        )
+        common = dict(
+            schema_version=1,
+            issue_number=state.issue_anchor.anchor.issue_number,
+            issue_database_id=state.issue_anchor.anchor.issue_database_id,
+            issue_node_id=state.issue_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+            issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+            issue_branch_lease_sha256=hashlib.sha256(state.lease.comment.body.encode()).hexdigest(),
+            binding_id=state.binding.binding_id,
+            source_id=state.binding.source_id,
+            source_repository_id=state.binding.source_repository_id,
+            pull_request_number=state.binding.pull_request_number,
+            pull_request_database_id=state.binding.pull_request_database_id,
+            pull_request_node_id=state.binding.pull_request_node_id,
+            central_repository_node_id=state.binding.central_repository_node_id,
+            branch_ref=state.binding.branch_ref,
+            request_class=RequestClass.ADD,
+            accepted_base_sha=self.BASE_SHA,
+            accepted_base_tree_sha=self.BASE_TREE_SHA,
+            from_head_sha=self.INITIAL_HEAD_SHA,
+            from_tree_sha=self.FROM_TREE_SHA,
+            to_head_sha="0" * 40,
+            to_tree_sha=self.TARGET_TREE_SHA,
+            transition_kind="PROPOSAL",
+            carrier_nonce="5" * 64,
+            effective_request_digest="6" * 64,
+            patch_projection_evidence_digest="7" * 64,
+            target_evidence_digest=target_digest,
+        )
+        prepared = IssueHeadClaim.create(**common)
+        marker = controller_module._issue_head_claim_marker(prepared).render()
+        to_head = controller_module._expected_deterministic_commit_sha(
+            self.TARGET_TREE_SHA, self.INITIAL_HEAD_SHA, marker, self.AUTHOR_DATE,
+        )
+        claim = IssueHeadClaim.create(**{**common, "to_head_sha": to_head})
+        trees = {
+            self.BASE_SHA: (self.BASE_TREE_SHA, (GitTreeEntry("federation.json", "100644", "blob", old_blob),)),
+            self.INITIAL_HEAD_SHA: (self.FROM_TREE_SHA, (GitTreeEntry("federation.json", "100644", "blob", old_blob),)),
+            to_head: (self.TARGET_TREE_SHA, (GitTreeEntry("federation.json", "100644", "blob", new_blob),)),
+        }
+        commits = {
+            self.BASE_SHA: GitCommitMetadata(self.BASE_SHA, self.BASE_TREE_SHA, (), self.AUTHOR_DATE),
+            self.INITIAL_HEAD_SHA: GitCommitMetadata(self.INITIAL_HEAD_SHA, self.FROM_TREE_SHA, (self.BASE_SHA,), self.AUTHOR_DATE),
+            to_head: GitCommitMetadata(to_head, self.TARGET_TREE_SHA, (self.INITIAL_HEAD_SHA,), self.AUTHOR_DATE),
+        }
+        return claim, commits, trees, {old_blob: old_bytes, new_blob: new_bytes}
+
+    def test_managed_normalize_reads_created_tree_and_claims_wrapper_before_cas(self):
+        issue, _anchor_comment, _anchor, original_state = self.make_state()
+        current_main = "f" * 40
+        current_main_tree = "9" * 40
+        raw_candidate_sha = "4" * 40
+        raw_candidate_tree = "5" * 40
+        normalized_tree_sha = "7" * 40
+        state = replace(original_state, pr=replace(original_state.pr, base_oid=current_main))
+        request = parse_issue_request_body(issue.body)
+        fold = type("Fold", (), {"request": request})()
+        repository = RepositoryMetadata(1, self.CENTRAL_NODE_ID, self.CENTRAL, "main")
+
+        base_bytes = b"fresh accepted federation state\n"
+        candidate_bytes = b"raw C02 candidate federation state\n"
+        base_blob = self._git_blob_sha(base_bytes)
+        candidate_blob = self._git_blob_sha(candidate_bytes)
+        marker_bytes = (RequestClass.ADD.value + "\n").encode("utf-8")
+        marker_blob = self._git_blob_sha(marker_bytes)
+        main_entries = (GitTreeEntry("federation.json", "100644", "blob", base_blob),)
+        candidate_entries = (GitTreeEntry("federation.json", "100644", "blob", candidate_blob),)
+        from_entries = (
+            GitTreeEntry(".federation-request", "100644", "blob", marker_blob),
+            GitTreeEntry("federation.json", "100644", "blob", "6" * 40),
+        )
+        target_entries = tuple(sorted(
+            (*main_entries, GitTreeEntry(".federation-request", "100644", "blob", marker_blob)),
+            key=lambda item: item.path.encode("utf-8"),
+        ))
+        tree_entries = {
+            current_main_tree: main_entries,
+            self.FROM_TREE_SHA: from_entries,
+            normalized_tree_sha: target_entries,
+        }
+        events = []
+
+        class TreeTransport:
+            def request(_self, method, url, headers, body, timeout):
+                expected_prefix = REST_BASE_URL + f"/repos/{self.CENTRAL}/git/trees/"
+                if method != "GET" or not url.startswith(expected_prefix) or not url.endswith("?recursive=1"):
+                    raise AssertionError((method, url))
+                requested_tree = url[len(expected_prefix):-len("?recursive=1")]
+                events.append(("get-tree", requested_tree))
+                entries = tree_entries[requested_tree]
+                payload = {
+                    "sha": requested_tree,
+                    "tree": [
+                        {"path": entry.path, "mode": entry.mode, "type": entry.object_type, "sha": entry.sha}
+                        for entry in entries
+                    ],
+                    "truncated": False,
+                }
+                return HttpResponse(200, url, json.dumps(payload).encode("utf-8"))
+
+        class ManagedNormalizeClient(GitHubClient):
+            def __init__(_self):
+                super().__init__(None, TreeTransport())
+                _self.current_ref = self.INITIAL_HEAD_SHA
+                _self.commit_reads = []
+                _self.commit_metadata = {
+                    current_main: GitCommitMetadata(current_main, current_main_tree, (), self.AUTHOR_DATE),
+                    self.INITIAL_HEAD_SHA: GitCommitMetadata(
+                        self.INITIAL_HEAD_SHA, self.FROM_TREE_SHA, (self.BASE_SHA,), self.AUTHOR_DATE,
+                    ),
+                }
+                _self.blobs = {
+                    base_blob: base_bytes,
+                    candidate_blob: candidate_bytes,
+                    marker_blob: marker_bytes,
+                }
+                _self.pull_comments = []
+                _self.ref_updates = []
+                _self.created_tree = None
+                _self.created_commit = None
+
+            def get_commit_metadata(_self, _repository, commit_sha):
+                _self.commit_reads.append(commit_sha)
+                if commit_sha not in _self.commit_metadata:
+                    raise AssertionError(f"unexpected commit metadata read: {commit_sha}")
+                return _self.commit_metadata[commit_sha]
+
+            def get_blob(_self, _repository, blob_sha):
+                return _self.blobs[blob_sha]
+
+            def create_blob(_self, _repository, content, *, encoding="base64"):
+                self.assertEqual(encoding, "base64")
+                data = base64.b64decode(content, validate=True)
+                self.assertEqual(data, marker_bytes)
+                events.append(("create-blob", data))
+                return GitObject(marker_blob)
+
+            def create_tree(_self, _repository, base_tree, entries):
+                entry_list = list(entries)
+                self.assertEqual(base_tree, current_main_tree)
+                self.assertEqual(entry_list, [{
+                    "path": ".federation-request", "mode": "100644", "type": "blob", "sha": marker_blob,
+                }])
+                events.append(("create-tree", base_tree))
+                _self.created_tree = (base_tree, entry_list)
+                return GitObject(normalized_tree_sha)
+
+            def create_commit(_self, _repository, message, tree, parents, *, timestamp=None):
+                parent_list = list(parents)
+                self.assertEqual(tree, normalized_tree_sha)
+                self.assertEqual(parent_list, [self.INITIAL_HEAD_SHA])
+                wrapper_sha = controller_module._expected_deterministic_commit_sha(
+                    tree, parent_list[0], message, timestamp,
+                )
+                events.append(("create-commit", tree, tuple(parent_list)))
+                _self.created_commit = (message, tree, tuple(parent_list), timestamp, wrapper_sha)
+                _self.commit_metadata[wrapper_sha] = GitCommitMetadata(
+                    wrapper_sha, tree, tuple(parent_list), timestamp,
+                )
+                return GitObject(wrapper_sha)
+
+            def create_issue_comment(_self, _repository, number, body):
+                self.assertEqual(number, state.binding.pull_request_number)
+                events.append(("claim-post", body))
+                comment = IssueAnchorControllerTests.comment(body, database_id=501)
+                _self.pull_comments.append(comment)
+                return comment
+
+            def list_issue_comments(_self, _repository, number):
+                if number == state.binding.pull_request_number:
+                    if _self.pull_comments:
+                        events.append(("claim-readback", _self.pull_comments[-1].body))
+                    return tuple(_self.pull_comments)
+                return ()
+
+            def get_issue_metadata(_self, _repository, number):
+                self.assertEqual(number, issue.number)
+                return issue
+
+            def get_pull_request_metadata(_self, _repository, number):
+                self.assertEqual(number, state.binding.pull_request_number)
+                return state.pr
+
+            def get_ref_oid(_self, _repository, _branch):
+                return _self.current_ref
+
+            def update_refs(_self, repository_id, updates):
+                update_list = tuple(updates)
+                events.append(("ref-cas", repository_id, update_list))
+                _self.ref_updates.append((repository_id, update_list))
+                _self.current_ref = update_list[0].after_oid
+                return {}
+
+        client = ManagedNormalizeClient()
+        candidate = controller_module.ProposalCandidate(
+            raw_candidate_sha,
+            current_main,
+            ("federation.json",),
+            RequestClass.ADD,
+            "owner-repo",
+            41,
+            False,
+        )
+        snapshots = {
+            current_main: (
+                client.commit_metadata[current_main], current_main_tree, main_entries,
+            ),
+            raw_candidate_sha: (
+                GitCommitMetadata(raw_candidate_sha, raw_candidate_tree, (current_main,), self.AUTHOR_DATE),
+                raw_candidate_tree,
+                candidate_entries,
+            ),
+            self.INITIAL_HEAD_SHA: (
+                client.commit_metadata[self.INITIAL_HEAD_SHA], self.FROM_TREE_SHA, from_entries,
+            ),
+        }
+        lease_snapshot_calls = []
+        real_lease_snapshot = controller_module._lease_tree_snapshot
+
+        def lease_snapshot(_client, repository_name, commit_sha):
+            self.assertNotEqual(commit_sha, normalized_tree_sha)
+            lease_snapshot_calls.append(commit_sha)
+            if commit_sha in snapshots:
+                return snapshots[commit_sha]
+            return real_lease_snapshot(_client, repository_name, commit_sha)
+
+        claim_readbacks = []
+
+        def read_claims(_client, _repository, comments, _app, _state, current_ref):
+            claims = []
+            for comment in comments:
+                if comment.body.startswith(ISSUE_HEAD_CLAIM_MARKER):
+                    claim = controller_module.parse_issue_head_claim(comment.body)
+                    claim_readbacks.append((claim, current_ref))
+                    claims.append(controller_module.IssueHeadClaimComment(
+                        claim, comment, claim.to_head_sha == current_ref,
+                    ))
+            return tuple(claims)
+
+        controller = controller_module.R02Controller.__new__(controller_module.R02Controller)
+        controller.client = client
+        controller.central_repository = self.CENTRAL
+        controller.app = self.APP
+        controller.candidate_builder = lambda *_args: candidate
+        with (
+            patch.object(
+                controller_module, "_validate_managed_issue_head_history",
+                return_value=(state, self.INITIAL_HEAD_SHA, (), ()),
+            ),
+            patch.object(controller_module, "_ensure_managed_issue_pr_request_anchor"),
+            patch.object(controller_module, "_read_managed_issue_pr_binding_state", return_value=state),
+            patch.object(controller_module, "_fresh_issue_projection_set", return_value=(fold, ())),
+            patch.object(controller_module, "_synchronize_issue_patch_projections", return_value=(fold, (), (), ())),
+            patch.object(controller_module, "_validate_issue_source_authority"),
+            patch.object(controller_module, "_issue_pr_authority_fence"),
+            patch.object(controller_module, "_issue_head_claim_comments", side_effect=read_claims),
+            patch.object(controller_module, "_lease_tree_snapshot", side_effect=lease_snapshot),
+            patch.object(controller, "current_accepted_main", return_value=(repository, current_main)),
+        ):
+            final_claim = controller.interactive_issue_managed_proposal(
+                issue.number, lambda *_args: IssueAnchorControllerTests.authority(), nonce_factory=lambda: "8" * 64,
+            )
+
+        self.assertEqual(final_claim.transition_kind, "NORMALIZE")
+        self.assertEqual(final_claim.accepted_base_sha, current_main)
+        self.assertEqual(final_claim.accepted_base_tree_sha, current_main_tree)
+        self.assertEqual(final_claim.to_tree_sha, normalized_tree_sha)
+        self.assertEqual(client.created_tree[0], current_main_tree)
+        self.assertEqual(client.created_commit[1:3], (normalized_tree_sha, (self.INITIAL_HEAD_SHA,)))
+        self.assertIn(("get-tree", normalized_tree_sha), events)
+        self.assertLess(events.index(("create-tree", current_main_tree)), events.index(("get-tree", normalized_tree_sha)))
+        self.assertLess(events.index(("get-tree", normalized_tree_sha)), next(i for i, event in enumerate(events) if event[0] == "create-commit"))
+        self.assertNotIn(normalized_tree_sha, client.commit_reads)
+        self.assertNotIn(normalized_tree_sha, lease_snapshot_calls)
+        self.assertEqual(len(claim_readbacks), 1)
+        self.assertEqual(claim_readbacks[0][0], final_claim)
+        self.assertEqual(claim_readbacks[0][1], self.INITIAL_HEAD_SHA)
+        event_names = [event[0] for event in events]
+        self.assertLess(event_names.index("claim-post"), event_names.index("claim-readback"))
+        self.assertLess(event_names.index("claim-readback"), event_names.index("ref-cas"))
+        self.assertEqual(len(client.ref_updates), 1)
+        repository_id, updates = client.ref_updates[0]
+        self.assertEqual(repository_id, self.CENTRAL_NODE_ID)
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0].before_oid, self.INITIAL_HEAD_SHA)
+        self.assertEqual(updates[0].after_oid, final_claim.to_head_sha)
+        self.assertIs(updates[0].force, False)
+        self.assertNotEqual(updates[0].after_oid, normalized_tree_sha)
+        self.assertEqual(client.current_ref, final_claim.to_head_sha)
+
+    def test_f1_proposal_remains_historically_valid_after_f2_and_losing_cas_is_nonactive(self):
+        _issue, _anchor_comment, _anchor, state = self.make_state()
+        claim, commits, trees, blobs = self.make_proposal_claim(state)
+        claim_comment = IssueAnchorControllerTests.comment(claim.render(), database_id=300)
+
+        class HistoricalClient:
+            current_issue_comments = ()
+
+            def get_commit_metadata(_self, _repository, sha):
+                return commits[sha]
+
+            def get_commit_tree(_self, _repository, sha):
+                return trees[sha]
+
+            def get_blob(_self, _repository, sha):
+                return blobs[sha]
+
+        # F2 exists only in the mutable source Issue comments. Historical claim
+        # validation must prove F1 from its stored evidence and Git target alone.
+        f2 = IssueAnchorControllerTests.comment(
+            f"{PATCH_SENTINEL}\n\nDescription:\nF2\n", database_id=400,
+            author_id="U_requester", author_login="alice", author_type="User",
+        )
+        historical_client = HistoricalClient()
+        historical_client.current_issue_comments = (f2,)
+        with patch.object(controller_module, "reconstruct_issue_from_github", side_effect=AssertionError("historical path must not fold current Issue comments")):
+            validated = controller_module._issue_head_claim_comments(
+                historical_client, self.CENTRAL, [claim_comment], self.APP, state, "9" * 40,
+            )
+        self.assertEqual(len(validated), 1)
+        self.assertEqual(validated[0].claim, claim)
+        self.assertFalse(validated[0].active)
+        active = controller_module._issue_head_claim_comments(
+            historical_client, self.CENTRAL, [claim_comment], self.APP, state, claim.to_head_sha,
+        )
+        self.assertTrue(active[0].active)
+        self.assertEqual(
+            classify_issue_head_claim_progression(
+                claim,
+                fresh_effective_request_digest="8" * 64,
+                fresh_patch_projection_evidence_digest="7" * 64,
+                fresh_accepted_base_sha="a" * 40,
+                fresh_accepted_base_tree_sha=self.BASE_TREE_SHA,
+                proposal_exists=True,
+            ),
+            "PATCH_REGENERATION",
+        )
+        self.assertEqual(
+            classify_issue_head_claim_progression(
+                claim,
+                fresh_effective_request_digest=claim.effective_request_digest,
+                fresh_patch_projection_evidence_digest=claim.patch_projection_evidence_digest,
+                fresh_accepted_base_sha="8" * 40,
+                fresh_accepted_base_tree_sha="9" * 40,
+                proposal_exists=True,
+            ),
+            "MAIN_ADVANCE",
+        )
+        self.assertEqual(
+            classify_issue_head_claim_progression(
+                claim,
+                fresh_effective_request_digest="8" * 64,
+                fresh_patch_projection_evidence_digest="9" * 64,
+                fresh_accepted_base_sha="8" * 40,
+                fresh_accepted_base_tree_sha="9" * 40,
+                proposal_exists=True,
+            ),
+            "PATCH_REGENERATION",
+        )
+
+    def test_f2_racing_claim_post_keeps_persisted_f1_fields_unchanged(self):
+        _issue, _anchor_comment, _anchor, state = self.make_state()
+        claim, _commits, _trees, _blobs = self.make_proposal_claim(state)
+
+        class PersistClient:
+            def __init__(_self):
+                _self.pr_comments = [state.pr_binding_comment]
+                _self.issue_comments = []
+
+            def create_issue_comment(_self, _repository, number, body):
+                self.assertEqual(number, state.binding.pull_request_number)
+                _self.pr_comments.append(IssueAnchorControllerTests.comment(body, database_id=301))
+                _self.issue_comments.append(IssueAnchorControllerTests.comment(
+                    f"{PATCH_SENTINEL}\n\nDescription:\nF2\n", database_id=400,
+                    author_id="U_requester", author_login="alice", author_type="User",
+                ))
+
+            def list_issue_comments(_self, _repository, number):
+                return tuple(_self.pr_comments)
+
+            def get_ref_oid(_self, _repository, _branch):
+                return self.INITIAL_HEAD_SHA
+
+        client = PersistClient()
+        with (
+            patch.object(controller_module, "_validate_issue_head_claim_target"),
+            patch.object(controller_module, "reconstruct_issue_from_github", side_effect=AssertionError("claim persistence must not refold F2")),
+        ):
+            controller = controller_module.R02Controller.__new__(controller_module.R02Controller)
+            controller.client = client
+            controller.central_repository = self.CENTRAL
+            controller.app = self.APP
+            persisted = controller._persist_issue_head_claim(state, claim)
+        self.assertEqual(persisted.claim, claim)
+        self.assertEqual(persisted.claim.carrier_nonce, claim.carrier_nonce)
+        self.assertEqual(persisted.claim.target_evidence_digest, claim.target_evidence_digest)
+        self.assertEqual(persisted.claim.to_head_sha, claim.to_head_sha)
+        self.assertEqual(len(client.issue_comments), 1)
+
+    def test_crash_replay_uses_persisted_claim_target_and_single_force_false_cas(self):
+        _issue, _anchor_comment, _anchor, state = self.make_state()
+        claim, _commits, _trees, _blobs = self.make_proposal_claim(state)
+
+        class CASClient:
+            def __init__(_self):
+                _self.ref = claim.from_head_sha
+                _self.updates = []
+                _self.comment_posts = []
+
+            def get_ref_oid(_self, _repository, _branch):
+                return _self.ref
+
+            def update_refs(_self, _repository_id, updates):
+                _self.updates.append(tuple(updates))
+                update = updates[0]
+                _self.ref = update.after_oid
+
+        client = CASClient()
+        controller = controller_module.R02Controller.__new__(controller_module.R02Controller)
+        controller.client = client
+        controller.central_repository = self.CENTRAL
+        controller._apply_persisted_issue_head_claim(state, claim, claim.from_head_sha)
+        self.assertEqual(len(client.updates), 1)
+        update = client.updates[0][0]
+        self.assertEqual(update.before_oid, claim.from_head_sha)
+        self.assertEqual(update.after_oid, claim.to_head_sha)
+        self.assertIs(update.force, False)
+        self.assertEqual(client.ref, claim.to_head_sha)
+        self.assertEqual(client.comment_posts, [])
+
+    def test_accepted_patch_projection_is_persisted_on_bound_pr_and_complete_before_transition(self):
+        issue, _anchor_comment, _anchor, state = self.make_state()
+        patch_comment = IssueAnchorControllerTests.comment(
+            f"{PATCH_SENTINEL}\n\nDescription:\nProjected description\n",
+            database_id=104,
+            author_id="U_requester",
+            author_login="alice",
+            author_type="User",
+        )
+        source_comments = (
+            state.issue_anchor.comment,
+            state.lease.comment,
+            patch_comment,
+            state.issue_binding_comment,
+        )
+
+        class ProjectionClient:
+            def __init__(_self):
+                _self.source_comments = list(source_comments)
+                _self.pr_comments = [state.pr_binding_comment]
+                _self.posts = []
+
+            def get_collaborator_permission(_self, _repository, _login):
+                raise AssertionError("original requester authorization needs no permission read")
+
+            def create_issue_patch_projection_comment(_self, _repository, number, body):
+                _self.posts.append((number, body))
+                _self.pr_comments.append(IssueAnchorControllerTests.comment(body, database_id=302))
+
+            def list_issue_comments(_self, _repository, number):
+                return tuple(_self.source_comments if number == issue.number else _self.pr_comments)
+
+            def get_issue_metadata(_self, _repository, number):
+                if number != issue.number:
+                    raise AssertionError("projection refresh must reread the source Issue")
+                return issue
+
+        client = ProjectionClient()
+        fold, projections, _fresh_source_comments, fresh_pr_comments = controller_module._synchronize_issue_patch_projections(
+            client,
+            self.CENTRAL,
+            issue,
+            state.issue_anchor,
+            state.binding,
+            source_comments,
+            [state.pr_binding_comment],
+            self.APP,
+            None,
+        )
+        self.assertEqual(fold.request.description, "Projected description")
+        self.assertEqual(len(projections), 1)
+        self.assertEqual(client.posts[0][0], state.binding.pull_request_number)
+        self.assertTrue(any(comment.body.startswith("<!-- swiftstream-federation-issue-patch-projection:v1 -->") for comment in fresh_pr_comments))
+        with self.assertRaises(R02Error):
+            controller_module._fresh_issue_projection_set(
+                client, self.CENTRAL, issue, state.issue_anchor, state.binding,
+                tuple(source_comments) + (fresh_pr_comments[-1],), fresh_pr_comments,
+                self.APP, None, require_complete=True,
+            )
+
+    def test_managed_issue_pr_hands_off_one_exact_reusable_request_anchor(self):
+        _issue, _anchor_comment, _anchor, state = self.make_state()
+
+        class AnchorClient:
+            def __init__(_self):
+                _self.comments = [state.pr_binding_comment]
+                _self.posts = []
+
+            def get_pull_request_metadata(_self, _repository, number):
+                self.assertEqual(number, state.binding.pull_request_number)
+                return state.pr
+
+            def list_issue_comments(_self, _repository, number):
+                self.assertEqual(number, state.binding.pull_request_number)
+                return tuple(_self.comments)
+
+            def create_issue_comment(_self, _repository, number, body):
+                _self.posts.append((number, body))
+                _self.comments.append(IssueAnchorControllerTests.comment(body, database_id=304))
+
+        client = AnchorClient()
+        first = controller_module._ensure_managed_issue_pr_request_anchor(
+            client, self.CENTRAL, state, RequestClass.ADD, self.APP,
+        )
+        replay = controller_module._ensure_managed_issue_pr_request_anchor(
+            client, self.CENTRAL, state, RequestClass.ADD, self.APP,
+        )
+        self.assertEqual(first, replay)
+        self.assertEqual(first.anchor.initial_request, state.issue_anchor.anchor.initial_request)
+        self.assertEqual(len(client.posts), 1)
+        self.assertEqual(client.posts[0][0], state.binding.pull_request_number)
+
+    def test_no_semantic_change_stops_each_request_class_before_claim_or_status_mutation(self):
+        repository = RepositoryMetadata(1, self.CENTRAL_NODE_ID, self.CENTRAL, "main")
+
+        class ReadOnlyClient:
+            def __init__(_self):
+                _self.writes = []
+
+            def get_repository_metadata(_self, _repository):
+                return repository
+
+            def list_issue_comments(_self, _repository, _number):
+                return ()
+
+            def get_issue_metadata(_self, _repository, number):
+                self.assertEqual(number, issue.number)
+                return issue
+
+            def get_pull_request_metadata(_self, _repository, number):
+                self.assertEqual(number, state.binding.pull_request_number)
+                return state.pr
+
+            def __getattr__(_self, name):
+                if name.startswith(("create_", "update_", "dispatch_", "merge_", "close_")):
+                    return lambda *_args, **_kwargs: _self.writes.append(name)
+                raise AttributeError(name)
+
+        for request_class in (RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE):
+            with self.subTest(request_class=request_class):
+                issue, _anchor_comment, _anchor, state = self.make_state(request_class)
+                request = parse_issue_request_body(issue.body)
+                fold = type("Fold", (), {"request": request})()
+                main_meta = GitCommitMetadata(self.BASE_SHA, self.BASE_TREE_SHA, (), self.AUTHOR_DATE)
+                client = ReadOnlyClient()
+
+                def no_semantic_candidate(*_args):
+                    raise IssueManagedNoSemanticChange(request_class)
+
+                controller = controller_module.R02Controller.__new__(controller_module.R02Controller)
+                controller.client = client
+                controller.central_repository = self.CENTRAL
+                controller.app = self.APP
+                controller.candidate_builder = no_semantic_candidate
+                with (
+                    patch.object(
+                        controller_module,
+                        "_validate_managed_issue_head_history",
+                        return_value=(state, self.INITIAL_HEAD_SHA, (), ()),
+                    ),
+                    patch.object(controller_module, "_ensure_managed_issue_pr_request_anchor", return_value=object()),
+                    patch.object(controller_module, "_read_managed_issue_pr_binding_state", return_value=state),
+                    patch.object(controller_module, "_fresh_issue_projection_set", return_value=(fold, ())),
+                    patch.object(controller_module, "_synchronize_issue_patch_projections", return_value=(fold, (), (), ())),
+                    patch.object(controller_module, "_validate_issue_source_authority"),
+                    patch.object(controller_module, "_issue_pr_authority_fence"),
+                    patch.object(controller_module, "_issue_head_claim_comments", return_value=()),
+                    patch.object(
+                        controller_module,
+                        "_lease_tree_snapshot",
+                        return_value=(main_meta, self.BASE_TREE_SHA, ()),
+                    ),
+                    patch.object(controller_module, "_read_issue_branch_ref", return_value=self.INITIAL_HEAD_SHA),
+                    patch.object(controller, "current_accepted_main", return_value=(repository, self.BASE_SHA)),
+                ):
+                    first = controller.interactive_issue_managed_route(
+                        issue.number,
+                        lambda *_args: object(),
+                    )
+                    replay = controller.interactive_issue_managed_route(
+                        issue.number,
+                        lambda *_args: object(),
+                    )
+                self.assertEqual(first.outcome, "NOOP")
+                self.assertEqual(first.reason, "NO_SEMANTIC_CHANGE")
+                self.assertIs(first.request_class, request_class)
+                self.assertEqual(replay, first)
+                self.assertEqual(client.writes, [])
+
+    def test_claim_ready_route_result_includes_exact_request_class(self):
+        _issue, _anchor_comment, _anchor, state = self.make_state(RequestClass.ADD)
+        claim, _commits, _trees, _blobs = self.make_proposal_claim(state)
+        controller = controller_module.R02Controller.__new__(controller_module.R02Controller)
+        with patch.object(controller, "interactive_issue_managed_proposal", return_value=claim):
+            result = controller.interactive_issue_managed_route(7, lambda *_args: object())
+        self.assertEqual(result, controller_module.IssueManagedRouteResult(
+            "CLAIM_READY", claim.transition_kind, RequestClass.ADD,
+        ))
+        self.assertIs(result.request_class, claim.request_class)
+
+    def test_patch_and_main_advance_uses_patch_regeneration_from_fresh_main(self):
+        issue, _anchor_comment, _anchor, original_state = self.make_state()
+        claim, _commits, _trees, _blobs = self.make_proposal_claim(original_state)
+        fresh_main = "8" * 40
+        fresh_main_tree = "9" * 40
+        fresh_main_meta = GitCommitMetadata(fresh_main, fresh_main_tree, (), self.AUTHOR_DATE)
+        state = replace(
+            original_state,
+            pr=replace(original_state.pr, head_oid=claim.to_head_sha, base_oid=fresh_main),
+        )
+        request = parse_issue_request_body(issue.body)
+        fold = type("Fold", (), {"request": request})()
+        repository = RepositoryMetadata(1, self.CENTRAL_NODE_ID, self.CENTRAL, "main")
+        active = controller_module.IssueHeadClaimComment(
+            claim,
+            IssueAnchorControllerTests.comment(claim.render(), database_id=300),
+            True,
+        )
+
+        class ReadOnlyClient:
+            def __init__(_self):
+                _self.writes = []
+
+            def get_repository_metadata(_self, _repository):
+                return repository
+
+            def list_issue_comments(_self, _repository, _number):
+                return ()
+
+            def get_issue_metadata(_self, _repository, number):
+                self.assertEqual(number, issue.number)
+                return issue
+
+            def get_pull_request_metadata(_self, _repository, number):
+                self.assertEqual(number, state.binding.pull_request_number)
+                return state.pr
+
+            def __getattr__(_self, name):
+                if name.startswith(("create_", "update_", "dispatch_", "merge_", "close_")):
+                    return lambda *_args, **_kwargs: _self.writes.append(name)
+                raise AttributeError(name)
+
+        client = ReadOnlyClient()
+        candidate_inputs = []
+        classified_transitions = []
+
+        def candidate_from_fresh_snapshot(request_value, request_class, accepted_base_sha, head_sha):
+            candidate_inputs.append((request_value, request_class, accepted_base_sha, head_sha))
+            raise IssueManagedNoSemanticChange(request_class)
+
+        def classify_transition(*args, **kwargs):
+            result = classify_issue_head_claim_progression(*args, **kwargs)
+            classified_transitions.append(result)
+            return result
+
+        controller = controller_module.R02Controller.__new__(controller_module.R02Controller)
+        controller.client = client
+        controller.central_repository = self.CENTRAL
+        controller.app = self.APP
+        controller.candidate_builder = candidate_from_fresh_snapshot
+        with (
+            patch.object(
+                controller_module,
+                "_validate_managed_issue_head_history",
+                return_value=(state, claim.to_head_sha, (), (active,)),
+            ),
+            patch.object(controller_module, "_ensure_managed_issue_pr_request_anchor", return_value=object()),
+            patch.object(controller_module, "_read_managed_issue_pr_binding_state", return_value=state),
+            patch.object(controller_module, "_fresh_issue_projection_set", return_value=(fold, ())),
+            patch.object(controller_module, "_synchronize_issue_patch_projections", return_value=(fold, (), (), ())),
+            patch.object(controller_module, "_validate_issue_source_authority"),
+            patch.object(controller_module, "_issue_pr_authority_fence"),
+            patch.object(controller_module, "_issue_head_claim_comments", return_value=(active,)),
+            patch.object(
+                controller_module,
+                "_lease_tree_snapshot",
+                side_effect=[
+                    (fresh_main_meta, fresh_main_tree, ()),
+                    (fresh_main_meta, fresh_main_tree, ()),
+                ],
+            ),
+            patch.object(controller_module, "_read_issue_branch_ref", return_value=claim.to_head_sha),
+            patch.object(controller, "current_accepted_main", return_value=(repository, fresh_main)),
+            patch.object(
+                controller_module,
+                "classify_issue_head_claim_progression",
+                side_effect=classify_transition,
+            ),
+        ):
+            with self.assertRaises(IssueManagedNoSemanticChange):
+                controller.interactive_issue_managed_proposal(issue.number, lambda *_args: object())
+
+        self.assertEqual(classified_transitions, ["PATCH_REGENERATION"])
+        self.assertEqual(candidate_inputs, [(request, RequestClass.ADD, fresh_main, claim.to_head_sha)])
+        self.assertEqual(client.writes, [])
 
 
 if __name__ == "__main__":
