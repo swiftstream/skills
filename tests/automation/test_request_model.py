@@ -14,6 +14,8 @@ from automation.federation.request_model import (
     ISSUE_INTERNAL_PR_BINDING_MARKER,
     ISSUE_PATCH_PROJECTION_MARKER,
     ISSUE_HEAD_CLAIM_MARKER,
+    REQUIRED_STATUS_EPOCH_MARKER,
+    ISSUE_FINALIZATION_EPOCH_MARKER,
     PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
     MAX_BODY_BYTES,
@@ -25,6 +27,10 @@ from automation.federation.request_model import (
     IssuePatchEvent,
     IssuePatchProjection,
     IssueHeadClaim,
+    RequiredStatusEpoch,
+    RequiredStatusEpochReason,
+    IssueFinalizationEpoch,
+    ExactAppRequiredStatusEvidence,
     IssueBranchLease,
     IssueRequestAnchor,
     IssuePRBinding,
@@ -58,6 +64,7 @@ from automation.federation.request_model import (
     normalize_target_evidence_digest,
     proposal_target_evidence_digest,
     issue_head_claim_authority_digest,
+    issue_final_status_evidence_digest,
     external_status_evidence_digest,
     parse_status_description,
     render_status_description,
@@ -67,6 +74,9 @@ from automation.federation.request_model import (
     parse_issue_branch_lease,
     parse_issue_patch_projection,
     parse_issue_head_claim,
+    parse_required_status_epoch,
+    parse_issue_finalization_epoch,
+    parse_exact_app_required_status_evidence,
     parse_anchor,
     parse_issue_request_body,
     parse_issue_request_anchor,
@@ -1861,6 +1871,389 @@ class Wave05CarrierStatusModelTests(unittest.TestCase):
         )
         self.assertEqual(marker.render(), expected)
         self.assertEqual(parse_claimed_head_marker(expected), marker)
+
+
+class Wave06EpochModelTests(unittest.TestCase):
+    @staticmethod
+    def exact_status(**changes):
+        fields = dict(
+            status_id=901,
+            status_node_id="SC_kwDOStatus",
+            state="success",
+            context="federation/trusted-validation",
+            description=render_status_description(StatusClass.ISSUE_FINAL, "a" * 64),
+            target_url=None,
+            creator_database_id=4834068,
+            creator_node_id="MDM6QXBwNDgzNDA2OA",
+            creator_login="swiftstream-federation[bot]",
+            creator_type="Bot",
+            created_at="2026-10-05T10:11:12Z",
+            updated_at="2026-10-05T10:11:12.123Z",
+        )
+        fields.update(changes)
+        return ExactAppRequiredStatusEvidence(**fields)
+
+    @staticmethod
+    def required_fields(**changes):
+        fields = dict(
+            issue_number=7,
+            issue_database_id=700,
+            issue_node_id="I_kwDOIssue",
+            issue_request_anchor_comment_database_id=101,
+            issue_request_anchor_sha256="a" * 64,
+            issue_branch_lease_comment_database_id=102,
+            issue_branch_lease_sha256="b" * 64,
+            binding_id="c" * 64,
+            source_id="owner-repo",
+            source_repository_id=41,
+            pull_request_number=8,
+            pull_request_database_id=800,
+            pull_request_node_id="PR_kwDOPull",
+            central_repository_node_id="R_central",
+            branch_ref="refs/heads/bot/federation/request/issue-7",
+            request_class=RequestClass.ADD,
+            accepted_base_sha="1" * 40,
+            accepted_base_tree_sha="2" * 40,
+            base_ref="main",
+            from_head_sha="3" * 40,
+            from_tree_sha="4" * 40,
+            to_head_sha="5" * 40,
+            to_tree_sha="4" * 40,
+            carrier_nonce="6" * 64,
+            reason_class=RequiredStatusEpochReason.ACTIVE_REVALIDATION,
+            from_provenance_kind="ISSUE_HEAD_CLAIM",
+            from_provenance_id="7" * 64,
+            from_provenance_sha256="8" * 64,
+            from_carrier_role="ISSUE_ACTIVE",
+            prior_required_status=None,
+        )
+        fields.update(changes)
+        return fields
+
+    @classmethod
+    def required_epoch(cls, **changes):
+        return RequiredStatusEpoch.create(**cls.required_fields(**changes))
+
+    @staticmethod
+    def finalization_fields(**changes):
+        fields = dict(
+            issue_number=7,
+            issue_database_id=700,
+            issue_node_id="I_kwDOIssue",
+            issue_request_anchor_comment_database_id=101,
+            issue_request_anchor_sha256="a" * 64,
+            issue_branch_lease_comment_database_id=102,
+            issue_branch_lease_sha256="b" * 64,
+            binding_id="c" * 64,
+            source_id="owner-repo",
+            source_repository_id=41,
+            pull_request_number=8,
+            pull_request_database_id=800,
+            pull_request_node_id="PR_kwDOPull",
+            central_repository_node_id="R_central",
+            branch_ref="refs/heads/bot/federation/request/issue-7",
+            request_class=RequestClass.ADD,
+            accepted_base_sha="1" * 40,
+            accepted_base_tree_sha="2" * 40,
+            base_ref="main",
+            from_head_sha="3" * 40,
+            from_tree_sha="4" * 40,
+            final_head_sha="5" * 40,
+            final_tree_sha="4" * 40,
+            carrier_nonce="6" * 64,
+            from_authority_kind="ISSUE_HEAD_CLAIM",
+            from_authority_comment_database_id=201,
+            from_authority_artifact_id="7" * 64,
+            from_authority_artifact_sha256="8" * 64,
+            from_authority_role="ISSUE_ACTIVE",
+            proposal_origin_claim_comment_database_id=201,
+            proposal_origin_claim_id="7" * 64,
+            proposal_origin_claim_sha256="8" * 64,
+            effective_request_digest="9" * 64,
+            patch_projection_evidence_digest="a" * 64,
+            claimed_target_evidence_digest="b" * 64,
+            fresh_proposal_scope_evidence_digest="b" * 64,
+        )
+        fields.update(changes)
+        return fields
+
+    @classmethod
+    def finalization_epoch(cls, **changes):
+        return IssueFinalizationEpoch.create(**cls.finalization_fields(**changes))
+
+    def test_exact_app_required_status_snapshot_is_canonical_and_hashes_every_field(self):
+        evidence = self.exact_status()
+        rendered = evidence.render()
+        self.assertEqual(parse_exact_app_required_status_evidence(rendered), evidence)
+        self.assertEqual(rendered, json.dumps(json.loads(rendered), ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        self.assertEqual(
+            evidence.canonical_sha256(),
+            hashlib.sha256(("swiftstream-federation-prior-required-status-evidence:v1\n" + rendered).encode()).hexdigest(),
+        )
+        for field, replacement in (
+            ("status_id", 902), ("status_node_id", "SC_other"), ("description", render_status_description(StatusClass.ISSUE_FINAL, "c" * 64)),
+            ("creator_login", "other[bot]"), ("created_at", "2026-10-05T10:11:13Z"),
+        ):
+            values = evidence.as_value()
+            key = {
+                "status_id": "statusId", "status_node_id": "statusNodeId", "description": "description",
+                "creator_login": "creatorLogin", "created_at": "createdAt",
+            }[field]
+            values[key] = replacement
+            self.assertNotEqual(ExactAppRequiredStatusEvidence.from_value(values).canonical_sha256(), evidence.canonical_sha256())
+
+    def test_exact_app_required_status_rejects_wrong_tuple_identity_ids_and_timestamps(self):
+        invalid = (
+            {"context": "other/context"},
+            {"state": "failure"},
+            {"description": render_status_description(StatusClass.EXTERNAL, "a" * 64)},
+            {"creator_type": "User"},
+            {"target_url": "https://example.invalid"},
+            {"status_id": True},
+            {"creator_database_id": 0},
+            {"created_at": "October 5, 2026"},
+            {"updated_at": "2026-10-05T10:11:12+00:00"},
+        )
+        for change in invalid:
+            with self.subTest(change=change), self.assertRaises(RequestModelError):
+                self.exact_status(**change)
+        with self.assertRaises(RequestModelError):
+            parse_exact_app_required_status_evidence(self.exact_status().render() + " ")
+
+    def test_required_status_epoch_exact_schema_canonical_roundtrip_and_marker(self):
+        epoch = self.required_epoch()
+        rendered = epoch.render()
+        self.assertTrue(rendered.startswith(REQUIRED_STATUS_EPOCH_MARKER + "\n"))
+        self.assertEqual(parse_required_status_epoch(rendered), epoch)
+        value = json.loads(rendered.splitlines()[1])
+        self.assertEqual(set(value), {
+            "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+            "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256",
+            "issueBranchLeaseCommentDatabaseId", "issueBranchLeaseSha256", "bindingId",
+            "sourceId", "sourceRepositoryId", "pullRequestNumber", "pullRequestDatabaseId",
+            "pullRequestNodeId", "centralRepositoryNodeId", "branchRef", "requestClass",
+            "acceptedBaseSha", "acceptedBaseTreeSha", "baseRef", "fromHeadSha", "fromTreeSha",
+            "toHeadSha", "toTreeSha", "carrierRole", "claimKind", "claimGenerationId",
+            "transitionKind", "carrierNonce", "reasonClass", "fromProvenanceKind",
+            "fromProvenanceId", "fromProvenanceSha256", "fromCarrierRole", "priorRequiredStatus",
+            "authorityPreimageDigest", "markerDigest", "epochId",
+        })
+        self.assertEqual(list(value), sorted(value))
+        self.assertEqual(
+            epoch.epoch_id,
+            hashlib.sha256(("swiftstream-federation-required-status-epoch-id:v1\n" + json.dumps(
+                {key: item for key, item in value.items() if key != "epochId"},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            )).encode()).hexdigest(),
+        )
+        marker = parse_claimed_head_marker(
+            "swiftstream-federation-head:v2\n"
+            "claim-kind=REQUIRED_STATUS_EPOCH\nrole=ISSUE_ACTIVE\nowner-kind=ISSUE\n"
+            "owner-key=R_central:700:I_kwDOIssue:7\n"
+            f"generation={epoch.claim_generation_id}\nnonce={epoch.carrier_nonce}\ntransition=ACTIVE_REVALIDATION\n"
+        )
+        self.assertEqual(marker.claim_generation_id, epoch.claim_generation_id)
+        self.assertNotIn("epochId", marker.render())
+        self.assertNotIn("toHeadSha", epoch.authority_preimage_value())
+        self.assertNotIn("epochId", epoch.authority_preimage_value())
+        self.assertNotIn("markerDigest", epoch.authority_preimage_value())
+        self.assertNotIn("toTreeSha", epoch.authority_preimage_value())
+
+    def test_required_status_epoch_no_tree_role_kind_and_closed_reason_invariants(self):
+        with self.assertRaises(RequestModelError):
+            self.required_epoch(to_tree_sha="9" * 40)
+        for change in (
+            {"carrier_role": "ISSUE_FINALIZING"},
+            {"claim_kind": "ISSUE_HEAD_CLAIM"},
+            {"transition_kind": "WHATEVER"},
+            {"reason_class": "ACTIVE_REVALIDATION"},
+            {"reason_class": RequiredStatusEpochReason.FINALIZATION_INVALIDATED},
+            {"from_provenance_kind": "ISSUE_FINALIZATION_EPOCH"},
+            {"from_provenance_kind": "UNKNOWN"},
+        ):
+            with self.subTest(change=change), self.assertRaises(RequestModelError):
+                self.required_epoch(**change)
+        finalizer_source = self.required_epoch(
+            reason_class=RequiredStatusEpochReason.FINALIZATION_INVALIDATED,
+            from_provenance_kind="ISSUE_FINALIZATION_EPOCH",
+            from_carrier_role="ISSUE_FINALIZING",
+        )
+        self.assertEqual(finalizer_source.from_carrier_role, "ISSUE_FINALIZING")
+        with self.assertRaises(RequestModelError):
+            self.required_epoch(
+                reason_class=RequiredStatusEpochReason.FINALIZATION_INVALIDATED,
+                from_provenance_kind="ISSUE_HEAD_CLAIM",
+            )
+
+    def test_required_status_generation_binds_only_pre_target_authority_and_epoch_id_binds_final_target(self):
+        original = self.required_epoch()
+        baseline_generation = original.claim_generation_id
+        for changes in (
+            {"reason_class": RequiredStatusEpochReason.MAIN_ADVANCE_REVALIDATION},
+            {"from_head_sha": "9" * 40},
+            {"from_tree_sha": "9" * 40, "to_tree_sha": "9" * 40},
+            {"carrier_nonce": "9" * 64},
+            {"binding_id": "9" * 64},
+        ):
+            with self.subTest(changes=changes):
+                self.assertNotEqual(self.required_epoch(**changes).claim_generation_id, baseline_generation)
+        retargeted = self.required_epoch(to_head_sha="9" * 40)
+        self.assertEqual(retargeted.claim_generation_id, baseline_generation)
+        self.assertNotEqual(retargeted.epoch_id, original.epoch_id)
+        snapshotted = self.required_epoch(prior_required_status=self.exact_status())
+        self.assertNotEqual(snapshotted.claim_generation_id, baseline_generation)
+        self.assertNotEqual(snapshotted.epoch_id, original.epoch_id)
+        marked = self.required_epoch(carrier_nonce="8" * 64)
+        self.assertNotEqual(marked.marker_digest, original.marker_digest)
+        self.assertNotEqual(marked.epoch_id, original.epoch_id)
+        self.assertEqual(parse_required_status_epoch(snapshotted.render()), snapshotted)
+
+    def test_required_status_snapshot_absence_does_not_weaken_finalization_invalidation(self):
+        epoch = self.required_epoch(
+            reason_class=RequiredStatusEpochReason.FINALIZATION_INVALIDATED,
+            from_provenance_kind="ISSUE_FINALIZATION_EPOCH",
+            from_carrier_role="ISSUE_FINALIZING",
+            prior_required_status=None,
+        )
+        self.assertIsNone(epoch.prior_required_status)
+        self.assertEqual(epoch.from_carrier_role, "ISSUE_FINALIZING")
+
+    def test_issue_finalization_epoch_direct_claim_schema_status_tuple_and_roundtrip(self):
+        epoch = self.finalization_epoch()
+        rendered = epoch.render()
+        self.assertTrue(rendered.startswith(ISSUE_FINALIZATION_EPOCH_MARKER + "\n"))
+        self.assertEqual(parse_issue_finalization_epoch(rendered), epoch)
+        value = json.loads(rendered.splitlines()[1])
+        self.assertEqual(set(value), {
+            "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+            "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256",
+            "issueBranchLeaseCommentDatabaseId", "issueBranchLeaseSha256", "bindingId",
+            "sourceId", "sourceRepositoryId", "pullRequestNumber", "pullRequestDatabaseId",
+            "pullRequestNodeId", "centralRepositoryNodeId", "branchRef", "requestClass",
+            "acceptedBaseSha", "acceptedBaseTreeSha", "baseRef", "fromHeadSha", "fromTreeSha",
+            "finalHeadSha", "finalTreeSha", "carrierRole", "claimKind", "claimGenerationId",
+            "transitionKind", "carrierNonce", "fromAuthorityKind", "fromAuthorityCommentDatabaseId",
+            "fromAuthorityArtifactId", "fromAuthorityArtifactSha256", "fromAuthorityRole",
+            "proposalOriginClaimCommentDatabaseId", "proposalOriginClaimId", "proposalOriginClaimSha256",
+            "effectiveRequestDigest", "patchProjectionEvidenceDigest", "claimedTargetEvidenceDigest",
+            "freshProposalScopeEvidenceDigest", "authorityPreimageDigest", "finalizerEvidenceDigest",
+            "requiredStatusContext", "requiredStatusClass", "requiredStatusState",
+            "requiredStatusTargetUrl", "requiredStatusEvidenceDigest", "requiredStatusDescription",
+            "markerDigest", "epochId",
+        })
+        self.assertEqual(list(value), sorted(value))
+        self.assertEqual(epoch.carrier_role, "ISSUE_FINALIZING")
+        self.assertEqual(epoch.claim_kind, "ISSUE_FINALIZATION_EPOCH")
+        self.assertEqual(epoch.transition_kind, "FINALIZE")
+        self.assertEqual(epoch.final_tree_sha, epoch.from_tree_sha)
+        self.assertEqual(epoch.from_authority_kind, "ISSUE_HEAD_CLAIM")
+        self.assertEqual(epoch.from_authority_artifact_id, epoch.proposal_origin_claim_id)
+        self.assertEqual(epoch.from_authority_artifact_sha256, epoch.proposal_origin_claim_sha256)
+        self.assertEqual(epoch.required_status_context, "federation/trusted-validation")
+        self.assertEqual(epoch.required_status_class, "issue-final")
+        self.assertEqual(epoch.required_status_state, "success")
+        self.assertIsNone(epoch.required_status_target_url)
+        self.assertEqual(len(epoch.required_status_description.encode("ascii")), 86)
+        self.assertEqual(issue_final_status_evidence_digest(epoch), epoch.required_status_evidence_digest)
+
+    def test_issue_finalization_epoch_required_status_and_proposal_origin_are_exact(self):
+        distinct = self.finalization_epoch(
+            from_authority_kind="REQUIRED_STATUS_EPOCH",
+            from_authority_comment_database_id=202,
+            from_authority_artifact_id="c" * 64,
+            from_authority_artifact_sha256="d" * 64,
+            proposal_origin_claim_comment_database_id=201,
+            proposal_origin_claim_id="7" * 64,
+            proposal_origin_claim_sha256="8" * 64,
+        )
+        self.assertNotEqual(distinct.from_authority_artifact_id, distinct.proposal_origin_claim_id)
+        self.assertNotEqual(distinct.from_authority_comment_database_id, distinct.proposal_origin_claim_comment_database_id)
+        self.assertEqual(parse_issue_finalization_epoch(distinct.render()), distinct)
+        for change in (
+            {"from_authority_kind": "ISSUE_FINALIZATION_EPOCH"},
+            {"from_authority_kind": "REQUIRED_STATUS_EPOCH", "from_authority_role": "ISSUE_FINALIZING"},
+            {"from_authority_role": "ISSUE_FINALIZING"},
+            {"proposal_origin_claim_id": ""},
+            {"claimed_target_evidence_digest": "c" * 64},
+            {"fresh_proposal_scope_evidence_digest": "c" * 64},
+        ):
+            with self.subTest(change=change), self.assertRaises(RequestModelError):
+                self.finalization_epoch(**change)
+        direct_mismatch = self.finalization_fields(proposal_origin_claim_id="c" * 64)
+        with self.assertRaises(RequestModelError):
+            IssueFinalizationEpoch.create(**direct_mismatch)
+
+    def test_issue_finalization_rejects_tree_role_kind_transition_and_status_tuple_drift(self):
+        for change in (
+            {"final_tree_sha": "9" * 40},
+            {"carrier_role": "ISSUE_ACTIVE"},
+            {"claim_kind": "ISSUE_HEAD_CLAIM"},
+            {"transition_kind": "PROPOSAL"},
+        ):
+            with self.subTest(change=change), self.assertRaises(RequestModelError):
+                self.finalization_epoch(**change)
+        epoch = self.finalization_epoch()
+        for field, replacement in (
+            ("required_status_context", "other/context"),
+            ("required_status_class", "external"),
+            ("required_status_state", "failure"),
+            ("required_status_target_url", "https://example.invalid"),
+        ):
+            changed = object.__new__(IssueFinalizationEpoch)
+            for name, value in epoch._fields().items():
+                object.__setattr__(changed, name, value)
+            object.__setattr__(changed, field, replacement)
+            with self.subTest(field=field), self.assertRaises(RequestModelError):
+                changed.__post_init__()
+
+    def test_issue_final_digest_binds_head_repository_base_authorities_and_proposal_evidence(self):
+        baseline = self.finalization_epoch()
+        for changes in (
+            {"final_head_sha": "9" * 40},
+            {"central_repository_node_id": "R_other"},
+            {"accepted_base_sha": "9" * 40},
+            {"accepted_base_tree_sha": "9" * 40},
+            {"from_authority_artifact_id": "c" * 64, "from_authority_artifact_sha256": "d" * 64,
+             "proposal_origin_claim_id": "c" * 64, "proposal_origin_claim_sha256": "d" * 64},
+            {"from_authority_kind": "REQUIRED_STATUS_EPOCH", "from_authority_comment_database_id": 202,
+             "from_authority_artifact_id": "c" * 64, "from_authority_artifact_sha256": "d" * 64},
+            {"from_authority_comment_database_id": 203, "from_authority_artifact_id": "c" * 64,
+             "from_authority_artifact_sha256": "d" * 64,
+             "proposal_origin_claim_comment_database_id": 203, "proposal_origin_claim_id": "c" * 64,
+             "proposal_origin_claim_sha256": "d" * 64},
+            {"effective_request_digest": "c" * 64},
+            {"patch_projection_evidence_digest": "c" * 64},
+            {"claimed_target_evidence_digest": "c" * 64, "fresh_proposal_scope_evidence_digest": "c" * 64},
+        ):
+            with self.subTest(changes=changes):
+                changed = self.finalization_epoch(**changes)
+                self.assertNotEqual(changed.required_status_evidence_digest, baseline.required_status_evidence_digest)
+                self.assertNotEqual(changed.epoch_id, baseline.epoch_id)
+        self.assertEqual(issue_final_status_evidence_digest(baseline), baseline.required_status_evidence_digest)
+        copied = object.__new__(IssueFinalizationEpoch)
+        for name, value in baseline._fields().items():
+            object.__setattr__(copied, name, value)
+        object.__setattr__(copied, "epoch_id", "f" * 64)
+        self.assertEqual(issue_final_status_evidence_digest(copied), baseline.required_status_evidence_digest)
+
+    def test_epoch_parsers_reject_wrong_marker_noncanonical_duplicate_unknown_or_missing_fields(self):
+        for epoch, parse, marker in (
+            (self.required_epoch(), parse_required_status_epoch, REQUIRED_STATUS_EPOCH_MARKER),
+            (self.finalization_epoch(), parse_issue_finalization_epoch, ISSUE_FINALIZATION_EPOCH_MARKER),
+        ):
+            rendered = epoch.render()
+            line = rendered.splitlines()[1]
+            value = json.loads(line)
+            for invalid in (
+                rendered.replace(marker, "<!-- other -->", 1),
+                rendered.replace(line, line.replace(":", ": ", 1), 1),
+                marker + "\n" + json.dumps({**value, "unexpected": 1}, sort_keys=True, separators=(",", ":")) + "\n",
+                marker + "\n" + json.dumps({key: item for key, item in value.items() if key != "schemaVersion"}, sort_keys=True, separators=(",", ":")) + "\n",
+                marker + "\n" + line[:-1] + ',"epochId":"' + "0" * 64 + '"}\n',
+                rendered.replace("\n", "\r\n"),
+            ):
+                with self.subTest(parser=parse.__name__, invalid=invalid[:80]), self.assertRaises(RequestModelError):
+                    parse(invalid)
 
 
 if __name__ == "__main__":

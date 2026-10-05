@@ -43,6 +43,8 @@ from .request_model import (
     ISSUE_REQUEST_ANCHOR_MARKER,
     ISSUE_PATCH_PROJECTION_MARKER,
     ISSUE_HEAD_CLAIM_MARKER,
+    REQUIRED_STATUS_EPOCH_MARKER,
+    ISSUE_FINALIZATION_EPOCH_MARKER,
     ISSUE_INTERNAL_PR_BINDING_MARKER,
     PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
@@ -54,6 +56,10 @@ from .request_model import (
     IssueRequestAnchor,
     IssuePRBinding,
     IssueHeadClaim,
+    RequiredStatusEpoch,
+    RequiredStatusEpochReason,
+    IssueFinalizationEpoch,
+    ExactAppRequiredStatusEvidence,
     IssuePatchProjection,
     ClaimedHeadMarker,
     CLAIMED_HEAD_MARKER_HEADER,
@@ -74,6 +80,7 @@ from .request_model import (
     fold_issue_patch_events,
     issue_branch_lease_authority_digest,
     issue_head_claim_authority_digest,
+    issue_final_status_evidence_digest,
     issue_patch_projection_evidence_digest,
     normalize_target_evidence_digest,
     proposal_target_evidence_digest,
@@ -89,9 +96,12 @@ from .request_model import (
     parse_pr_issue_origin_binding,
     parse_issue_branch_lease,
     parse_issue_head_claim,
+    parse_required_status_epoch,
+    parse_issue_finalization_epoch,
     parse_issue_patch_projection,
     parse_claimed_head_marker,
     render_status_description,
+    parse_status_description,
     parse_issue_request_body,
     parse_request_body,
     render_request_body,
@@ -548,10 +558,16 @@ def resolve_sha_carrier_role(
     except RequestModelError:
         return _conflicting_sha_carrier()
 
+    supported_roles = {
+        "ISSUE_BRANCH_LEASE": CarrierRole.ISSUE_ACTIVE.value,
+        "ISSUE_HEAD_CLAIM": CarrierRole.ISSUE_ACTIVE.value,
+        "REQUIRED_STATUS_EPOCH": CarrierRole.ISSUE_ACTIVE.value,
+        "ISSUE_FINALIZATION_EPOCH": CarrierRole.ISSUE_FINALIZING.value,
+    }
     if (
         marker.owner_kind != "ISSUE"
-        or marker.role != CarrierRole.ISSUE_ACTIVE.value
-        or marker.claim_kind not in {"ISSUE_BRANCH_LEASE", "ISSUE_HEAD_CLAIM"}
+        or marker.claim_kind not in supported_roles
+        or marker.role != supported_roles.get(marker.claim_kind)
     ):
         return _conflicting_sha_carrier(marker)
 
@@ -613,12 +629,18 @@ def resolve_sha_carrier_role(
             client, repository, state.lease.lease.branch_ref.removeprefix("refs/heads/"),
         )
         pr_comments = tuple(client.list_issue_comments(repository, state.binding.pull_request_number))
-        claims = _issue_head_claim_comments(
+        history = _issue_authority_history(
             client, repository, pr_comments, app, state, current_ref or ZERO_OID,
         )
         matches = [
-            item for item in claims
-            if item.claim.to_head_sha == head_sha and _issue_head_claim_marker(item.claim) == marker
+            item for item in history
+            if item.target_head_sha == head_sha
+            and (
+                (_issue_head_claim_marker(item.artifact) if item.claim_kind == "ISSUE_HEAD_CLAIM"
+                 else _required_status_epoch_marker(item.artifact) if item.claim_kind == "REQUIRED_STATUS_EPOCH"
+                 else _issue_finalization_epoch_marker(item.artifact) if item.claim_kind == "ISSUE_FINALIZATION_EPOCH"
+                 else _lease_marker_for(item.artifact)) == marker
+            )
         ]
         if len(matches) != 1:
             return _conflicting_sha_carrier(marker)
@@ -643,7 +665,8 @@ def resolve_sha_carrier_role(
             and activation_state.pr.head_oid == head_sha
         )
         activation = CarrierActivation.ACTIVE if active else CarrierActivation.RESERVED_INACTIVE
-        return ShaCarrierResolution(activation, CarrierRole.ISSUE_ACTIVE, marker)
+        result_role = CarrierRole(supported_roles[marker.claim_kind])
+        return ShaCarrierResolution(activation, result_role, marker)
     except Exception:
         return _conflicting_sha_carrier(marker)
 
@@ -710,6 +733,84 @@ def publish_unclaimed_external_success(
         or status.creator_type != "Bot"
     ):
         raise R02Error("external status response does not match the exact App Bot tuple")
+    return receipt
+
+
+def _latest_exact_issue_final_status_evidence(
+    client: GitHubClient,
+    repository: str,
+    head_sha: str,
+    app: AppIdentity,
+) -> ExactAppRequiredStatusEvidence | None:
+    """Select corroborating evidence only from the exact App's issue-final success rows."""
+    try:
+        statuses = tuple(client.list_commit_statuses(repository, head_sha))
+    except Exception:
+        # This evidence is corroborating only. Its absence or temporary
+        # unavailability never suppresses a RequiredStatusEpoch transition.
+        return None
+    matching: list[CommitStatus] = []
+    for status in statuses:
+        if type(status) is not CommitStatus or (
+            status.creator_database_id != app.bot_id
+            or status.creator_node_id != app.bot_node_id
+            or status.creator_login != app.bot_login
+            or status.creator_type != "Bot"
+            or status.state != "success"
+            or status.context != "federation/trusted-validation"
+            or status.target_url is not None
+            or status.description is None
+        ):
+            continue
+        try:
+            description = parse_status_description(status.description)
+        except RequestModelError:
+            continue
+        if description.status_class is StatusClass.ISSUE_FINAL:
+            matching.append(status)
+    if not matching:
+        return None
+    latest = max(matching, key=lambda item: (item.updated_at, item.created_at, item.id))
+    try:
+        return ExactAppRequiredStatusEvidence(
+            latest.id, latest.node_id, latest.state, latest.context, latest.description or "",
+            latest.target_url, latest.creator_database_id, latest.creator_node_id,
+            latest.creator_login, latest.creator_type, latest.created_at, latest.updated_at,
+        )
+    except RequestModelError:
+        return None
+
+
+def _validate_issue_final_status_receipt(
+    receipt: StatusWriteReceipt,
+    repository: RepositoryMetadata,
+    epoch: IssueFinalizationEpoch,
+    app: AppIdentity,
+) -> StatusWriteReceipt:
+    expected_route = f"/repos/{repository.full_name}/statuses/{epoch.final_head_sha}"
+    if type(receipt) is not StatusWriteReceipt or (
+        receipt.repository != repository.full_name
+        or receipt.requested_sha != epoch.final_head_sha
+        or receipt.method != "POST"
+        or receipt.route != expected_route
+        or receipt.requested_state != "success"
+        or receipt.requested_context != epoch.required_status_context
+        or receipt.requested_description != epoch.required_status_description
+        or receipt.requested_target_url is not None
+    ):
+        raise R02Error("issue-final status receipt does not match the exact epoch tuple")
+    status = receipt.returned_status
+    if type(status) is not CommitStatus or (
+        status.context != epoch.required_status_context
+        or status.state != "success"
+        or status.description != epoch.required_status_description
+        or status.target_url is not None
+        or status.creator_database_id != app.bot_id
+        or status.creator_node_id != app.bot_node_id
+        or status.creator_login != app.bot_login
+        or status.creator_type != "Bot"
+    ):
+        raise R02Error("issue-final response does not match the exact App Bot status tuple")
     return receipt
 
 
@@ -1078,6 +1179,56 @@ class IssueHeadClaimComment:
     claim: IssueHeadClaim
     comment: IssueComment
     active: bool
+
+
+@dataclass(frozen=True)
+class RequiredStatusEpochComment:
+    epoch: RequiredStatusEpoch
+    comment: IssueComment
+    active: bool
+
+
+@dataclass(frozen=True)
+class IssueFinalizationEpochComment:
+    epoch: IssueFinalizationEpoch
+    comment: IssueComment
+    active: bool
+
+
+@dataclass(frozen=True)
+class _IssueAuthorityNode:
+    claim_kind: str
+    role: CarrierRole
+    target_head_sha: str
+    from_head_sha: str | None
+    tree_sha: str
+    transition_kind: str
+    artifact_id: str
+    artifact_sha256: str
+    comment: IssueComment
+    artifact: Any
+    active: bool = False
+    proposal_origin: Any | None = None
+
+
+@dataclass(frozen=True)
+class _IssueEpochSnapshot:
+    state: IssuePRBindingState
+    repository: RepositoryMetadata
+    accepted_main_sha: str
+    accepted_main_tree_sha: str
+    accepted_main_entries: tuple[Any, ...]
+    current_ref: str
+    issue: IssueMetadata
+    issue_comments: tuple[IssueComment, ...]
+    pr_comments: tuple[IssueComment, ...]
+    fold: PatchFoldResult
+    projections: tuple[IssuePatchProjection, ...]
+    fresh_source: IssueSourceAuthority | None
+    source_error: str | None
+    history: tuple[_IssueAuthorityNode, ...]
+    current_authority: _IssueAuthorityNode
+    resolution: ShaCarrierResolution
 
 
 @dataclass(frozen=True)
@@ -1546,6 +1697,8 @@ def _issue_pr_authority_fence(comments: Iterable[IssueComment], app: AppIdentity
         ISSUE_INTERNAL_PR_BINDING_MARKER,
         ISSUE_PATCH_PROJECTION_MARKER,
         ISSUE_HEAD_CLAIM_MARKER,
+        REQUIRED_STATUS_EPOCH_MARKER,
+        ISSUE_FINALIZATION_EPOCH_MARKER,
     )
     reserved_prefix = "<!-- swiftstream-federation-issue-"
     for comment in comments:
@@ -1611,6 +1764,44 @@ def _issue_head_claim_marker(claim: IssueHeadClaim) -> ClaimedHeadMarker:
         claim.claim_generation_id,
         claim.carrier_nonce,
         claim.transition_kind,
+    )
+
+
+def _required_status_epoch_marker(epoch: RequiredStatusEpoch) -> ClaimedHeadMarker:
+    if type(epoch) is not RequiredStatusEpoch:
+        raise R02Error("RequiredStatusEpoch marker requires its exact parsed artifact")
+    return ClaimedHeadMarker(
+        epoch.claim_kind,
+        epoch.carrier_role,
+        "ISSUE",
+        issue_owner_key(
+            epoch.central_repository_node_id,
+            epoch.issue_database_id,
+            epoch.issue_node_id,
+            epoch.issue_number,
+        ),
+        epoch.claim_generation_id,
+        epoch.carrier_nonce,
+        epoch.transition_kind,
+    )
+
+
+def _issue_finalization_epoch_marker(epoch: IssueFinalizationEpoch) -> ClaimedHeadMarker:
+    if type(epoch) is not IssueFinalizationEpoch:
+        raise R02Error("IssueFinalizationEpoch marker requires its exact parsed artifact")
+    return ClaimedHeadMarker(
+        epoch.claim_kind,
+        epoch.carrier_role,
+        "ISSUE",
+        issue_owner_key(
+            epoch.central_repository_node_id,
+            epoch.issue_database_id,
+            epoch.issue_node_id,
+            epoch.issue_number,
+        ),
+        epoch.claim_generation_id,
+        epoch.carrier_nonce,
+        epoch.transition_kind,
     )
 
 
@@ -1781,6 +1972,405 @@ def _validate_issue_head_claim_target(
         raise R02Error("IssueHeadClaim target evidence digest does not match the stored target tree")
 
 
+def _validate_required_status_epoch_binding(
+    epoch: RequiredStatusEpoch,
+    state: IssuePRBindingState,
+) -> None:
+    anchor = state.issue_anchor
+    lease = state.lease
+    binding = state.binding
+    expected = (
+        anchor.anchor.issue_number, anchor.anchor.issue_database_id, anchor.anchor.issue_node_id,
+        anchor.comment.database_id, anchor.anchor.canonical_sha256(),
+        lease.comment.database_id, _binding_comment_sha256(lease.comment), binding.binding_id,
+        anchor.anchor.source_id, anchor.anchor.source_repository_id,
+        binding.pull_request_number, binding.pull_request_database_id, binding.pull_request_node_id,
+        binding.central_repository_node_id, binding.branch_ref, anchor.anchor.request_class,
+    )
+    actual = (
+        epoch.issue_number, epoch.issue_database_id, epoch.issue_node_id,
+        epoch.issue_request_anchor_comment_database_id, epoch.issue_request_anchor_sha256,
+        epoch.issue_branch_lease_comment_database_id, epoch.issue_branch_lease_sha256, epoch.binding_id,
+        epoch.source_id, epoch.source_repository_id,
+        epoch.pull_request_number, epoch.pull_request_database_id, epoch.pull_request_node_id,
+        epoch.central_repository_node_id, epoch.branch_ref, epoch.request_class,
+    )
+    if actual != expected:
+        raise R02Error("RequiredStatusEpoch does not bind immutable Issue/lease/binding identities")
+
+
+def _validate_issue_finalization_epoch_binding(
+    epoch: IssueFinalizationEpoch,
+    state: IssuePRBindingState,
+) -> None:
+    anchor = state.issue_anchor
+    lease = state.lease
+    binding = state.binding
+    expected = (
+        anchor.anchor.issue_number, anchor.anchor.issue_database_id, anchor.anchor.issue_node_id,
+        anchor.comment.database_id, anchor.anchor.canonical_sha256(),
+        lease.comment.database_id, _binding_comment_sha256(lease.comment), binding.binding_id,
+        anchor.anchor.source_id, anchor.anchor.source_repository_id,
+        binding.pull_request_number, binding.pull_request_database_id, binding.pull_request_node_id,
+        binding.central_repository_node_id, binding.branch_ref, anchor.anchor.request_class,
+    )
+    actual = (
+        epoch.issue_number, epoch.issue_database_id, epoch.issue_node_id,
+        epoch.issue_request_anchor_comment_database_id, epoch.issue_request_anchor_sha256,
+        epoch.issue_branch_lease_comment_database_id, epoch.issue_branch_lease_sha256, epoch.binding_id,
+        epoch.source_id, epoch.source_repository_id,
+        epoch.pull_request_number, epoch.pull_request_database_id, epoch.pull_request_node_id,
+        epoch.central_repository_node_id, epoch.branch_ref, epoch.request_class,
+    )
+    if actual != expected:
+        raise R02Error("IssueFinalizationEpoch does not bind immutable Issue/lease/binding identities")
+
+
+def _validate_epoch_target_commit(
+    client: GitHubClient,
+    repository: str,
+    *,
+    target_sha: str,
+    from_head_sha: str,
+    from_tree_sha: str,
+    target_tree_sha: str,
+    accepted_base_sha: str,
+    accepted_base_tree_sha: str,
+    marker: ClaimedHeadMarker,
+    marker_digest: str,
+    label: str,
+) -> None:
+    marker_text = marker.render()
+    if parse_claimed_head_marker(marker_text) != marker:
+        raise R02Error(f"{label} marker does not parse canonically")
+    if hashlib.sha256(marker_text.encode("utf-8")).hexdigest() != marker_digest:
+        raise R02Error(f"{label} marker digest does not match immutable artifact")
+    from_meta, actual_from_tree, _from_entries = _lease_tree_snapshot(client, repository, from_head_sha)
+    if from_meta.sha != from_head_sha or actual_from_tree != from_tree_sha:
+        raise R02Error(f"{label} from-head tree provenance does not match")
+    base_meta, actual_base_tree, _base_entries = _lease_tree_snapshot(client, repository, accepted_base_sha)
+    if base_meta.sha != accepted_base_sha or actual_base_tree != accepted_base_tree_sha:
+        raise R02Error(f"{label} accepted-base tree provenance does not match")
+    target_meta, actual_target_tree, _target_entries = _lease_tree_snapshot(client, repository, target_sha)
+    if (
+        target_meta.sha != target_sha
+        or target_meta.parents != (from_head_sha,)
+        or target_meta.tree_sha != target_tree_sha
+        or actual_target_tree != target_tree_sha
+        or actual_target_tree != from_tree_sha
+    ):
+        raise R02Error(f"{label} target is not an exact no-tree-change direct child")
+    try:
+        target_object = client.get_git_commit_object(repository, target_sha)
+    except Exception as error:
+        raise R02Error(f"{label} exact target commit object is unavailable: {_bounded_reason(error)}") from None
+    if type(target_object) is not GitCommitObject or type(target_object.message) is not str:
+        raise R02Error(f"{label} exact target commit object is malformed")
+    try:
+        parsed_target_marker = parse_claimed_head_marker(target_object.message)
+    except RequestModelError as error:
+        raise R02Error(f"{label} target marker is malformed: {_bounded_reason(error)}") from None
+    if (
+        type(target_object) is not GitCommitObject
+        or target_object.sha != target_sha
+        or target_object.message != marker_text
+        or target_object.parents != (from_head_sha,)
+        or target_object.tree_sha != target_tree_sha
+        or parsed_target_marker != marker
+    ):
+        raise R02Error(f"{label} exact target commit message/parent/tree is invalid")
+    expected_sha = _expected_deterministic_commit_sha(
+        target_tree_sha, from_head_sha, marker_text, target_meta.author_date,
+    )
+    if expected_sha != target_sha:
+        raise R02Error(f"{label} target SHA does not bind its canonical marker")
+
+
+def _validate_required_status_epoch_target(
+    client: GitHubClient,
+    repository: str,
+    epoch: RequiredStatusEpoch,
+    state: IssuePRBindingState,
+) -> None:
+    _validate_required_status_epoch_binding(epoch, state)
+    _validate_epoch_target_commit(
+        client,
+        repository,
+        target_sha=epoch.to_head_sha,
+        from_head_sha=epoch.from_head_sha,
+        from_tree_sha=epoch.from_tree_sha,
+        target_tree_sha=epoch.to_tree_sha,
+        accepted_base_sha=epoch.accepted_base_sha,
+        accepted_base_tree_sha=epoch.accepted_base_tree_sha,
+        marker=_required_status_epoch_marker(epoch),
+        marker_digest=epoch.marker_digest,
+        label="RequiredStatusEpoch",
+    )
+
+
+def _validate_issue_finalization_epoch_target(
+    client: GitHubClient,
+    repository: str,
+    epoch: IssueFinalizationEpoch,
+    state: IssuePRBindingState,
+) -> None:
+    _validate_issue_finalization_epoch_binding(epoch, state)
+    if issue_final_status_evidence_digest(epoch) != epoch.required_status_evidence_digest:
+        raise R02Error("IssueFinalizationEpoch issue-final evidence digest does not recompute")
+    _validate_epoch_target_commit(
+        client,
+        repository,
+        target_sha=epoch.final_head_sha,
+        from_head_sha=epoch.from_head_sha,
+        from_tree_sha=epoch.from_tree_sha,
+        target_tree_sha=epoch.final_tree_sha,
+        accepted_base_sha=epoch.accepted_base_sha,
+        accepted_base_tree_sha=epoch.accepted_base_tree_sha,
+        marker=_issue_finalization_epoch_marker(epoch),
+        marker_digest=epoch.marker_digest,
+        label="IssueFinalizationEpoch",
+    )
+
+
+def _epoch_comment_authority(comment: IssueComment, app: AppIdentity, label: str) -> None:
+    if (
+        comment.author_id != app.bot_node_id
+        or comment.author_login != app.bot_login
+        or comment.author_type not in {None, "Bot"}
+        or _issue_comment_edited(comment)
+    ):
+        raise R02Error(f"{label} comment authorship/edit integrity is invalid")
+
+
+def _required_status_epoch_comments(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    state: IssuePRBindingState,
+    current_ref: str,
+) -> tuple[RequiredStatusEpochComment, ...]:
+    grouped: dict[str, dict[str, list[tuple[RequiredStatusEpoch, IssueComment]]]] = {}
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(REQUIRED_STATUS_EPOCH_MARKER):
+            continue
+        try:
+            epoch = parse_required_status_epoch(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed RequiredStatusEpoch comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "RequiredStatusEpoch")
+        if epoch.prior_required_status is not None and (
+            epoch.prior_required_status.creator_database_id != app.bot_id
+            or epoch.prior_required_status.creator_node_id != app.bot_node_id
+            or epoch.prior_required_status.creator_login != app.bot_login
+            or epoch.prior_required_status.creator_type != "Bot"
+        ):
+            raise R02Error("RequiredStatusEpoch prior status evidence is not from the exact current App Bot")
+        _validate_required_status_epoch_target(client, repository, epoch, state)
+        grouped.setdefault(epoch.claim_generation_id, {}).setdefault(epoch.render(), []).append((epoch, comment))
+    result: list[RequiredStatusEpochComment] = []
+    for payloads in grouped.values():
+        if len(payloads) != 1:
+            raise R02Error("conflicting RequiredStatusEpoch payloads for one generation block resolution")
+        equivalent = next(iter(payloads.values()))
+        epoch, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result.append(RequiredStatusEpochComment(epoch, comment, current_ref == epoch.to_head_sha))
+    return tuple(sorted(result, key=lambda item: (item.comment.database_id, item.epoch.claim_generation_id)))
+
+
+def _issue_finalization_epoch_comments(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    state: IssuePRBindingState,
+    current_ref: str,
+) -> tuple[IssueFinalizationEpochComment, ...]:
+    grouped: dict[str, dict[str, list[tuple[IssueFinalizationEpoch, IssueComment]]]] = {}
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_FINALIZATION_EPOCH_MARKER):
+            continue
+        try:
+            epoch = parse_issue_finalization_epoch(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueFinalizationEpoch comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueFinalizationEpoch")
+        _validate_issue_finalization_epoch_target(client, repository, epoch, state)
+        grouped.setdefault(epoch.claim_generation_id, {}).setdefault(epoch.render(), []).append((epoch, comment))
+    result: list[IssueFinalizationEpochComment] = []
+    for payloads in grouped.values():
+        if len(payloads) != 1:
+            raise R02Error("conflicting IssueFinalizationEpoch payloads for one generation block resolution")
+        equivalent = next(iter(payloads.values()))
+        epoch, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result.append(IssueFinalizationEpochComment(epoch, comment, current_ref == epoch.final_head_sha))
+    return tuple(sorted(result, key=lambda item: (item.comment.database_id, item.epoch.claim_generation_id)))
+
+
+def _issue_authority_history(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    state: IssuePRBindingState,
+    current_ref: str,
+) -> tuple[_IssueAuthorityNode, ...]:
+    """Validate all Issue-owned claim/epoch nodes, then resolve one unified provenance graph."""
+    comment_list = tuple(comments)
+    claim_groups: dict[str, dict[str, list[tuple[IssueHeadClaim, IssueComment]]]] = {}
+    for comment in comment_list:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_HEAD_CLAIM_MARKER):
+            continue
+        try:
+            claim = parse_issue_head_claim(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueHeadClaim comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueHeadClaim")
+        _issue_head_claim_matches_binding(claim, state)
+        _validate_issue_head_claim_target(client, repository, claim, state.lease.lease)
+        claim_groups.setdefault(claim.claim_generation_id, {}).setdefault(claim.render(), []).append((claim, comment))
+    claims: list[IssueHeadClaimComment] = []
+    for payloads in claim_groups.values():
+        if len(payloads) != 1:
+            raise R02Error("conflicting IssueHeadClaim payloads for one generation block progression")
+        equivalent = next(iter(payloads.values()))
+        claim, comment = min(equivalent, key=lambda item: item[1].database_id)
+        claims.append(IssueHeadClaimComment(claim, comment, current_ref == claim.to_head_sha))
+    required_epochs = _required_status_epoch_comments(client, repository, comment_list, app, state, current_ref)
+    finalization_epochs = _issue_finalization_epoch_comments(client, repository, comment_list, app, state, current_ref)
+
+    lease = state.lease.lease
+    root = _IssueAuthorityNode(
+        "ISSUE_BRANCH_LEASE", CarrierRole.ISSUE_ACTIVE, lease.initial_head_sha, None,
+        lease.initial_head_tree_sha, "INITIAL", lease.lease_id,
+        _binding_comment_sha256(state.lease.comment), state.lease.comment, lease,
+        active=current_ref == lease.initial_head_sha,
+    )
+    nodes: list[_IssueAuthorityNode] = [root]
+    for item in claims:
+        claim = item.claim
+        nodes.append(_IssueAuthorityNode(
+            claim.claim_kind, CarrierRole.ISSUE_ACTIVE, claim.to_head_sha, claim.from_head_sha,
+            claim.to_tree_sha, claim.transition_kind, claim.claim_id,
+            _binding_comment_sha256(item.comment), item.comment, claim, active=item.active,
+        ))
+    for item in required_epochs:
+        epoch = item.epoch
+        nodes.append(_IssueAuthorityNode(
+            epoch.claim_kind, CarrierRole.ISSUE_ACTIVE, epoch.to_head_sha, epoch.from_head_sha,
+            epoch.to_tree_sha, epoch.transition_kind, epoch.epoch_id,
+            _binding_comment_sha256(item.comment), item.comment, epoch, active=item.active,
+        ))
+    for item in finalization_epochs:
+        epoch = item.epoch
+        nodes.append(_IssueAuthorityNode(
+            epoch.claim_kind, CarrierRole.ISSUE_FINALIZING, epoch.final_head_sha, epoch.from_head_sha,
+            epoch.final_tree_sha, epoch.transition_kind, epoch.epoch_id,
+            _binding_comment_sha256(item.comment), item.comment, epoch, active=item.active,
+        ))
+
+    by_target: dict[str, _IssueAuthorityNode] = {}
+    for node in nodes:
+        old = by_target.get(node.target_head_sha)
+        if old is not None and (
+            old.claim_kind != node.claim_kind
+            or old.role is not node.role
+            or old.artifact_id != node.artifact_id
+            or old.artifact_sha256 != node.artifact_sha256
+        ):
+            raise R02Error("conflicting Issue-owned role/provenance for one claimed SHA")
+        by_target[node.target_head_sha] = node
+
+    reachable: dict[str, _IssueAuthorityNode] = {root.target_head_sha: root}
+    unresolved = [node for node in nodes if node is not root]
+    while unresolved:
+        advanced = False
+        remaining: list[_IssueAuthorityNode] = []
+        for node in unresolved:
+            parent = reachable.get(node.from_head_sha or "")
+            if parent is None:
+                remaining.append(node)
+                continue
+            if node.claim_kind == "ISSUE_HEAD_CLAIM":
+                claim = node.artifact
+                if parent.role is not CarrierRole.ISSUE_ACTIVE or parent.claim_kind == "ISSUE_FINALIZATION_EPOCH":
+                    raise R02Error("IssueHeadClaim cannot descend directly from ISSUE_FINALIZING")
+                if claim.transition_kind == "NORMALIZE":
+                    if parent.claim_kind != "ISSUE_BRANCH_LEASE" or claim.from_head_sha != lease.initial_head_sha:
+                        raise R02Error("NORMALIZE IssueHeadClaim must descend directly from the leased root")
+                    origin = None
+                elif claim.transition_kind in {"PROPOSAL", "PATCH_REGENERATION", "MAIN_ADVANCE"}:
+                    if parent.claim_kind not in {
+                        "ISSUE_BRANCH_LEASE", "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH",
+                    }:
+                        raise R02Error("proposal IssueHeadClaim has an unsupported ISSUE_ACTIVE predecessor")
+                    origin = node
+                else:
+                    raise R02Error("IssueHeadClaim history has an unsupported transition kind")
+            elif node.claim_kind == "REQUIRED_STATUS_EPOCH":
+                epoch = node.artifact
+                if (
+                    epoch.from_provenance_kind != parent.claim_kind
+                    or epoch.from_provenance_id != parent.artifact_id
+                    or epoch.from_provenance_sha256 != parent.artifact_sha256
+                    or epoch.from_carrier_role != parent.role.value
+                ):
+                    raise R02Error("RequiredStatusEpoch exact predecessor provenance does not match unified history")
+                if epoch.reason_class is RequiredStatusEpochReason.FINALIZATION_INVALIDATED:
+                    if parent.claim_kind != "ISSUE_FINALIZATION_EPOCH" or parent.role is not CarrierRole.ISSUE_FINALIZING:
+                        raise R02Error("FINALIZATION_INVALIDATED must descend from exact ISSUE_FINALIZING provenance")
+                elif parent.role is not CarrierRole.ISSUE_ACTIVE:
+                    raise R02Error("non-finalization RequiredStatusEpoch must descend from ISSUE_ACTIVE")
+                origin = parent.proposal_origin
+            elif node.claim_kind == "ISSUE_FINALIZATION_EPOCH":
+                epoch = node.artifact
+                if parent.role is not CarrierRole.ISSUE_ACTIVE or parent.claim_kind not in {
+                    "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH",
+                }:
+                    raise R02Error("IssueFinalizationEpoch must descend from exact ISSUE_ACTIVE claim/epoch authority")
+                if (
+                    epoch.from_authority_kind != parent.claim_kind
+                    or epoch.from_authority_comment_database_id != parent.comment.database_id
+                    or epoch.from_authority_artifact_id != parent.artifact_id
+                    or epoch.from_authority_artifact_sha256 != parent.artifact_sha256
+                    or epoch.from_authority_role != parent.role.value
+                ):
+                    raise R02Error("IssueFinalizationEpoch immediate authority identity/hash/comment mismatch")
+                if parent.claim_kind == "ISSUE_HEAD_CLAIM":
+                    origin = parent if parent.transition_kind in {"PROPOSAL", "PATCH_REGENERATION", "MAIN_ADVANCE"} else None
+                else:
+                    origin = parent.proposal_origin
+                if origin is None or type(origin.artifact) is not IssueHeadClaim:
+                    raise R02Error("IssueFinalizationEpoch ancestry has no proposal-bearing IssueHeadClaim origin")
+                if origin.artifact.transition_kind == "NORMALIZE":
+                    raise R02Error("IssueFinalizationEpoch proposal origin cannot be NORMALIZE")
+                if (
+                    epoch.proposal_origin_claim_comment_database_id != origin.comment.database_id
+                    or epoch.proposal_origin_claim_id != origin.artifact.claim_id
+                    or epoch.proposal_origin_claim_sha256 != _binding_comment_sha256(origin.comment)
+                    or epoch.claimed_target_evidence_digest != origin.artifact.target_evidence_digest
+                    or epoch.fresh_proposal_scope_evidence_digest != origin.artifact.target_evidence_digest
+                ):
+                    raise R02Error("IssueFinalizationEpoch proposal-origin/scope evidence mismatch")
+            else:
+                raise R02Error("unsupported Issue-owned history node kind")
+            if node.target_head_sha in reachable:
+                existing = reachable[node.target_head_sha]
+                if existing.claim_kind != node.claim_kind or existing.artifact_id != node.artifact_id:
+                    raise R02Error("multiple Issue authority nodes claim the same target SHA")
+            else:
+                reachable[node.target_head_sha] = _IssueAuthorityNode(
+                    node.claim_kind, node.role, node.target_head_sha, node.from_head_sha, node.tree_sha,
+                    node.transition_kind, node.artifact_id, node.artifact_sha256, node.comment, node.artifact,
+                    active=node.active, proposal_origin=origin,
+                )
+            advanced = True
+        if not advanced:
+            raise R02Error("unified Issue-owned history has missing or cyclic predecessor provenance")
+        unresolved = remaining
+    return tuple(sorted(reachable.values(), key=lambda node: (node.target_head_sha, node.claim_kind)))
+
+
 def _issue_head_claim_comments(
     client: GitHubClient,
     repository: str,
@@ -1789,49 +2379,12 @@ def _issue_head_claim_comments(
     state: IssuePRBindingState,
     current_ref: str,
 ) -> tuple[IssueHeadClaimComment, ...]:
-    by_generation: dict[str, dict[str, list[tuple[IssueHeadClaim, IssueComment]]]] = {}
-    for comment in comments:
-        if type(comment.body) is not str or not comment.body.startswith(ISSUE_HEAD_CLAIM_MARKER):
-            continue
-        try:
-            claim = parse_issue_head_claim(comment.body)
-        except RequestModelError as error:
-            raise R02Error(f"malformed IssueHeadClaim comment: {_bounded_reason(error)}") from None
-        if (
-            comment.author_id != app.bot_node_id
-            or comment.author_login != app.bot_login
-            or comment.author_type not in {None, "Bot"}
-            or _issue_comment_edited(comment)
-        ):
-            raise R02Error("IssueHeadClaim comment authorship/edit integrity is invalid")
-        _issue_head_claim_matches_binding(claim, state)
-        _validate_issue_head_claim_target(client, repository, claim, state.lease.lease)
-        by_generation.setdefault(claim.claim_generation_id, {}).setdefault(claim.render(), []).append((claim, comment))
-    canonical: list[IssueHeadClaimComment] = []
-    for payloads in by_generation.values():
-        if len(payloads) != 1:
-            raise R02Error("conflicting IssueHeadClaim payloads for one generation block progression")
-        equivalent = next(iter(payloads.values()))
-        claim, comment = min(equivalent, key=lambda item: item[1].database_id)
-        canonical.append(IssueHeadClaimComment(claim, comment, current_ref == claim.to_head_sha))
-    reachable_heads = {state.lease.lease.initial_head_sha}
-    unresolved = list(canonical)
-    while unresolved:
-        advanced = False
-        remaining: list[IssueHeadClaimComment] = []
-        for item in unresolved:
-            claim = item.claim
-            if claim.transition_kind == "NORMALIZE" and claim.from_head_sha != state.lease.lease.initial_head_sha:
-                raise R02Error("NORMALIZE IssueHeadClaim must descend directly from the leased initial head")
-            if claim.from_head_sha in reachable_heads:
-                reachable_heads.add(claim.to_head_sha)
-                advanced = True
-            else:
-                remaining.append(item)
-        if not advanced:
-            raise R02Error("IssueHeadClaim history has a missing or cyclic from-head predecessor")
-        unresolved = remaining
-    return tuple(sorted(canonical, key=lambda item: (item.comment.database_id, item.claim.claim_generation_id)))
+    history = _issue_authority_history(client, repository, comments, app, state, current_ref)
+    claims = tuple(
+        IssueHeadClaimComment(node.artifact, node.comment, node.active)
+        for node in history if node.claim_kind == "ISSUE_HEAD_CLAIM"
+    )
+    return tuple(sorted(claims, key=lambda item: (item.comment.database_id, item.claim.claim_generation_id)))
 
 
 def _fresh_issue_projection_set(
@@ -1888,10 +2441,12 @@ def _fresh_issue_projection_set(
     ):
         raise R02Error("IssuePatchProjection comments must be stored on the generated Issue PR")
     if any(
-        type(comment.body) is str and comment.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        type(comment.body) is str and comment.body.startswith((
+            ISSUE_HEAD_CLAIM_MARKER, REQUIRED_STATUS_EPOCH_MARKER, ISSUE_FINALIZATION_EPOCH_MARKER,
+        ))
         for comment in source_comment_list
     ):
-        raise R02Error("IssueHeadClaim comments must be stored on the generated Issue PR")
+        raise R02Error("Issue-owned claim/epoch comments must be stored on the generated Issue PR")
     for comment in pr_comment_list:
         if type(comment.body) is not str or not comment.body.startswith(ISSUE_PATCH_PROJECTION_MARKER):
             continue
@@ -2703,12 +3258,14 @@ def _validate_managed_issue_head_history(
         raise StaleAuthorityError("managed Issue PR head is not the exact current leased-ref head")
     pr_comments = tuple(client.list_issue_comments(repository, state.binding.pull_request_number))
     _issue_pr_authority_fence(pr_comments, app)
-    claims = _issue_head_claim_comments(client, repository, pr_comments, app, state, current_ref)
-    active = tuple(item for item in claims if item.active)
-    if len(active) > 1:
-        raise R02Error("multiple distinct IssueHeadClaims are active at the current generated ref")
-    if current_ref != state.lease.lease.initial_head_sha and not active:
-        raise R02Error("current generated Issue head has no valid historical IssueHeadClaim authority")
+    history = _issue_authority_history(client, repository, pr_comments, app, state, current_ref)
+    active = tuple(item for item in history if item.target_head_sha == current_ref)
+    if len(active) != 1:
+        raise R02Error("current generated Issue head has no unique validated Issue-owned authority")
+    claims = tuple(
+        IssueHeadClaimComment(item.artifact, item.comment, item.active)
+        for item in history if item.claim_kind == "ISSUE_HEAD_CLAIM"
+    )
     return state, current_ref, pr_comments, claims
 
 
@@ -4164,8 +4721,12 @@ class R02Controller:
             != tuple(item.render() for item in expected_projections)
         ):
             raise StaleAuthorityError("Issue PATCH/projection snapshot changed before claim progression")
-        historical = _issue_head_claim_comments(
+        authority_history = _issue_authority_history(
             self.client, self.central_repository, pr_comments, self.app, state, current_ref,
+        )
+        historical = tuple(
+            IssueHeadClaimComment(node.artifact, node.comment, node.active)
+            for node in authority_history if node.claim_kind == "ISSUE_HEAD_CLAIM"
         )
         active = tuple(item for item in historical if item.active)
         if len(active) > 1:
@@ -4251,8 +4812,12 @@ class R02Controller:
             != tuple(item.render() for item in expected_projections)
         ):
             raise StaleAuthorityError("Issue PATCH/projection snapshot changed before claim progression")
-        historical = _issue_head_claim_comments(
+        authority_history = _issue_authority_history(
             self.client, self.central_repository, pr_comments, self.app, state, current_ref,
+        )
+        historical = tuple(
+            IssueHeadClaimComment(node.artifact, node.comment, node.active)
+            for node in authority_history if node.claim_kind == "ISSUE_HEAD_CLAIM"
         )
         active = tuple(item for item in historical if item.active)
         if len(active) > 1:
@@ -4272,15 +4837,45 @@ class R02Controller:
             self._apply_persisted_issue_head_claim(state, replay, current_ref)
             return replay
 
-        active_claim = active[0].claim if active else None
-        if active_claim is None:
-            if current_ref != state.lease.lease.initial_head_sha:
-                raise StaleAuthorityError("current Issue ref has no active historical IssueHeadClaim authority")
-            transition = (
-                "PROPOSAL"
-                if current_main == state.lease.lease.accepted_base_sha
-                else "NORMALIZE"
+        current_authority = next(
+            (node for node in authority_history if node.target_head_sha == current_ref), None,
+        )
+        if current_authority is None:
+            compatibility_claims = _issue_head_claim_comments(
+                self.client, self.central_repository, pr_comments, self.app, state, current_ref,
             )
+            compatibility_claim = next((item for item in compatibility_claims if item.active), None)
+            if compatibility_claim is not None:
+                current_authority = _IssueAuthorityNode(
+                    "ISSUE_HEAD_CLAIM", CarrierRole.ISSUE_ACTIVE,
+                    compatibility_claim.claim.to_head_sha, compatibility_claim.claim.from_head_sha,
+                    compatibility_claim.claim.to_tree_sha, compatibility_claim.claim.transition_kind,
+                    compatibility_claim.claim.claim_id, _binding_comment_sha256(compatibility_claim.comment),
+                    compatibility_claim.comment, compatibility_claim.claim, active=True,
+                    proposal_origin=(compatibility_claim if compatibility_claim.claim.transition_kind != "NORMALIZE" else None),
+                )
+        if current_authority is None:
+            raise StaleAuthorityError("current Issue ref has no active unified Issue authority")
+        if current_authority.claim_kind == "ISSUE_HEAD_CLAIM":
+            active_claim = current_authority.artifact
+        elif current_authority.claim_kind == "REQUIRED_STATUS_EPOCH":
+            origin = current_authority.proposal_origin
+            active_claim = origin.artifact if origin is not None else None
+        else:
+            active_claim = None
+        if active_claim is None:
+            if current_authority.claim_kind == "ISSUE_BRANCH_LEASE":
+                transition = (
+                    "PROPOSAL"
+                    if current_main == state.lease.lease.accepted_base_sha
+                    else "NORMALIZE"
+                )
+            else:
+                transition = (
+                    "PROPOSAL"
+                    if current_main == state.lease.lease.accepted_base_sha
+                    else "MAIN_ADVANCE"
+                )
         else:
             transition = classify_issue_head_claim_progression(
                 active_claim,
@@ -4501,6 +5096,718 @@ class R02Controller:
         after = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
         if after != claim.to_head_sha:
             raise StaleAuthorityError("IssueHeadClaim CAS did not read back the exact target head")
+
+    def _read_issue_epoch_snapshot(
+        self,
+        issue_number: int,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        semantic_validator: Callable[[Request], bool] | None,
+        *,
+        allow_source_mismatch: bool = False,
+        allow_base_mismatch: bool = False,
+    ) -> _IssueEpochSnapshot:
+        if not callable(source_authority_resolver):
+            raise R02Error("a fresh Issue source-authority resolver is required")
+        repository, accepted_main = self.current_accepted_main()
+        if (
+            repository.full_name != self.central_repository
+            or repository.default_branch != "main"
+            or type(repository.node_id) is not str
+            or not repository.node_id
+        ):
+            raise StaleAuthorityError("central repository identity/default branch is not the exact accepted main")
+        state = _read_managed_issue_pr_binding_state(
+            self.client, self.central_repository, issue_number, self.app,
+            repository.node_id, lambda _request, _request_class: None,
+            validate_fresh_source_authority=False,
+        )
+        if state.binding.central_repository_node_id != repository.node_id:
+            raise StaleAuthorityError("managed Issue binding belongs to a different central repository identity")
+        issue = self.client.get_issue_metadata(self.central_repository, issue_number)
+        issue_comments = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+        pr_comments = tuple(self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number))
+        if (
+            issue.number != state.owning_issue.number
+            or issue.database_id != state.owning_issue.database_id
+            or issue.node_id != state.owning_issue.node_id
+            or issue.is_pull_request
+            or issue.state != "open"
+        ):
+            raise StaleAuthorityError("owning Issue identity or lifecycle changed during epoch validation")
+        fold, projections = _fresh_issue_projection_set(
+            self.client, self.central_repository, issue, state.issue_anchor, state.binding,
+            issue_comments, pr_comments, self.app, semantic_validator,
+            require_complete=not allow_source_mismatch,
+        )
+        fresh_source: IssueSourceAuthority | None = None
+        source_error: str | None = None
+        try:
+            fresh_source = source_authority_resolver(fold.request, state.issue_anchor.anchor.request_class)
+        except Exception as error:
+            source_error = f"UNAVAILABLE:{_bounded_reason(error)}"
+        else:
+            try:
+                _validate_issue_source_authority(state.issue_anchor.anchor, fresh_source)
+            except Exception as error:
+                source_error = f"MISMATCH:{_bounded_reason(error)}"
+        if source_error is not None and not allow_source_mismatch:
+            raise StaleAuthorityError(
+                f"fresh Issue source authority is unavailable or changed: {source_error}"
+            ) from None
+
+        main_meta, main_tree, main_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, accepted_main,
+        )
+        if main_meta.sha != accepted_main:
+            raise StaleAuthorityError("accepted central main commit identity changed")
+        branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
+        current_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        pr = self.client.get_pull_request_metadata(self.central_repository, state.binding.pull_request_number)
+        if (
+            current_ref is None
+            or current_ref != pr.head_oid
+            or (not allow_base_mismatch and pr.base_oid != accepted_main)
+            or pr.base_ref != repository.default_branch
+            or state.pr.head_oid != pr.head_oid
+            or state.pr.base_oid != pr.base_oid
+            or state.pr_issue.state != "open"
+        ):
+            raise StaleAuthorityError("bound Issue PR/ref/base is not the exact current accepted snapshot")
+        _issue_pr_authority_fence(pr_comments, self.app)
+        history = _issue_authority_history(
+            self.client, self.central_repository, pr_comments, self.app, state, current_ref,
+        )
+        current_nodes = tuple(node for node in history if node.target_head_sha == current_ref)
+        if len(current_nodes) != 1:
+            raise StaleAuthorityError("current Issue ref has no unique validated authority node")
+        current_authority = current_nodes[0]
+        marker = (
+            _issue_head_claim_marker(current_authority.artifact)
+            if current_authority.claim_kind == "ISSUE_HEAD_CLAIM"
+            else _required_status_epoch_marker(current_authority.artifact)
+            if current_authority.claim_kind == "REQUIRED_STATUS_EPOCH"
+            else _issue_finalization_epoch_marker(current_authority.artifact)
+            if current_authority.claim_kind == "ISSUE_FINALIZATION_EPOCH"
+            else _lease_marker_for(current_authority.artifact)
+        )
+        resolution = resolve_sha_carrier_role(
+            self.client,
+            self.central_repository,
+            current_ref,
+            self.app.slug,
+            LegacyEvidenceDisposition.CONFLICTING,
+        )
+        if (
+            resolution.activation is not CarrierActivation.ACTIVE
+            or resolution.role is not current_authority.role
+            or resolution.marker != marker
+        ):
+            raise StaleAuthorityError("current Issue head is not ACTIVE under the real SHA-global resolver")
+        return _IssueEpochSnapshot(
+            state, repository, accepted_main, main_tree, main_entries, current_ref,
+            issue, issue_comments, pr_comments, fold, projections, fresh_source,
+            source_error, history, current_authority, resolution,
+        )
+
+    def _derive_issue_proposal_scope(
+        self,
+        snapshot: _IssueEpochSnapshot,
+        proposal_head_sha: str,
+        proposal_origin: _IssueAuthorityNode,
+    ) -> tuple[str, str, str]:
+        if type(proposal_origin.artifact) is not IssueHeadClaim or proposal_origin.transition_kind == "NORMALIZE":
+            raise R02Error("finalizer authority requires a proposal-bearing IssueHeadClaim origin")
+        if self.candidate_builder is None:
+            raise R02Error("fresh C02 proposal candidate builder is unavailable")
+        request_class = snapshot.state.issue_anchor.anchor.request_class
+        request_digest = effective_request_digest(snapshot.fold.request)
+        projection_digest = issue_patch_projection_evidence_digest(snapshot.projections)
+        candidate = _plan_issue_managed_candidate(
+            self.candidate_builder,
+            snapshot.fold.request,
+            request_class,
+            snapshot.accepted_main_sha,
+            proposal_head_sha,
+        )
+        candidate_meta, candidate_tree, candidate_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, candidate.commit_sha,
+        )
+        if candidate_meta.parents != (snapshot.accepted_main_sha,):
+            raise CandidateScopeError("fresh finalizer candidate is not an exact child of accepted main")
+        actual_changed, candidate_evidence = _proposal_tree_evidence(
+            self.client, self.central_repository,
+            snapshot.accepted_main_entries, candidate_entries,
+        )
+        if actual_changed != candidate.changed_paths:
+            raise CandidateScopeError("fresh finalizer candidate changed paths do not match its Git tree")
+        validate_proposal_scope(request_class, actual_changed)
+        if REQUEST_MARKER in _lease_leaf_map(candidate_entries):
+            raise CandidateScopeError("fresh finalizer candidate retains the transient Issue request marker")
+        target_meta, target_tree, target_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, proposal_head_sha,
+        )
+        if target_meta.sha != proposal_head_sha or target_tree != candidate_tree:
+            raise CandidateScopeError("current proposal head tree differs from the freshly built accepted-base candidate")
+        actual_target_changed, target_evidence = _proposal_tree_evidence(
+            self.client, self.central_repository,
+            snapshot.accepted_main_entries, target_entries,
+        )
+        if actual_target_changed != actual_changed:
+            raise CandidateScopeError("current proposal head changed-path scope differs from the fresh candidate")
+        candidate_digest = proposal_target_evidence_digest(
+            candidate_tree_sha=candidate_tree,
+            changed=candidate_evidence,
+            candidate_changed_paths=actual_changed,
+        )
+        target_digest = proposal_target_evidence_digest(
+            candidate_tree_sha=target_tree,
+            changed=target_evidence,
+            candidate_changed_paths=actual_target_changed,
+        )
+        origin_claim = proposal_origin.artifact
+        if (
+            candidate_digest != target_digest
+            or target_digest != origin_claim.target_evidence_digest
+            or request_digest != origin_claim.effective_request_digest
+            or projection_digest != origin_claim.patch_projection_evidence_digest
+        ):
+            raise StaleAuthorityError("fresh request/projection/proposal evidence differs from the proposal-origin claim")
+        return target_digest, request_digest, projection_digest
+
+    def _persist_issue_epoch_artifact(
+        self,
+        state: IssuePRBindingState,
+        artifact: IssueFinalizationEpoch | RequiredStatusEpoch,
+        expected_ref: str,
+    ) -> IssueComment:
+        body = artifact.render()
+        if len(body.encode("utf-8")) > 16_384:
+            raise R02Error("Issue epoch comment exceeds the generic Issue-comment bound")
+        try:
+            self.client.create_issue_comment(
+                self.central_repository, state.binding.pull_request_number, body,
+            )
+        except Exception as error:
+            # An ambiguous POST is diagnosed, then left for a later invocation to
+            # replay. It never creates a replacement target in this invocation.
+            try:
+                comments = tuple(self.client.list_issue_comments(
+                    self.central_repository, state.binding.pull_request_number,
+                ))
+                _issue_authority_history(
+                    self.client, self.central_repository, comments, self.app, state, expected_ref,
+                )
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous Issue epoch POST could not be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            raise StaleAuthorityError(
+                f"ambiguous Issue epoch POST; exact artifact is reserved for a later invocation: {_bounded_reason(error)}"
+            ) from None
+        try:
+            comments = tuple(self.client.list_issue_comments(
+                self.central_repository, state.binding.pull_request_number,
+            ))
+            history = _issue_authority_history(
+                self.client, self.central_repository, comments, self.app, state, expected_ref,
+            )
+        except Exception as error:
+            raise StaleAuthorityError(f"persisted Issue epoch could not be validated: {_bounded_reason(error)}") from None
+        marker = (
+            ISSUE_FINALIZATION_EPOCH_MARKER
+            if type(artifact) is IssueFinalizationEpoch else REQUIRED_STATUS_EPOCH_MARKER
+        )
+        matches = [
+            node.comment for node in history
+            if node.comment.body.startswith(marker)
+            and node.artifact == artifact
+            and node.artifact_sha256 == hashlib.sha256(body.encode("utf-8")).hexdigest()
+        ]
+        if not matches:
+            raise StaleAuthorityError("persisted Issue epoch is absent or differs from the exact intended payload")
+        return min(matches, key=lambda item: item.database_id)
+
+    def _apply_persisted_issue_epoch_target(
+        self,
+        state: IssuePRBindingState,
+        from_head_sha: str,
+        target_head_sha: str,
+        expected_ref: str,
+    ) -> None:
+        branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
+        before = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if before == target_head_sha:
+            return
+        if before != expected_ref or before != from_head_sha:
+            raise StaleAuthorityError("persisted Issue epoch lost its exact from-head ref CAS")
+        try:
+            self.client.update_refs(
+                state.binding.central_repository_node_id,
+                [RefUpdate(state.binding.branch_ref, before, target_head_sha, force=False)],
+            )
+        except (RefCASConflict, GitHubAPIError) as error:
+            after = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            try:
+                comments = tuple(self.client.list_issue_comments(
+                    self.central_repository, state.binding.pull_request_number,
+                ))
+                _issue_authority_history(
+                    self.client, self.central_repository, comments, self.app, state, after or ZERO_OID,
+                )
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous Issue epoch CAS cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            if after == target_head_sha:
+                return
+            raise StaleAuthorityError(
+                f"Issue epoch CAS did not reach its exact target; target remains historical: {_bounded_reason(error)}"
+            ) from None
+        after = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if after != target_head_sha:
+            raise StaleAuthorityError("Issue epoch CAS did not read back the exact target head")
+
+    def prepare_issue_finalization_epoch(
+        self,
+        issue_number: int,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> IssueFinalizationEpoch:
+        """Persist and CAS one exact HA -> HF finalization epoch; publish no status."""
+        snapshot = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+        )
+        current = snapshot.current_authority
+
+        # A retry after a completed CAS returns the already active exact epoch.
+        if current.claim_kind == "ISSUE_FINALIZATION_EPOCH":
+            epoch = current.artifact
+            origin = current.proposal_origin
+            if origin is None:
+                raise StaleAuthorityError("active finalization has no unique proposal-origin claim")
+            scope_digest, request_digest, projection_digest = self._derive_issue_proposal_scope(
+                snapshot, epoch.from_head_sha, origin,
+            )
+            if (
+                type(epoch) is not IssueFinalizationEpoch
+                or epoch.from_head_sha not in {node.target_head_sha for node in snapshot.history}
+                or epoch.accepted_base_sha != snapshot.accepted_main_sha
+                or epoch.accepted_base_tree_sha != snapshot.accepted_main_tree_sha
+                or epoch.claimed_target_evidence_digest != scope_digest
+                or epoch.fresh_proposal_scope_evidence_digest != scope_digest
+                or epoch.effective_request_digest != request_digest
+                or epoch.patch_projection_evidence_digest != projection_digest
+            ):
+                raise StaleAuthorityError("active finalization epoch no longer matches fresh finalizer authority")
+            return epoch
+
+        if (
+            current.role is not CarrierRole.ISSUE_ACTIVE
+            or current.claim_kind not in {"ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH"}
+        ):
+            raise StaleAuthorityError("only an active IssueHeadClaim or RequiredStatusEpoch can enter finalization")
+        origin = current.proposal_origin
+        if origin is None or type(origin.artifact) is not IssueHeadClaim:
+            raise StaleAuthorityError("current Issue head has no unique proposal-bearing IssueHeadClaim ancestry")
+        if origin.transition_kind == "NORMALIZE":
+            raise StaleAuthorityError("normalization-only Issue history cannot enter finalization")
+        target_digest, request_digest, projection_digest = self._derive_issue_proposal_scope(
+            snapshot, snapshot.current_ref, origin,
+        )
+        state = snapshot.state
+        immediate = current
+        stable_fields = dict(
+            schema_version=1,
+            issue_number=state.issue_anchor.anchor.issue_number,
+            issue_database_id=state.issue_anchor.anchor.issue_database_id,
+            issue_node_id=state.issue_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+            issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+            issue_branch_lease_sha256=_binding_comment_sha256(state.lease.comment),
+            binding_id=state.binding.binding_id,
+            source_id=state.issue_anchor.anchor.source_id,
+            source_repository_id=state.issue_anchor.anchor.source_repository_id,
+            pull_request_number=state.binding.pull_request_number,
+            pull_request_database_id=state.binding.pull_request_database_id,
+            pull_request_node_id=state.binding.pull_request_node_id,
+            central_repository_node_id=state.binding.central_repository_node_id,
+            branch_ref=state.binding.branch_ref,
+            request_class=state.issue_anchor.anchor.request_class,
+            accepted_base_sha=snapshot.accepted_main_sha,
+            accepted_base_tree_sha=snapshot.accepted_main_tree_sha,
+            base_ref="main",
+            from_head_sha=snapshot.current_ref,
+            from_tree_sha=immediate.tree_sha,
+            final_head_sha="0" * 40,
+            final_tree_sha=immediate.tree_sha,
+            carrier_nonce="0" * 64,
+            from_authority_kind=immediate.claim_kind,
+            from_authority_comment_database_id=immediate.comment.database_id,
+            from_authority_artifact_id=immediate.artifact_id,
+            from_authority_artifact_sha256=immediate.artifact_sha256,
+            from_authority_role=immediate.role.value,
+            proposal_origin_claim_comment_database_id=origin.comment.database_id,
+            proposal_origin_claim_id=origin.artifact.claim_id,
+            proposal_origin_claim_sha256=origin.artifact_sha256,
+            effective_request_digest=request_digest,
+            patch_projection_evidence_digest=projection_digest,
+            claimed_target_evidence_digest=target_digest,
+            fresh_proposal_scope_evidence_digest=target_digest,
+        )
+
+        pending = tuple(
+            node for node in snapshot.history
+            if node.claim_kind == "ISSUE_FINALIZATION_EPOCH"
+            and node.from_head_sha == snapshot.current_ref
+        )
+        replay_pending = bool(pending)
+        if len(pending) > 1:
+            raise R02Error("multiple pending finalization epochs from the current HA conflict")
+        if pending:
+            epoch = pending[0].artifact
+            expected = stable_fields.copy()
+            for name in ("final_head_sha", "carrier_nonce"):
+                expected.pop(name)
+            actual = {
+                "schema_version": epoch.schema_version,
+                "issue_number": epoch.issue_number,
+                "issue_database_id": epoch.issue_database_id,
+                "issue_node_id": epoch.issue_node_id,
+                "issue_request_anchor_comment_database_id": epoch.issue_request_anchor_comment_database_id,
+                "issue_request_anchor_sha256": epoch.issue_request_anchor_sha256,
+                "issue_branch_lease_comment_database_id": epoch.issue_branch_lease_comment_database_id,
+                "issue_branch_lease_sha256": epoch.issue_branch_lease_sha256,
+                "binding_id": epoch.binding_id,
+                "source_id": epoch.source_id,
+                "source_repository_id": epoch.source_repository_id,
+                "pull_request_number": epoch.pull_request_number,
+                "pull_request_database_id": epoch.pull_request_database_id,
+                "pull_request_node_id": epoch.pull_request_node_id,
+                "central_repository_node_id": epoch.central_repository_node_id,
+                "branch_ref": epoch.branch_ref,
+                "request_class": epoch.request_class,
+                "accepted_base_sha": epoch.accepted_base_sha,
+                "accepted_base_tree_sha": epoch.accepted_base_tree_sha,
+                "base_ref": epoch.base_ref,
+                "from_head_sha": epoch.from_head_sha,
+                "from_tree_sha": epoch.from_tree_sha,
+                "final_tree_sha": epoch.final_tree_sha,
+                "from_authority_kind": epoch.from_authority_kind,
+                "from_authority_comment_database_id": epoch.from_authority_comment_database_id,
+                "from_authority_artifact_id": epoch.from_authority_artifact_id,
+                "from_authority_artifact_sha256": epoch.from_authority_artifact_sha256,
+                "from_authority_role": epoch.from_authority_role,
+                "proposal_origin_claim_comment_database_id": epoch.proposal_origin_claim_comment_database_id,
+                "proposal_origin_claim_id": epoch.proposal_origin_claim_id,
+                "proposal_origin_claim_sha256": epoch.proposal_origin_claim_sha256,
+                "effective_request_digest": epoch.effective_request_digest,
+                "patch_projection_evidence_digest": epoch.patch_projection_evidence_digest,
+                "claimed_target_evidence_digest": epoch.claimed_target_evidence_digest,
+                "fresh_proposal_scope_evidence_digest": epoch.fresh_proposal_scope_evidence_digest,
+            }
+            if actual != expected:
+                raise StaleAuthorityError("pending finalization epoch does not match the freshly resolved HA authority")
+        else:
+            nonce = (nonce_factory or new_carrier_nonce)()
+            if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{64}", nonce):
+                raise R02Error("IssueFinalizationEpoch nonce must be lowercase 256-bit hex")
+            stable_fields["carrier_nonce"] = nonce
+            prepared = IssueFinalizationEpoch.create(**stable_fields)
+            marker_text = _issue_finalization_epoch_marker(prepared).render()
+            timestamp = self.client.bot_commit_timestamp_after(
+                self.central_repository, snapshot.current_ref,
+            )
+            wrapper = self.client.create_commit(
+                self.central_repository, marker_text, immediate.tree_sha,
+                [snapshot.current_ref], timestamp=timestamp,
+            )
+            epoch = IssueFinalizationEpoch.create(**{
+                **stable_fields,
+                "final_head_sha": wrapper.sha,
+            })
+            _validate_issue_finalization_epoch_target(
+                self.client, self.central_repository, epoch, state,
+            )
+
+        if not replay_pending:
+            self._persist_issue_epoch_artifact(state, epoch, snapshot.current_ref)
+        before_cas = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+        )
+        _require_same_managed_issue_pr_binding(state, before_cas.state)
+        if (
+            before_cas.current_ref != snapshot.current_ref
+            or before_cas.current_authority.claim_kind != immediate.claim_kind
+            or before_cas.current_authority.artifact_id != immediate.artifact_id
+            or before_cas.accepted_main_sha != epoch.accepted_base_sha
+        ):
+            raise StaleAuthorityError("HA, accepted main, or immediate authority changed before finalization CAS")
+        fresh_scope, fresh_request, fresh_projection = self._derive_issue_proposal_scope(
+            before_cas, snapshot.current_ref, before_cas.current_authority.proposal_origin,
+        )
+        if (
+            fresh_scope != epoch.fresh_proposal_scope_evidence_digest
+            or fresh_request != epoch.effective_request_digest
+            or fresh_projection != epoch.patch_projection_evidence_digest
+        ):
+            raise StaleAuthorityError("finalizer-grade proposal evidence changed before finalization CAS")
+        self._apply_persisted_issue_epoch_target(
+            before_cas.state, epoch.from_head_sha, epoch.final_head_sha, snapshot.current_ref,
+        )
+        final_snapshot = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+        )
+        _require_same_managed_issue_pr_binding(state, final_snapshot.state)
+        if (
+            final_snapshot.current_ref != epoch.final_head_sha
+            or final_snapshot.current_authority.claim_kind != "ISSUE_FINALIZATION_EPOCH"
+            or final_snapshot.current_authority.artifact != epoch
+        ):
+            raise StaleAuthorityError("finalization CAS is not the exact active HF")
+        origin = final_snapshot.current_authority.proposal_origin
+        if origin is None:
+            raise StaleAuthorityError("active HF lost its exact proposal-origin ancestry")
+        fresh_scope, fresh_request, fresh_projection = self._derive_issue_proposal_scope(
+            final_snapshot, epoch.from_head_sha, origin,
+        )
+        if (
+            fresh_scope != epoch.fresh_proposal_scope_evidence_digest
+            or fresh_request != epoch.effective_request_digest
+            or fresh_projection != epoch.patch_projection_evidence_digest
+        ):
+            raise StaleAuthorityError("finalizer-grade authority changed after finalization CAS")
+        return epoch
+
+    def publish_issue_final_success(
+        self,
+        issue_number: int,
+        epoch: IssueFinalizationEpoch,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+    ) -> StatusWriteReceipt:
+        """Append only the exact success tuple authorized by the active HF epoch."""
+        if type(epoch) is not IssueFinalizationEpoch:
+            raise R02Error("issue-final publication requires an exact IssueFinalizationEpoch")
+        snapshot = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+        )
+        node = snapshot.current_authority
+        if (
+            node.claim_kind != "ISSUE_FINALIZATION_EPOCH"
+            or node.role is not CarrierRole.ISSUE_FINALIZING
+            or node.artifact != epoch
+            or snapshot.resolution.activation is not CarrierActivation.ACTIVE
+        ):
+            raise StaleAuthorityError("issue-final success requires the exact ACTIVE(ISSUE_FINALIZING) epoch")
+        if (
+            epoch.issue_number != issue_number
+            or epoch.final_head_sha != snapshot.current_ref
+            or snapshot.state.pr.head_oid != epoch.final_head_sha
+            or snapshot.state.owning_issue.state != "open"
+            or snapshot.state.pr_issue.state != "open"
+            or epoch.accepted_base_sha != snapshot.accepted_main_sha
+            or epoch.accepted_base_tree_sha != snapshot.accepted_main_tree_sha
+        ):
+            raise StaleAuthorityError("issue-final epoch, accepted base, or live managed state changed")
+        origin = node.proposal_origin
+        if origin is None:
+            raise StaleAuthorityError("active finalization epoch has no proposal-origin IssueHeadClaim")
+        scope_digest, request_digest, projection_digest = self._derive_issue_proposal_scope(
+            snapshot, epoch.from_head_sha, origin,
+        )
+        if (
+            scope_digest != epoch.claimed_target_evidence_digest
+            or scope_digest != epoch.fresh_proposal_scope_evidence_digest
+            or request_digest != epoch.effective_request_digest
+            or projection_digest != epoch.patch_projection_evidence_digest
+        ):
+            raise StaleAuthorityError("fresh finalizer-grade authority no longer matches the exact HF epoch")
+        receipt = self.client.create_commit_status(
+            self.central_repository,
+            epoch.final_head_sha,
+            "success",
+            epoch.required_status_context,
+            epoch.required_status_description,
+            None,
+        )
+        return _validate_issue_final_status_receipt(receipt, snapshot.repository, epoch, self.app)
+
+    def revoke_required_status_epoch(
+        self,
+        issue_number: int,
+        reason: RequiredStatusEpochReason,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> RequiredStatusEpoch:
+        """Move invalidated current Issue semantics to a fresh no-tree-change HV."""
+        if type(reason) is not RequiredStatusEpochReason:
+            raise R02Error("RequiredStatusEpoch revocation requires an exact closed reason")
+        snapshot = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+            allow_source_mismatch=True,
+            allow_base_mismatch=True,
+        )
+        current = snapshot.current_authority
+        if current.claim_kind == "REQUIRED_STATUS_EPOCH":
+            epoch = current.artifact
+            if epoch.reason_class is reason:
+                return epoch
+            raise StaleAuthorityError("current active RequiredStatusEpoch already represents a different reason")
+        if current.claim_kind not in {
+            "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH", "ISSUE_FINALIZATION_EPOCH",
+        }:
+            raise StaleAuthorityError("only an active Wave 06 Issue-owned claim/epoch can be revoked")
+        if current.role is CarrierRole.ISSUE_FINALIZING:
+            if (
+                reason is not RequiredStatusEpochReason.FINALIZATION_INVALIDATED
+                or current.claim_kind != "ISSUE_FINALIZATION_EPOCH"
+            ):
+                raise R02Error("an active finalization epoch requires FINALIZATION_INVALIDATED revocation")
+        elif reason is RequiredStatusEpochReason.FINALIZATION_INVALIDATED:
+            raise R02Error("FINALIZATION_INVALIDATED requires an exact active ISSUE_FINALIZING predecessor")
+
+        artifact = current.artifact
+        if reason is RequiredStatusEpochReason.MAIN_ADVANCE_REVALIDATION:
+            if getattr(artifact, "accepted_base_sha", None) == snapshot.accepted_main_sha:
+                raise R02Error("MAIN_ADVANCE_REVALIDATION requires accepted main to have advanced")
+        elif reason is RequiredStatusEpochReason.REQUEST_PATCH_REVALIDATION:
+            origin = current.proposal_origin
+            if origin is None or type(origin.artifact) is not IssueHeadClaim:
+                raise R02Error("REQUEST_PATCH_REVALIDATION requires proposal-bearing claim ancestry")
+            if (
+                effective_request_digest(snapshot.fold.request) == origin.artifact.effective_request_digest
+                and issue_patch_projection_evidence_digest(snapshot.projections)
+                == origin.artifact.patch_projection_evidence_digest
+            ):
+                raise R02Error("REQUEST_PATCH_REVALIDATION requires changed request or PATCH evidence")
+        elif reason is RequiredStatusEpochReason.SOURCE_IDENTITY_REVALIDATION:
+            if snapshot.source_error is None or not snapshot.source_error.startswith("MISMATCH:"):
+                raise R02Error("SOURCE_IDENTITY_REVALIDATION requires a detected source-identity mismatch")
+        elif reason is RequiredStatusEpochReason.ACTIVE_REVALIDATION:
+            if snapshot.source_error is not None:
+                raise R02Error("ACTIVE_REVALIDATION cannot conceal unresolved source identity drift")
+        elif reason is not RequiredStatusEpochReason.FINALIZATION_INVALIDATED and snapshot.source_error is not None:
+            raise R02Error("this revocation reason cannot conceal unresolved source identity drift")
+
+        prior_status = (
+            _latest_exact_issue_final_status_evidence(
+                self.client, self.central_repository, snapshot.current_ref, self.app,
+            )
+            if current.role is CarrierRole.ISSUE_FINALIZING else None
+        )
+        pending = tuple(
+            node for node in snapshot.history
+            if node.claim_kind == "REQUIRED_STATUS_EPOCH"
+            and node.from_head_sha == snapshot.current_ref
+        )
+        replay_pending = bool(pending)
+        if len(pending) > 1:
+            raise R02Error("multiple pending RequiredStatusEpoch artifacts from the current head conflict")
+        if pending:
+            epoch = pending[0].artifact
+            if (
+                epoch.reason_class is not reason
+                or epoch.from_provenance_kind != current.claim_kind
+                or epoch.from_provenance_id != current.artifact_id
+                or epoch.from_provenance_sha256 != current.artifact_sha256
+                or epoch.from_carrier_role != current.role.value
+                or epoch.accepted_base_sha != snapshot.accepted_main_sha
+                or epoch.accepted_base_tree_sha != snapshot.accepted_main_tree_sha
+            ):
+                raise StaleAuthorityError("pending RequiredStatusEpoch does not match the fresh revocation authority")
+        else:
+            nonce = (nonce_factory or new_carrier_nonce)()
+            if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{64}", nonce):
+                raise R02Error("RequiredStatusEpoch nonce must be lowercase 256-bit hex")
+            state = snapshot.state
+            epoch_fields = dict(
+                schema_version=2,
+                issue_number=state.issue_anchor.anchor.issue_number,
+                issue_database_id=state.issue_anchor.anchor.issue_database_id,
+                issue_node_id=state.issue_anchor.anchor.issue_node_id,
+                issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+                issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+                issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+                issue_branch_lease_sha256=_binding_comment_sha256(state.lease.comment),
+                binding_id=state.binding.binding_id,
+                source_id=state.issue_anchor.anchor.source_id,
+                source_repository_id=state.issue_anchor.anchor.source_repository_id,
+                pull_request_number=state.binding.pull_request_number,
+                pull_request_database_id=state.binding.pull_request_database_id,
+                pull_request_node_id=state.binding.pull_request_node_id,
+                central_repository_node_id=state.binding.central_repository_node_id,
+                branch_ref=state.binding.branch_ref,
+                request_class=state.issue_anchor.anchor.request_class,
+                accepted_base_sha=snapshot.accepted_main_sha,
+                accepted_base_tree_sha=snapshot.accepted_main_tree_sha,
+                base_ref="main",
+                from_head_sha=snapshot.current_ref,
+                from_tree_sha=current.tree_sha,
+                to_head_sha="0" * 40,
+                to_tree_sha=current.tree_sha,
+                carrier_nonce=nonce,
+                reason_class=reason,
+                from_provenance_kind=current.claim_kind,
+                from_provenance_id=current.artifact_id,
+                from_provenance_sha256=current.artifact_sha256,
+                from_carrier_role=current.role.value,
+                prior_required_status=prior_status,
+            )
+            prepared = RequiredStatusEpoch.create(**epoch_fields)
+            marker_text = _required_status_epoch_marker(prepared).render()
+            timestamp = self.client.bot_commit_timestamp_after(
+                self.central_repository, snapshot.current_ref,
+            )
+            wrapper = self.client.create_commit(
+                self.central_repository, marker_text, current.tree_sha,
+                [snapshot.current_ref], timestamp=timestamp,
+            )
+            epoch = RequiredStatusEpoch.create(**{
+                **epoch_fields,
+                "to_head_sha": wrapper.sha,
+            })
+            _validate_required_status_epoch_target(
+                self.client, self.central_repository, epoch, state,
+            )
+
+        if not replay_pending:
+            self._persist_issue_epoch_artifact(snapshot.state, epoch, snapshot.current_ref)
+        before_cas = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+            allow_source_mismatch=True,
+            allow_base_mismatch=True,
+        )
+        _require_same_managed_issue_pr_binding(snapshot.state, before_cas.state)
+        if (
+            before_cas.current_ref != snapshot.current_ref
+            or before_cas.current_authority.claim_kind != current.claim_kind
+            or before_cas.current_authority.artifact_id != current.artifact_id
+            or before_cas.accepted_main_sha != epoch.accepted_base_sha
+        ):
+            raise StaleAuthorityError("current head, accepted main, or predecessor changed before revocation CAS")
+        self._apply_persisted_issue_epoch_target(
+            before_cas.state, epoch.from_head_sha, epoch.to_head_sha, snapshot.current_ref,
+        )
+        after_cas = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+            allow_source_mismatch=True,
+            allow_base_mismatch=True,
+        )
+        _require_same_managed_issue_pr_binding(snapshot.state, after_cas.state)
+        if (
+            after_cas.current_ref != epoch.to_head_sha
+            or after_cas.current_authority.claim_kind != "REQUIRED_STATUS_EPOCH"
+            or after_cas.current_authority.artifact != epoch
+            or after_cas.resolution.role is not CarrierRole.ISSUE_ACTIVE
+        ):
+            raise StaleAuthorityError("revocation CAS is not the exact ACTIVE(ISSUE_ACTIVE) HV")
+        return epoch
 
     def trusted_machine_validation(self, pr_number: int, accepted_base_sha: str, *, expected_head_sha: str | None = None) -> TrustedValidationResult:
         repository, current_main = self.current_accepted_main()

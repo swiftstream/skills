@@ -40,12 +40,17 @@ from automation.federation.request_model import (
     ISSUE_REQUEST_ANCHOR_MARKER,
     ISSUE_BRANCH_LEASE_MARKER,
     ISSUE_HEAD_CLAIM_MARKER,
+    REQUIRED_STATUS_EPOCH_MARKER,
+    ISSUE_FINALIZATION_EPOCH_MARKER,
     ISSUE_INTERNAL_PR_BINDING_MARKER,
     PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
     CommentEvent,
     IssueRequestAnchor,
     IssueHeadClaim,
+    RequiredStatusEpoch,
+    RequiredStatusEpochReason,
+    IssueFinalizationEpoch,
     IssuePRBinding,
     IssueBranchLease,
     ClaimedHeadMarker,
@@ -65,11 +70,15 @@ from automation.federation.request_model import (
     parse_pr_issue_origin_binding,
     issue_branch_ref,
     issue_head_claim_authority_digest,
+    issue_final_status_evidence_digest,
     external_status_evidence_digest,
     effective_request_digest,
     proposal_target_evidence_digest,
+    normalize_target_evidence_digest,
     render_request_body,
     render_status_description,
+    parse_required_status_epoch,
+    parse_issue_finalization_epoch,
 )
 from automation.federation.github_api import (
     GitHubAPIError,
@@ -2841,6 +2850,456 @@ class Wave05ShaCarrierResolverTests(unittest.TestCase):
         return client, issue, anchor_comment, lease, state, claim
 
     @staticmethod
+    def _persist_test_epoch_target(client, sha, parent_sha, tree_sha, marker_text, timestamp=None):
+        timestamp = timestamp or IssueBranchLeaseControllerTests.CLAIM_DATE
+        parent_tree, entries = client.commit_trees[parent_sha]
+        if parent_tree != tree_sha:
+            raise AssertionError("epoch target fixture must preserve its parent tree")
+        client.commit_metadata[sha] = GitCommitMetadata(sha, tree_sha, (parent_sha,), timestamp)
+        client.commit_messages[sha] = marker_text
+        client.commit_trees[sha] = (tree_sha, entries)
+
+    @staticmethod
+    def _activate_fixture_head(client, state, head_sha):
+        client.current_ref = head_sha
+        client.pull_requests[state.binding.pull_request_number] = replace(
+            client.pull_requests[state.binding.pull_request_number], head_oid=head_sha,
+        )
+
+    def make_required_status_epoch_client(self, *, prior_required_status=None, nonce="9" * 64):
+        client, issue, anchor_comment, lease, state, claim = self.make_claim_client()
+        claim_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        )
+        common = dict(
+            issue_number=state.issue_anchor.anchor.issue_number,
+            issue_database_id=state.issue_anchor.anchor.issue_database_id,
+            issue_node_id=state.issue_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+            issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+            issue_branch_lease_sha256=hashlib.sha256(state.lease.comment.body.encode("utf-8")).hexdigest(),
+            binding_id=state.binding.binding_id,
+            source_id=state.binding.source_id,
+            source_repository_id=state.binding.source_repository_id,
+            pull_request_number=state.binding.pull_request_number,
+            pull_request_database_id=state.binding.pull_request_database_id,
+            pull_request_node_id=state.binding.pull_request_node_id,
+            central_repository_node_id=state.binding.central_repository_node_id,
+            branch_ref=state.binding.branch_ref,
+            request_class=state.issue_anchor.anchor.request_class,
+            accepted_base_sha=claim.accepted_base_sha,
+            accepted_base_tree_sha=claim.accepted_base_tree_sha,
+            base_ref="main",
+            from_head_sha=claim.to_head_sha,
+            from_tree_sha=claim.to_tree_sha,
+            to_head_sha="0" * 40,
+            to_tree_sha=claim.to_tree_sha,
+            carrier_nonce=nonce,
+            reason_class=RequiredStatusEpochReason.ACTIVE_REVALIDATION,
+            from_provenance_kind="ISSUE_HEAD_CLAIM",
+            from_provenance_id=claim.claim_id,
+            from_provenance_sha256=hashlib.sha256(claim_comment.body.encode("utf-8")).hexdigest(),
+            from_carrier_role="ISSUE_ACTIVE",
+            prior_required_status=prior_required_status,
+        )
+        prepared = RequiredStatusEpoch.create(**common)
+        marker_text = controller_module._required_status_epoch_marker(prepared).render()
+        timestamp = IssueBranchLeaseControllerTests.CLAIM_DATE
+        target_sha = controller_module._expected_deterministic_commit_sha(
+            claim.to_tree_sha, claim.to_head_sha, marker_text, timestamp,
+        )
+        epoch = RequiredStatusEpoch.create(**{**common, "to_head_sha": target_sha})
+        self._persist_test_epoch_target(client, target_sha, claim.to_head_sha, claim.to_tree_sha, marker_text)
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(epoch.render(), database_id=3_101),
+        )
+        self._activate_fixture_head(client, state, target_sha)
+        client.authority_reads = []
+        client.issue_metadata_reads = []
+        client.pull_request_metadata_reads = []
+        client.issue_comment_reads = []
+        client.generated_ref_reads = []
+        client.ref_reads = []
+        return client, issue, anchor_comment, lease, state, claim, epoch
+
+    def make_finalization_epoch_client(self, *, through_required_status=False):
+        if through_required_status:
+            client, issue, anchor_comment, lease, state, claim, immediate = self.make_required_status_epoch_client()
+            immediate_kind = "REQUIRED_STATUS_EPOCH"
+            immediate_comment = next(
+                item for item in client.pr_comments[state.binding.pull_request_number]
+                if item.body.startswith(REQUIRED_STATUS_EPOCH_MARKER)
+            )
+            from_head = immediate.to_head_sha
+            from_tree = immediate.to_tree_sha
+        else:
+            client, issue, anchor_comment, lease, state, claim = self.make_claim_client()
+            immediate = claim
+            immediate_kind = "ISSUE_HEAD_CLAIM"
+            immediate_comment = next(
+                item for item in client.pr_comments[state.binding.pull_request_number]
+                if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+            )
+            from_head = claim.to_head_sha
+            from_tree = claim.to_tree_sha
+        origin_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        )
+        common = dict(
+            issue_number=state.issue_anchor.anchor.issue_number,
+            issue_database_id=state.issue_anchor.anchor.issue_database_id,
+            issue_node_id=state.issue_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+            issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+            issue_branch_lease_sha256=hashlib.sha256(state.lease.comment.body.encode("utf-8")).hexdigest(),
+            binding_id=state.binding.binding_id,
+            source_id=state.binding.source_id,
+            source_repository_id=state.binding.source_repository_id,
+            pull_request_number=state.binding.pull_request_number,
+            pull_request_database_id=state.binding.pull_request_database_id,
+            pull_request_node_id=state.binding.pull_request_node_id,
+            central_repository_node_id=state.binding.central_repository_node_id,
+            branch_ref=state.binding.branch_ref,
+            request_class=state.issue_anchor.anchor.request_class,
+            accepted_base_sha=claim.accepted_base_sha,
+            accepted_base_tree_sha=claim.accepted_base_tree_sha,
+            base_ref="main",
+            from_head_sha=from_head,
+            from_tree_sha=from_tree,
+            final_head_sha="0" * 40,
+            final_tree_sha=from_tree,
+            carrier_nonce="a" * 64,
+            from_authority_kind=immediate_kind,
+            from_authority_comment_database_id=immediate_comment.database_id,
+            from_authority_artifact_id=immediate.epoch_id if through_required_status else immediate.claim_id,
+            from_authority_artifact_sha256=hashlib.sha256(immediate_comment.body.encode("utf-8")).hexdigest(),
+            from_authority_role="ISSUE_ACTIVE",
+            proposal_origin_claim_comment_database_id=origin_comment.database_id,
+            proposal_origin_claim_id=claim.claim_id,
+            proposal_origin_claim_sha256=hashlib.sha256(origin_comment.body.encode("utf-8")).hexdigest(),
+            effective_request_digest=claim.effective_request_digest,
+            patch_projection_evidence_digest=claim.patch_projection_evidence_digest,
+            claimed_target_evidence_digest=claim.target_evidence_digest,
+            fresh_proposal_scope_evidence_digest=claim.target_evidence_digest,
+        )
+        prepared = IssueFinalizationEpoch.create(**common)
+        marker_text = controller_module._issue_finalization_epoch_marker(prepared).render()
+        timestamp = IssueBranchLeaseControllerTests.CLAIM_DATE
+        target_sha = controller_module._expected_deterministic_commit_sha(
+            from_tree, from_head, marker_text, timestamp,
+        )
+        epoch = IssueFinalizationEpoch.create(**{**common, "final_head_sha": target_sha})
+        self._persist_test_epoch_target(client, target_sha, from_head, from_tree, marker_text)
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(epoch.render(), database_id=3_102),
+        )
+        self._activate_fixture_head(client, state, target_sha)
+        client.authority_reads = []
+        client.issue_metadata_reads = []
+        client.pull_request_metadata_reads = []
+        client.issue_comment_reads = []
+        client.generated_ref_reads = []
+        client.ref_reads = []
+        return client, issue, anchor_comment, lease, state, claim, immediate, epoch
+
+    def make_finalization_invalidation_chain(self):
+        client, issue, anchor_comment, lease, state, claim, _claim_authority, first_final = self.make_finalization_epoch_client()
+        final_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_FINALIZATION_EPOCH_MARKER)
+        )
+        revoke_fields = dict(
+            issue_number=first_final.issue_number,
+            issue_database_id=first_final.issue_database_id,
+            issue_node_id=first_final.issue_node_id,
+            issue_request_anchor_comment_database_id=first_final.issue_request_anchor_comment_database_id,
+            issue_request_anchor_sha256=first_final.issue_request_anchor_sha256,
+            issue_branch_lease_comment_database_id=first_final.issue_branch_lease_comment_database_id,
+            issue_branch_lease_sha256=first_final.issue_branch_lease_sha256,
+            binding_id=first_final.binding_id,
+            source_id=first_final.source_id,
+            source_repository_id=first_final.source_repository_id,
+            pull_request_number=first_final.pull_request_number,
+            pull_request_database_id=first_final.pull_request_database_id,
+            pull_request_node_id=first_final.pull_request_node_id,
+            central_repository_node_id=first_final.central_repository_node_id,
+            branch_ref=first_final.branch_ref,
+            request_class=first_final.request_class,
+            accepted_base_sha=first_final.accepted_base_sha,
+            accepted_base_tree_sha=first_final.accepted_base_tree_sha,
+            base_ref="main",
+            from_head_sha=first_final.final_head_sha,
+            from_tree_sha=first_final.final_tree_sha,
+            to_head_sha="0" * 40,
+            to_tree_sha=first_final.final_tree_sha,
+            carrier_nonce="b" * 64,
+            reason_class=RequiredStatusEpochReason.FINALIZATION_INVALIDATED,
+            from_provenance_kind="ISSUE_FINALIZATION_EPOCH",
+            from_provenance_id=first_final.epoch_id,
+            from_provenance_sha256=hashlib.sha256(final_comment.body.encode("utf-8")).hexdigest(),
+            from_carrier_role="ISSUE_FINALIZING",
+            prior_required_status=None,
+        )
+        prepared_revoke = RequiredStatusEpoch.create(**revoke_fields)
+        revoke_marker = controller_module._required_status_epoch_marker(prepared_revoke).render()
+        timestamp = IssueBranchLeaseControllerTests.CLAIM_DATE
+        hv = controller_module._expected_deterministic_commit_sha(
+            first_final.final_tree_sha, first_final.final_head_sha, revoke_marker, timestamp,
+        )
+        revoke = RequiredStatusEpoch.create(**{**revoke_fields, "to_head_sha": hv})
+        self._persist_test_epoch_target(client, hv, first_final.final_head_sha, first_final.final_tree_sha, revoke_marker)
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(revoke.render(), database_id=3_103),
+        )
+        self._activate_fixture_head(client, state, hv)
+        revoke_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(REQUIRED_STATUS_EPOCH_MARKER)
+        )
+        claim_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        )
+        final_fields = dict(
+            issue_number=claim.issue_number,
+            issue_database_id=claim.issue_database_id,
+            issue_node_id=claim.issue_node_id,
+            issue_request_anchor_comment_database_id=claim.issue_request_anchor_comment_database_id,
+            issue_request_anchor_sha256=claim.issue_request_anchor_sha256,
+            issue_branch_lease_comment_database_id=claim.issue_branch_lease_comment_database_id,
+            issue_branch_lease_sha256=claim.issue_branch_lease_sha256,
+            binding_id=claim.binding_id,
+            source_id=claim.source_id,
+            source_repository_id=claim.source_repository_id,
+            pull_request_number=claim.pull_request_number,
+            pull_request_database_id=claim.pull_request_database_id,
+            pull_request_node_id=claim.pull_request_node_id,
+            central_repository_node_id=claim.central_repository_node_id,
+            branch_ref=claim.branch_ref,
+            request_class=claim.request_class,
+            accepted_base_sha=claim.accepted_base_sha,
+            accepted_base_tree_sha=claim.accepted_base_tree_sha,
+            base_ref="main",
+            from_head_sha=hv,
+            from_tree_sha=revoke.to_tree_sha,
+            final_head_sha="0" * 40,
+            final_tree_sha=revoke.to_tree_sha,
+            carrier_nonce="d" * 64,
+            from_authority_kind="REQUIRED_STATUS_EPOCH",
+            from_authority_comment_database_id=revoke_comment.database_id,
+            from_authority_artifact_id=revoke.epoch_id,
+            from_authority_artifact_sha256=hashlib.sha256(revoke_comment.body.encode("utf-8")).hexdigest(),
+            from_authority_role="ISSUE_ACTIVE",
+            proposal_origin_claim_comment_database_id=claim_comment.database_id,
+            proposal_origin_claim_id=claim.claim_id,
+            proposal_origin_claim_sha256=hashlib.sha256(claim_comment.body.encode("utf-8")).hexdigest(),
+            effective_request_digest=claim.effective_request_digest,
+            patch_projection_evidence_digest=claim.patch_projection_evidence_digest,
+            claimed_target_evidence_digest=claim.target_evidence_digest,
+            fresh_proposal_scope_evidence_digest=claim.target_evidence_digest,
+        )
+        prepared_final = IssueFinalizationEpoch.create(**final_fields)
+        final_marker = controller_module._issue_finalization_epoch_marker(prepared_final).render()
+        hf2 = controller_module._expected_deterministic_commit_sha(
+            revoke.to_tree_sha, hv, final_marker, timestamp,
+        )
+        final2 = IssueFinalizationEpoch.create(**{**final_fields, "final_head_sha": hf2})
+        self._persist_test_epoch_target(client, hf2, hv, revoke.to_tree_sha, final_marker)
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(final2.render(), database_id=3_104),
+        )
+        self._activate_fixture_head(client, state, hf2)
+        return client, issue, anchor_comment, lease, state, claim, first_final, revoke, final2
+
+    def make_claim_from_epoch(self, client, state, parent_epoch, base_claim, *, transition="PROPOSAL", nonce="e" * 64):
+        common = dict(
+            schema_version=1,
+            issue_number=base_claim.issue_number,
+            issue_database_id=base_claim.issue_database_id,
+            issue_node_id=base_claim.issue_node_id,
+            issue_request_anchor_comment_database_id=base_claim.issue_request_anchor_comment_database_id,
+            issue_request_anchor_sha256=base_claim.issue_request_anchor_sha256,
+            issue_branch_lease_comment_database_id=base_claim.issue_branch_lease_comment_database_id,
+            issue_branch_lease_sha256=base_claim.issue_branch_lease_sha256,
+            binding_id=base_claim.binding_id,
+            source_id=base_claim.source_id,
+            source_repository_id=base_claim.source_repository_id,
+            pull_request_number=base_claim.pull_request_number,
+            pull_request_database_id=base_claim.pull_request_database_id,
+            pull_request_node_id=base_claim.pull_request_node_id,
+            central_repository_node_id=base_claim.central_repository_node_id,
+            branch_ref=base_claim.branch_ref,
+            request_class=base_claim.request_class,
+            accepted_base_sha=base_claim.accepted_base_sha,
+            accepted_base_tree_sha=base_claim.accepted_base_tree_sha,
+            from_head_sha=parent_epoch.to_head_sha if type(parent_epoch) is RequiredStatusEpoch else parent_epoch.final_head_sha,
+            from_tree_sha=parent_epoch.to_tree_sha if type(parent_epoch) is RequiredStatusEpoch else parent_epoch.final_tree_sha,
+            to_head_sha="0" * 40,
+            to_tree_sha=base_claim.to_tree_sha,
+            transition_kind=transition,
+            carrier_nonce=nonce,
+            effective_request_digest=base_claim.effective_request_digest,
+            patch_projection_evidence_digest=base_claim.patch_projection_evidence_digest,
+            target_evidence_digest=base_claim.target_evidence_digest,
+        )
+        prepared = IssueHeadClaim.create(**common)
+        marker_text = controller_module._issue_head_claim_marker(prepared).render()
+        timestamp = IssueBranchLeaseControllerTests.CLAIM_DATE
+        target_sha = controller_module._expected_deterministic_commit_sha(
+            prepared.to_tree_sha, prepared.from_head_sha, marker_text, timestamp,
+        )
+        claim = IssueHeadClaim.create(**{**common, "to_head_sha": target_sha})
+        self._persist_test_epoch_target(client, target_sha, prepared.from_head_sha, prepared.to_tree_sha, marker_text)
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(claim.render(), database_id=3_105),
+        )
+        return claim
+
+    def make_normalize_origin_finalization_client(self):
+        issue, anchor_comment = IssueBranchLeaseControllerTests.setup_anchor()
+        client = self.CarrierClient(issue, anchor_comment)
+        lease = IssueBranchLeaseControllerTests().create(client, anchor_comment, nonce_factory=lambda: "c" * 64)
+        client.binding_anchor = anchor_comment
+        client.binding_lease = lease
+        client.current_ref = lease.lease.initial_head_sha
+        binder = IssuePRBindingControllerTests()
+        state = binder.run_binding(client)
+        marker_content = (state.issue_anchor.anchor.request_class.value + "\n").encode("utf-8")
+        marker_blob_sha = hashlib.sha1(
+            b"blob " + str(len(marker_content)).encode("ascii") + b"\0" + marker_content,
+        ).hexdigest()
+        normalize_target = normalize_target_evidence_digest(
+            request_class=state.issue_anchor.anchor.request_class,
+            request_marker_blob_sha=marker_blob_sha,
+            target_tree_sha=lease.lease.initial_head_tree_sha,
+        )
+        claim_fields = dict(
+            schema_version=1,
+            issue_number=state.issue_anchor.anchor.issue_number,
+            issue_database_id=state.issue_anchor.anchor.issue_database_id,
+            issue_node_id=state.issue_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+            issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+            issue_branch_lease_sha256=hashlib.sha256(state.lease.comment.body.encode("utf-8")).hexdigest(),
+            binding_id=state.binding.binding_id,
+            source_id=state.binding.source_id,
+            source_repository_id=state.binding.source_repository_id,
+            pull_request_number=state.binding.pull_request_number,
+            pull_request_database_id=state.binding.pull_request_database_id,
+            pull_request_node_id=state.binding.pull_request_node_id,
+            central_repository_node_id=state.binding.central_repository_node_id,
+            branch_ref=state.binding.branch_ref,
+            request_class=state.issue_anchor.anchor.request_class,
+            accepted_base_sha=lease.lease.accepted_base_sha,
+            accepted_base_tree_sha=IssueBranchLeaseControllerTests.BASE_TREE,
+            from_head_sha=lease.lease.initial_head_sha,
+            from_tree_sha=lease.lease.initial_head_tree_sha,
+            to_head_sha="0" * 40,
+            to_tree_sha=lease.lease.initial_head_tree_sha,
+            transition_kind="NORMALIZE",
+            carrier_nonce="d" * 64,
+            effective_request_digest=effective_request_digest(state.issue_anchor.anchor.initial_request),
+            patch_projection_evidence_digest="7" * 64,
+            target_evidence_digest=normalize_target,
+        )
+        prepared = IssueHeadClaim.create(**claim_fields)
+        marker_text = controller_module._issue_head_claim_marker(prepared).render()
+        timestamp = IssueBranchLeaseControllerTests.CLAIM_DATE
+        target_sha = controller_module._expected_deterministic_commit_sha(
+            prepared.to_tree_sha, prepared.from_head_sha, marker_text, timestamp,
+        )
+        normalize_claim = IssueHeadClaim.create(**{**claim_fields, "to_head_sha": target_sha})
+        self._persist_test_epoch_target(
+            client, target_sha, lease.lease.initial_head_sha,
+            lease.lease.initial_head_tree_sha, marker_text,
+        )
+        client.blobs[marker_blob_sha] = marker_content
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(normalize_claim.render(), database_id=3_107),
+        )
+        # Persist a finalization artifact that is structurally exact but whose
+        # only IssueHeadClaim origin is normalization-only.
+        common = dict(
+            issue_number=normalize_claim.issue_number,
+            issue_database_id=normalize_claim.issue_database_id,
+            issue_node_id=normalize_claim.issue_node_id,
+            issue_request_anchor_comment_database_id=normalize_claim.issue_request_anchor_comment_database_id,
+            issue_request_anchor_sha256=normalize_claim.issue_request_anchor_sha256,
+            issue_branch_lease_comment_database_id=normalize_claim.issue_branch_lease_comment_database_id,
+            issue_branch_lease_sha256=normalize_claim.issue_branch_lease_sha256,
+            binding_id=normalize_claim.binding_id,
+            source_id=normalize_claim.source_id,
+            source_repository_id=normalize_claim.source_repository_id,
+            pull_request_number=normalize_claim.pull_request_number,
+            pull_request_database_id=normalize_claim.pull_request_database_id,
+            pull_request_node_id=normalize_claim.pull_request_node_id,
+            central_repository_node_id=normalize_claim.central_repository_node_id,
+            branch_ref=normalize_claim.branch_ref,
+            request_class=normalize_claim.request_class,
+            accepted_base_sha=normalize_claim.accepted_base_sha,
+            accepted_base_tree_sha=normalize_claim.accepted_base_tree_sha,
+            base_ref="main",
+            from_head_sha=normalize_claim.to_head_sha,
+            from_tree_sha=normalize_claim.to_tree_sha,
+            final_head_sha="0" * 40,
+            final_tree_sha=normalize_claim.to_tree_sha,
+            carrier_nonce="f" * 64,
+            from_authority_kind="ISSUE_HEAD_CLAIM",
+            from_authority_comment_database_id=3_107,
+            from_authority_artifact_id=normalize_claim.claim_id,
+            from_authority_artifact_sha256=hashlib.sha256(normalize_claim.render().encode("utf-8")).hexdigest(),
+            from_authority_role="ISSUE_ACTIVE",
+            proposal_origin_claim_comment_database_id=3_107,
+            proposal_origin_claim_id=normalize_claim.claim_id,
+            proposal_origin_claim_sha256=hashlib.sha256(normalize_claim.render().encode("utf-8")).hexdigest(),
+            effective_request_digest=normalize_claim.effective_request_digest,
+            patch_projection_evidence_digest=normalize_claim.patch_projection_evidence_digest,
+            claimed_target_evidence_digest=normalize_claim.target_evidence_digest,
+            fresh_proposal_scope_evidence_digest=normalize_claim.target_evidence_digest,
+        )
+        prepared_final = IssueFinalizationEpoch.create(**common)
+        final_marker = controller_module._issue_finalization_epoch_marker(prepared_final).render()
+        final_sha = controller_module._expected_deterministic_commit_sha(
+            normalize_claim.to_tree_sha, normalize_claim.to_head_sha, final_marker, timestamp,
+        )
+        final_epoch = IssueFinalizationEpoch.create(**{**common, "final_head_sha": final_sha})
+        self._persist_test_epoch_target(client, final_sha, normalize_claim.to_head_sha, normalize_claim.to_tree_sha, final_marker)
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(final_epoch.render(), database_id=3_108),
+        )
+        self._activate_fixture_head(client, state, final_sha)
+        return client, state, normalize_claim, final_epoch
+
+    def append_finalization_variant(self, client, state, fields, *, comment_id, timestamp=None):
+        for key in (
+            "claim_generation_id", "authority_preimage_digest", "finalizer_evidence_digest",
+            "required_status_context", "required_status_class", "required_status_state",
+            "required_status_target_url", "required_status_evidence_digest",
+            "required_status_description", "marker_digest", "epoch_id",
+        ):
+            fields.pop(key, None)
+        fields["final_head_sha"] = "0" * 40
+        prepared = IssueFinalizationEpoch.create(**fields)
+        marker_text = controller_module._issue_finalization_epoch_marker(prepared).render()
+        commit_time = timestamp or IssueBranchLeaseControllerTests.CLAIM_DATE
+        head_sha = controller_module._expected_deterministic_commit_sha(
+            prepared.final_tree_sha, prepared.from_head_sha, marker_text, commit_time,
+        )
+        epoch = IssueFinalizationEpoch.create(**{**fields, "final_head_sha": head_sha})
+        self._persist_test_epoch_target(
+            client, head_sha, epoch.from_head_sha, epoch.final_tree_sha, marker_text, commit_time,
+        )
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(epoch.render(), database_id=comment_id),
+        )
+        return epoch
+
+    @staticmethod
     def commit_message_client(sha, message):
         class MarkerClient:
             def __init__(self):
@@ -3511,6 +3970,560 @@ class Wave05ShaCarrierResolverTests(unittest.TestCase):
         self.assertEqual(len(failed.calls), 1)
         self.assertEqual(failed.calls[0][0], "POST")
 
+    def test_required_status_epoch_active_and_moved_ref_use_real_provenance_graph(self):
+        client, _issue, _anchor, _lease, state, _claim, epoch = self.make_required_status_epoch_client()
+        legacy_reads = []
+        active = self.resolve(
+            client, epoch.to_head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+        self.assertEqual(active, ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE,
+            controller_module._required_status_epoch_marker(epoch),
+        ))
+        self.assertEqual(legacy_reads, [])
+        client.current_ref = epoch.from_head_sha
+        reserved = self.resolve(client, epoch.to_head_sha, LegacyEvidenceDisposition.ABSENT)
+        self.assertEqual(reserved.activation, CarrierActivation.RESERVED_INACTIVE)
+        self.assertEqual(reserved.role, CarrierRole.ISSUE_ACTIVE)
+        self.assertEqual(client.pr_inventory_reads, 0)
+
+    def test_required_status_epoch_post_provenance_lifecycle_head_and_ref_drift_are_reserved(self):
+        scenarios = ("ref-moved", "pr-head-moved", "issue-closed", "pr-closed")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                client, issue, _anchor, _lease, state, _claim, epoch = self.make_required_status_epoch_client()
+                branch = state.binding.branch_ref.removeprefix("refs/heads/")
+                if scenario == "ref-moved":
+                    client.current_ref = epoch.from_head_sha
+                elif scenario == "pr-head-moved":
+                    client.pull_requests[state.binding.pull_request_number] = replace(
+                        client.pull_requests[state.binding.pull_request_number], head_oid=epoch.from_head_sha,
+                    )
+                elif scenario == "issue-closed":
+                    client.issue = replace(issue, state="closed")
+                else:
+                    pr_number = state.binding.pull_request_number
+                    client.pull_request_issues[pr_number] = replace(
+                        client.pull_request_issues[pr_number], state="closed",
+                    )
+                result = self.resolve(client, epoch.to_head_sha, LegacyEvidenceDisposition.ABSENT)
+                self.assertEqual(result.activation, CarrierActivation.RESERVED_INACTIVE)
+                self.assertEqual(result.role, CarrierRole.ISSUE_ACTIVE)
+                self.assertEqual(result.marker, controller_module._required_status_epoch_marker(epoch))
+                self.assertEqual(client.ref_reads, [branch, branch])
+
+    def test_required_status_epoch_missing_wrong_app_edited_and_conflicting_comments_fail_closed(self):
+        for corruption in ("missing", "wrong-app", "edited"):
+            with self.subTest(corruption=corruption):
+                client, _issue, _anchor, _lease, state, _claim, epoch = self.make_required_status_epoch_client()
+                comments = list(client.pr_comments[state.binding.pull_request_number])
+                if corruption == "missing":
+                    comments = [item for item in comments if not item.body.startswith(REQUIRED_STATUS_EPOCH_MARKER)]
+                else:
+                    comments = [
+                        replace(item, author_id="wrong") if corruption == "wrong-app" and item.body.startswith(REQUIRED_STATUS_EPOCH_MARKER)
+                        else replace(item, editor_id=self.APP.bot_node_id) if corruption == "edited" and item.body.startswith(REQUIRED_STATUS_EPOCH_MARKER)
+                        else item
+                        for item in comments
+                    ]
+                client.pr_comments[state.binding.pull_request_number] = comments
+                legacy_reads = []
+                result = self.resolve(
+                    client, epoch.to_head_sha,
+                    lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+                )
+                self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+                self.assertEqual(legacy_reads, [])
+
+    def test_required_status_epoch_conflicting_duplicate_and_target_corruption_block(self):
+        client, _issue, _anchor, _lease, state, claim, epoch = self.make_required_status_epoch_client()
+        fields = epoch._fields()
+        for name in ("claim_generation_id", "authority_preimage_digest", "marker_digest", "epoch_id"):
+            fields.pop(name)
+        alternate_time = "2026-10-05T00:00:01Z"
+        prepared = RequiredStatusEpoch.create(**{**fields, "to_head_sha": "0" * 40})
+        marker_text = controller_module._required_status_epoch_marker(prepared).render()
+        alternate_sha = controller_module._expected_deterministic_commit_sha(
+            epoch.to_tree_sha, epoch.from_head_sha, marker_text, alternate_time,
+        )
+        duplicate = RequiredStatusEpoch.create(**{**fields, "to_head_sha": alternate_sha})
+        client.commit_metadata[alternate_sha] = GitCommitMetadata(
+            alternate_sha, epoch.to_tree_sha, (epoch.from_head_sha,), alternate_time,
+        )
+        parent_tree, entries = client.commit_trees[epoch.from_head_sha]
+        self.assertEqual(parent_tree, epoch.to_tree_sha)
+        client.commit_messages[alternate_sha] = marker_text
+        client.commit_trees[alternate_sha] = (epoch.to_tree_sha, entries)
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(duplicate.render(), database_id=3_106),
+        )
+        result = self.resolve(client, epoch.to_head_sha, LegacyEvidenceDisposition.ABSENT)
+        self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+
+        for corruption in ("parent", "tree", "marker"):
+            with self.subTest(corruption=corruption):
+                fresh, _issue, _anchor, _lease, _state, _claim, fresh_epoch = self.make_required_status_epoch_client()
+                sha = fresh_epoch.to_head_sha
+                metadata = fresh.commit_metadata[sha]
+                if corruption == "parent":
+                    fresh.commit_metadata[sha] = replace(metadata, parents=("f" * 40,))
+                elif corruption == "tree":
+                    fresh.commit_metadata[sha] = replace(metadata, tree_sha="f" * 40)
+                else:
+                    fresh.commit_messages[sha] += "forged\n"
+                self.assertEqual(
+                    self.resolve(fresh, sha, LegacyEvidenceDisposition.ABSENT).activation,
+                    CarrierActivation.CONFLICTING,
+                )
+
+    def test_required_status_epoch_finalization_invalidated_requires_exact_finalizer_parent(self):
+        client, issue, anchor_comment, lease, state, claim, first_final, revoke, final2 = self.make_finalization_invalidation_chain()
+        self.assertEqual(revoke.reason_class, RequiredStatusEpochReason.FINALIZATION_INVALIDATED)
+        active = self.resolve(client, final2.final_head_sha, LegacyEvidenceDisposition.ABSENT)
+        self.assertEqual(active.activation, CarrierActivation.ACTIVE)
+        self.assertEqual(active.role, CarrierRole.ISSUE_FINALIZING)
+        self.assertEqual(active.marker, controller_module._issue_finalization_epoch_marker(final2))
+        self.assertEqual(
+            [item.body.splitlines()[0] for item in client.pr_comments[state.binding.pull_request_number]
+             if item.body.startswith((ISSUE_HEAD_CLAIM_MARKER, REQUIRED_STATUS_EPOCH_MARKER, ISSUE_FINALIZATION_EPOCH_MARKER))],
+            [ISSUE_HEAD_CLAIM_MARKER, ISSUE_FINALIZATION_EPOCH_MARKER, REQUIRED_STATUS_EPOCH_MARKER, ISSUE_FINALIZATION_EPOCH_MARKER],
+        )
+
+    def test_issue_finalization_epoch_active_direct_and_after_required_status_chain(self):
+        for through_required in (False, True):
+            with self.subTest(through_required=through_required):
+                client, _issue, _anchor, _lease, _state, _claim, _immediate, epoch = self.make_finalization_epoch_client(
+                    through_required_status=through_required,
+                )
+                legacy_reads = []
+                result = self.resolve(
+                    client, epoch.final_head_sha,
+                    lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+                )
+                self.assertEqual(result.activation, CarrierActivation.ACTIVE)
+                self.assertEqual(result.role, CarrierRole.ISSUE_FINALIZING)
+                self.assertEqual(result.marker, controller_module._issue_finalization_epoch_marker(epoch))
+                self.assertEqual(legacy_reads, [])
+
+    def test_issue_finalization_epoch_moved_head_and_lifecycle_are_reserved(self):
+        for moved in ("ref", "pr-head", "issue-closed", "pr-closed"):
+            with self.subTest(moved=moved):
+                client, issue, _anchor, _lease, state, _claim, _immediate, epoch = self.make_finalization_epoch_client()
+                if moved == "ref":
+                    client.current_ref = epoch.from_head_sha
+                elif moved == "pr-head":
+                    client.pull_requests[state.binding.pull_request_number] = replace(
+                        client.pull_requests[state.binding.pull_request_number], head_oid=epoch.from_head_sha,
+                    )
+                elif moved == "issue-closed":
+                    client.issue = replace(issue, state="closed")
+                else:
+                    number = state.binding.pull_request_number
+                    client.pull_request_issues[number] = replace(client.pull_request_issues[number], state="closed")
+                result = self.resolve(client, epoch.final_head_sha, LegacyEvidenceDisposition.ABSENT)
+                self.assertEqual(result.activation, CarrierActivation.RESERVED_INACTIVE)
+                self.assertEqual(result.role, CarrierRole.ISSUE_FINALIZING)
+
+    def test_issue_finalization_epoch_missing_edited_wrong_app_and_status_digest_tamper_conflict(self):
+        for corruption in ("missing", "edited", "wrong-app", "status-digest"):
+            with self.subTest(corruption=corruption):
+                client, _issue, _anchor, _lease, state, _claim, _immediate, epoch = self.make_finalization_epoch_client()
+                comments = list(client.pr_comments[state.binding.pull_request_number])
+                index = next(i for i, item in enumerate(comments) if item.body.startswith(ISSUE_FINALIZATION_EPOCH_MARKER))
+                if corruption == "missing":
+                    comments.pop(index)
+                elif corruption == "edited":
+                    comments[index] = replace(comments[index], editor_id=self.APP.bot_node_id)
+                elif corruption == "wrong-app":
+                    comments[index] = replace(comments[index], author_login="wrong[bot]")
+                else:
+                    value = json.loads(comments[index].body.splitlines()[1])
+                    value["requiredStatusEvidenceDigest"] = "f" * 64
+                    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    comments[index] = replace(comments[index], body=ISSUE_FINALIZATION_EPOCH_MARKER + "\n" + payload + "\n")
+                client.pr_comments[state.binding.pull_request_number] = comments
+                result = self.resolve(client, epoch.final_head_sha, LegacyEvidenceDisposition.ABSENT)
+                self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+
+    def test_issue_finalization_epoch_target_parent_tree_and_marker_mismatch_conflict(self):
+        for corruption in ("parent", "tree", "marker"):
+            with self.subTest(corruption=corruption):
+                client, _issue, _anchor, _lease, _state, _claim, _immediate, epoch = self.make_finalization_epoch_client()
+                sha = epoch.final_head_sha
+                metadata = client.commit_metadata[sha]
+                if corruption == "parent":
+                    client.commit_metadata[sha] = replace(metadata, parents=("f" * 40,))
+                elif corruption == "tree":
+                    client.commit_metadata[sha] = replace(metadata, tree_sha="f" * 40)
+                else:
+                    client.commit_messages[sha] += "forged\n"
+                self.assertEqual(
+                    self.resolve(client, sha, LegacyEvidenceDisposition.ABSENT).activation,
+                    CarrierActivation.CONFLICTING,
+                )
+
+    def test_unified_history_accepts_issue_head_claim_from_active_required_status_head(self):
+        client, _issue, _anchor, _lease, state, base_claim, epoch = self.make_required_status_epoch_client()
+        successor = self.make_claim_from_epoch(client, state, epoch, base_claim)
+        history = controller_module._issue_authority_history(
+            client, self.CENTRAL, client.pr_comments[state.binding.pull_request_number],
+            self.APP, state, epoch.to_head_sha,
+        )
+        self.assertTrue(any(node.target_head_sha == successor.to_head_sha and node.claim_kind == "ISSUE_HEAD_CLAIM" for node in history))
+        self.assertEqual(
+            controller_module._issue_head_claim_comments(
+                client, self.CENTRAL, client.pr_comments[state.binding.pull_request_number],
+                self.APP, state, epoch.to_head_sha,
+            )[-1].claim,
+            successor,
+        )
+
+    def test_issue_head_claim_from_finalizing_and_normalize_from_epoch_are_rejected(self):
+        client, _issue, _anchor, _lease, state, claim, _immediate, final = self.make_finalization_epoch_client()
+        direct_successor = self.make_claim_from_epoch(client, state, final, claim)
+        self.assertEqual(
+            self.resolve(client, direct_successor.to_head_sha, LegacyEvidenceDisposition.ABSENT).activation,
+            CarrierActivation.CONFLICTING,
+        )
+
+        client, _issue, _anchor, _lease, state, claim, epoch = self.make_required_status_epoch_client()
+        normalize = self.make_claim_from_epoch(client, state, epoch, claim, transition="NORMALIZE")
+        self.assertEqual(
+            self.resolve(client, normalize.to_head_sha, LegacyEvidenceDisposition.ABSENT).activation,
+            CarrierActivation.CONFLICTING,
+        )
+
+    def test_issue_finalization_rejects_required_authority_and_proposal_origin_mismatches(self):
+        client, _issue, _anchor, _lease, state, _claim, _immediate, epoch = self.make_finalization_epoch_client()
+        wrong_immediate = epoch._fields()
+        wrong_immediate.update({
+            "from_authority_kind": "REQUIRED_STATUS_EPOCH",
+            "from_authority_comment_database_id": 999,
+            "from_authority_artifact_id": "c" * 64,
+            "from_authority_artifact_sha256": "d" * 64,
+        })
+        variant = self.append_finalization_variant(client, state, wrong_immediate, comment_id=3_109)
+        self.assertEqual(
+            self.resolve(client, variant.final_head_sha, LegacyEvidenceDisposition.ABSENT).activation,
+            CarrierActivation.CONFLICTING,
+        )
+
+        client, _issue, _anchor, _lease, state, _claim, _immediate, epoch = self.make_finalization_epoch_client(
+            through_required_status=True,
+        )
+        wrong_origin = epoch._fields()
+        wrong_origin.update({
+            "proposal_origin_claim_comment_database_id": 999,
+            "proposal_origin_claim_id": "c" * 64,
+            "proposal_origin_claim_sha256": "d" * 64,
+        })
+        variant = self.append_finalization_variant(client, state, wrong_origin, comment_id=3_110)
+        self.assertEqual(
+            self.resolve(client, variant.final_head_sha, LegacyEvidenceDisposition.ABSENT).activation,
+            CarrierActivation.CONFLICTING,
+        )
+
+    def test_issue_finalization_conflicting_duplicate_and_normalization_only_origin_block(self):
+        client, _issue, _anchor, _lease, state, _claim, _immediate, epoch = self.make_finalization_epoch_client()
+        duplicate_fields = epoch._fields()
+        duplicate = self.append_finalization_variant(
+            client, state, duplicate_fields, comment_id=3_111,
+            timestamp="2026-10-05T00:00:01Z",
+        )
+        self.assertEqual(duplicate.claim_generation_id, epoch.claim_generation_id)
+        self.assertEqual(
+            self.resolve(client, epoch.final_head_sha, LegacyEvidenceDisposition.ABSENT).activation,
+            CarrierActivation.CONFLICTING,
+        )
+
+        client, state, _normalize_claim, normalize_origin_epoch = self.make_normalize_origin_finalization_client()
+        self.assertEqual(
+            self.resolve(client, normalize_origin_epoch.final_head_sha, LegacyEvidenceDisposition.ABSENT).activation,
+            CarrierActivation.CONFLICTING,
+        )
+
+    def test_missing_mixed_epoch_predecessor_fails_closed_without_fallback(self):
+        client, issue, _anchor, _lease, state, claim, _active_epoch = self.make_required_status_epoch_client()
+        missing_parent = "f" * 40
+        client.commit_metadata[missing_parent] = GitCommitMetadata(
+            missing_parent, claim.to_tree_sha, (), IssueBranchLeaseControllerTests.CLAIM_DATE,
+        )
+        client.commit_trees[missing_parent] = (claim.to_tree_sha, client.commit_trees[claim.to_head_sha][1])
+        fields = dict(
+            issue_number=state.issue_anchor.anchor.issue_number,
+            issue_database_id=state.issue_anchor.anchor.issue_database_id,
+            issue_node_id=state.issue_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+            issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+            issue_branch_lease_sha256=hashlib.sha256(state.lease.comment.body.encode("utf-8")).hexdigest(),
+            binding_id=state.binding.binding_id,
+            source_id=state.binding.source_id,
+            source_repository_id=state.binding.source_repository_id,
+            pull_request_number=state.binding.pull_request_number,
+            pull_request_database_id=state.binding.pull_request_database_id,
+            pull_request_node_id=state.binding.pull_request_node_id,
+            central_repository_node_id=state.binding.central_repository_node_id,
+            branch_ref=state.binding.branch_ref,
+            request_class=state.issue_anchor.anchor.request_class,
+            accepted_base_sha=claim.accepted_base_sha,
+            accepted_base_tree_sha=claim.accepted_base_tree_sha,
+            base_ref="main",
+            from_head_sha=missing_parent,
+            from_tree_sha=claim.to_tree_sha,
+            to_head_sha="0" * 40,
+            to_tree_sha=claim.to_tree_sha,
+            carrier_nonce="8" * 64,
+            reason_class=RequiredStatusEpochReason.ACTIVE_REVALIDATION,
+            from_provenance_kind="ISSUE_HEAD_CLAIM",
+            from_provenance_id="9" * 64,
+            from_provenance_sha256="a" * 64,
+            from_carrier_role="ISSUE_ACTIVE",
+            prior_required_status=None,
+        )
+        prepared = RequiredStatusEpoch.create(**fields)
+        marker_text = controller_module._required_status_epoch_marker(prepared).render()
+        timestamp = IssueBranchLeaseControllerTests.CLAIM_DATE
+        target = controller_module._expected_deterministic_commit_sha(
+            claim.to_tree_sha, missing_parent, marker_text, timestamp,
+        )
+        epoch = RequiredStatusEpoch.create(**{**fields, "to_head_sha": target})
+        self._persist_test_epoch_target(client, target, missing_parent, claim.to_tree_sha, marker_text)
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(epoch.render(), database_id=3_112),
+        )
+        legacy_reads = []
+        result = self.resolve(
+            client, target,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+        self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+        self.assertEqual(legacy_reads, [])
+
+    def test_unified_issue_authority_history_rejects_genuine_mixed_cycle(self):
+        client, _issue, _anchor, _lease, state, claim = self.make_claim_client()
+
+        def validated_shape(target_sha, parent_sha, epoch_id):
+            epoch = object.__new__(RequiredStatusEpoch)
+            object.__setattr__(epoch, "claim_kind", "REQUIRED_STATUS_EPOCH")
+            object.__setattr__(epoch, "to_head_sha", target_sha)
+            object.__setattr__(epoch, "from_head_sha", parent_sha)
+            object.__setattr__(epoch, "to_tree_sha", claim.to_tree_sha)
+            object.__setattr__(epoch, "transition_kind", "ACTIVE_REVALIDATION")
+            object.__setattr__(epoch, "epoch_id", epoch_id)
+            comment = IssueAnchorControllerTests.comment(
+                f"validated Phase-1 wrapper {epoch_id}", database_id=3_120 + int(epoch_id[0], 16),
+            )
+            return controller_module.RequiredStatusEpochComment(epoch, comment, False)
+
+        target_a, target_b = "d" * 40, "e" * 40
+        self.assertNotIn(target_a, {state.lease.lease.initial_head_sha, claim.to_head_sha})
+        self.assertNotIn(target_b, {state.lease.lease.initial_head_sha, claim.to_head_sha})
+        cycle = (
+            validated_shape(target_a, target_b, "1" * 64),
+            validated_shape(target_b, target_a, "2" * 64),
+        )
+        comments = client.pr_comments[state.binding.pull_request_number]
+        with patch.object(controller_module, "_required_status_epoch_comments", return_value=cycle):
+            with self.assertRaises(R02Error) as caught:
+                controller_module._issue_authority_history(
+                    client, self.CENTRAL, comments, self.APP, state, claim.to_head_sha,
+                )
+        self.assertEqual(
+            str(caught.exception),
+            "unified Issue-owned history has missing or cyclic predecessor provenance",
+        )
+
+    def test_unified_issue_authority_history_rejects_conflicting_role_provenance_for_same_target(self):
+        client, _issue, _anchor, _lease, state, claim = self.make_claim_client()
+        target_sha = "f" * 40
+        self.assertNotIn(target_sha, {state.lease.lease.initial_head_sha, claim.to_head_sha})
+
+        required = object.__new__(RequiredStatusEpoch)
+        for name, value in {
+            "claim_kind": "REQUIRED_STATUS_EPOCH",
+            "epoch_id": "3" * 64,
+            "from_head_sha": claim.to_head_sha,
+            "to_head_sha": target_sha,
+            "to_tree_sha": claim.to_tree_sha,
+            "transition_kind": "ACTIVE_REVALIDATION",
+        }.items():
+            object.__setattr__(required, name, value)
+        finalization = object.__new__(IssueFinalizationEpoch)
+        for name, value in {
+            "claim_kind": "ISSUE_FINALIZATION_EPOCH",
+            "epoch_id": "4" * 64,
+            "from_head_sha": claim.to_head_sha,
+            "final_head_sha": target_sha,
+            "final_tree_sha": claim.to_tree_sha,
+            "transition_kind": "FINALIZE",
+        }.items():
+            object.__setattr__(finalization, name, value)
+        required_wrapper = controller_module.RequiredStatusEpochComment(
+            required,
+            IssueAnchorControllerTests.comment("validated RSE wrapper", database_id=3_123),
+            False,
+        )
+        finalization_wrapper = controller_module.IssueFinalizationEpochComment(
+            finalization,
+            IssueAnchorControllerTests.comment("validated IFE wrapper", database_id=3_124),
+            False,
+        )
+        comments = client.pr_comments[state.binding.pull_request_number]
+        with (
+            patch.object(controller_module, "_required_status_epoch_comments", return_value=(required_wrapper,)),
+            patch.object(controller_module, "_issue_finalization_epoch_comments", return_value=(finalization_wrapper,)),
+        ):
+            with self.assertRaises(R02Error) as caught:
+                controller_module._issue_authority_history(
+                    client, self.CENTRAL, comments, self.APP, state, claim.to_head_sha,
+                )
+        self.assertEqual(
+            str(caught.exception),
+            "conflicting Issue-owned role/provenance for one claimed SHA",
+        )
+
+    def test_finalization_from_required_epoch_rejects_stale_older_proposal_origin(self):
+        client, _issue, _anchor, _lease, state, proposal_one, _epoch_one, final_one = (
+            self.make_finalization_epoch_client(through_required_status=True)
+        )
+        proposal_two = self.make_claim_from_epoch(client, state, _epoch_one, proposal_one)
+        proposal_two_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER) and item.database_id == 3_105
+        )
+
+        epoch_fields = _epoch_one._fields()
+        for key in ("claim_generation_id", "authority_preimage_digest", "marker_digest", "epoch_id"):
+            epoch_fields.pop(key)
+        epoch_fields.update({
+            "from_head_sha": proposal_two.to_head_sha,
+            "from_tree_sha": proposal_two.to_tree_sha,
+            "to_head_sha": "0" * 40,
+            "to_tree_sha": proposal_two.to_tree_sha,
+            "carrier_nonce": "b" * 64,
+            "from_provenance_kind": "ISSUE_HEAD_CLAIM",
+            "from_provenance_id": proposal_two.claim_id,
+            "from_provenance_sha256": hashlib.sha256(proposal_two_comment.body.encode("utf-8")).hexdigest(),
+            "from_carrier_role": "ISSUE_ACTIVE",
+        })
+        prepared_epoch_two = RequiredStatusEpoch.create(**epoch_fields)
+        epoch_two_marker = controller_module._required_status_epoch_marker(prepared_epoch_two).render()
+        epoch_two_sha = controller_module._expected_deterministic_commit_sha(
+            proposal_two.to_tree_sha, proposal_two.to_head_sha, epoch_two_marker,
+            IssueBranchLeaseControllerTests.CLAIM_DATE,
+        )
+        epoch_two = RequiredStatusEpoch.create(**{**epoch_fields, "to_head_sha": epoch_two_sha})
+        self._persist_test_epoch_target(
+            client, epoch_two_sha, proposal_two.to_head_sha, proposal_two.to_tree_sha, epoch_two_marker,
+        )
+        epoch_two_comment = IssueAnchorControllerTests.comment(epoch_two.render(), database_id=3_125)
+        client.pr_comments[state.binding.pull_request_number].append(epoch_two_comment)
+
+        stale_final_fields = final_one._fields()
+        stale_final_fields.update({
+            "from_head_sha": epoch_two.to_head_sha,
+            "from_tree_sha": epoch_two.to_tree_sha,
+            "final_head_sha": "0" * 40,
+            "final_tree_sha": epoch_two.to_tree_sha,
+            "from_authority_kind": "REQUIRED_STATUS_EPOCH",
+            "from_authority_comment_database_id": epoch_two_comment.database_id,
+            "from_authority_artifact_id": epoch_two.epoch_id,
+            "from_authority_artifact_sha256": hashlib.sha256(epoch_two_comment.body.encode("utf-8")).hexdigest(),
+        })
+        stale_final = self.append_finalization_variant(
+            client, state, stale_final_fields, comment_id=3_126,
+        )
+        self._activate_fixture_head(client, state, stale_final.final_head_sha)
+
+        self.assertNotEqual(proposal_one.claim_id, proposal_two.claim_id)
+        self.assertEqual(epoch_two.from_provenance_id, proposal_two.claim_id)
+        self.assertEqual(stale_final.from_head_sha, epoch_two.to_head_sha)
+        self.assertEqual(stale_final.proposal_origin_claim_id, proposal_one.claim_id)
+        legacy_reads = []
+        result = self.resolve(
+            client, stale_final.final_head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+        self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+        self.assertIsNone(result.role)
+        self.assertEqual(legacy_reads, [])
+
+    def test_required_status_epoch_post_provenance_races_and_binding_drift(self):
+        for race in ("issue-close", "pr-close", "pr-head", "ref", "final-ref-error", "binding"):
+            with self.subTest(race=race):
+                client, issue, _anchor, _lease, state, _claim, epoch = self.make_required_status_epoch_client()
+                pr_number = state.binding.pull_request_number
+                branch = state.binding.branch_ref.removeprefix("refs/heads/")
+                if race == "issue-close":
+                    client.issue_metadata_sequences[issue.number] = [issue, issue, replace(issue, state="closed")]
+                elif race == "pr-close":
+                    pr_issue = client.pull_request_issues[pr_number]
+                    client.issue_metadata_sequences[pr_number] = [pr_issue, replace(pr_issue, state="closed")]
+                elif race == "pr-head":
+                    pr = client.pull_requests[pr_number]
+                    client.pull_request_metadata_sequences[pr_number] = [pr, replace(pr, head_oid=epoch.from_head_sha)]
+                elif race == "ref":
+                    client.generated_ref_sequence = [epoch.to_head_sha, epoch.from_head_sha]
+                elif race == "final-ref-error":
+                    client.generated_ref_sequence = [epoch.to_head_sha, RuntimeError("final ref unavailable")]
+                else:
+                    original = tuple(client.comments)
+                    drifted = list(original)
+                    index = next(i for i, comment in enumerate(drifted) if comment.body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER))
+                    drifted[index] = replace(drifted[index], body=drifted[index].body + "\n")
+                    client.issue_comment_sequences[issue.number] = [original, original, drifted]
+                result = self.resolve(client, epoch.to_head_sha, LegacyEvidenceDisposition.ABSENT)
+                if race == "final-ref-error" or race == "binding":
+                    self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+                else:
+                    self.assertEqual(result.activation, CarrierActivation.RESERVED_INACTIVE)
+                if race in {"ref", "final-ref-error"}:
+                    self.assertEqual(client.ref_reads, [branch, branch])
+
+    def test_finalization_epoch_post_provenance_issue_close_ref_and_binding_races_fail_closed(self):
+        for race in ("issue-close", "ref", "final-ref-error", "binding"):
+            with self.subTest(race=race):
+                client, issue, _anchor, _lease, state, _claim, _immediate, epoch = self.make_finalization_epoch_client()
+                branch = state.binding.branch_ref.removeprefix("refs/heads/")
+                if race == "issue-close":
+                    client.issue_metadata_sequences[issue.number] = [issue, issue, replace(issue, state="closed")]
+                elif race == "ref":
+                    client.generated_ref_sequence = [epoch.final_head_sha, epoch.from_head_sha]
+                elif race == "final-ref-error":
+                    client.generated_ref_sequence = [epoch.final_head_sha, RuntimeError("final ref unavailable")]
+                else:
+                    original = tuple(client.comments)
+                    drifted = list(original)
+                    index = next(i for i, comment in enumerate(drifted) if comment.body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER))
+                    drifted[index] = replace(drifted[index], body=drifted[index].body + "\n")
+                    client.issue_comment_sequences[issue.number] = [original, original, drifted]
+                result = self.resolve(client, epoch.final_head_sha, LegacyEvidenceDisposition.ABSENT)
+                if race in {"final-ref-error", "binding"}:
+                    self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+                else:
+                    self.assertEqual(result.activation, CarrierActivation.RESERVED_INACTIVE)
+                if race in {"ref", "final-ref-error"}:
+                    self.assertEqual(client.ref_reads, [branch, branch])
+
+    def test_epoch_reserved_markers_never_use_legacy_and_future_wave_roles_remain_conflicting(self):
+        markers = (
+            self.marker(claim_kind="REQUIRED_STATUS_EPOCH", role="ISSUE_ACTIVE").render(),
+            self.marker(claim_kind="ISSUE_FINALIZATION_EPOCH", role="ISSUE_FINALIZING").render(),
+            self.marker(claim_kind="ISSUE_CANCELLATION_FENCE", role="ISSUE_CANCEL").render(),
+            self.marker(claim_kind="MACHINE_REF_CLAIM", role="MACHINE_PUBLICATION", owner_kind="MACHINE_SOURCE").render(),
+        )
+        for marker_text in markers:
+            legacy_reads = []
+            fake = self.commit_message_client("a" * 40, marker_text)
+            result = self.resolve(
+                fake, "a" * 40,
+                lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+            )
+            self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+            self.assertEqual(legacy_reads, [])
+
     def test_wave05_resolver_and_external_writer_are_not_runtime_activated(self):
         source = Path(controller_module.__file__).read_text(encoding="utf-8")
         module_ast = ast.parse(source)
@@ -3521,6 +4534,703 @@ class Wave05ShaCarrierResolverTests(unittest.TestCase):
         self.assertIn("def upsert_trusted_validation_check(", source)
         self.assertIn("allow_create=True, allow_green=False", source)
         self.assertIn("allow_create=True, allow_green=True", source)
+
+
+class IssueEpochControllerComponentTests(unittest.TestCase):
+    APP = IssueAnchorControllerTests.APP
+    CENTRAL = Wave05ShaCarrierResolverTests.CENTRAL
+    CENTRAL_NODE_ID = Wave05ShaCarrierResolverTests.CENTRAL_NODE_ID
+
+    class MutationClient:
+        def __init__(self):
+            self.commit_calls = []
+            self.status_calls = []
+            self.status_reads = 0
+            self.check_calls = []
+            self.timestamp = IssueBranchLeaseControllerTests.CLAIM_DATE
+            self.status_receipt = None
+            self.status_error = None
+
+        def bot_commit_timestamp_after(self, repository, parent_sha):
+            return self.timestamp
+
+        def create_commit(self, repository, message, tree, parents, *, timestamp=None):
+            parent_list = tuple(parents)
+            sha = controller_module._expected_deterministic_commit_sha(
+                tree, parent_list[0], message, timestamp or self.timestamp,
+            )
+            self.commit_calls.append((repository, message, tree, parent_list, timestamp, sha))
+            return GitObject(sha)
+
+        def create_commit_status(self, repository, sha, state, context, description, target_url=None):
+            self.status_calls.append((repository, sha, state, context, description, target_url))
+            if self.status_error is not None:
+                raise self.status_error
+            return self.status_receipt
+
+        def list_commit_statuses(self, repository, sha):
+            self.status_reads += 1
+            return ()
+
+        def create_check_run(self, *args, **kwargs):
+            self.check_calls.append((args, kwargs))
+            raise AssertionError("Issue finalization must not fall back to Check Runs")
+
+    @staticmethod
+    def _node_for_claim(claim, comment, *, origin=None, active=True):
+        base = controller_module._IssueAuthorityNode(
+            "ISSUE_HEAD_CLAIM", CarrierRole.ISSUE_ACTIVE, claim.to_head_sha,
+            claim.from_head_sha, claim.to_tree_sha, claim.transition_kind,
+            claim.claim_id, hashlib.sha256(comment.body.encode()).hexdigest(),
+            comment, claim, active=active,
+        )
+        if origin is None and claim.transition_kind != "NORMALIZE":
+            origin = base
+        return controller_module._IssueAuthorityNode(
+            base.claim_kind, base.role, base.target_head_sha, base.from_head_sha,
+            base.tree_sha, base.transition_kind, base.artifact_id,
+            base.artifact_sha256, base.comment, base.artifact, active=active,
+            proposal_origin=origin,
+        )
+
+    @classmethod
+    def _snapshot(
+        cls,
+        *,
+        client,
+        issue,
+        state,
+        claim,
+        current_authority,
+        current_ref,
+        history=None,
+        source_error=None,
+        accepted_main=None,
+    ):
+        main_sha = accepted_main or claim.accepted_base_sha
+        main_meta = client.commit_metadata[main_sha]
+        _main_tree, main_entries = client.commit_trees[main_sha]
+        state = replace(
+            state,
+            pr=replace(state.pr, head_oid=current_ref, base_oid=main_sha),
+        )
+        request = parse_issue_request_body(issue.body)
+        fold = type("Fold", (), {"request": request})()
+        role = current_authority.role
+        if current_authority.claim_kind == "ISSUE_HEAD_CLAIM":
+            marker = controller_module._issue_head_claim_marker(current_authority.artifact)
+        elif current_authority.claim_kind == "REQUIRED_STATUS_EPOCH":
+            marker = controller_module._required_status_epoch_marker(current_authority.artifact)
+        else:
+            marker = controller_module._issue_finalization_epoch_marker(current_authority.artifact)
+        resolution = ShaCarrierResolution(CarrierActivation.ACTIVE, role, marker)
+        return controller_module._IssueEpochSnapshot(
+            state,
+            RepositoryMetadata(1, cls.CENTRAL_NODE_ID, cls.CENTRAL, "main"),
+            main_sha,
+            main_meta.tree_sha,
+            tuple(main_entries),
+            current_ref,
+            issue,
+            (),
+            tuple(client.pr_comments.get(state.binding.pull_request_number, ())),
+            fold,
+            (),
+            IssueAnchorControllerTests.authority(),
+            source_error,
+            tuple(history if history is not None else (current_authority,)),
+            current_authority,
+            resolution,
+        )
+
+    @classmethod
+    def _finalization_node(cls, epoch, comment, origin, *, active=True):
+        return controller_module._IssueAuthorityNode(
+            "ISSUE_FINALIZATION_EPOCH", CarrierRole.ISSUE_FINALIZING,
+            epoch.final_head_sha, epoch.from_head_sha, epoch.final_tree_sha,
+            epoch.transition_kind, epoch.epoch_id,
+            hashlib.sha256(comment.body.encode()).hexdigest(), comment, epoch,
+            active=active, proposal_origin=origin,
+        )
+
+    @classmethod
+    def _required_status_node(cls, epoch, comment, origin, *, active=True):
+        return controller_module._IssueAuthorityNode(
+            "REQUIRED_STATUS_EPOCH", CarrierRole.ISSUE_ACTIVE,
+            epoch.to_head_sha, epoch.from_head_sha, epoch.to_tree_sha,
+            epoch.transition_kind, epoch.epoch_id,
+            hashlib.sha256(comment.body.encode()).hexdigest(), comment, epoch,
+            active=active, proposal_origin=origin,
+        )
+
+    @classmethod
+    def _controller(cls, client):
+        result = controller_module.R02Controller.__new__(controller_module.R02Controller)
+        result.client = client
+        result.central_repository = cls.CENTRAL
+        result.app = cls.APP
+        result.candidate_builder = None
+        result.environ = {}
+        return result
+
+    @staticmethod
+    def _install_created_commit(client):
+        client.commit_calls = []
+        client.bot_commit_timestamp_after = lambda _repo, _parent: client.timestamp
+
+    def _active_claim_fixture(self):
+        client, issue, _anchor_comment, _lease, state, claim = Wave05ShaCarrierResolverTests().make_claim_client()
+        claim_comment = next(
+            comment for comment in client.pr_comments[state.binding.pull_request_number]
+            if comment.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        )
+        node = self._node_for_claim(claim, claim_comment)
+        snapshot = self._snapshot(
+            client=client, issue=issue, state=state, claim=claim,
+            current_authority=node, current_ref=claim.to_head_sha,
+        )
+        mutation = self.MutationClient()
+        self._install_created_commit(mutation)
+        controller = self._controller(mutation)
+        return client, issue, state, claim, node, snapshot, controller, mutation
+
+    def _active_finalization_fixture(self):
+        client, issue, _anchor_comment, _lease, state, claim, _immediate, epoch = (
+            Wave05ShaCarrierResolverTests().make_finalization_epoch_client()
+        )
+        claim_comment = next(
+            comment for comment in client.pr_comments[state.binding.pull_request_number]
+            if comment.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        )
+        final_comment = next(
+            comment for comment in client.pr_comments[state.binding.pull_request_number]
+            if comment.body.startswith(ISSUE_FINALIZATION_EPOCH_MARKER)
+        )
+        origin = self._node_for_claim(claim, claim_comment)
+        final_node = self._finalization_node(epoch, final_comment, origin)
+        snapshot = self._snapshot(
+            client=client, issue=issue, state=state, claim=claim,
+            current_authority=final_node, current_ref=epoch.final_head_sha,
+        )
+        mutation = self.MutationClient()
+        self._install_created_commit(mutation)
+        controller = self._controller(mutation)
+        return client, issue, state, claim, epoch, final_node, origin, snapshot, controller, mutation
+
+    def test_prepare_finalization_persists_before_nonforce_cas_and_creates_exact_no_tree_child(self):
+        _client, issue, state, claim, _node, snapshot, controller, mutation = self._active_claim_fixture()
+        events = []
+        captured = {}
+
+        def persist(_state, epoch, _head):
+            events.append("persist")
+            captured["epoch"] = epoch
+
+        def cas(_state, parent, target, _expected):
+            events.append(("cas", parent, target))
+
+        calls = 0
+
+        def read_snapshot(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                return snapshot
+            epoch = captured["epoch"]
+            comment = IssueAnchorControllerTests.comment(epoch.render(), database_id=3_901)
+            origin = snapshot.current_authority
+            final_node = self._finalization_node(epoch, comment, origin)
+            return self._snapshot(
+                client=_client, issue=issue, state=state, claim=claim,
+                current_authority=final_node, current_ref=epoch.final_head_sha,
+            )
+
+        target_digest = claim.target_evidence_digest
+        with (
+            patch.object(controller, "_read_issue_epoch_snapshot", side_effect=read_snapshot),
+            patch.object(controller, "_derive_issue_proposal_scope", return_value=(
+                target_digest, claim.effective_request_digest, claim.patch_projection_evidence_digest,
+            )),
+            patch.object(controller, "_persist_issue_epoch_artifact", side_effect=persist),
+            patch.object(controller, "_apply_persisted_issue_epoch_target", side_effect=cas),
+            patch.object(controller_module, "_validate_issue_finalization_epoch_target"),
+        ):
+            result = controller.prepare_issue_finalization_epoch(
+                issue.number, IssueAnchorControllerTests.resolver(), nonce_factory=lambda: "f" * 64,
+            )
+        self.assertEqual(result, captured["epoch"])
+        self.assertEqual([event if isinstance(event, str) else event[0] for event in events], ["persist", "cas"])
+        self.assertEqual(events[1][1:], (claim.to_head_sha, result.final_head_sha))
+        self.assertEqual(mutation.commit_calls[0][2:4], (claim.to_tree_sha, (claim.to_head_sha,)))
+        self.assertEqual(mutation.commit_calls[0][1], controller_module._issue_finalization_epoch_marker(result).render())
+        self.assertEqual(result.final_tree_sha, claim.to_tree_sha)
+        self.assertEqual(mutation.status_calls, [])
+
+    def test_prepare_from_required_status_head_binds_immediate_epoch_and_earlier_proposal_origin(self):
+        client, issue, _anchor, _lease, state, claim, required = (
+            Wave05ShaCarrierResolverTests().make_required_status_epoch_client()
+        )
+        claim_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        )
+        required_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(REQUIRED_STATUS_EPOCH_MARKER)
+        )
+        origin = self._node_for_claim(claim, claim_comment)
+        immediate = self._required_status_node(required, required_comment, origin)
+        snapshot = self._snapshot(
+            client=client, issue=issue, state=state, claim=claim,
+            current_authority=immediate, current_ref=required.to_head_sha,
+        )
+        mutation = self.MutationClient()
+        self._install_created_commit(mutation)
+        controller = self._controller(mutation)
+        events, captured = [], {}
+        def persist(_state, epoch, _head):
+            events.append("persist")
+            captured["epoch"] = epoch
+        def cas(_state, parent, target, _expected):
+            events.append(("cas", parent, target))
+        reads = 0
+        def read_snapshot(*_args, **_kwargs):
+            nonlocal reads
+            reads += 1
+            if reads < 3:
+                return snapshot
+            epoch = captured["epoch"]
+            final_comment = IssueAnchorControllerTests.comment(epoch.render(), database_id=3_902)
+            final_node = self._finalization_node(epoch, final_comment, origin)
+            return self._snapshot(
+                client=client, issue=issue, state=state, claim=claim,
+                current_authority=final_node, current_ref=epoch.final_head_sha,
+            )
+        with (
+            patch.object(controller, "_read_issue_epoch_snapshot", side_effect=read_snapshot),
+            patch.object(controller, "_derive_issue_proposal_scope", return_value=(
+                claim.target_evidence_digest, claim.effective_request_digest,
+                claim.patch_projection_evidence_digest,
+            )),
+            patch.object(controller, "_persist_issue_epoch_artifact", side_effect=persist),
+            patch.object(controller, "_apply_persisted_issue_epoch_target", side_effect=cas),
+            patch.object(controller_module, "_validate_issue_finalization_epoch_target"),
+        ):
+            result = controller.prepare_issue_finalization_epoch(
+                issue.number, IssueAnchorControllerTests.resolver(), nonce_factory=lambda: "b" * 64,
+            )
+        self.assertEqual(result.from_head_sha, required.to_head_sha)
+        self.assertEqual(result.from_authority_kind, "REQUIRED_STATUS_EPOCH")
+        self.assertEqual(result.from_authority_artifact_id, required.epoch_id)
+        self.assertEqual(result.proposal_origin_claim_id, claim.claim_id)
+        self.assertNotEqual(required.to_head_sha, claim.to_head_sha)
+        self.assertEqual(events[0], "persist")
+
+    def test_pending_finalization_replay_reuses_exact_epoch_without_reposting_or_new_target(self):
+        client, issue, state, claim, epoch, _final, origin, _old_snapshot, controller, mutation = (
+            self._active_finalization_fixture()
+        )
+        claim_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        )
+        immediate = self._node_for_claim(claim, claim_comment)
+        pending_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_FINALIZATION_EPOCH_MARKER)
+        )
+        pending = self._finalization_node(epoch, pending_comment, origin, active=False)
+        initial = self._snapshot(
+            client=client, issue=issue, state=state, claim=claim,
+            current_authority=immediate, current_ref=claim.to_head_sha,
+            history=(immediate, pending),
+        )
+        captured, events = {}, []
+        reads = 0
+        def read_snapshot(*_args, **_kwargs):
+            nonlocal reads
+            reads += 1
+            if reads < 3:
+                return initial
+            comment = IssueAnchorControllerTests.comment(epoch.render(), database_id=pending_comment.database_id)
+            final_node = self._finalization_node(epoch, comment, origin)
+            return self._snapshot(
+                client=client, issue=issue, state=state, claim=claim,
+                current_authority=final_node, current_ref=epoch.final_head_sha,
+            )
+        def cas(_state, parent, target, _expected):
+            events.append((parent, target))
+        with (
+            patch.object(controller, "_read_issue_epoch_snapshot", side_effect=read_snapshot),
+            patch.object(controller, "_derive_issue_proposal_scope", return_value=(
+                claim.target_evidence_digest, claim.effective_request_digest,
+                claim.patch_projection_evidence_digest,
+            )),
+            patch.object(controller, "_persist_issue_epoch_artifact", side_effect=AssertionError("replay must not repost")),
+            patch.object(controller, "_apply_persisted_issue_epoch_target", side_effect=cas),
+        ):
+            replay = controller.prepare_issue_finalization_epoch(
+                issue.number, IssueAnchorControllerTests.resolver(), nonce_factory=lambda: "c" * 64,
+            )
+        self.assertEqual(replay, epoch)
+        self.assertEqual(mutation.commit_calls, [])
+        self.assertEqual(events, [(epoch.from_head_sha, epoch.final_head_sha)])
+
+    def test_conflicting_pending_finalizations_block_without_creating_a_target(self):
+        client, issue, state, claim, epoch, _final, origin, _snapshot, controller, mutation = (
+            self._active_finalization_fixture()
+        )
+        claim_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        )
+        current = self._node_for_claim(claim, claim_comment)
+        pending_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_FINALIZATION_EPOCH_MARKER)
+        )
+        pending = self._finalization_node(epoch, pending_comment, origin, active=False)
+        variant_fields = epoch._fields()
+        for derived in (
+            "claim_generation_id", "authority_preimage_digest", "finalizer_evidence_digest",
+            "required_status_context", "required_status_class", "required_status_state",
+            "required_status_target_url", "required_status_evidence_digest",
+            "required_status_description", "marker_digest", "epoch_id",
+        ):
+            variant_fields.pop(derived)
+        variant_fields["carrier_nonce"] = "9" * 64
+        variant_fields["final_head_sha"] = "0" * 40
+        variant_prepared = IssueFinalizationEpoch.create(**variant_fields)
+        variant_marker = controller_module._issue_finalization_epoch_marker(variant_prepared).render()
+        variant_sha = controller_module._expected_deterministic_commit_sha(
+            variant_prepared.final_tree_sha, variant_prepared.from_head_sha,
+            variant_marker, IssueBranchLeaseControllerTests.CLAIM_DATE,
+        )
+        variant = IssueFinalizationEpoch.create(**{**variant_fields, "final_head_sha": variant_sha})
+        variant_comment = IssueAnchorControllerTests.comment(variant.render(), database_id=3_899)
+        variant_node = self._finalization_node(variant, variant_comment, origin, active=False)
+        snapshot = self._snapshot(
+            client=client, issue=issue, state=state, claim=claim,
+            current_authority=current, current_ref=claim.to_head_sha,
+            history=(current, pending, variant_node),
+        )
+        with patch.object(controller, "_read_issue_epoch_snapshot", return_value=snapshot), patch.object(
+            controller, "_derive_issue_proposal_scope", return_value=(
+                claim.target_evidence_digest, claim.effective_request_digest,
+                claim.patch_projection_evidence_digest,
+            ),
+        ), self.assertRaises(R02Error):
+            controller.prepare_issue_finalization_epoch(issue.number, IssueAnchorControllerTests.resolver())
+        self.assertEqual(mutation.commit_calls, [])
+
+    def test_finalization_pre_cas_main_drift_leaves_persisted_epoch_historical(self):
+        _client, issue, state, claim, _node, initial, controller, mutation = self._active_claim_fixture()
+        events, captured = [], {}
+        changed = replace(initial, accepted_main_sha="8" * 40)
+        reads = 0
+        def read_snapshot(*_args, **_kwargs):
+            nonlocal reads
+            reads += 1
+            return initial if reads == 1 else changed
+        def persist(_state, epoch, _head):
+            events.append("persist")
+            captured["epoch"] = epoch
+        with patch.object(controller, "_read_issue_epoch_snapshot", side_effect=read_snapshot), patch.object(
+            controller, "_derive_issue_proposal_scope", return_value=(
+                claim.target_evidence_digest, claim.effective_request_digest,
+                claim.patch_projection_evidence_digest,
+            ),
+        ), patch.object(controller, "_persist_issue_epoch_artifact", side_effect=persist), patch.object(
+            controller, "_apply_persisted_issue_epoch_target", side_effect=lambda *_: events.append("cas"),
+        ), patch.object(controller_module, "_validate_issue_finalization_epoch_target"), self.assertRaises(StaleAuthorityError):
+            controller.prepare_issue_finalization_epoch(
+                issue.number, IssueAnchorControllerTests.resolver(), nonce_factory=lambda: "d" * 64,
+            )
+        self.assertEqual(events, ["persist"])
+        self.assertEqual(len(mutation.commit_calls), 1)
+
+    def test_finalization_cas_loss_does_not_create_a_second_target(self):
+        _client, issue, _state, claim, _node, snapshot, controller, mutation = self._active_claim_fixture()
+        events = []
+        with (
+            patch.object(controller, "_read_issue_epoch_snapshot", return_value=snapshot),
+            patch.object(controller, "_derive_issue_proposal_scope", return_value=(
+                claim.target_evidence_digest, claim.effective_request_digest,
+                claim.patch_projection_evidence_digest,
+            )),
+            patch.object(controller, "_persist_issue_epoch_artifact", side_effect=lambda *_: events.append("persist")),
+            patch.object(
+                controller, "_apply_persisted_issue_epoch_target",
+                side_effect=StaleAuthorityError("ref CAS lost"),
+            ),
+            patch.object(controller_module, "_validate_issue_finalization_epoch_target"),
+            self.assertRaises(StaleAuthorityError),
+        ):
+            controller.prepare_issue_finalization_epoch(
+                issue.number, IssueAnchorControllerTests.resolver(), nonce_factory=lambda: "1" * 64,
+            )
+        self.assertEqual(events, ["persist"])
+        self.assertEqual(len(mutation.commit_calls), 1)
+
+    def test_prepare_normalization_only_chain_is_not_finalizable(self):
+        _client, issue, state, _claim, _node, snapshot, controller, mutation = self._active_claim_fixture()
+        normalize = replace(snapshot.current_authority, transition_kind="NORMALIZE", proposal_origin=None)
+        snapshot = replace(snapshot, current_authority=normalize)
+        with patch.object(controller, "_read_issue_epoch_snapshot", return_value=snapshot), self.assertRaises(StaleAuthorityError):
+            controller.prepare_issue_finalization_epoch(issue.number, IssueAnchorControllerTests.resolver())
+        self.assertEqual(mutation.commit_calls, [])
+
+    def test_publish_issue_final_status_uses_exact_hf_tuple_and_never_check_run(self):
+        _client, issue, state, claim, epoch, final_node, _origin, snapshot, controller, mutation = (
+            self._active_finalization_fixture()
+        )
+        status = CommitStatus(
+            9, "S_status", "success", epoch.required_status_context,
+            epoch.required_status_description, None, self.APP.bot_id, self.APP.bot_node_id,
+            self.APP.bot_login, "Bot", "2026-10-05T00:00:00Z", "2026-10-05T00:00:00Z",
+        )
+        mutation.status_receipt = StatusWriteReceipt(
+            self.CENTRAL, epoch.final_head_sha, "POST",
+            f"/repos/{self.CENTRAL}/statuses/{epoch.final_head_sha}",
+            "success", epoch.required_status_context, epoch.required_status_description, None, status,
+        )
+        with (
+            patch.object(controller, "_read_issue_epoch_snapshot", return_value=snapshot),
+            patch.object(controller, "_derive_issue_proposal_scope", return_value=(
+                epoch.fresh_proposal_scope_evidence_digest,
+                epoch.effective_request_digest, epoch.patch_projection_evidence_digest,
+            )),
+        ):
+            receipt = controller.publish_issue_final_success(
+                issue.number, epoch, IssueAnchorControllerTests.resolver(),
+            )
+        self.assertIs(receipt, mutation.status_receipt)
+        self.assertEqual(mutation.status_calls, [(
+            self.CENTRAL, epoch.final_head_sha, "success", "federation/trusted-validation",
+            epoch.required_status_description, None,
+        )])
+        self.assertEqual(mutation.check_calls, [])
+        self.assertEqual(mutation.status_reads, 0)
+
+    def test_publish_rejects_wrong_receipt_sha_or_creator_without_fallback(self):
+        _client, issue, _state, _claim, epoch, _node, _origin, snapshot, controller, mutation = (
+            self._active_finalization_fixture()
+        )
+        wrong_sha = "8" * 40
+        for wrong_creator in (False, True):
+            status = CommitStatus(
+                10, "S_wrong", "success", epoch.required_status_context,
+                epoch.required_status_description, None,
+                self.APP.bot_id if not wrong_creator else 99,
+                self.APP.bot_node_id if not wrong_creator else "B_other",
+                self.APP.bot_login if not wrong_creator else "other[bot]", "Bot",
+                "2026-10-05T00:00:00Z", "2026-10-05T00:00:00Z",
+            )
+            requested_sha = epoch.final_head_sha if wrong_creator else wrong_sha
+            mutation.status_receipt = StatusWriteReceipt(
+                self.CENTRAL, requested_sha, "POST",
+                f"/repos/{self.CENTRAL}/statuses/{requested_sha}",
+                "success", epoch.required_status_context,
+                epoch.required_status_description, None, status,
+            )
+            with (
+                patch.object(controller, "_read_issue_epoch_snapshot", return_value=snapshot),
+                patch.object(controller, "_derive_issue_proposal_scope", return_value=(
+                    epoch.fresh_proposal_scope_evidence_digest,
+                    epoch.effective_request_digest, epoch.patch_projection_evidence_digest,
+                )),
+                self.assertRaises(R02Error),
+            ):
+                controller.publish_issue_final_success(issue.number, epoch, IssueAnchorControllerTests.resolver())
+        self.assertEqual(len(mutation.status_calls), 2)
+        self.assertEqual(mutation.check_calls, [])
+
+    def test_issue_final_status_never_posts_on_active_or_reserved_issue_active_authority(self):
+        _client, issue, _state, claim, epoch, _node, _origin, snapshot, controller, mutation = (
+            self._active_finalization_fixture()
+        )
+        active_claim_comment = IssueAnchorControllerTests.comment(claim.render(), database_id=3_911)
+        active_claim = self._node_for_claim(claim, active_claim_comment)
+        issue_snapshot = replace(
+            snapshot, current_ref=claim.to_head_sha, current_authority=active_claim,
+            resolution=ShaCarrierResolution(
+                CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE,
+                controller_module._issue_head_claim_marker(claim),
+            ),
+        )
+        with patch.object(controller, "_read_issue_epoch_snapshot", return_value=issue_snapshot), self.assertRaises(StaleAuthorityError):
+            controller.publish_issue_final_success(issue.number, epoch, IssueAnchorControllerTests.resolver())
+        inactive = replace(
+            snapshot,
+            resolution=ShaCarrierResolution(
+                CarrierActivation.RESERVED_INACTIVE, CarrierRole.ISSUE_FINALIZING,
+                controller_module._issue_finalization_epoch_marker(epoch),
+            ),
+        )
+        with patch.object(controller, "_read_issue_epoch_snapshot", return_value=inactive), self.assertRaises(StaleAuthorityError):
+            controller.publish_issue_final_success(issue.number, epoch, IssueAnchorControllerTests.resolver())
+        self.assertEqual(mutation.status_calls, [])
+
+    def test_status_transport_error_is_ambiguous_and_does_not_read_or_fallback(self):
+        _client, issue, _state, _claim, epoch, _node, _origin, snapshot, controller, mutation = (
+            self._active_finalization_fixture()
+        )
+        mutation.status_error = TransportError("network unavailable")
+        with (
+            patch.object(controller, "_read_issue_epoch_snapshot", return_value=snapshot),
+            patch.object(controller, "_derive_issue_proposal_scope", return_value=(
+                epoch.fresh_proposal_scope_evidence_digest,
+                epoch.effective_request_digest, epoch.patch_projection_evidence_digest,
+            )),
+            self.assertRaises(TransportError),
+        ):
+            controller.publish_issue_final_success(issue.number, epoch, IssueAnchorControllerTests.resolver())
+        self.assertEqual(len(mutation.status_calls), 1)
+        self.assertEqual(mutation.status_reads, 0)
+        self.assertEqual(mutation.check_calls, [])
+
+    def test_revoke_invalid_active_finalization_even_without_visible_status_and_never_writes_hv_status(self):
+        client, issue, state, claim, epoch, final_node, origin, snapshot, controller, mutation = (
+            self._active_finalization_fixture()
+        )
+        events, captured = [], {}
+        def persist(_state, required, _head):
+            events.append("persist")
+            captured["epoch"] = required
+        def cas(_state, parent, target, _expected):
+            events.append(("cas", parent, target))
+        reads = 0
+        def read_snapshot(*_args, **_kwargs):
+            nonlocal reads
+            reads += 1
+            if reads < 3:
+                return snapshot
+            required = captured["epoch"]
+            comment = IssueAnchorControllerTests.comment(required.render(), database_id=3_920)
+            required_node = self._required_status_node(required, comment, origin)
+            return self._snapshot(
+                client=client, issue=issue, state=state, claim=claim,
+                current_authority=required_node, current_ref=required.to_head_sha,
+            )
+        with (
+            patch.object(controller, "_read_issue_epoch_snapshot", side_effect=read_snapshot),
+            patch.object(controller, "_persist_issue_epoch_artifact", side_effect=persist),
+            patch.object(controller, "_apply_persisted_issue_epoch_target", side_effect=cas),
+            patch.object(controller_module, "_latest_exact_issue_final_status_evidence", return_value=None),
+            patch.object(controller_module, "_validate_required_status_epoch_target"),
+        ):
+            required = controller.revoke_required_status_epoch(
+                issue.number, RequiredStatusEpochReason.FINALIZATION_INVALIDATED,
+                IssueAnchorControllerTests.resolver(), nonce_factory=lambda: "e" * 64,
+            )
+        self.assertIsNone(required.prior_required_status)
+        self.assertEqual(required.from_head_sha, epoch.final_head_sha)
+        self.assertEqual(required.from_provenance_kind, "ISSUE_FINALIZATION_EPOCH")
+        self.assertEqual(events[0], "persist")
+        self.assertEqual(events[1][1:], (epoch.final_head_sha, required.to_head_sha))
+        self.assertEqual(mutation.commit_calls[0][2:4], (epoch.final_tree_sha, (epoch.final_head_sha,)))
+        self.assertEqual(mutation.status_calls, [])
+
+    def test_finalization_invalidated_is_rejected_for_issue_active_head(self):
+        _client, issue, _state, _claim, _node, snapshot, controller, mutation = self._active_claim_fixture()
+        with patch.object(controller, "_read_issue_epoch_snapshot", return_value=snapshot), self.assertRaises(R02Error):
+            controller.revoke_required_status_epoch(
+                issue.number, RequiredStatusEpochReason.FINALIZATION_INVALIDATED,
+                IssueAnchorControllerTests.resolver(),
+            )
+        self.assertEqual(mutation.commit_calls, [])
+
+    def test_required_status_pending_replay_reuses_exact_hv_without_second_target(self):
+        client, issue, _anchor, _lease, state, claim, first_final, revoke, _final2 = (
+            Wave05ShaCarrierResolverTests().make_finalization_invalidation_chain()
+        )
+        final_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_FINALIZATION_EPOCH_MARKER)
+        )
+        origin_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        )
+        origin = self._node_for_claim(claim, origin_comment)
+        final_node = self._finalization_node(first_final, final_comment, origin)
+        revoke_comment = next(
+            item for item in client.pr_comments[state.binding.pull_request_number]
+            if item.body.startswith(REQUIRED_STATUS_EPOCH_MARKER)
+        )
+        pending = self._required_status_node(revoke, revoke_comment, origin, active=False)
+        snapshot = self._snapshot(
+            client=client, issue=issue, state=state, claim=claim,
+            current_authority=final_node, current_ref=first_final.final_head_sha,
+            history=(origin, final_node, pending),
+        )
+        mutation = self.MutationClient()
+        self._install_created_commit(mutation)
+        controller = self._controller(mutation)
+        reads = 0
+        def read_snapshot(*_args, **_kwargs):
+            nonlocal reads
+            reads += 1
+            if reads < 3:
+                return snapshot
+            active_revoke = self._required_status_node(revoke, revoke_comment, origin)
+            return self._snapshot(
+                client=client, issue=issue, state=state, claim=claim,
+                current_authority=active_revoke, current_ref=revoke.to_head_sha,
+            )
+        def cas(_state, parent, target, _expected):
+            self.assertEqual((parent, target), (first_final.final_head_sha, revoke.to_head_sha))
+        with (
+            patch.object(controller, "_read_issue_epoch_snapshot", side_effect=read_snapshot),
+            patch.object(controller, "_persist_issue_epoch_artifact", side_effect=AssertionError("pending HV must not repost")),
+            patch.object(controller, "_apply_persisted_issue_epoch_target", side_effect=cas),
+            patch.object(controller_module, "_latest_exact_issue_final_status_evidence", return_value=None),
+        ):
+            replay = controller.revoke_required_status_epoch(
+                issue.number, RequiredStatusEpochReason.FINALIZATION_INVALIDATED,
+                IssueAnchorControllerTests.resolver(),
+            )
+        self.assertEqual(replay, revoke)
+        self.assertEqual(mutation.commit_calls, [])
+        self.assertEqual(mutation.status_calls, [])
+
+    def test_revoke_captures_exact_app_status_and_ignores_foreign_bot_status(self):
+        client, issue, state, claim, epoch, _node, _origin, _snapshot, _controller, _mutation = (
+            self._active_finalization_fixture()
+        )
+        def status(status_id, *, creator_id, creator_node, creator_login, creator_type, updated):
+            return CommitStatus(
+                status_id, f"S{status_id}", "success", epoch.required_status_context,
+                epoch.required_status_description, None, creator_id, creator_node,
+                creator_login, creator_type, "2026-10-05T00:00:00Z", updated,
+            )
+        foreign = status(99, creator_id=99, creator_node="B_other", creator_login="other[bot]", creator_type="Bot", updated="2026-10-06T00:00:00Z")
+        exact = status(11, creator_id=self.APP.bot_id, creator_node=self.APP.bot_node_id, creator_login=self.APP.bot_login, creator_type="Bot", updated="2026-10-05T01:00:00Z")
+        class StatusReader:
+            def list_commit_statuses(self, _repository, sha):
+                self_sha.append(sha)
+                return (exact, foreign)
+        self_sha = []
+        evidence = controller_module._latest_exact_issue_final_status_evidence(
+            StatusReader(), self.CENTRAL, epoch.final_head_sha, self.APP,
+        )
+        self.assertEqual(evidence.status_id, exact.id)
+        self.assertEqual(self_sha, [epoch.final_head_sha])
+
+    def test_nonactivation_ast_keeps_wave06_callables_out_of_main(self):
+        source = Path(controller_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "main")
+        called = {
+            item.func.attr if isinstance(item.func, ast.Attribute) else item.func.id
+            for item in ast.walk(main)
+            if isinstance(item, ast.Call)
+            and (isinstance(item.func, ast.Attribute) or isinstance(item.func, ast.Name))
+        }
+        self.assertNotIn("prepare_issue_finalization_epoch", called)
+        self.assertNotIn("publish_issue_final_success", called)
+        self.assertNotIn("revoke_required_status_epoch", called)
+        self.assertIn("def finalize_one_manual_pr(", source)
 
 
 if __name__ == "__main__":

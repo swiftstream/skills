@@ -34,6 +34,15 @@ ISSUE_PATCH_PROJECTION_EVIDENCE_PREFIX = "swiftstream-federation-issue-patch-pro
 NORMALIZE_TARGET_EVIDENCE_PREFIX = "swiftstream-federation-issue-head-normalize-target:v1\n"
 PROPOSAL_TARGET_EVIDENCE_PREFIX = "swiftstream-federation-issue-head-proposal-target:v1\n"
 EXTERNAL_STATUS_EVIDENCE_PREFIX = "swiftstream-federation-external-status-evidence:v1\n"
+REQUIRED_STATUS_EPOCH_MARKER = "<!-- swiftstream-federation-required-status-epoch:v2 -->"
+ISSUE_FINALIZATION_EPOCH_MARKER = "<!-- swiftstream-federation-issue-finalization-epoch:v1 -->"
+REQUIRED_STATUS_EPOCH_AUTHORITY_PREFIX = "swiftstream-federation-required-status-epoch-authority:v1\n"
+REQUIRED_STATUS_EPOCH_ID_PREFIX = "swiftstream-federation-required-status-epoch-id:v1\n"
+ISSUE_FINALIZATION_EPOCH_AUTHORITY_PREFIX = "swiftstream-federation-issue-finalization-epoch-authority:v1\n"
+ISSUE_FINALIZATION_EPOCH_EVIDENCE_PREFIX = "swiftstream-federation-issue-finalization-evidence:v1\n"
+ISSUE_FINALIZATION_EPOCH_ID_PREFIX = "swiftstream-federation-issue-finalization-epoch-id:v1\n"
+ISSUE_FINAL_STATUS_EVIDENCE_PREFIX = "swiftstream-federation-issue-final-status-evidence:v1\n"
+EXACT_APP_REQUIRED_STATUS_EVIDENCE_PREFIX = "swiftstream-federation-prior-required-status-evidence:v1\n"
 
 CLAIMED_HEAD_MARKER_HEADER = "swiftstream-federation-head:v2"
 ISSUE_BRANCH_LEASE_MARKER = "<!-- swiftstream-federation-issue-branch-lease:v1 -->"
@@ -1716,6 +1725,111 @@ _STATUS_DESCRIPTION_RE = re.compile(
 )
 
 
+class RequiredStatusEpochReason(Enum):
+    ACTIVE_REVALIDATION = "ACTIVE_REVALIDATION"
+    MAIN_ADVANCE_REVALIDATION = "MAIN_ADVANCE_REVALIDATION"
+    REQUEST_PATCH_REVALIDATION = "REQUEST_PATCH_REVALIDATION"
+    SOURCE_IDENTITY_REVALIDATION = "SOURCE_IDENTITY_REVALIDATION"
+    FINALIZATION_INVALIDATED = "FINALIZATION_INVALIDATED"
+
+
+_CANONICAL_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$"
+)
+
+
+def _canonical_utc_timestamp(value: Any, label: str) -> str:
+    text = _issue_bounded_text(value, label, 64)
+    if not _CANONICAL_TIMESTAMP_RE.fullmatch(text):
+        _fail(f"{label} must be a canonical UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00")
+    except ValueError:
+        _fail(f"{label} must be a canonical UTC timestamp")
+    if parsed.utcoffset() is None:
+        _fail(f"{label} must be a canonical UTC timestamp")
+    return text
+
+
+@dataclass(frozen=True)
+class ExactAppRequiredStatusEvidence:
+    """Canonical corroborating evidence for a selected exact-App status."""
+
+    status_id: int
+    status_node_id: str | None
+    state: str
+    context: str
+    description: str
+    target_url: None
+    creator_database_id: int
+    creator_node_id: str
+    creator_login: str
+    creator_type: str
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self) -> None:
+        _issue_positive_int(self.status_id, "statusId")
+        if self.status_node_id is not None:
+            _lease_node_id(self.status_node_id, "statusNodeId", delimiter_free=True)
+        if self.state != "success":
+            _fail("prior required status state must be exact success")
+        if self.context != "federation/trusted-validation":
+            _fail("prior required status context must be exact federation/trusted-validation")
+        parsed = parse_status_description(self.description)
+        if parsed.status_class is not StatusClass.ISSUE_FINAL:
+            _fail("prior required status description must use issue-final class")
+        if self.target_url is not None:
+            _fail("prior required status target_url must be null")
+        _issue_positive_int(self.creator_database_id, "creatorDatabaseId")
+        _lease_node_id(self.creator_node_id, "creatorNodeId", delimiter_free=True)
+        _issue_bounded_text(self.creator_login, "creatorLogin", 256)
+        if self.creator_type != "Bot":
+            _fail("prior required status creator type must be exact Bot")
+        _canonical_utc_timestamp(self.created_at, "createdAt")
+        _canonical_utc_timestamp(self.updated_at, "updatedAt")
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "context": self.context,
+            "createdAt": self.created_at,
+            "creatorDatabaseId": self.creator_database_id,
+            "creatorLogin": self.creator_login,
+            "creatorNodeId": self.creator_node_id,
+            "creatorType": self.creator_type,
+            "description": self.description,
+            "state": self.state,
+            "statusId": self.status_id,
+            "statusNodeId": self.status_node_id,
+            "targetUrl": self.target_url,
+            "updatedAt": self.updated_at,
+        }
+
+    def render(self) -> str:
+        return _canonical_json(self.as_value())
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(
+            (EXACT_APP_REQUIRED_STATUS_EVIDENCE_PREFIX + self.render()).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ExactAppRequiredStatusEvidence":
+        expected = {
+            "statusId", "statusNodeId", "state", "context", "description", "targetUrl",
+            "creatorDatabaseId", "creatorNodeId", "creatorLogin", "creatorType",
+            "createdAt", "updatedAt",
+        }
+        if type(value) is not dict or set(value) != expected:
+            _fail("prior required status evidence has invalid exact keys")
+        return cls(
+            value["statusId"], value["statusNodeId"], value["state"], value["context"],
+            value["description"], value["targetUrl"], value["creatorDatabaseId"],
+            value["creatorNodeId"], value["creatorLogin"], value["creatorType"],
+            value["createdAt"], value["updatedAt"],
+        )
+
+
 def parse_status_description(text: str) -> StatusEvidenceDescription:
     if type(text) is not str:
         _fail("status description must be a string")
@@ -2558,6 +2672,889 @@ def parse_issue_head_claim(text: str) -> IssueHeadClaim:
     if lines[1] != _canonical_json(claim.as_value()) or text != claim.render():
         _fail("IssueHeadClaim representation is not canonical")
     return claim
+
+
+_REQUIRED_STATUS_EPOCH_FROM_KINDS = frozenset({
+    "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH", "ISSUE_FINALIZATION_EPOCH",
+})
+_REQUIRED_STATUS_EPOCH_KEYS = frozenset({
+    "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+    "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256",
+    "issueBranchLeaseCommentDatabaseId", "issueBranchLeaseSha256", "bindingId",
+    "sourceId", "sourceRepositoryId", "pullRequestNumber", "pullRequestDatabaseId",
+    "pullRequestNodeId", "centralRepositoryNodeId", "branchRef", "requestClass",
+    "acceptedBaseSha", "acceptedBaseTreeSha", "baseRef", "fromHeadSha", "fromTreeSha",
+    "toHeadSha", "toTreeSha", "carrierRole", "claimKind", "claimGenerationId",
+    "transitionKind", "carrierNonce", "reasonClass", "fromProvenanceKind",
+    "fromProvenanceId", "fromProvenanceSha256", "fromCarrierRole",
+    "priorRequiredStatus", "authorityPreimageDigest", "markerDigest", "epochId",
+})
+
+
+def _required_status_epoch_preimage_from_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
+    reason = fields["reason_class"]
+    request_class = fields["request_class"]
+    if type(reason) is not RequiredStatusEpochReason:
+        _fail("RequiredStatusEpoch reasonClass must be a closed RequiredStatusEpochReason")
+    if type(request_class) is not RequestClass:
+        _fail("RequiredStatusEpoch requestClass must be ADD, UPDATE, or REMOVE")
+    prior = fields["prior_required_status"]
+    if prior is not None and type(prior) is not ExactAppRequiredStatusEvidence:
+        _fail("priorRequiredStatus must be exact App status evidence or null")
+    return {
+        "schemaVersion": fields["schema_version"],
+        "issueNumber": fields["issue_number"],
+        "issueDatabaseId": fields["issue_database_id"],
+        "issueNodeId": fields["issue_node_id"],
+        "issueRequestAnchorCommentDatabaseId": fields["issue_request_anchor_comment_database_id"],
+        "issueRequestAnchorSha256": fields["issue_request_anchor_sha256"],
+        "issueBranchLeaseCommentDatabaseId": fields["issue_branch_lease_comment_database_id"],
+        "issueBranchLeaseSha256": fields["issue_branch_lease_sha256"],
+        "bindingId": fields["binding_id"],
+        "sourceId": fields["source_id"],
+        "sourceRepositoryId": fields["source_repository_id"],
+        "pullRequestNumber": fields["pull_request_number"],
+        "pullRequestDatabaseId": fields["pull_request_database_id"],
+        "pullRequestNodeId": fields["pull_request_node_id"],
+        "centralRepositoryNodeId": fields["central_repository_node_id"],
+        "branchRef": fields["branch_ref"],
+        "requestClass": request_class.value,
+        "acceptedBaseSha": fields["accepted_base_sha"],
+        "acceptedBaseTreeSha": fields["accepted_base_tree_sha"],
+        "baseRef": fields["base_ref"],
+        "fromHeadSha": fields["from_head_sha"],
+        "fromTreeSha": fields["from_tree_sha"],
+        "transitionKind": reason.value,
+        "reasonClass": reason.value,
+        "fromProvenanceKind": fields["from_provenance_kind"],
+        "fromProvenanceId": fields["from_provenance_id"],
+        "fromProvenanceSha256": fields["from_provenance_sha256"],
+        "fromCarrierRole": fields["from_carrier_role"],
+        "priorRequiredStatus": prior.as_value() if prior is not None else None,
+    }
+
+
+def _required_status_epoch_authority_digest_from_fields(fields: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        (REQUIRED_STATUS_EPOCH_AUTHORITY_PREFIX + _canonical_json(
+            _required_status_epoch_preimage_from_fields(fields)
+        )).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class RequiredStatusEpoch:
+    schema_version: int
+    issue_number: int
+    issue_database_id: int
+    issue_node_id: str
+    issue_request_anchor_comment_database_id: int
+    issue_request_anchor_sha256: str
+    issue_branch_lease_comment_database_id: int
+    issue_branch_lease_sha256: str
+    binding_id: str
+    source_id: str
+    source_repository_id: int
+    pull_request_number: int
+    pull_request_database_id: int
+    pull_request_node_id: str
+    central_repository_node_id: str
+    branch_ref: str
+    request_class: RequestClass
+    accepted_base_sha: str
+    accepted_base_tree_sha: str
+    base_ref: str
+    from_head_sha: str
+    from_tree_sha: str
+    to_head_sha: str
+    to_tree_sha: str
+    carrier_role: str
+    claim_kind: str
+    claim_generation_id: str
+    transition_kind: str
+    carrier_nonce: str
+    reason_class: RequiredStatusEpochReason
+    from_provenance_kind: str
+    from_provenance_id: str
+    from_provenance_sha256: str
+    from_carrier_role: str
+    prior_required_status: ExactAppRequiredStatusEvidence | None
+    authority_preimage_digest: str
+    marker_digest: str
+    epoch_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 2:
+            _fail("RequiredStatusEpoch schemaVersion must be exact integer 2")
+        for name in (
+            "issue_number", "issue_database_id", "issue_request_anchor_comment_database_id",
+            "issue_branch_lease_comment_database_id", "source_repository_id",
+            "pull_request_number", "pull_request_database_id",
+        ):
+            _issue_positive_int(getattr(self, name), name)
+        for name in ("issue_node_id", "pull_request_node_id", "central_repository_node_id"):
+            _lease_node_id(getattr(self, name), name, delimiter_free=True)
+        for name in (
+            "issue_request_anchor_sha256", "issue_branch_lease_sha256", "binding_id",
+            "claim_generation_id", "carrier_nonce", "from_provenance_id",
+            "from_provenance_sha256", "authority_preimage_digest", "marker_digest", "epoch_id",
+        ):
+            _lease_sha(getattr(self, name), name)
+        try:
+            c02.validate_source_id(self.source_id)
+        except (TypeError, c02.FederationError):
+            _fail("sourceId is invalid")
+        if type(self.branch_ref) is not str or self.branch_ref != issue_branch_ref(self.issue_number):
+            _fail("branchRef must be the exact Issue branch ref")
+        if type(self.request_class) is not RequestClass or self.request_class not in _ISSUE_REQUEST_CLASSES:
+            _fail("requestClass must be ADD, UPDATE, or REMOVE")
+        for name in (
+            "accepted_base_sha", "accepted_base_tree_sha", "from_head_sha", "from_tree_sha",
+            "to_head_sha", "to_tree_sha",
+        ):
+            _lease_sha(getattr(self, name), name, git=True)
+        if self.base_ref != "main":
+            _fail("baseRef must be exact main")
+        if self.to_tree_sha != self.from_tree_sha:
+            _fail("RequiredStatusEpoch must preserve the exact from-tree")
+        if self.carrier_role != "ISSUE_ACTIVE":
+            _fail("RequiredStatusEpoch carrierRole must be ISSUE_ACTIVE")
+        if self.claim_kind != "REQUIRED_STATUS_EPOCH":
+            _fail("RequiredStatusEpoch claimKind must be REQUIRED_STATUS_EPOCH")
+        if type(self.reason_class) is not RequiredStatusEpochReason:
+            _fail("reasonClass must be a closed RequiredStatusEpochReason")
+        if self.transition_kind != self.reason_class.value:
+            _fail("RequiredStatusEpoch transitionKind must equal reasonClass")
+        _lease_sha(self.carrier_nonce, "carrierNonce")
+        if self.from_provenance_kind not in _REQUIRED_STATUS_EPOCH_FROM_KINDS:
+            _fail("RequiredStatusEpoch fromProvenanceKind is unsupported")
+        expected_role = (
+            "ISSUE_FINALIZING"
+            if self.from_provenance_kind == "ISSUE_FINALIZATION_EPOCH"
+            else "ISSUE_ACTIVE"
+        )
+        if self.from_carrier_role != expected_role:
+            _fail("fromCarrierRole does not match source provenance kind")
+        if self.reason_class is RequiredStatusEpochReason.FINALIZATION_INVALIDATED and (
+            self.from_provenance_kind != "ISSUE_FINALIZATION_EPOCH"
+            or self.from_carrier_role != "ISSUE_FINALIZING"
+        ):
+            _fail("FINALIZATION_INVALIDATED requires an ISSUE_FINALIZATION_EPOCH predecessor")
+        if self.prior_required_status is not None and type(self.prior_required_status) is not ExactAppRequiredStatusEvidence:
+            _fail("priorRequiredStatus must be exact App status evidence or null")
+        expected_authority = _required_status_epoch_authority_digest_from_fields(self._fields())
+        if self.authority_preimage_digest != expected_authority:
+            _fail("RequiredStatusEpoch authorityPreimageDigest does not match immutable authority")
+        expected_generation = claim_generation_id(
+            authority_preimage_digest=self.authority_preimage_digest,
+            carrier_nonce=self.carrier_nonce,
+            central_repository_node_id=self.central_repository_node_id,
+            owner_key=issue_owner_key(
+                self.central_repository_node_id, self.issue_database_id, self.issue_node_id, self.issue_number,
+            ),
+            from_head_sha=self.from_head_sha,
+            from_tree_sha=self.from_tree_sha,
+            claim_kind=self.claim_kind,
+            role=self.carrier_role,
+            owner_kind="ISSUE",
+            transition_kind=self.transition_kind,
+        )
+        if self.claim_generation_id != expected_generation:
+            _fail("RequiredStatusEpoch claimGenerationId does not match immutable authority")
+        marker = ClaimedHeadMarker(
+            self.claim_kind, self.carrier_role, "ISSUE",
+            issue_owner_key(self.central_repository_node_id, self.issue_database_id, self.issue_node_id, self.issue_number),
+            self.claim_generation_id, self.carrier_nonce, self.transition_kind,
+        )
+        if self.marker_digest != hashlib.sha256(marker.render().encode("utf-8")).hexdigest():
+            _fail("RequiredStatusEpoch markerDigest does not match canonical generation marker")
+        expected_epoch_id = hashlib.sha256(
+            (REQUIRED_STATUS_EPOCH_ID_PREFIX + _canonical_json(self.as_value(include_epoch_id=False))).encode("utf-8")
+        ).hexdigest()
+        if self.epoch_id != expected_epoch_id:
+            _fail("RequiredStatusEpoch epochId does not match canonical final body")
+
+    def _fields(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in (
+                "schema_version", "issue_number", "issue_database_id", "issue_node_id",
+                "issue_request_anchor_comment_database_id", "issue_request_anchor_sha256",
+                "issue_branch_lease_comment_database_id", "issue_branch_lease_sha256", "binding_id",
+                "source_id", "source_repository_id", "pull_request_number", "pull_request_database_id",
+                "pull_request_node_id", "central_repository_node_id", "branch_ref", "request_class",
+                "accepted_base_sha", "accepted_base_tree_sha", "base_ref", "from_head_sha", "from_tree_sha",
+                "to_head_sha", "to_tree_sha", "carrier_role", "claim_kind", "claim_generation_id",
+                "transition_kind", "carrier_nonce", "reason_class", "from_provenance_kind",
+                "from_provenance_id", "from_provenance_sha256", "from_carrier_role",
+                "prior_required_status", "authority_preimage_digest", "marker_digest", "epoch_id",
+            )
+        }
+
+    def authority_preimage_value(self) -> dict[str, Any]:
+        return _required_status_epoch_preimage_from_fields(self._fields())
+
+    def as_value(self, *, include_epoch_id: bool = True) -> dict[str, Any]:
+        value = {
+            "schemaVersion": self.schema_version,
+            "issueNumber": self.issue_number,
+            "issueDatabaseId": self.issue_database_id,
+            "issueNodeId": self.issue_node_id,
+            "issueRequestAnchorCommentDatabaseId": self.issue_request_anchor_comment_database_id,
+            "issueRequestAnchorSha256": self.issue_request_anchor_sha256,
+            "issueBranchLeaseCommentDatabaseId": self.issue_branch_lease_comment_database_id,
+            "issueBranchLeaseSha256": self.issue_branch_lease_sha256,
+            "bindingId": self.binding_id,
+            "sourceId": self.source_id,
+            "sourceRepositoryId": self.source_repository_id,
+            "pullRequestNumber": self.pull_request_number,
+            "pullRequestDatabaseId": self.pull_request_database_id,
+            "pullRequestNodeId": self.pull_request_node_id,
+            "centralRepositoryNodeId": self.central_repository_node_id,
+            "branchRef": self.branch_ref,
+            "requestClass": self.request_class.value,
+            "acceptedBaseSha": self.accepted_base_sha,
+            "acceptedBaseTreeSha": self.accepted_base_tree_sha,
+            "baseRef": self.base_ref,
+            "fromHeadSha": self.from_head_sha,
+            "fromTreeSha": self.from_tree_sha,
+            "toHeadSha": self.to_head_sha,
+            "toTreeSha": self.to_tree_sha,
+            "carrierRole": self.carrier_role,
+            "claimKind": self.claim_kind,
+            "claimGenerationId": self.claim_generation_id,
+            "transitionKind": self.transition_kind,
+            "carrierNonce": self.carrier_nonce,
+            "reasonClass": self.reason_class.value,
+            "fromProvenanceKind": self.from_provenance_kind,
+            "fromProvenanceId": self.from_provenance_id,
+            "fromProvenanceSha256": self.from_provenance_sha256,
+            "fromCarrierRole": self.from_carrier_role,
+            "priorRequiredStatus": self.prior_required_status.as_value() if self.prior_required_status is not None else None,
+            "authorityPreimageDigest": self.authority_preimage_digest,
+            "markerDigest": self.marker_digest,
+        }
+        if include_epoch_id:
+            value["epochId"] = self.epoch_id
+        return value
+
+    @classmethod
+    def create(cls, **fields: Any) -> "RequiredStatusEpoch":
+        body = dict(fields)
+        body.setdefault("schema_version", 2)
+        body.setdefault("carrier_role", "ISSUE_ACTIVE")
+        body.setdefault("claim_kind", "REQUIRED_STATUS_EPOCH")
+        if type(body.get("reason_class")) is not RequiredStatusEpochReason:
+            _fail("RequiredStatusEpoch.create requires a RequiredStatusEpochReason")
+        body.setdefault("transition_kind", body["reason_class"].value)
+        required = {
+            "schema_version", "issue_number", "issue_database_id", "issue_node_id",
+            "issue_request_anchor_comment_database_id", "issue_request_anchor_sha256",
+            "issue_branch_lease_comment_database_id", "issue_branch_lease_sha256", "binding_id",
+            "source_id", "source_repository_id", "pull_request_number", "pull_request_database_id",
+            "pull_request_node_id", "central_repository_node_id", "branch_ref", "request_class",
+            "accepted_base_sha", "accepted_base_tree_sha", "base_ref", "from_head_sha", "from_tree_sha",
+            "to_head_sha", "to_tree_sha", "carrier_role", "claim_kind", "transition_kind",
+            "carrier_nonce", "reason_class", "from_provenance_kind", "from_provenance_id",
+            "from_provenance_sha256", "from_carrier_role", "prior_required_status",
+        }
+        if set(body) != required:
+            _fail("RequiredStatusEpoch.create fields do not match the construction schema")
+        authority = _required_status_epoch_authority_digest_from_fields(body)
+        generation = claim_generation_id(
+            authority_preimage_digest=authority,
+            carrier_nonce=body["carrier_nonce"],
+            central_repository_node_id=body["central_repository_node_id"],
+            owner_key=issue_owner_key(
+                body["central_repository_node_id"], body["issue_database_id"],
+                body["issue_node_id"], body["issue_number"],
+            ),
+            from_head_sha=body["from_head_sha"],
+            from_tree_sha=body["from_tree_sha"],
+            claim_kind=body["claim_kind"],
+            role=body["carrier_role"],
+            owner_kind="ISSUE",
+            transition_kind=body["transition_kind"],
+        )
+        marker = ClaimedHeadMarker(
+            body["claim_kind"], body["carrier_role"], "ISSUE",
+            issue_owner_key(body["central_repository_node_id"], body["issue_database_id"], body["issue_node_id"], body["issue_number"]),
+            generation, body["carrier_nonce"], body["transition_kind"],
+        )
+        marker_digest = hashlib.sha256(marker.render().encode("utf-8")).hexdigest()
+        values = dict(body)
+        values.update({"claim_generation_id": generation, "authority_preimage_digest": authority, "marker_digest": marker_digest})
+        provisional = cls.__new__(cls)
+        for name, value in values.items():
+            object.__setattr__(provisional, name, value)
+        epoch_without_id = provisional.as_value(include_epoch_id=False)
+        epoch_id = hashlib.sha256(
+            (REQUIRED_STATUS_EPOCH_ID_PREFIX + _canonical_json(epoch_without_id)).encode("utf-8")
+        ).hexdigest()
+        values["epoch_id"] = epoch_id
+        return cls(**values)
+
+    def render(self) -> str:
+        return f"{REQUIRED_STATUS_EPOCH_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+def parse_required_status_epoch(text: str) -> RequiredStatusEpoch:
+    if type(text) is not str or not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _fail("RequiredStatusEpoch must use exact LF-terminated lines")
+    lines = text[:-1].split("\n")
+    if len(lines) != 2 or lines[0] != REQUIRED_STATUS_EPOCH_MARKER or not lines[1]:
+        _fail("RequiredStatusEpoch marker or JSON line is invalid")
+    try:
+        value = c02.decode_json(lines[1])
+    except Exception as error:
+        _fail(f"invalid RequiredStatusEpoch JSON: {error}")
+    if type(value) is not dict or set(value) != _REQUIRED_STATUS_EPOCH_KEYS:
+        _fail("RequiredStatusEpoch has invalid exact keys")
+    try:
+        request_class = _ISSUE_REQUEST_CLASS_VALUES[value["requestClass"]]
+        reason_class = RequiredStatusEpochReason(value["reasonClass"])
+        prior = ExactAppRequiredStatusEvidence.from_value(value["priorRequiredStatus"]) if value["priorRequiredStatus"] is not None else None
+    except (KeyError, TypeError, ValueError):
+        _fail("RequiredStatusEpoch enum or nested evidence value is invalid")
+    epoch = RequiredStatusEpoch(
+        value["schemaVersion"], value["issueNumber"], value["issueDatabaseId"], value["issueNodeId"],
+        value["issueRequestAnchorCommentDatabaseId"], value["issueRequestAnchorSha256"],
+        value["issueBranchLeaseCommentDatabaseId"], value["issueBranchLeaseSha256"], value["bindingId"],
+        value["sourceId"], value["sourceRepositoryId"], value["pullRequestNumber"],
+        value["pullRequestDatabaseId"], value["pullRequestNodeId"], value["centralRepositoryNodeId"],
+        value["branchRef"], request_class, value["acceptedBaseSha"], value["acceptedBaseTreeSha"],
+        value["baseRef"], value["fromHeadSha"], value["fromTreeSha"], value["toHeadSha"], value["toTreeSha"],
+        value["carrierRole"], value["claimKind"], value["claimGenerationId"], value["transitionKind"],
+        value["carrierNonce"], reason_class, value["fromProvenanceKind"], value["fromProvenanceId"],
+        value["fromProvenanceSha256"], value["fromCarrierRole"], prior, value["authorityPreimageDigest"],
+        value["markerDigest"], value["epochId"],
+    )
+    if lines[1] != _canonical_json(epoch.as_value()) or text != epoch.render():
+        _fail("RequiredStatusEpoch representation is not canonical")
+    return epoch
+
+
+_ISSUE_FINALIZATION_EPOCH_FROM_KINDS = frozenset({"ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH"})
+_ISSUE_FINALIZATION_EPOCH_KEYS = frozenset({
+    "schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId",
+    "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256",
+    "issueBranchLeaseCommentDatabaseId", "issueBranchLeaseSha256", "bindingId",
+    "sourceId", "sourceRepositoryId", "pullRequestNumber", "pullRequestDatabaseId",
+    "pullRequestNodeId", "centralRepositoryNodeId", "branchRef", "requestClass",
+    "acceptedBaseSha", "acceptedBaseTreeSha", "baseRef", "fromHeadSha", "fromTreeSha",
+    "finalHeadSha", "finalTreeSha", "carrierRole", "claimKind", "claimGenerationId",
+    "transitionKind", "carrierNonce", "fromAuthorityKind", "fromAuthorityCommentDatabaseId",
+    "fromAuthorityArtifactId", "fromAuthorityArtifactSha256", "fromAuthorityRole",
+    "proposalOriginClaimCommentDatabaseId", "proposalOriginClaimId", "proposalOriginClaimSha256",
+    "effectiveRequestDigest", "patchProjectionEvidenceDigest", "claimedTargetEvidenceDigest",
+    "freshProposalScopeEvidenceDigest", "authorityPreimageDigest", "finalizerEvidenceDigest",
+    "requiredStatusContext", "requiredStatusClass", "requiredStatusState",
+    "requiredStatusTargetUrl", "requiredStatusEvidenceDigest", "requiredStatusDescription",
+    "markerDigest", "epochId",
+})
+
+
+def _issue_finalization_epoch_preimage_from_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
+    request_class = fields["request_class"]
+    if type(request_class) is not RequestClass or request_class not in _ISSUE_REQUEST_CLASSES:
+        _fail("IssueFinalizationEpoch requestClass must be ADD, UPDATE, or REMOVE")
+    return {
+        "schemaVersion": fields["schema_version"],
+        "issueNumber": fields["issue_number"],
+        "issueDatabaseId": fields["issue_database_id"],
+        "issueNodeId": fields["issue_node_id"],
+        "issueRequestAnchorCommentDatabaseId": fields["issue_request_anchor_comment_database_id"],
+        "issueRequestAnchorSha256": fields["issue_request_anchor_sha256"],
+        "issueBranchLeaseCommentDatabaseId": fields["issue_branch_lease_comment_database_id"],
+        "issueBranchLeaseSha256": fields["issue_branch_lease_sha256"],
+        "bindingId": fields["binding_id"],
+        "sourceId": fields["source_id"],
+        "sourceRepositoryId": fields["source_repository_id"],
+        "pullRequestNumber": fields["pull_request_number"],
+        "pullRequestDatabaseId": fields["pull_request_database_id"],
+        "pullRequestNodeId": fields["pull_request_node_id"],
+        "centralRepositoryNodeId": fields["central_repository_node_id"],
+        "branchRef": fields["branch_ref"],
+        "requestClass": request_class.value,
+        "acceptedBaseSha": fields["accepted_base_sha"],
+        "acceptedBaseTreeSha": fields["accepted_base_tree_sha"],
+        "baseRef": fields["base_ref"],
+        "fromHeadSha": fields["from_head_sha"],
+        "fromTreeSha": fields["from_tree_sha"],
+        "fromAuthorityKind": fields["from_authority_kind"],
+        "fromAuthorityCommentDatabaseId": fields["from_authority_comment_database_id"],
+        "fromAuthorityArtifactId": fields["from_authority_artifact_id"],
+        "fromAuthorityArtifactSha256": fields["from_authority_artifact_sha256"],
+        "fromAuthorityRole": fields["from_authority_role"],
+        "proposalOriginClaimCommentDatabaseId": fields["proposal_origin_claim_comment_database_id"],
+        "proposalOriginClaimId": fields["proposal_origin_claim_id"],
+        "proposalOriginClaimSha256": fields["proposal_origin_claim_sha256"],
+        "effectiveRequestDigest": fields["effective_request_digest"],
+        "patchProjectionEvidenceDigest": fields["patch_projection_evidence_digest"],
+        "claimedTargetEvidenceDigest": fields["claimed_target_evidence_digest"],
+        "freshProposalScopeEvidenceDigest": fields["fresh_proposal_scope_evidence_digest"],
+    }
+
+
+def _issue_finalization_epoch_authority_digest_from_fields(fields: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        (ISSUE_FINALIZATION_EPOCH_AUTHORITY_PREFIX + _canonical_json(
+            _issue_finalization_epoch_preimage_from_fields(fields)
+        )).encode("utf-8")
+    ).hexdigest()
+
+
+def _issue_finalization_epoch_evidence_digest_from_fields(fields: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        (ISSUE_FINALIZATION_EPOCH_EVIDENCE_PREFIX + _canonical_json(
+            _issue_finalization_epoch_preimage_from_fields(fields)
+        )).encode("utf-8")
+    ).hexdigest()
+
+
+def _issue_final_status_evidence_value(fields: Mapping[str, Any]) -> dict[str, Any]:
+    request_class = fields["request_class"]
+    if type(request_class) is not RequestClass or request_class not in _ISSUE_REQUEST_CLASSES:
+        _fail("issue-final evidence requestClass must be ADD, UPDATE, or REMOVE")
+    return {
+        "centralRepositoryNodeId": fields["central_repository_node_id"],
+        "finalHeadSha": fields["final_head_sha"],
+        "finalTreeSha": fields["final_tree_sha"],
+        "claimGenerationId": fields["claim_generation_id"],
+        "markerDigest": fields["marker_digest"],
+        "issueNumber": fields["issue_number"],
+        "issueDatabaseId": fields["issue_database_id"],
+        "issueNodeId": fields["issue_node_id"],
+        "issueRequestAnchorCommentDatabaseId": fields["issue_request_anchor_comment_database_id"],
+        "issueRequestAnchorSha256": fields["issue_request_anchor_sha256"],
+        "issueBranchLeaseCommentDatabaseId": fields["issue_branch_lease_comment_database_id"],
+        "issueBranchLeaseSha256": fields["issue_branch_lease_sha256"],
+        "bindingId": fields["binding_id"],
+        "sourceId": fields["source_id"],
+        "sourceRepositoryId": fields["source_repository_id"],
+        "pullRequestNumber": fields["pull_request_number"],
+        "pullRequestDatabaseId": fields["pull_request_database_id"],
+        "pullRequestNodeId": fields["pull_request_node_id"],
+        "branchRef": fields["branch_ref"],
+        "acceptedBaseSha": fields["accepted_base_sha"],
+        "acceptedBaseTreeSha": fields["accepted_base_tree_sha"],
+        "baseRef": fields["base_ref"],
+        "requestClass": request_class.value,
+        "fromHeadSha": fields["from_head_sha"],
+        "fromTreeSha": fields["from_tree_sha"],
+        "fromAuthorityKind": fields["from_authority_kind"],
+        "fromAuthorityCommentDatabaseId": fields["from_authority_comment_database_id"],
+        "fromAuthorityArtifactId": fields["from_authority_artifact_id"],
+        "fromAuthorityArtifactSha256": fields["from_authority_artifact_sha256"],
+        "fromAuthorityRole": fields["from_authority_role"],
+        "proposalOriginClaimCommentDatabaseId": fields["proposal_origin_claim_comment_database_id"],
+        "proposalOriginClaimId": fields["proposal_origin_claim_id"],
+        "proposalOriginClaimSha256": fields["proposal_origin_claim_sha256"],
+        "effectiveRequestDigest": fields["effective_request_digest"],
+        "patchProjectionEvidenceDigest": fields["patch_projection_evidence_digest"],
+        "claimedTargetEvidenceDigest": fields["claimed_target_evidence_digest"],
+        "freshProposalScopeEvidenceDigest": fields["fresh_proposal_scope_evidence_digest"],
+        "finalizerEvidenceDigest": fields["finalizer_evidence_digest"],
+        "requiredStatusContext": "federation/trusted-validation",
+        "requiredStatusClass": "issue-final",
+        "requiredStatusState": "success",
+        "requiredStatusTargetUrl": None,
+    }
+
+
+def _issue_final_status_evidence_digest_from_fields(fields: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        (ISSUE_FINAL_STATUS_EVIDENCE_PREFIX + _canonical_json(
+            _issue_final_status_evidence_value(fields)
+        )).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class IssueFinalizationEpoch:
+    schema_version: int
+    issue_number: int
+    issue_database_id: int
+    issue_node_id: str
+    issue_request_anchor_comment_database_id: int
+    issue_request_anchor_sha256: str
+    issue_branch_lease_comment_database_id: int
+    issue_branch_lease_sha256: str
+    binding_id: str
+    source_id: str
+    source_repository_id: int
+    pull_request_number: int
+    pull_request_database_id: int
+    pull_request_node_id: str
+    central_repository_node_id: str
+    branch_ref: str
+    request_class: RequestClass
+    accepted_base_sha: str
+    accepted_base_tree_sha: str
+    base_ref: str
+    from_head_sha: str
+    from_tree_sha: str
+    final_head_sha: str
+    final_tree_sha: str
+    carrier_role: str
+    claim_kind: str
+    claim_generation_id: str
+    transition_kind: str
+    carrier_nonce: str
+    from_authority_kind: str
+    from_authority_comment_database_id: int
+    from_authority_artifact_id: str
+    from_authority_artifact_sha256: str
+    from_authority_role: str
+    proposal_origin_claim_comment_database_id: int
+    proposal_origin_claim_id: str
+    proposal_origin_claim_sha256: str
+    effective_request_digest: str
+    patch_projection_evidence_digest: str
+    claimed_target_evidence_digest: str
+    fresh_proposal_scope_evidence_digest: str
+    authority_preimage_digest: str
+    finalizer_evidence_digest: str
+    required_status_context: str
+    required_status_class: str
+    required_status_state: str
+    required_status_target_url: None
+    required_status_evidence_digest: str
+    required_status_description: str
+    marker_digest: str
+    epoch_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("IssueFinalizationEpoch schemaVersion must be exact integer 1")
+        for name in (
+            "issue_number", "issue_database_id", "issue_request_anchor_comment_database_id",
+            "issue_branch_lease_comment_database_id", "source_repository_id", "pull_request_number",
+            "pull_request_database_id", "from_authority_comment_database_id",
+            "proposal_origin_claim_comment_database_id",
+        ):
+            _issue_positive_int(getattr(self, name), name)
+        for name in ("issue_node_id", "pull_request_node_id", "central_repository_node_id"):
+            _lease_node_id(getattr(self, name), name, delimiter_free=True)
+        for name in (
+            "issue_request_anchor_sha256", "issue_branch_lease_sha256", "binding_id",
+            "claim_generation_id", "carrier_nonce", "from_authority_artifact_id",
+            "from_authority_artifact_sha256", "proposal_origin_claim_id", "proposal_origin_claim_sha256",
+            "effective_request_digest", "patch_projection_evidence_digest", "claimed_target_evidence_digest",
+            "fresh_proposal_scope_evidence_digest", "authority_preimage_digest", "finalizer_evidence_digest",
+            "required_status_evidence_digest", "marker_digest", "epoch_id",
+        ):
+            _lease_sha(getattr(self, name), name)
+        try:
+            c02.validate_source_id(self.source_id)
+        except (TypeError, c02.FederationError):
+            _fail("sourceId is invalid")
+        if type(self.branch_ref) is not str or self.branch_ref != issue_branch_ref(self.issue_number):
+            _fail("branchRef must be the exact Issue branch ref")
+        if type(self.request_class) is not RequestClass or self.request_class not in _ISSUE_REQUEST_CLASSES:
+            _fail("requestClass must be ADD, UPDATE, or REMOVE")
+        for name in (
+            "accepted_base_sha", "accepted_base_tree_sha", "from_head_sha", "from_tree_sha",
+            "final_head_sha", "final_tree_sha",
+        ):
+            _lease_sha(getattr(self, name), name, git=True)
+        if self.base_ref != "main":
+            _fail("baseRef must be exact main")
+        if self.final_tree_sha != self.from_tree_sha:
+            _fail("IssueFinalizationEpoch must preserve the exact from-tree")
+        if self.carrier_role != "ISSUE_FINALIZING":
+            _fail("IssueFinalizationEpoch carrierRole must be ISSUE_FINALIZING")
+        if self.claim_kind != "ISSUE_FINALIZATION_EPOCH":
+            _fail("IssueFinalizationEpoch claimKind must be ISSUE_FINALIZATION_EPOCH")
+        if self.transition_kind != "FINALIZE":
+            _fail("IssueFinalizationEpoch transitionKind must be exact FINALIZE")
+        _lease_sha(self.carrier_nonce, "carrierNonce")
+        if self.from_authority_kind not in _ISSUE_FINALIZATION_EPOCH_FROM_KINDS:
+            _fail("IssueFinalizationEpoch immediate authority kind is unsupported")
+        _lease_sha(self.from_authority_artifact_id, "fromAuthorityArtifactId")
+        _lease_sha(self.from_authority_artifact_sha256, "fromAuthorityArtifactSha256")
+        if self.from_authority_role != "ISSUE_ACTIVE":
+            _fail("IssueFinalizationEpoch immediate authority role must be ISSUE_ACTIVE")
+        _lease_sha(self.proposal_origin_claim_id, "proposalOriginClaimId")
+        _lease_sha(self.proposal_origin_claim_sha256, "proposalOriginClaimSha256")
+        if self.from_authority_kind == "ISSUE_HEAD_CLAIM" and (
+            self.from_authority_comment_database_id != self.proposal_origin_claim_comment_database_id
+            or self.from_authority_artifact_id != self.proposal_origin_claim_id
+            or self.from_authority_artifact_sha256 != self.proposal_origin_claim_sha256
+        ):
+            _fail("direct IssueHeadClaim authority must equal exact proposal-origin claim")
+        if self.claimed_target_evidence_digest != self.fresh_proposal_scope_evidence_digest:
+            _fail("claimed target evidence must equal freshly rederived proposal scope")
+        if self.required_status_context != "federation/trusted-validation":
+            _fail("required status context must be exact federation/trusted-validation")
+        if self.required_status_class != "issue-final":
+            _fail("required status class must be exact issue-final")
+        if self.required_status_state != "success":
+            _fail("required status state must be exact success")
+        if self.required_status_target_url is not None:
+            _fail("required status target_url must be null")
+        expected_authority = _issue_finalization_epoch_authority_digest_from_fields(self._fields())
+        if self.authority_preimage_digest != expected_authority:
+            _fail("IssueFinalizationEpoch authorityPreimageDigest does not match finalizer authority")
+        expected_finalizer_evidence = _issue_finalization_epoch_evidence_digest_from_fields(self._fields())
+        if self.finalizer_evidence_digest != expected_finalizer_evidence:
+            _fail("IssueFinalizationEpoch finalizerEvidenceDigest does not match exact pre-HF evidence")
+        expected_generation = claim_generation_id(
+            authority_preimage_digest=self.authority_preimage_digest,
+            carrier_nonce=self.carrier_nonce,
+            central_repository_node_id=self.central_repository_node_id,
+            owner_key=issue_owner_key(
+                self.central_repository_node_id, self.issue_database_id, self.issue_node_id, self.issue_number,
+            ),
+            from_head_sha=self.from_head_sha,
+            from_tree_sha=self.from_tree_sha,
+            claim_kind=self.claim_kind,
+            role=self.carrier_role,
+            owner_kind="ISSUE",
+            transition_kind=self.transition_kind,
+        )
+        if self.claim_generation_id != expected_generation:
+            _fail("IssueFinalizationEpoch claimGenerationId does not match finalizer authority")
+        marker = ClaimedHeadMarker(
+            self.claim_kind, self.carrier_role, "ISSUE",
+            issue_owner_key(self.central_repository_node_id, self.issue_database_id, self.issue_node_id, self.issue_number),
+            self.claim_generation_id, self.carrier_nonce, self.transition_kind,
+        )
+        if self.marker_digest != hashlib.sha256(marker.render().encode("utf-8")).hexdigest():
+            _fail("IssueFinalizationEpoch markerDigest does not match canonical generation marker")
+        expected_status_digest = _issue_final_status_evidence_digest_from_fields(self._fields())
+        if self.required_status_evidence_digest != expected_status_digest:
+            _fail("IssueFinalizationEpoch issue-final evidence digest does not match full provenance")
+        expected_description = render_status_description(StatusClass.ISSUE_FINAL, expected_status_digest)
+        if self.required_status_description != expected_description:
+            _fail("IssueFinalizationEpoch required status description is not exact")
+        if len(self.required_status_description.encode("ascii")) != 86:
+            _fail("IssueFinalizationEpoch issue-final description must be exactly 86 ASCII bytes")
+        expected_epoch_id = hashlib.sha256(
+            (ISSUE_FINALIZATION_EPOCH_ID_PREFIX + _canonical_json(self.as_value(include_epoch_id=False))).encode("utf-8")
+        ).hexdigest()
+        if self.epoch_id != expected_epoch_id:
+            _fail("IssueFinalizationEpoch epochId does not match canonical final body")
+
+    def _fields(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in (
+                "schema_version", "issue_number", "issue_database_id", "issue_node_id",
+                "issue_request_anchor_comment_database_id", "issue_request_anchor_sha256",
+                "issue_branch_lease_comment_database_id", "issue_branch_lease_sha256", "binding_id",
+                "source_id", "source_repository_id", "pull_request_number", "pull_request_database_id",
+                "pull_request_node_id", "central_repository_node_id", "branch_ref", "request_class",
+                "accepted_base_sha", "accepted_base_tree_sha", "base_ref", "from_head_sha", "from_tree_sha",
+                "final_head_sha", "final_tree_sha", "carrier_role", "claim_kind", "claim_generation_id",
+                "transition_kind", "carrier_nonce", "from_authority_kind", "from_authority_comment_database_id",
+                "from_authority_artifact_id", "from_authority_artifact_sha256", "from_authority_role",
+                "proposal_origin_claim_comment_database_id", "proposal_origin_claim_id", "proposal_origin_claim_sha256",
+                "effective_request_digest", "patch_projection_evidence_digest", "claimed_target_evidence_digest",
+                "fresh_proposal_scope_evidence_digest", "authority_preimage_digest", "finalizer_evidence_digest",
+                "required_status_context", "required_status_class", "required_status_state", "required_status_target_url",
+                "required_status_evidence_digest", "required_status_description", "marker_digest", "epoch_id",
+            )
+        }
+
+    def authority_preimage_value(self) -> dict[str, Any]:
+        return _issue_finalization_epoch_preimage_from_fields(self._fields())
+
+    def as_value(self, *, include_epoch_id: bool = True) -> dict[str, Any]:
+        value = {
+            "schemaVersion": self.schema_version,
+            "issueNumber": self.issue_number,
+            "issueDatabaseId": self.issue_database_id,
+            "issueNodeId": self.issue_node_id,
+            "issueRequestAnchorCommentDatabaseId": self.issue_request_anchor_comment_database_id,
+            "issueRequestAnchorSha256": self.issue_request_anchor_sha256,
+            "issueBranchLeaseCommentDatabaseId": self.issue_branch_lease_comment_database_id,
+            "issueBranchLeaseSha256": self.issue_branch_lease_sha256,
+            "bindingId": self.binding_id,
+            "sourceId": self.source_id,
+            "sourceRepositoryId": self.source_repository_id,
+            "pullRequestNumber": self.pull_request_number,
+            "pullRequestDatabaseId": self.pull_request_database_id,
+            "pullRequestNodeId": self.pull_request_node_id,
+            "centralRepositoryNodeId": self.central_repository_node_id,
+            "branchRef": self.branch_ref,
+            "requestClass": self.request_class.value,
+            "acceptedBaseSha": self.accepted_base_sha,
+            "acceptedBaseTreeSha": self.accepted_base_tree_sha,
+            "baseRef": self.base_ref,
+            "fromHeadSha": self.from_head_sha,
+            "fromTreeSha": self.from_tree_sha,
+            "finalHeadSha": self.final_head_sha,
+            "finalTreeSha": self.final_tree_sha,
+            "carrierRole": self.carrier_role,
+            "claimKind": self.claim_kind,
+            "claimGenerationId": self.claim_generation_id,
+            "transitionKind": self.transition_kind,
+            "carrierNonce": self.carrier_nonce,
+            "fromAuthorityKind": self.from_authority_kind,
+            "fromAuthorityCommentDatabaseId": self.from_authority_comment_database_id,
+            "fromAuthorityArtifactId": self.from_authority_artifact_id,
+            "fromAuthorityArtifactSha256": self.from_authority_artifact_sha256,
+            "fromAuthorityRole": self.from_authority_role,
+            "proposalOriginClaimCommentDatabaseId": self.proposal_origin_claim_comment_database_id,
+            "proposalOriginClaimId": self.proposal_origin_claim_id,
+            "proposalOriginClaimSha256": self.proposal_origin_claim_sha256,
+            "effectiveRequestDigest": self.effective_request_digest,
+            "patchProjectionEvidenceDigest": self.patch_projection_evidence_digest,
+            "claimedTargetEvidenceDigest": self.claimed_target_evidence_digest,
+            "freshProposalScopeEvidenceDigest": self.fresh_proposal_scope_evidence_digest,
+            "authorityPreimageDigest": self.authority_preimage_digest,
+            "finalizerEvidenceDigest": self.finalizer_evidence_digest,
+            "requiredStatusContext": self.required_status_context,
+            "requiredStatusClass": self.required_status_class,
+            "requiredStatusState": self.required_status_state,
+            "requiredStatusTargetUrl": self.required_status_target_url,
+            "requiredStatusEvidenceDigest": self.required_status_evidence_digest,
+            "requiredStatusDescription": self.required_status_description,
+            "markerDigest": self.marker_digest,
+        }
+        if include_epoch_id:
+            value["epochId"] = self.epoch_id
+        return value
+
+    @classmethod
+    def create(cls, **fields: Any) -> "IssueFinalizationEpoch":
+        body = dict(fields)
+        body.setdefault("schema_version", 1)
+        body.setdefault("carrier_role", "ISSUE_FINALIZING")
+        body.setdefault("claim_kind", "ISSUE_FINALIZATION_EPOCH")
+        body.setdefault("transition_kind", "FINALIZE")
+        required = {
+            "schema_version", "issue_number", "issue_database_id", "issue_node_id",
+            "issue_request_anchor_comment_database_id", "issue_request_anchor_sha256",
+            "issue_branch_lease_comment_database_id", "issue_branch_lease_sha256", "binding_id",
+            "source_id", "source_repository_id", "pull_request_number", "pull_request_database_id",
+            "pull_request_node_id", "central_repository_node_id", "branch_ref", "request_class",
+            "accepted_base_sha", "accepted_base_tree_sha", "base_ref", "from_head_sha", "from_tree_sha",
+            "final_head_sha", "final_tree_sha", "carrier_role", "claim_kind", "transition_kind",
+            "carrier_nonce", "from_authority_kind", "from_authority_comment_database_id",
+            "from_authority_artifact_id", "from_authority_artifact_sha256", "from_authority_role",
+            "proposal_origin_claim_comment_database_id", "proposal_origin_claim_id", "proposal_origin_claim_sha256",
+            "effective_request_digest", "patch_projection_evidence_digest", "claimed_target_evidence_digest",
+            "fresh_proposal_scope_evidence_digest",
+        }
+        if set(body) != required:
+            _fail("IssueFinalizationEpoch.create fields do not match the construction schema")
+        authority = _issue_finalization_epoch_authority_digest_from_fields(body)
+        finalizer_digest = _issue_finalization_epoch_evidence_digest_from_fields(body)
+        generation = claim_generation_id(
+            authority_preimage_digest=authority,
+            carrier_nonce=body["carrier_nonce"],
+            central_repository_node_id=body["central_repository_node_id"],
+            owner_key=issue_owner_key(
+                body["central_repository_node_id"], body["issue_database_id"],
+                body["issue_node_id"], body["issue_number"],
+            ),
+            from_head_sha=body["from_head_sha"],
+            from_tree_sha=body["from_tree_sha"],
+            claim_kind=body["claim_kind"],
+            role=body["carrier_role"],
+            owner_kind="ISSUE",
+            transition_kind=body["transition_kind"],
+        )
+        marker = ClaimedHeadMarker(
+            body["claim_kind"], body["carrier_role"], "ISSUE",
+            issue_owner_key(body["central_repository_node_id"], body["issue_database_id"], body["issue_node_id"], body["issue_number"]),
+            generation, body["carrier_nonce"], body["transition_kind"],
+        )
+        marker_digest = hashlib.sha256(marker.render().encode("utf-8")).hexdigest()
+        values = dict(body)
+        values.update({
+            "claim_generation_id": generation,
+            "authority_preimage_digest": authority,
+            "finalizer_evidence_digest": finalizer_digest,
+            "marker_digest": marker_digest,
+            "required_status_context": "federation/trusted-validation",
+            "required_status_class": "issue-final",
+            "required_status_state": "success",
+            "required_status_target_url": None,
+        })
+        values["required_status_evidence_digest"] = _issue_final_status_evidence_digest_from_fields(values)
+        values["required_status_description"] = render_status_description(
+            StatusClass.ISSUE_FINAL, values["required_status_evidence_digest"]
+        )
+        provisional = cls.__new__(cls)
+        for name, value in values.items():
+            object.__setattr__(provisional, name, value)
+        epoch_id = hashlib.sha256(
+            (ISSUE_FINALIZATION_EPOCH_ID_PREFIX + _canonical_json(provisional.as_value(include_epoch_id=False))).encode("utf-8")
+        ).hexdigest()
+        values["epoch_id"] = epoch_id
+        return cls(**values)
+
+    def render(self) -> str:
+        return f"{ISSUE_FINALIZATION_EPOCH_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+def issue_final_status_evidence_digest(epoch: IssueFinalizationEpoch) -> str:
+    if type(epoch) is not IssueFinalizationEpoch:
+        _fail("issue-final status evidence digest requires an IssueFinalizationEpoch")
+    return _issue_final_status_evidence_digest_from_fields(epoch._fields())
+
+
+def parse_issue_finalization_epoch(text: str) -> IssueFinalizationEpoch:
+    if type(text) is not str or not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _fail("IssueFinalizationEpoch must use exact LF-terminated lines")
+    lines = text[:-1].split("\n")
+    if len(lines) != 2 or lines[0] != ISSUE_FINALIZATION_EPOCH_MARKER or not lines[1]:
+        _fail("IssueFinalizationEpoch marker or JSON line is invalid")
+    try:
+        value = c02.decode_json(lines[1])
+    except Exception as error:
+        _fail(f"invalid IssueFinalizationEpoch JSON: {error}")
+    if type(value) is not dict or set(value) != _ISSUE_FINALIZATION_EPOCH_KEYS:
+        _fail("IssueFinalizationEpoch has invalid exact keys")
+    try:
+        request_class = _ISSUE_REQUEST_CLASS_VALUES[value["requestClass"]]
+    except (KeyError, TypeError):
+        _fail("IssueFinalizationEpoch requestClass is invalid")
+    epoch = IssueFinalizationEpoch(
+        value["schemaVersion"], value["issueNumber"], value["issueDatabaseId"], value["issueNodeId"],
+        value["issueRequestAnchorCommentDatabaseId"], value["issueRequestAnchorSha256"],
+        value["issueBranchLeaseCommentDatabaseId"], value["issueBranchLeaseSha256"], value["bindingId"],
+        value["sourceId"], value["sourceRepositoryId"], value["pullRequestNumber"],
+        value["pullRequestDatabaseId"], value["pullRequestNodeId"], value["centralRepositoryNodeId"],
+        value["branchRef"], request_class, value["acceptedBaseSha"], value["acceptedBaseTreeSha"],
+        value["baseRef"], value["fromHeadSha"], value["fromTreeSha"], value["finalHeadSha"],
+        value["finalTreeSha"], value["carrierRole"], value["claimKind"], value["claimGenerationId"],
+        value["transitionKind"], value["carrierNonce"], value["fromAuthorityKind"],
+        value["fromAuthorityCommentDatabaseId"], value["fromAuthorityArtifactId"],
+        value["fromAuthorityArtifactSha256"], value["fromAuthorityRole"],
+        value["proposalOriginClaimCommentDatabaseId"], value["proposalOriginClaimId"],
+        value["proposalOriginClaimSha256"], value["effectiveRequestDigest"],
+        value["patchProjectionEvidenceDigest"], value["claimedTargetEvidenceDigest"],
+        value["freshProposalScopeEvidenceDigest"], value["authorityPreimageDigest"],
+        value["finalizerEvidenceDigest"], value["requiredStatusContext"], value["requiredStatusClass"],
+        value["requiredStatusState"], value["requiredStatusTargetUrl"], value["requiredStatusEvidenceDigest"],
+        value["requiredStatusDescription"], value["markerDigest"], value["epochId"],
+    )
+    if lines[1] != _canonical_json(epoch.as_value()) or text != epoch.render():
+        _fail("IssueFinalizationEpoch representation is not canonical")
+    return epoch
+
+
+def parse_exact_app_required_status_evidence(text: str) -> ExactAppRequiredStatusEvidence:
+    if type(text) is not str or "\r" in text or "\x00" in text:
+        _fail("prior required status evidence must be exact canonical JSON")
+    try:
+        value = c02.decode_json(text)
+    except Exception as error:
+        _fail(f"invalid prior required status evidence JSON: {error}")
+    evidence = ExactAppRequiredStatusEvidence.from_value(value)
+    if evidence.render() != text:
+        _fail("prior required status evidence is not canonical")
+    return evidence
 
 
 def classify_issue_head_claim_progression(
