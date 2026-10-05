@@ -33,6 +33,7 @@ EFFECTIVE_REQUEST_DIGEST_PREFIX = "swiftstream-federation-effective-request:v1\n
 ISSUE_PATCH_PROJECTION_EVIDENCE_PREFIX = "swiftstream-federation-issue-patch-projection-evidence:v1\n"
 NORMALIZE_TARGET_EVIDENCE_PREFIX = "swiftstream-federation-issue-head-normalize-target:v1\n"
 PROPOSAL_TARGET_EVIDENCE_PREFIX = "swiftstream-federation-issue-head-proposal-target:v1\n"
+EXTERNAL_STATUS_EVIDENCE_PREFIX = "swiftstream-federation-external-status-evidence:v1\n"
 
 CLAIMED_HEAD_MARKER_HEADER = "swiftstream-federation-head:v2"
 ISSUE_BRANCH_LEASE_MARKER = "<!-- swiftstream-federation-issue-branch-lease:v1 -->"
@@ -1617,6 +1618,150 @@ def issue_owner_key(
     node_id = _lease_node_id(issue_node_id, "issueNodeId", delimiter_free=True)
     number = _lease_decimal(issue_number, "issueNumber")
     return f"{central}:{database_id}:{node_id}:{number}"
+
+
+def parse_issue_owner_key(owner_key: str) -> tuple[str, int, str, int]:
+    """Parse the canonical Issue owner key; the text alone grants no authority."""
+    text = _issue_bounded_text(owner_key, "issueOwnerKey", 1_024)
+    parts = text.split(":")
+    if len(parts) != 4:
+        _fail("issueOwnerKey must contain exactly four components")
+    central_node_id, database_text, issue_node_id, number_text = parts
+    _lease_node_id(central_node_id, "centralRepositoryNodeId", delimiter_free=True)
+    _lease_node_id(issue_node_id, "issueNodeId", delimiter_free=True)
+    if not re.fullmatch(r"[1-9][0-9]*", database_text):
+        _fail("issueDatabaseId must use canonical positive decimal form")
+    if not re.fullmatch(r"[1-9][0-9]*", number_text):
+        _fail("issueNumber must use canonical positive decimal form")
+    if len(database_text) > 19 or len(number_text) > 19:
+        _fail("Issue owner-key integer exceeds signed-64 range")
+    database_id = _lease_decimal(int(database_text), "issueDatabaseId")
+    issue_number = _lease_decimal(int(number_text), "issueNumber")
+    if issue_owner_key(central_node_id, database_id, issue_node_id, issue_number) != text:
+        _fail("issueOwnerKey is not canonical")
+    return central_node_id, database_id, issue_node_id, issue_number
+
+
+class CarrierActivation(Enum):
+    RESERVED_INACTIVE = "RESERVED_INACTIVE"
+    ACTIVE = "ACTIVE"
+    LEGACY_CUTOVER_QUARANTINE = "LEGACY_CUTOVER_QUARANTINE"
+    UNCLAIMED_OUT_OF_FEDERATION = "UNCLAIMED_OUT_OF_FEDERATION"
+    CONFLICTING = "CONFLICTING"
+
+
+class CarrierRole(Enum):
+    ISSUE_ACTIVE = "ISSUE_ACTIVE"
+    ISSUE_FINALIZING = "ISSUE_FINALIZING"
+    ISSUE_CANCEL = "ISSUE_CANCEL"
+    MACHINE_PUBLICATION = "MACHINE_PUBLICATION"
+
+
+class LegacyEvidenceDisposition(Enum):
+    ABSENT = "ABSENT"
+    QUARANTINE = "QUARANTINE"
+    CONFLICTING = "CONFLICTING"
+
+
+@dataclass(frozen=True)
+class ShaCarrierResolution:
+    """A PR-independent carrier classification for one exact commit SHA."""
+
+    activation: CarrierActivation
+    role: CarrierRole | None = None
+    marker: ClaimedHeadMarker | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.activation) is not CarrierActivation:
+            _fail("carrier activation must be a closed CarrierActivation value")
+        if self.role is not None and type(self.role) is not CarrierRole:
+            _fail("carrier role must be a closed CarrierRole value")
+        if self.marker is not None and type(self.marker) is not ClaimedHeadMarker:
+            _fail("carrier marker must be a parsed ClaimedHeadMarker")
+        if self.activation in (CarrierActivation.ACTIVE, CarrierActivation.RESERVED_INACTIVE):
+            if self.role is None:
+                _fail("active and reserved carrier resolutions require a role")
+        elif self.role is not None:
+            _fail("quarantine, unclaimed, and conflicting resolutions cannot carry a role")
+        if self.marker is not None and self.role is not None and self.marker.role != self.role.value:
+            _fail("carrier marker role does not match the resolution role")
+
+
+class StatusClass(Enum):
+    ISSUE_FINAL = "issue-final"
+    CANCEL = "cancel"
+    EXTERNAL = "external"
+    LEGACY = "legacy"
+    MAINTENANCE = "maintenance"
+
+
+@dataclass(frozen=True)
+class StatusEvidenceDescription:
+    status_class: StatusClass
+    evidence_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.status_class) is not StatusClass:
+            _fail("status class must be a closed StatusClass value")
+        _lease_sha(self.evidence_digest, "status evidence digest")
+
+    def render(self) -> str:
+        if self.status_class is StatusClass.MAINTENANCE:
+            _fail("maintenance status descriptions are parse-only")
+        return f"ssf:v1 {self.status_class.value} ev={self.evidence_digest}"
+
+
+_STATUS_DESCRIPTION_RE = re.compile(
+    r"ssf:v1 (issue-final|cancel|external|legacy|maintenance) ev=([0-9a-f]{64})"
+)
+
+
+def parse_status_description(text: str) -> StatusEvidenceDescription:
+    if type(text) is not str:
+        _fail("status description must be a string")
+    try:
+        encoded = text.encode("ascii")
+    except UnicodeEncodeError:
+        _fail("status description must be ASCII")
+    if len(encoded) > 86 or any(char in text for char in "\r\n\x00"):
+        _fail("status description has invalid length or control characters")
+    match = _STATUS_DESCRIPTION_RE.fullmatch(text)
+    if match is None:
+        _fail("status description is not in canonical ssf:v1 form")
+    status = StatusEvidenceDescription(
+        StatusClass(match.group(1)), match.group(2)
+    )
+    if status.status_class is not StatusClass.MAINTENANCE and status.render() != text:
+        _fail("status description is not canonical")
+    return status
+
+
+def render_status_description(status_class: StatusClass, evidence_digest: str) -> str:
+    return StatusEvidenceDescription(status_class, evidence_digest).render()
+
+
+def external_status_evidence_digest(
+    central_repository_database_id: int,
+    central_repository_node_id: str,
+    central_repository_full_name: str,
+    head_sha: str,
+) -> str:
+    database_id = _issue_positive_int(central_repository_database_id, "centralRepositoryDatabaseId")
+    node_id = _lease_node_id(central_repository_node_id, "centralRepositoryNodeId")
+    full_name = _issue_bounded_text(central_repository_full_name, "centralRepositoryFullName", 256)
+    if full_name.count("/") != 1 or any(not part for part in full_name.split("/")):
+        _fail("centralRepositoryFullName must be canonical owner/repo form")
+    sha = _lease_sha(head_sha, "headSha", git=True)
+    value = {
+        "carrierRole": "UNCLAIMED_OUT_OF_FEDERATION",
+        "carrierSchemaVersion": 1,
+        "centralRepositoryDatabaseId": database_id,
+        "centralRepositoryFullName": full_name,
+        "centralRepositoryNodeId": node_id,
+        "headSha": sha,
+    }
+    preimage = EXTERNAL_STATUS_EVIDENCE_PREFIX.encode("utf-8") + _canonical_json(value).encode("utf-8")
+    return hashlib.sha256(preimage).hexdigest()
 
 
 def issue_branch_ref(issue_number: int) -> str:

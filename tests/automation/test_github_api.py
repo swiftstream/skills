@@ -38,6 +38,11 @@ from automation.federation.github_api import (
     UnexpectedStatusError,
     REST_BASE_URL,
     GitCommitMetadata,
+    GitCommitObject,
+    GitCommitIdentity,
+    CommitStatus,
+    StatusWriteReceipt,
+    latest_exact_app_status,
 )
 from automation.federation.request_model import (
     MAX_BODY_BYTES,
@@ -61,6 +66,19 @@ class FakeTransport:
     def request(self, method, url, headers, body, timeout):
         self.calls.append((method, url, headers, body, timeout))
         return self.response
+
+
+class SequenceTransport:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def request(self, method, url, headers, body, timeout):
+        self.calls.append((method, url, headers, body, timeout))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def _canonical_projection_at_max_size():
@@ -1626,6 +1644,252 @@ class GitHubAPITests(unittest.TestCase):
                     "swiftstream/skills", head="bot/federation/request/issue-7", base="main",
                     title="Issue request", body="canonical\nbody\n",
                 )
+
+
+class Wave05CommitStatusAPITests(unittest.TestCase):
+    repository = "swiftstream/skills"
+    sha = "a" * 40
+    context = "federation/trusted-validation"
+    description = "ssf:v1 external ev=" + "b" * 64
+    bot = {
+        "id": 9001,
+        "node_id": "BOT_NODE",
+        "login": "swift-stream-bot[bot]",
+        "type": "Bot",
+    }
+
+    @classmethod
+    def status_payload(cls, *, status_id=1, state="success", context=None, description=None,
+                       target_url=None, creator=None, created_at="2026-10-05T12:00:00Z",
+                       updated_at="2026-10-05T12:00:01Z", node_id="STATUS_NODE"):
+        return {
+            "id": status_id,
+            "node_id": node_id,
+            "state": state,
+            "context": cls.context if context is None else context,
+            "description": cls.description if description is None else description,
+            "target_url": target_url,
+            "creator": dict(cls.bot if creator is None else creator),
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+
+    @staticmethod
+    def response(status, route, body=None):
+        if body is None:
+            raw = b""
+        elif isinstance(body, bytes):
+            raw = body
+        else:
+            raw = json.dumps(body, separators=(",", ":")).encode()
+        return HttpResponse(status, REST_BASE_URL + route, raw)
+
+    def test_git_commit_object_reads_exact_sha_and_defensively_parses_metadata(self):
+        route = f"/repos/{self.repository}/git/commits/{self.sha}"
+        payload = {
+            "sha": self.sha,
+            "message": "subject\n\nswiftstream-federation-head:v2\n",
+            "tree": {"sha": "c" * 40},
+            "parents": [{"sha": "d" * 40}],
+            "author": {"name": "Author", "email": "author@example.test", "date": "2026-10-05T11:00:00Z"},
+            "committer": {"name": "Committer", "email": "bot@example.test", "date": "2026-10-05T11:01:00Z"},
+        }
+        transport = SequenceTransport([self.response(200, route, json.dumps(payload).encode())])
+        commit = GitHubClient(None, transport).get_git_commit_object(self.repository, self.sha)
+        self.assertEqual(
+            commit,
+            GitCommitObject(
+                self.sha,
+                payload["message"],
+                "c" * 40,
+                ("d" * 40,),
+                GitCommitIdentity("Author", "author@example.test", "2026-10-05T11:00:00Z"),
+                GitCommitIdentity("Committer", "bot@example.test", "2026-10-05T11:01:00Z"),
+            ),
+        )
+        self.assertEqual(transport.calls[0][0:2], ("GET", REST_BASE_URL + route))
+
+        invalid_payloads = (
+            {**payload, "sha": "e" * 40},
+            {**payload, "message": None},
+            {**payload, "tree": {"sha": "C" * 40}},
+            {**payload, "parents": [{"sha": "bad"}]},
+            {**payload, "author": {"name": "Author", "email": "author@example.test"}},
+            {**payload, "committer": {"name": "Committer", "email": "bot@example.test", "date": "2026-10-05T11:01:00+00:00"}},
+        )
+        for invalid in invalid_payloads:
+            with self.subTest(invalid=invalid), self.assertRaises(InvalidResponseError):
+                transport = SequenceTransport([self.response(200, route, json.dumps(invalid).encode())])
+                GitHubClient(None, transport).get_git_commit_object(self.repository, self.sha)
+
+    def test_create_status_requires_same_response_201_and_returns_exact_receipt(self):
+        route = f"/repos/{self.repository}/statuses/{self.sha}"
+        status = self.status_payload(target_url=None)
+        transport = SequenceTransport([self.response(201, route, status)])
+        receipt = GitHubClient(None, transport).create_commit_status(
+            self.repository, self.sha, "success", self.context, self.description, None,
+        )
+        self.assertEqual(receipt, StatusWriteReceipt(
+            self.repository, self.sha, "POST", route, "success", self.context,
+            self.description, None,
+            CommitStatus(1, "STATUS_NODE", "success", self.context, self.description, None,
+                         9001, "BOT_NODE", "swift-stream-bot[bot]", "Bot",
+                         "2026-10-05T12:00:00Z", "2026-10-05T12:00:01Z"),
+        ))
+        method, url, _headers, body, _timeout = transport.calls[0]
+        self.assertEqual((method, url), ("POST", REST_BASE_URL + route))
+        self.assertEqual(json.loads(body), {
+            "state": "success", "context": self.context,
+            "description": self.description, "target_url": None,
+        })
+        self.assertNotIn("sha", status)
+
+        for code in (200, 202, 204):
+            with self.subTest(status=code), self.assertRaises(UnexpectedStatusError):
+                transport = SequenceTransport([self.response(code, route, status)])
+                GitHubClient(None, transport).create_commit_status(
+                    self.repository, self.sha, "success", self.context, self.description,
+                )
+                self.assertEqual(len(transport.calls), 1)
+
+    def test_create_status_rejects_mismatched_or_malformed_same_response(self):
+        route = f"/repos/{self.repository}/statuses/{self.sha}"
+        invalid = (
+            self.status_payload(context="other/context"),
+            self.status_payload(state="failure"),
+            self.status_payload(description="different"),
+            self.status_payload(target_url="https://example.test"),
+            {key: value for key, value in self.status_payload().items() if key != "creator"},
+            {**self.status_payload(), "created_at": "not-a-date"},
+            {**self.status_payload(), "state": "queued"},
+        )
+        for response_body in invalid:
+            with self.subTest(response_body=response_body), self.assertRaises(InvalidResponseError):
+                transport = SequenceTransport([self.response(201, route, response_body)])
+                GitHubClient(None, transport).create_commit_status(
+                    self.repository, self.sha, "success", self.context, self.description,
+                )
+
+        for invalid_request in (
+            ("success", "", self.description, None),
+            ("neutral", self.context, self.description, None),
+            ("success", self.context, "ssf:v1 external ev=BAD", None),
+        ):
+            transport = SequenceTransport([])
+            with self.subTest(invalid_request=invalid_request), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).create_commit_status(self.repository, self.sha, *invalid_request)
+            self.assertEqual(transport.calls, [])
+
+    def test_status_write_errors_are_ambiguous_or_fail_closed_without_fallback(self):
+        route = f"/repos/{self.repository}/statuses/{self.sha}"
+        error_transport = SequenceTransport([self.response(422, route, {"message": "invalid status"})])
+        with self.assertRaises(UnprocessableError):
+            GitHubClient(None, error_transport).create_commit_status(
+                self.repository, self.sha, "success", self.context, self.description,
+            )
+        self.assertEqual(len(error_transport.calls), 1)
+        self.assertEqual(error_transport.calls[0][0:2], ("POST", REST_BASE_URL + route))
+
+        timeout_transport = SequenceTransport([TransportError("connection timed out")])
+        with self.assertRaises(TransportError):
+            GitHubClient(None, timeout_transport).create_commit_status(
+                self.repository, self.sha, "success", self.context, self.description,
+            )
+        self.assertEqual(len(timeout_transport.calls), 1)
+        self.assertEqual(timeout_transport.calls[0][0], "POST")
+
+        repeated = SequenceTransport([
+            self.response(201, route, self.status_payload()),
+            self.response(201, route, self.status_payload(status_id=2)),
+        ])
+        client = GitHubClient(None, repeated)
+        client.create_commit_status(self.repository, self.sha, "success", self.context, self.description)
+        client.create_commit_status(self.repository, self.sha, "success", self.context, self.description)
+        self.assertEqual(len(repeated.calls), 2)
+        self.assertTrue(all(call[0] == "POST" and call[1] == REST_BASE_URL + route for call in repeated.calls))
+
+    def test_status_reads_paginate_in_api_order_and_select_exact_bot_context(self):
+        wrong_context = self.status_payload(status_id=1, context="other/context")
+        wrong_database = self.status_payload(status_id=2, creator={**self.bot, "id": 9002})
+        wrong_node = self.status_payload(status_id=3, creator={**self.bot, "node_id": "OTHER_NODE"})
+        wrong_login = self.status_payload(status_id=4, creator={**self.bot, "login": "other[bot]"})
+        wrong_type = self.status_payload(status_id=5, creator={**self.bot, "type": "User"})
+        newest_exact = self.status_payload(status_id=6, created_at="2026-10-05T12:00:00Z")
+        older_exact = self.status_payload(status_id=7, created_at="2026-10-05T11:00:00Z")
+        first_page = [wrong_context, wrong_database, wrong_node, wrong_login, wrong_type, newest_exact, older_exact]
+        first_page.extend(self.status_payload(status_id=index, context="old/context") for index in range(8, 101))
+        second_page = [self.status_payload(status_id=101, created_at="2026-10-04T10:00:00Z")]
+
+        class StatusPages:
+            def __init__(self):
+                self.calls = []
+
+            def request(inner_self, method, url, headers, body, timeout):
+                inner_self.calls.append((method, url, headers, body, timeout))
+                page = int(url.rsplit("&page=", 1)[1])
+                payload = first_page if page == 1 else second_page
+                return HttpResponse(200, url, json.dumps(payload).encode())
+
+        transport = StatusPages()
+        statuses = GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=2)
+        self.assertEqual([status.id for status in statuses], list(range(1, 101)) + [101])
+        self.assertEqual(len(transport.calls), 2)
+        expected_prefix = f"{REST_BASE_URL}/repos/{self.repository}/commits/{self.sha}/statuses?per_page=100&page="
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "GET"])
+        self.assertEqual([call[1] for call in transport.calls], [expected_prefix + "1", expected_prefix + "2"])
+        self.assertTrue(all(call[3] is None for call in transport.calls))
+
+        self.assertIs(
+            latest_exact_app_status(
+                statuses, self.context, bot_database_id=9001, bot_node_id="BOT_NODE",
+                bot_login="swift-stream-bot[bot]",
+            ),
+            statuses[5],
+        )
+        self.assertIsNone(latest_exact_app_status(
+            statuses, "absent/context", bot_database_id=9001, bot_node_id="BOT_NODE",
+            bot_login="swift-stream-bot[bot]",
+        ))
+        self.assertEqual([status.id for status in statuses[:7]], [1, 2, 3, 4, 5, 6, 7])
+
+    def test_status_reads_reject_bad_pages_and_bounded_history_exhaustion(self):
+        route_prefix = f"/repos/{self.repository}/commits/{self.sha}/statuses?per_page=100&page="
+        for payload in (None, {}, {"statuses": []}):
+            url = REST_BASE_URL + route_prefix + "1"
+            transport = SequenceTransport([HttpResponse(200, url, json.dumps(payload).encode())])
+            with self.subTest(payload=payload), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=1)
+
+        malformed = self.status_payload(status_id=1)
+        malformed["creator"] = {"id": True, "node_id": "BOT_NODE", "login": "bot", "type": "Bot"}
+        url = REST_BASE_URL + route_prefix + "1"
+        transport = SequenceTransport([HttpResponse(200, url, json.dumps([self.status_payload(), malformed]).encode())])
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=1)
+
+        full_page = [self.status_payload(status_id=index) for index in range(1, 101)]
+        bad_second_page = dict(self.status_payload(status_id=101))
+        bad_second_page["updated_at"] = "2026-10-05T12:00:01+00:00"
+        second_url = REST_BASE_URL + route_prefix + "2"
+        transport = SequenceTransport([
+            HttpResponse(200, url, json.dumps(full_page).encode()),
+            HttpResponse(200, second_url, json.dumps([bad_second_page]).encode()),
+        ])
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=2)
+        self.assertEqual(len(transport.calls), 2)
+
+        full_page = [self.status_payload(status_id=index) for index in range(1, 101)]
+        transport = SequenceTransport([HttpResponse(200, url, json.dumps(full_page).encode())])
+        with self.assertRaisesRegex(InvalidResponseError, "pagination exceeds"):
+            GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=1)
+        self.assertEqual(len(transport.calls), 1)
+
+        for max_pages in (0, True, 101):
+            transport = SequenceTransport([])
+            with self.subTest(max_pages=max_pages), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=max_pages)
+            self.assertEqual(transport.calls, [])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import os
 import tempfile
@@ -28,6 +29,12 @@ from automation.federation.request_model import (
     IssueRequestAnchor,
     IssuePRBinding,
     ClaimedHeadMarker,
+    CarrierActivation,
+    CarrierRole,
+    LegacyEvidenceDisposition,
+    ShaCarrierResolution,
+    StatusClass,
+    StatusEvidenceDescription,
     Request,
     Patch,
     RequestAnchor,
@@ -40,6 +47,7 @@ from automation.federation.request_model import (
     ISSUE_BRANCH_LEASE_MARKER,
     CLAIM_GENERATION_PREFIX,
     issue_owner_key,
+    parse_issue_owner_key,
     issue_branch_ref,
     reserved_issue_branch_number,
     render_request_body,
@@ -50,6 +58,9 @@ from automation.federation.request_model import (
     normalize_target_evidence_digest,
     proposal_target_evidence_digest,
     issue_head_claim_authority_digest,
+    external_status_evidence_digest,
+    parse_status_description,
+    render_status_description,
     classify_issue_head_claim_progression,
     claim_generation_id,
     parse_claimed_head_marker,
@@ -1684,6 +1695,173 @@ class IssueHeadClaimModelTests(unittest.TestCase):
             fresh_accepted_base_tree_sha=normalized.accepted_base_tree_sha,
             proposal_exists=True,
         ))
+
+class Wave05CarrierStatusModelTests(unittest.TestCase):
+    @staticmethod
+    def marker(**changes):
+        fields = dict(
+            claim_kind="ISSUE_BRANCH_LEASE",
+            role="ISSUE_ACTIVE",
+            owner_kind="ISSUE",
+            owner_key="R_central:700:I_kwDOIssue:7",
+            claim_generation_id="1" * 64,
+            carrier_nonce="2" * 64,
+            transition_kind="INITIAL",
+        )
+        fields.update(changes)
+        return ClaimedHeadMarker(**fields)
+
+    def test_closed_enums_and_resolution_combinations(self):
+        for enum_type in (CarrierActivation, CarrierRole, LegacyEvidenceDisposition, StatusClass):
+            with self.subTest(enum_type=enum_type.__name__), self.assertRaises(ValueError):
+                enum_type("UNKNOWN")
+        with self.assertRaises(TypeError):
+            LegacyEvidenceDisposition()
+        with self.assertRaises(TypeError):
+            ShaCarrierResolution()
+
+        self.assertEqual(
+            ShaCarrierResolution(CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE),
+            ShaCarrierResolution(CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE),
+        )
+        self.assertEqual(
+            ShaCarrierResolution(CarrierActivation.RESERVED_INACTIVE, CarrierRole.ISSUE_CANCEL),
+            ShaCarrierResolution(CarrierActivation.RESERVED_INACTIVE, CarrierRole.ISSUE_CANCEL),
+        )
+        self.assertIsNone(ShaCarrierResolution(CarrierActivation.CONFLICTING).role)
+        invalid = (
+            (CarrierActivation.ACTIVE, None, None),
+            (CarrierActivation.RESERVED_INACTIVE, None, None),
+            (CarrierActivation.LEGACY_CUTOVER_QUARANTINE, CarrierRole.ISSUE_ACTIVE, None),
+            (CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION, CarrierRole.MACHINE_PUBLICATION, None),
+            (CarrierActivation.CONFLICTING, CarrierRole.ISSUE_FINALIZING, None),
+            ("ACTIVE", CarrierRole.ISSUE_ACTIVE, None),
+            (CarrierActivation.ACTIVE, "ISSUE_ACTIVE", None),
+            (CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION, self.marker()),
+        )
+        for activation, role, marker in invalid:
+            with self.subTest(activation=activation, role=role), self.assertRaises(RequestModelError):
+                ShaCarrierResolution(activation, role, marker)
+
+    def test_status_description_classes_render_and_parse_exactly(self):
+        digest = "a" * 64
+        for status_class in (
+            StatusClass.ISSUE_FINAL,
+            StatusClass.CANCEL,
+            StatusClass.EXTERNAL,
+            StatusClass.LEGACY,
+        ):
+            with self.subTest(status_class=status_class):
+                value = StatusEvidenceDescription(status_class, digest)
+                self.assertEqual(parse_status_description(value.render()), value)
+        maintenance_text = f"ssf:v1 maintenance ev={digest}"
+        self.assertEqual(
+            parse_status_description(maintenance_text),
+            StatusEvidenceDescription(StatusClass.MAINTENANCE, digest),
+        )
+        with self.assertRaises(RequestModelError):
+            render_status_description(StatusClass.MAINTENANCE, digest)
+        with self.assertRaises(RequestModelError):
+            StatusEvidenceDescription(StatusClass.MAINTENANCE, digest).render()
+        with self.assertRaises(RequestModelError):
+            StatusEvidenceDescription(StatusClass.EXTERNAL, "A" * 64)
+
+        for invalid in (
+            maintenance_text + " ",
+            maintenance_text.replace("maintenance", "unknown"),
+            maintenance_text.replace("ssf:v1 ", "ssf:v1  "),
+            maintenance_text.replace(" ev=", "  ev="),
+            maintenance_text + "\n",
+            maintenance_text + "\r",
+            maintenance_text + "\x00",
+            maintenance_text.replace("maintenance", "màintenance"),
+        ):
+            with self.subTest(invalid=repr(invalid)), self.assertRaises(RequestModelError):
+                parse_status_description(invalid)
+
+        self.assertEqual(len(render_status_description(StatusClass.EXTERNAL, digest).encode("ascii")), 83)
+        self.assertLessEqual(len(render_status_description(StatusClass.ISSUE_FINAL, digest).encode("ascii")), 86)
+        self.assertEqual(len(maintenance_text.encode("ascii")), 86)
+
+    def test_external_evidence_digest_matches_canonical_formula_and_binds_identity(self):
+        values = {
+            "central_repository_database_id": 12345,
+            "central_repository_node_id": "R_central",
+            "central_repository_full_name": "Owner/Repo",
+            "head_sha": "a" * 40,
+        }
+        value = {
+            "carrierRole": "UNCLAIMED_OUT_OF_FEDERATION",
+            "carrierSchemaVersion": 1,
+            "centralRepositoryDatabaseId": 12345,
+            "centralRepositoryFullName": "Owner/Repo",
+            "centralRepositoryNodeId": "R_central",
+            "headSha": "a" * 40,
+        }
+        expected = hashlib.sha256(
+            b"swiftstream-federation-external-status-evidence:v1\n"
+            + json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        digest = external_status_evidence_digest(**values)
+        self.assertEqual(digest, expected)
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(external_status_evidence_digest(**values), digest)
+        for changed in (
+            {**values, "central_repository_database_id": 12346},
+            {**values, "central_repository_node_id": "R_other"},
+            {**values, "central_repository_full_name": "Other/Repo"},
+            {**values, "head_sha": "b" * 40},
+        ):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(external_status_evidence_digest(**changed), digest)
+        self.assertEqual(
+            tuple(inspect.signature(external_status_evidence_digest).parameters),
+            (
+                "central_repository_database_id",
+                "central_repository_node_id",
+                "central_repository_full_name",
+                "head_sha",
+            ),
+        )
+        for invalid in (
+            {**values, "central_repository_database_id": True},
+            {**values, "central_repository_node_id": ""},
+            {**values, "central_repository_full_name": "Owner/"},
+            {**values, "head_sha": "A" * 40},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(RequestModelError):
+                external_status_evidence_digest(**invalid)
+
+    def test_issue_owner_key_inverse_is_strict_and_round_trips(self):
+        owner_key = issue_owner_key("R_central", 700, "I_kwDOIssue", 7)
+        self.assertEqual(
+            parse_issue_owner_key(owner_key),
+            ("R_central", 700, "I_kwDOIssue", 7),
+        )
+        for invalid in (
+            "R_central:0700:I_kwDOIssue:7",
+            "R_central:+700:I_kwDOIssue:7",
+            "R_central:700:I_kwDOIssue:07",
+            "R_central:700:I_kwDOIssue:0",
+            "R_central:700:I_kwDOIssue:7:extra",
+            ":700:I_kwDOIssue:7",
+            "R_central:700::7",
+            f"R_central:{'9' * 20}:I_kwDOIssue:7",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(RequestModelError):
+                parse_issue_owner_key(invalid)
+
+    def test_existing_claimed_head_marker_encoding_remains_unchanged(self):
+        marker = self.marker()
+        expected = (
+            "swiftstream-federation-head:v2\n"
+            "claim-kind=ISSUE_BRANCH_LEASE\nrole=ISSUE_ACTIVE\nowner-kind=ISSUE\n"
+            "owner-key=R_central:700:I_kwDOIssue:7\n"
+            f"generation={'1' * 64}\nnonce={'2' * 64}\ntransition=INITIAL\n"
+        )
+        self.assertEqual(marker.render(), expected)
+        self.assertEqual(parse_claimed_head_marker(expected), marker)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ from automation.federation.request_model import (
     MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES,
     RequestModelError,
     parse_issue_patch_projection,
+    parse_status_description,
     reserved_issue_branch_number,
 )
 
@@ -473,6 +474,121 @@ class GitCommitMetadata:
 
 
 @dataclass(frozen=True)
+class GitCommitIdentity:
+    name: str
+    email: str
+    date: str
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.name, "commit identity name", 256)
+        _bounded_text(self.email, "commit identity email", 320)
+        _canonical_utc_timestamp(self.date, "commit identity date")
+
+
+@dataclass(frozen=True)
+class GitCommitObject:
+    sha: str
+    message: str
+    tree_sha: str
+    parents: tuple[str, ...]
+    author: GitCommitIdentity
+    committer: GitCommitIdentity
+
+    def __post_init__(self) -> None:
+        if type(self.sha) is not str or not _SHA40_RE.fullmatch(self.sha):
+            raise GitHubAPIError("commit object sha must be lowercase 40-hex")
+        if type(self.tree_sha) is not str or not _SHA40_RE.fullmatch(self.tree_sha):
+            raise GitHubAPIError("commit object tree sha must be lowercase 40-hex")
+        if type(self.message) is not str:
+            raise GitHubAPIError("commit object message must be a string")
+        try:
+            message_bytes = self.message.encode("utf-8")
+        except UnicodeEncodeError:
+            raise GitHubAPIError("commit object message must be valid UTF-8") from None
+        if len(message_bytes) > 65_536 or "\x00" in self.message:
+            raise GitHubAPIError("commit object message exceeds bounds or contains NUL")
+        if type(self.parents) is not tuple or len(self.parents) > 1_000:
+            raise GitHubAPIError("commit object parents must be a bounded tuple")
+        if any(type(parent) is not str or not _SHA40_RE.fullmatch(parent) for parent in self.parents):
+            raise GitHubAPIError("commit object parent sha must be lowercase 40-hex")
+        if type(self.author) is not GitCommitIdentity or type(self.committer) is not GitCommitIdentity:
+            raise GitHubAPIError("commit object author and committer metadata are required")
+
+
+@dataclass(frozen=True)
+class CommitStatus:
+    id: int
+    node_id: str | None
+    state: str
+    context: str
+    description: str | None
+    target_url: str | None
+    creator_database_id: int
+    creator_node_id: str
+    creator_login: str
+    creator_type: str
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self) -> None:
+        _positive_id(self.id, "status.id")
+        if self.node_id is not None:
+            _bounded_text(self.node_id, "status.node_id")
+        if type(self.state) is not str or self.state not in {"error", "failure", "pending", "success"}:
+            raise GitHubAPIError("status.state is invalid")
+        _bounded_text(self.context, "status.context", 100)
+        if self.description is not None:
+            text = _optional_bounded_text(self.description, "status.description", 140)
+            if text.startswith("ssf:v1"):
+                try:
+                    parse_status_description(text)
+                except RequestModelError as error:
+                    raise GitHubAPIError(f"status.description is invalid: {error}") from None
+        if self.target_url is not None:
+            _optional_bounded_text(self.target_url, "status.target_url", 2_048)
+        _positive_id(self.creator_database_id, "status.creator.id")
+        _bounded_text(self.creator_node_id, "status.creator.node_id")
+        _bounded_text(self.creator_login, "status.creator.login")
+        if type(self.creator_type) is not str or self.creator_type not in {"Bot", "User"}:
+            raise GitHubAPIError("status.creator.type must be exact Bot or User")
+        _canonical_utc_timestamp(self.created_at, "status.created_at")
+        _canonical_utc_timestamp(self.updated_at, "status.updated_at")
+
+
+@dataclass(frozen=True)
+class StatusWriteReceipt:
+    repository: str
+    requested_sha: str
+    method: str
+    route: str
+    requested_state: str
+    requested_context: str
+    requested_description: str | None
+    requested_target_url: str | None
+    returned_status: CommitStatus
+
+    def __post_init__(self) -> None:
+        expected_route = _canonical_status_route(self.repository, self.requested_sha)
+        if self.method != "POST":
+            raise GitHubAPIError("status receipt method must be exact POST")
+        if self.route != expected_route:
+            raise GitHubAPIError("status receipt route does not match repository and SHA")
+        _validate_status_request(
+            self.requested_state, self.requested_context,
+            self.requested_description, self.requested_target_url,
+        )
+        if type(self.returned_status) is not CommitStatus:
+            raise GitHubAPIError("status receipt must contain the exact returned CommitStatus")
+        if (
+            self.returned_status.state != self.requested_state
+            or self.returned_status.context != self.requested_context
+            or self.returned_status.description != self.requested_description
+            or self.returned_status.target_url != self.requested_target_url
+        ):
+            raise InvalidResponseError("returned commit status does not match the request receipt")
+
+
+@dataclass(frozen=True)
 class CheckRun:
     id: int
     name: str
@@ -493,6 +609,32 @@ class MergeResult:
 class HttpTransport(Protocol):
     def request(self, method: str, url: str, headers: Mapping[str, str], body: bytes | None, timeout: float) -> HttpResponse:
         ...
+
+
+def latest_exact_app_status(
+    statuses: Iterable[CommitStatus],
+    context: str,
+    *,
+    bot_database_id: int,
+    bot_node_id: str,
+    bot_login: str,
+) -> CommitStatus | None:
+    _bounded_text(context, "status context", 100)
+    _positive_id(bot_database_id, "status bot database ID")
+    _bounded_text(bot_node_id, "status bot node ID")
+    _bounded_text(bot_login, "status bot login")
+    for status in statuses:
+        if type(status) is not CommitStatus:
+            raise InvalidResponseError("status history contains a non-CommitStatus value")
+        if (
+            status.context == context
+            and status.creator_database_id == bot_database_id
+            and status.creator_node_id == bot_node_id
+            and status.creator_login == bot_login
+            and status.creator_type == "Bot"
+        ):
+            return status
+    return None
 
 
 class _NoRedirectHandler(urlrequest.HTTPRedirectHandler):
@@ -567,6 +709,49 @@ def _validate_segment(segment: str) -> str:
     return urlparse.quote(segment, safe="-._~")
 
 
+_CANONICAL_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+
+
+def _canonical_utc_timestamp(value: Any, label: str) -> str:
+    if type(value) is not str or not _CANONICAL_UTC_RE.fullmatch(value):
+        raise InvalidResponseError(f"{label} must be canonical UTC timestamp text")
+    instant = _parse_github_timestamp(value, label)
+    if instant.isoformat(timespec="seconds").replace("+00:00", "Z") != value:
+        raise InvalidResponseError(f"{label} must be canonical UTC timestamp text")
+    return value
+
+
+def _canonical_repository_parts(repository: Any) -> tuple[str, str, str, str]:
+    if type(repository) is not str or repository.count("/") != 1 or len(repository) > 512:
+        raise GitHubAPIError("repository must be exact OWNER/REPO text")
+    owner, name = repository.split("/")
+    if not owner or not name:
+        raise GitHubAPIError("repository must be exact OWNER/REPO text")
+    return owner, name, _validate_segment(owner), _validate_segment(name)
+
+
+def _canonical_status_route(repository: Any, requested_sha: Any) -> str:
+    _owner, _name, owner_path, name_path = _canonical_repository_parts(repository)
+    if type(requested_sha) is not str or not _SHA40_RE.fullmatch(requested_sha):
+        raise GitHubAPIError("requested status SHA must be lowercase 40-hex")
+    return f"/repos/{owner_path}/{name_path}/statuses/{requested_sha}"
+
+
+def _validate_status_request(state: Any, context: Any, description: Any, target_url: Any) -> None:
+    if type(state) is not str or state not in {"error", "failure", "pending", "success"}:
+        raise GitHubAPIError("commit status state is invalid")
+    _bounded_text(context, "commit status context", 100)
+    if description is not None:
+        _optional_bounded_text(description, "commit status description", 140)
+        if description.startswith("ssf:v1"):
+            try:
+                parse_status_description(description)
+            except RequestModelError as error:
+                raise GitHubAPIError(f"canonical status description is invalid: {error}") from None
+    if target_url is not None:
+        _optional_bounded_text(target_url, "commit status target_url", 2_048)
+
+
 def _validate_tree_path(path: str) -> str:
     if type(path) is not str or not path or path.startswith("/") or "\\" in path or "\x00" in path or c02.contains_control(path):
         raise GitHubAPIError("Git tree path is invalid")
@@ -625,7 +810,7 @@ class GitHubClient:
             headers["Authorization"] = f"Bearer {self._token}"
         return headers
 
-    def _request(self, method: str, url: str, payload: Any = None) -> Any:
+    def _request_response(self, method: str, url: str, payload: Any = None) -> HttpResponse:
         if url not in {GRAPHQL_ENDPOINT} and not url.startswith(REST_BASE_URL + "/"):
             raise GitHubAPIError("GitHub URL is outside the fixed API endpoints")
         body = _json_bytes(payload) if payload is not None else None
@@ -646,6 +831,10 @@ class GitHubClient:
         if response.url != url:
             raise RedirectError("redirects are forbidden")
         self._raise_for_status(response.status)
+        return response
+
+    def _request(self, method: str, url: str, payload: Any = None) -> Any:
+        response = self._request_response(method, url, payload)
         if response.status == 204 and not response.body:
             return {}
         return _decode_json(response.body)
@@ -744,6 +933,141 @@ class GitHubClient:
         if type(author) is dict and type(author.get("date")) is str:
             author_date = _parse_github_timestamp(author["date"], "commit.author.date").strftime("%Y-%m-%dT%H:%M:%SZ")
         return GitCommitMetadata(commit, tree_sha, tuple(parents), author_date)
+
+    def get_git_commit_object(self, repository: str, sha: str) -> GitCommitObject:
+        _owner, _name, owner_path, name_path = _canonical_repository_parts(repository)
+        commit = self._sha(sha, "commit.sha")
+        url = f"{REST_BASE_URL}/repos/{owner_path}/{name_path}/git/commits/{commit}"
+        value = self._request("GET", url)
+        if type(value) is not dict or type(value.get("tree")) is not dict or type(value.get("parents")) is not list:
+            raise InvalidResponseError("Git commit object has invalid shape")
+        returned_sha = self._sha(value.get("sha"), "commit.sha")
+        if returned_sha != commit:
+            raise InvalidResponseError("Git commit object identity does not match requested SHA")
+        tree_sha = self._sha(value["tree"].get("sha"), "commit.tree.sha")
+        message = value.get("message")
+        if type(message) is not str:
+            raise InvalidResponseError("Git commit message must be exact string text")
+        try:
+            message_size = len(message.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise InvalidResponseError("Git commit message is not valid UTF-8") from None
+        if message_size > 65_536 or "\x00" in message:
+            raise InvalidResponseError("Git commit message exceeds bounds or contains NUL")
+        parents: list[str] = []
+        for parent in value["parents"]:
+            if type(parent) is not dict:
+                raise InvalidResponseError("Git commit parent has invalid shape")
+            parents.append(self._sha(parent.get("sha"), "commit.parent.sha"))
+        if len(parents) > 1_000:
+            raise InvalidResponseError("Git commit parent list exceeds bound")
+
+        def parse_identity(identity: Any, label: str) -> GitCommitIdentity:
+            if type(identity) is not dict:
+                raise InvalidResponseError(f"{label} metadata must be an object")
+            try:
+                return GitCommitIdentity(
+                    _bounded_text(identity.get("name"), f"{label}.name", 256),
+                    _bounded_text(identity.get("email"), f"{label}.email", 320),
+                    _canonical_utc_timestamp(identity.get("date"), f"{label}.date"),
+                )
+            except (GitHubAPIError, InvalidResponseError) as error:
+                raise InvalidResponseError(f"{label} metadata is invalid: {error}") from None
+
+        return GitCommitObject(
+            returned_sha,
+            message,
+            tree_sha,
+            tuple(parents),
+            parse_identity(value.get("author"), "commit.author"),
+            parse_identity(value.get("committer"), "commit.committer"),
+        )
+
+    @staticmethod
+    def _parse_commit_status(value: Any) -> CommitStatus:
+        if type(value) is not dict:
+            raise InvalidResponseError("commit status must be an object")
+        creator = value.get("creator")
+        if type(creator) is not dict:
+            raise InvalidResponseError("commit status creator must be an object")
+        try:
+            return CommitStatus(
+                id=_positive_id(value.get("id"), "status.id"),
+                node_id=None if value.get("node_id") is None else _bounded_text(value.get("node_id"), "status.node_id"),
+                state=value.get("state"),
+                context=_bounded_text(value.get("context"), "status.context", 100),
+                description=None if value.get("description") is None else _optional_bounded_text(value.get("description"), "status.description", 140),
+                target_url=None if value.get("target_url") is None else _optional_bounded_text(value.get("target_url"), "status.target_url", 2_048),
+                creator_database_id=_positive_id(creator.get("id"), "status.creator.id"),
+                creator_node_id=_bounded_text(creator.get("node_id"), "status.creator.node_id"),
+                creator_login=_bounded_text(creator.get("login"), "status.creator.login"),
+                creator_type=creator.get("type"),
+                created_at=_canonical_utc_timestamp(value.get("created_at"), "status.created_at"),
+                updated_at=_canonical_utc_timestamp(value.get("updated_at"), "status.updated_at"),
+            )
+        except GitHubAPIError as error:
+            raise InvalidResponseError(f"commit status is invalid: {error}") from None
+
+    def create_commit_status(
+        self,
+        repository: str,
+        requested_sha: str,
+        state: str,
+        context: str,
+        description: str | None,
+        target_url: str | None = None,
+    ) -> StatusWriteReceipt:
+        route = _canonical_status_route(repository, requested_sha)
+        _validate_status_request(state, context, description, target_url)
+        payload = {
+            "state": state,
+            "context": context,
+            "description": description,
+            "target_url": target_url,
+        }
+        response = self._request_response("POST", REST_BASE_URL + route, payload)
+        if response.status != 201:
+            raise UnexpectedStatusError("commit status creation requires same-response HTTP 201")
+        returned = self._parse_commit_status(_decode_json(response.body))
+        return StatusWriteReceipt(
+            repository=repository,
+            requested_sha=requested_sha,
+            method="POST",
+            route=route,
+            requested_state=state,
+            requested_context=context,
+            requested_description=description,
+            requested_target_url=target_url,
+            returned_status=returned,
+        )
+
+    def list_commit_statuses(
+        self,
+        repository: str,
+        queried_sha: str,
+        *,
+        max_pages: int = 100,
+    ) -> tuple[CommitStatus, ...]:
+        _owner, _name, owner_path, name_path = _canonical_repository_parts(repository)
+        sha = self._sha(queried_sha, "queried status SHA")
+        if type(max_pages) is not int or not 1 <= max_pages <= 100:
+            raise GitHubAPIError("status max_pages must be an integer from 1 through 100")
+        statuses: list[CommitStatus] = []
+        for page in range(1, max_pages + 1):
+            url = (
+                f"{REST_BASE_URL}/repos/{owner_path}/{name_path}/commits/{sha}/statuses"
+                f"?per_page=100&page={page}"
+            )
+            value = self._request("GET", url)
+            if type(value) is not list:
+                raise InvalidResponseError("commit status page must be a list")
+            page_statuses = tuple(self._parse_commit_status(item) for item in value)
+            if len(page_statuses) > 100:
+                raise InvalidResponseError("commit status page exceeds 100 entries")
+            statuses.extend(page_statuses)
+            if len(page_statuses) < 100:
+                return tuple(statuses)
+        raise InvalidResponseError("commit status pagination exceeds configured page bound")
 
     @classmethod
     def _parse_tree_response(cls, tree_sha: str, value: Any) -> tuple[str, tuple[GitTreeEntry, ...]]:

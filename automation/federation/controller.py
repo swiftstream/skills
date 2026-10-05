@@ -21,6 +21,8 @@ from .github_api import (
     AppMetadata,
     BotMetadata,
     CheckRun,
+    CommitStatus,
+    GitCommitObject,
     GitHubAPIError,
     GitHubClient,
     GraphQLError,
@@ -33,6 +35,7 @@ from .github_api import (
     RefCASConflict,
     RefUpdate,
     RepositoryMetadata,
+    StatusWriteReceipt,
     ZERO_OID,
 )
 from .request_model import (
@@ -53,6 +56,12 @@ from .request_model import (
     IssueHeadClaim,
     IssuePatchProjection,
     ClaimedHeadMarker,
+    CLAIMED_HEAD_MARKER_HEADER,
+    CarrierActivation,
+    CarrierRole,
+    LegacyEvidenceDisposition,
+    ShaCarrierResolution,
+    StatusClass,
     PatchFoldResult,
     Request,
     RequestAnchor,
@@ -70,6 +79,8 @@ from .request_model import (
     proposal_target_evidence_digest,
     issue_branch_ref,
     issue_owner_key,
+    parse_issue_owner_key,
+    external_status_evidence_digest,
     claim_generation_id,
     new_carrier_nonce,
     parse_anchor,
@@ -80,6 +91,7 @@ from .request_model import (
     parse_issue_head_claim,
     parse_issue_patch_projection,
     parse_claimed_head_marker,
+    render_status_description,
     parse_issue_request_body,
     parse_request_body,
     render_request_body,
@@ -483,6 +495,224 @@ def resolve_app_identity(client: GitHubClient, token_action_app_slug: str) -> Ap
     return AppIdentity(token_action_app_slug, app.id, app.node_id, bot.id, bot.node_id, bot.login)
 
 
+_CLAIMED_HEAD_FAMILY = "swiftstream-federation-head:"
+_EXTERNAL_STATUS_CONTEXT = "federation/trusted-validation"
+
+
+def _conflicting_sha_carrier(marker: ClaimedHeadMarker | None = None) -> ShaCarrierResolution:
+    return ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=marker)
+
+
+def resolve_sha_carrier_role(
+    client: GitHubClient,
+    repository: str,
+    head_sha: str,
+    app_slug: str,
+    legacy_evidence_disposition: LegacyEvidenceDisposition | Callable[[], LegacyEvidenceDisposition],
+) -> ShaCarrierResolution:
+    """Resolve the role of exact commit H without consulting PR topology first."""
+    try:
+        commit = client.get_git_commit_object(repository, head_sha)
+    except Exception:
+        return _conflicting_sha_carrier()
+    if type(commit) is not GitCommitObject or commit.sha != head_sha or type(commit.message) is not str:
+        return _conflicting_sha_carrier()
+
+    marker_count = commit.message.count(_CLAIMED_HEAD_FAMILY)
+    if marker_count == 0:
+        if type(legacy_evidence_disposition) is LegacyEvidenceDisposition:
+            disposition = legacy_evidence_disposition
+        elif callable(legacy_evidence_disposition):
+            try:
+                disposition = legacy_evidence_disposition()
+            except Exception:
+                return _conflicting_sha_carrier()
+        else:
+            raise R02Error("explicit trusted legacy evidence disposition is required")
+        if type(disposition) is not LegacyEvidenceDisposition:
+            return _conflicting_sha_carrier()
+        if disposition is LegacyEvidenceDisposition.QUARANTINE:
+            return ShaCarrierResolution(CarrierActivation.LEGACY_CUTOVER_QUARANTINE)
+        if disposition is LegacyEvidenceDisposition.CONFLICTING:
+            return _conflicting_sha_carrier()
+        if disposition is LegacyEvidenceDisposition.ABSENT:
+            return ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+        return _conflicting_sha_carrier()
+
+    # The whole literal namespace is reserved before any fallback. Only one exact
+    # supported v2 marker occupying the entire commit message reaches provenance.
+    if marker_count != 1 or not commit.message.startswith(CLAIMED_HEAD_MARKER_HEADER + "\n"):
+        return _conflicting_sha_carrier()
+    try:
+        marker = parse_claimed_head_marker(commit.message)
+    except RequestModelError:
+        return _conflicting_sha_carrier()
+
+    if (
+        marker.owner_kind != "ISSUE"
+        or marker.role != CarrierRole.ISSUE_ACTIVE.value
+        or marker.claim_kind not in {"ISSUE_BRANCH_LEASE", "ISSUE_HEAD_CLAIM"}
+    ):
+        return _conflicting_sha_carrier(marker)
+
+    try:
+        central = client.get_repository_metadata(repository)
+        if (
+            type(central) is not RepositoryMetadata
+            or central.full_name != repository
+            or not central.node_id
+        ):
+            return _conflicting_sha_carrier(marker)
+        owner_central_node_id, issue_database_id, issue_node_id, issue_number = parse_issue_owner_key(marker.owner_key)
+        if owner_central_node_id != central.node_id:
+            return _conflicting_sha_carrier(marker)
+        app = resolve_app_identity(client, app_slug)
+        issue = client.get_issue_metadata(repository, issue_number)
+        if (
+            type(issue) is not IssueMetadata
+            or issue.number != issue_number
+            or issue.database_id != issue_database_id
+            or issue.node_id != issue_node_id
+            or issue.is_pull_request
+        ):
+            return _conflicting_sha_carrier(marker)
+        comments = tuple(client.list_issue_comments(repository, issue_number))
+        anchor = validate_unique_issue_anchor(comments, issue, app)
+        if issue_owner_key(
+            central.node_id, anchor.anchor.issue_database_id,
+            anchor.anchor.issue_node_id, anchor.anchor.issue_number,
+        ) != marker.owner_key:
+            return _conflicting_sha_carrier(marker)
+        lease = _resolve_issue_branch_lease_class(
+            client, repository, comments, app, anchor.anchor,
+            anchor.comment.database_id, central.node_id,
+        )
+        if lease is None:
+            return _conflicting_sha_carrier(marker)
+
+        if marker.claim_kind == "ISSUE_BRANCH_LEASE":
+            if lease.lease.initial_head_sha != head_sha or _lease_marker_for(lease.lease) != marker:
+                return _conflicting_sha_carrier(marker)
+            current_ref = _read_issue_branch_ref(
+                client, repository, lease.lease.branch_ref.removeprefix("refs/heads/"),
+            )
+            activation = CarrierActivation.ACTIVE if current_ref == head_sha else CarrierActivation.RESERVED_INACTIVE
+            return ShaCarrierResolution(activation, CarrierRole.ISSUE_ACTIVE, marker)
+
+        state = _read_managed_issue_pr_binding_state(
+            client,
+            repository,
+            issue_number,
+            app,
+            central.node_id,
+            lambda _request, _request_class: None,
+            validate_fresh_source_authority=False,
+            require_open_lifecycle=False,
+        )
+        current_ref = _read_issue_branch_ref(
+            client, repository, state.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        pr_comments = tuple(client.list_issue_comments(repository, state.binding.pull_request_number))
+        claims = _issue_head_claim_comments(
+            client, repository, pr_comments, app, state, current_ref or ZERO_OID,
+        )
+        matches = [
+            item for item in claims
+            if item.claim.to_head_sha == head_sha and _issue_head_claim_marker(item.claim) == marker
+        ]
+        if len(matches) != 1:
+            return _conflicting_sha_carrier(marker)
+        activation_state = _read_managed_issue_pr_binding_state(
+            client,
+            repository,
+            issue_number,
+            app,
+            central.node_id,
+            lambda _request, _request_class: None,
+            validate_fresh_source_authority=False,
+            require_open_lifecycle=False,
+        )
+        _require_same_managed_issue_pr_binding(state, activation_state)
+        activation_ref = _read_issue_branch_ref(
+            client, repository, activation_state.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        active = (
+            activation_state.owning_issue.state == "open"
+            and activation_state.pr_issue.state == "open"
+            and activation_ref == head_sha
+            and activation_state.pr.head_oid == head_sha
+        )
+        activation = CarrierActivation.ACTIVE if active else CarrierActivation.RESERVED_INACTIVE
+        return ShaCarrierResolution(activation, CarrierRole.ISSUE_ACTIVE, marker)
+    except Exception:
+        return _conflicting_sha_carrier(marker)
+
+
+def publish_unclaimed_external_success(
+    client: GitHubClient,
+    repository: RepositoryMetadata,
+    head_sha: str,
+    resolution: ShaCarrierResolution,
+    app: AppIdentity,
+) -> StatusWriteReceipt:
+    """Publish only the PR-independent external success tuple for proven-unclaimed H."""
+    if type(repository) is not RepositoryMetadata:
+        raise R02Error("exact central repository metadata is required for external status")
+    if type(resolution) is not ShaCarrierResolution or resolution != ShaCarrierResolution(
+        CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION,
+    ):
+        raise R02Error("external success requires exact UNCLAIMED_OUT_OF_FEDERATION resolution")
+    if type(app) is not AppIdentity:
+        raise R02Error("exact trusted App identity is required for external status")
+    if (
+        type(repository.id) is not int or repository.id <= 0
+        or type(repository.node_id) is not str or not repository.node_id
+        or type(repository.full_name) is not str or repository.full_name.count("/") != 1
+        or not re.fullmatch(r"[0-9a-f]{40}", head_sha if type(head_sha) is str else "")
+        or type(app.bot_id) is not int or app.bot_id <= 0
+        or type(app.bot_node_id) is not str or not app.bot_node_id
+        or type(app.bot_login) is not str or not app.bot_login
+    ):
+        raise R02Error("external status repository, SHA, or Bot identity is malformed")
+    digest = external_status_evidence_digest(
+        repository.id, repository.node_id, repository.full_name, head_sha,
+    )
+    description = render_status_description(StatusClass.EXTERNAL, digest)
+    receipt = client.create_commit_status(
+        repository.full_name,
+        head_sha,
+        "success",
+        _EXTERNAL_STATUS_CONTEXT,
+        description,
+        None,
+    )
+    expected_route = f"/repos/{repository.full_name}/statuses/{head_sha}"
+    if type(receipt) is not StatusWriteReceipt or (
+        receipt.repository != repository.full_name
+        or receipt.requested_sha != head_sha
+        or receipt.method != "POST"
+        or receipt.route != expected_route
+        or receipt.requested_state != "success"
+        or receipt.requested_context != _EXTERNAL_STATUS_CONTEXT
+        or receipt.requested_description != description
+        or receipt.requested_target_url is not None
+    ):
+        raise R02Error("external status write receipt does not match the exact requested tuple")
+    status = receipt.returned_status
+    if type(status) is not CommitStatus or (
+        status.context != _EXTERNAL_STATUS_CONTEXT
+        or status.state != "success"
+        or status.description != description
+        or status.target_url is not None
+        or status.creator_database_id != app.bot_id
+        or status.creator_node_id != app.bot_node_id
+        or status.creator_login != app.bot_login
+        or status.creator_type != "Bot"
+    ):
+        raise R02Error("external status response does not match the exact App Bot tuple")
+    return receipt
+
+
 def marker_classes(marker_path: str, marker_value: str) -> RequestClass:
     if marker_path != REQUEST_MARKER or type(marker_value) is not str:
         raise R02Error("request marker path/value is not exact")
@@ -840,6 +1070,7 @@ class IssuePRBindingState:
     pr_binding_comment: IssueComment
     pr: PullRequestMetadata
     pr_issue: IssueMetadata
+    owning_issue: IssueMetadata
 
 
 @dataclass(frozen=True)
@@ -1862,6 +2093,7 @@ def _read_issue_pr_intake(
     source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
     *,
     validate_fresh_source_authority: bool = True,
+    require_open_lifecycle: bool = True,
 ) -> tuple[
     IssueMetadata,
     tuple[IssueComment, ...],
@@ -1876,7 +2108,7 @@ def _read_issue_pr_intake(
             type(issue) is not IssueMetadata
             or issue.number != issue_number
             or issue.is_pull_request
-            or issue.state != "open"
+            or (require_open_lifecycle and issue.state != "open")
         ):
             raise R02Error("Wave 03 requires the exact open Issue, not a PullRequest")
         comments = tuple(client.list_issue_comments(repository, issue_number))
@@ -2126,7 +2358,14 @@ def _fresh_issue_pr_binding_snapshot(
     complete = None
     if issue_binding_comment is not None and pr_binding_comment is not None:
         complete = IssuePRBindingState(
-            fresh[2], fresh[3], intended, issue_binding_comment, pr_binding_comment, pr, pr_issue,
+            issue_anchor=fresh[2],
+            lease=fresh[3],
+            binding=intended,
+            issue_binding_comment=issue_binding_comment,
+            pr_binding_comment=pr_binding_comment,
+            pr=pr,
+            pr_issue=pr_issue,
+            owning_issue=fresh[0],
         )
     return complete, fresh, pr, pr_issue, comments, pr_binding_candidates
 
@@ -2341,10 +2580,12 @@ def _read_managed_issue_pr_binding_state(
     source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
     *,
     validate_fresh_source_authority: bool = True,
+    require_open_lifecycle: bool = True,
 ) -> IssuePRBindingState:
     intake = _read_issue_pr_intake(
         client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
         validate_fresh_source_authority=validate_fresh_source_authority,
+        require_open_lifecycle=require_open_lifecycle,
     )
     issue, _issue_comments, anchor, lease, _repo, issue_bindings = intake
     if not issue_bindings:
@@ -2390,7 +2631,7 @@ def _read_managed_issue_pr_binding_state(
         or pr_issue.node_id != binding.pull_request_node_id
         or pr_issue.author_id != app.bot_node_id
         or pr_issue.author_login != app.bot_login
-        or pr_issue.state != "open"
+        or (require_open_lifecycle and pr_issue.state != "open")
         or pr_issue.body != pr.body
     ):
         raise R02Error("bound Issue PR composite identity/lifecycle/body is invalid")
@@ -2402,7 +2643,14 @@ def _read_managed_issue_pr_binding_state(
         raise R02Error("PRIssueOriginBinding does not match the exact persisted Issue binding")
     pr_binding_comment = min(pr_binding_candidates, key=lambda item: item.comment.database_id).comment
     return IssuePRBindingState(
-        anchor, lease, binding, binding_item.comment, pr_binding_comment, pr, pr_issue,
+        issue_anchor=anchor,
+        lease=lease,
+        binding=binding,
+        issue_binding_comment=binding_item.comment,
+        pr_binding_comment=pr_binding_comment,
+        pr=pr,
+        pr_issue=pr_issue,
+        owning_issue=issue,
     )
 
 
@@ -2422,6 +2670,11 @@ def _require_same_managed_issue_pr_binding(
         or before.issue_binding_comment.body != after.issue_binding_comment.body
         or before.pr_binding_comment.database_id != after.pr_binding_comment.database_id
         or before.pr_binding_comment.body != after.pr_binding_comment.body
+        or before.owning_issue.number != after.owning_issue.number
+        or before.owning_issue.database_id != after.owning_issue.database_id
+        or before.owning_issue.node_id != after.owning_issue.node_id
+        or before.owning_issue.is_pull_request != after.owning_issue.is_pull_request
+        or before.owning_issue.author_id != after.owning_issue.author_id
     ):
         raise StaleAuthorityError("Issue/lease/binding identities changed during managed progression")
 

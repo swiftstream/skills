@@ -1,6 +1,7 @@
 import ast
 import base64
 import hashlib
+import inspect
 import json
 from contextlib import nullcontext
 from dataclasses import replace
@@ -25,6 +26,8 @@ from automation.federation.controller import (
     R02Error,
     StaleAuthorityError,
     classify_request,
+    resolve_sha_carrier_role,
+    publish_unclaimed_external_success,
     create_or_validate_issue_anchor,
     create_or_validate_issue_branch_lease,
     create_or_recover_issue_pr_binding,
@@ -45,6 +48,12 @@ from automation.federation.request_model import (
     IssueHeadClaim,
     IssuePRBinding,
     IssueBranchLease,
+    ClaimedHeadMarker,
+    CarrierActivation,
+    CarrierRole,
+    LegacyEvidenceDisposition,
+    ShaCarrierResolution,
+    StatusClass,
     RequestClass,
     RequestAnchor,
     body_sha256,
@@ -56,14 +65,18 @@ from automation.federation.request_model import (
     parse_pr_issue_origin_binding,
     issue_branch_ref,
     issue_head_claim_authority_digest,
+    external_status_evidence_digest,
     effective_request_digest,
     proposal_target_evidence_digest,
     render_request_body,
+    render_status_description,
 )
 from automation.federation.github_api import (
     GitHubAPIError,
     GitHubClient,
     GitCommitMetadata,
+    GitCommitIdentity,
+    GitCommitObject,
     GitObject,
     GitTreeEntry,
     HttpResponse,
@@ -73,8 +86,15 @@ from automation.federation.github_api import (
     PullRequestMetadata,
     RefCASConflict,
     RepositoryMetadata,
+    AppMetadata,
+    BotMetadata,
+    CommitStatus,
+    StatusWriteReceipt,
     REST_BASE_URL,
     ZERO_OID,
+    UnexpectedStatusError,
+    UnprocessableError,
+    TransportError,
 )
 from scripts import federate as c02
 
@@ -1856,7 +1876,7 @@ class IssueHeadClaimControllerTests(unittest.TestCase):
         )
         state = IssuePRBindingState(
             IssueAnchorComment(anchor, anchor_comment), lease_comment_wrap, binding,
-            issue_binding_comment, pr_binding_comment, pr, pr_issue,
+            issue_binding_comment, pr_binding_comment, pr, pr_issue, issue,
         )
         return issue, anchor_comment, anchor, state
 
@@ -2584,6 +2604,923 @@ class IssueHeadClaimControllerTests(unittest.TestCase):
         self.assertEqual(classified_transitions, ["PATCH_REGENERATION"])
         self.assertEqual(candidate_inputs, [(request, RequestClass.ADD, fresh_main, claim.to_head_sha)])
         self.assertEqual(client.writes, [])
+
+
+class Wave05ShaCarrierResolverTests(unittest.TestCase):
+    CENTRAL = IssuePRBindingControllerTests.CENTRAL_REPOSITORY
+    CENTRAL_NODE_ID = IssuePRBindingControllerTests.CENTRAL_NODE_ID
+    APP = IssueAnchorControllerTests.APP
+
+    class CarrierClient(IssuePRBindingControllerTests.Client):
+        def __init__(self, issue, anchor_comment):
+            super().__init__(issue, anchor_comment)
+            self.commit_trees = {
+                IssueBranchLeaseControllerTests.BASE_SHA: (
+                    IssueBranchLeaseControllerTests.BASE_TREE,
+                    tuple(self.base_entries),
+                ),
+            }
+            self.commit_messages = {}
+            self.blobs = {}
+            self.commit_object_reads = []
+            self.authority_reads = []
+            self.pr_inventory_reads = 0
+            self.status_calls = []
+            self.issue_metadata_sequences = {}
+            self.issue_metadata_reads = []
+            self.pull_request_metadata_sequences = {}
+            self.pull_request_metadata_reads = []
+            self.issue_comment_sequences = {}
+            self.issue_comment_reads = []
+            self.generated_ref_sequence = None
+            self.generated_ref_reads = []
+
+        def create_tree(self, repository, base_tree, entries):
+            result = super().create_tree(repository, base_tree, entries)
+            self.commit_trees[IssueBranchLeaseControllerTests.HEAD_TREE] = (
+                IssueBranchLeaseControllerTests.HEAD_TREE, tuple(self.head_entries),
+            )
+            return result
+
+        def create_commit(self, repository, message, tree, parents, *, timestamp=None):
+            result = super().create_commit(repository, message, tree, parents, timestamp=timestamp)
+            self.commit_messages[result.sha] = message
+            self.commit_trees[result.sha] = (tree, tuple(self.head_entries))
+            return result
+
+        def get_commit_tree(self, repository, commit_sha):
+            if commit_sha in self.commit_trees:
+                return self.commit_trees[commit_sha]
+            return super().get_commit_tree(repository, commit_sha)
+
+        def get_git_commit_object(self, repository, sha):
+            self.commit_object_reads.append((repository, sha))
+            self.authority_reads.append("commit")
+            metadata = self.commit_metadata[sha]
+            identity = GitCommitIdentity("Swift Stream Bot", "bot@example.test", metadata.author_date)
+            return GitCommitObject(
+                sha, self.commit_messages[sha], metadata.tree_sha, metadata.parents, identity, identity,
+            )
+
+        def get_app_metadata(self, slug):
+            self.authority_reads.append("app")
+            return AppMetadata(self.APP.app_id, slug, self.APP.app_node_id)
+
+        def get_bot_metadata(self, slug):
+            self.authority_reads.append("bot")
+            return BotMetadata(self.APP.bot_id, self.APP.bot_login, self.APP.bot_node_id, "Bot")
+
+        def get_repository_metadata(self, repository):
+            self.authority_reads.append("repository")
+            return super().get_repository_metadata(repository)
+
+        def get_issue_metadata(self, repository, number):
+            self.authority_reads.append("issue")
+            sequence = self.issue_metadata_sequences.get(number)
+            if sequence:
+                value = sequence.pop(0)
+                if isinstance(value, BaseException):
+                    self.issue_metadata_reads.append((number, "ERROR"))
+                    raise value
+            else:
+                value = super().get_issue_metadata(repository, number)
+            self.issue_metadata_reads.append((number, getattr(value, "state", "MALFORMED")))
+            return value
+
+        def list_issue_comments(self, repository, number):
+            sequence = self.issue_comment_sequences.get(number)
+            if sequence:
+                value = sequence.pop(0)
+                if isinstance(value, BaseException):
+                    self.issue_comment_reads.append((number, "ERROR"))
+                    raise value
+            else:
+                value = super().list_issue_comments(repository, number)
+            result = tuple(value)
+            self.issue_comment_reads.append((number, len(result)))
+            return result
+
+        def get_pull_request_metadata(self, repository, number):
+            self.authority_reads.append("pull")
+            sequence = self.pull_request_metadata_sequences.get(number)
+            if sequence:
+                value = sequence.pop(0)
+                if isinstance(value, BaseException):
+                    self.pull_request_metadata_reads.append((number, "ERROR"))
+                    raise value
+            else:
+                value = super().get_pull_request_metadata(repository, number)
+            self.pull_request_metadata_reads.append((number, getattr(value, "head_oid", "MALFORMED")))
+            return value
+
+        def get_ref_oid(self, repository, branch):
+            if branch != "main" and self.generated_ref_sequence is not None:
+                self.ref_reads.append(branch)
+                if not self.generated_ref_sequence:
+                    raise AssertionError("generated-ref sequence was exhausted")
+                value = self.generated_ref_sequence.pop(0)
+                self.generated_ref_reads.append((branch, "ERROR" if isinstance(value, BaseException) else value))
+                if isinstance(value, BaseException):
+                    raise value
+                if value is None:
+                    raise NotFoundError("generated ref not found")
+                return value
+            return super().get_ref_oid(repository, branch)
+
+        def get_blob(self, repository, blob_sha):
+            return self.blobs[blob_sha]
+
+        def list_pull_requests(self, repository, *, state="open", max_pages=100):
+            self.pr_inventory_reads += 1
+            return super().list_pull_requests(repository, state=state, max_pages=max_pages)
+
+    @staticmethod
+    def make_client(nonce="c" * 64):
+        issue, anchor_comment = IssueBranchLeaseControllerTests.setup_anchor()
+        client = Wave05ShaCarrierResolverTests.CarrierClient(issue, anchor_comment)
+        lease = IssueBranchLeaseControllerTests().create(
+            client, anchor_comment, nonce_factory=lambda: nonce,
+        )
+        client.binding_anchor = anchor_comment
+        client.binding_lease = lease
+        client.current_ref = lease.lease.initial_head_sha
+        client.add_candidate()
+        return client, issue, anchor_comment, lease
+
+    @staticmethod
+    def resolve(client, sha, legacy=LegacyEvidenceDisposition.ABSENT):
+        return resolve_sha_carrier_role(
+            client,
+            Wave05ShaCarrierResolverTests.CENTRAL,
+            sha,
+            Wave05ShaCarrierResolverTests.APP.slug,
+            legacy,
+        )
+
+    def make_claim_client(self):
+        binder = IssuePRBindingControllerTests()
+        client, issue, anchor_comment, lease = self.make_client()
+        state = binder.run_binding(client)
+
+        data = b"Wave 05 resolver proposal evidence\n"
+        blob_sha = hashlib.sha1(b"blob " + str(len(data)).encode("ascii") + b"\0" + data).hexdigest()
+        target_tree = "e" * 40
+        target_entries = tuple(sorted(
+            (*client.base_entries, GitTreeEntry("federation.json", "100644", "blob", blob_sha)),
+            key=lambda entry: entry.path.encode("utf-8"),
+        ))
+        target_digest = proposal_target_evidence_digest(
+            candidate_tree_sha=target_tree,
+            changed=({
+                "path": "federation.json",
+                "state": "PRESENT",
+                "mode": "100644",
+                "objectType": "blob",
+                "blobSha": blob_sha,
+                "contentSha256": hashlib.sha256(data).hexdigest(),
+            },),
+            candidate_changed_paths=("federation.json",),
+        )
+        common = dict(
+            schema_version=1,
+            issue_number=state.issue_anchor.anchor.issue_number,
+            issue_database_id=state.issue_anchor.anchor.issue_database_id,
+            issue_node_id=state.issue_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+            issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+            issue_branch_lease_sha256=hashlib.sha256(state.lease.comment.body.encode("utf-8")).hexdigest(),
+            binding_id=state.binding.binding_id,
+            source_id=state.binding.source_id,
+            source_repository_id=state.binding.source_repository_id,
+            pull_request_number=state.binding.pull_request_number,
+            pull_request_database_id=state.binding.pull_request_database_id,
+            pull_request_node_id=state.binding.pull_request_node_id,
+            central_repository_node_id=state.binding.central_repository_node_id,
+            branch_ref=state.binding.branch_ref,
+            request_class=state.issue_anchor.anchor.request_class,
+            accepted_base_sha=lease.lease.accepted_base_sha,
+            accepted_base_tree_sha=IssueBranchLeaseControllerTests.BASE_TREE,
+            from_head_sha=lease.lease.initial_head_sha,
+            from_tree_sha=lease.lease.initial_head_tree_sha,
+            to_head_sha="0" * 40,
+            to_tree_sha=target_tree,
+            transition_kind="PROPOSAL",
+            carrier_nonce="5" * 64,
+            effective_request_digest=effective_request_digest(state.issue_anchor.anchor.initial_request),
+            patch_projection_evidence_digest="7" * 64,
+            target_evidence_digest=target_digest,
+        )
+        prepared = IssueHeadClaim.create(**common)
+        marker_text = controller_module._issue_head_claim_marker(prepared).render()
+        timestamp = IssueBranchLeaseControllerTests.CLAIM_DATE
+        target_sha = controller_module._expected_deterministic_commit_sha(
+            target_tree, lease.lease.initial_head_sha, marker_text, timestamp,
+        )
+        claim = IssueHeadClaim.create(**{**common, "to_head_sha": target_sha})
+        client.commit_metadata[target_sha] = GitCommitMetadata(
+            target_sha, target_tree, (lease.lease.initial_head_sha,), timestamp,
+        )
+        client.commit_messages[target_sha] = marker_text
+        client.commit_trees[target_sha] = (target_tree, target_entries)
+        client.blobs[blob_sha] = data
+        client.current_ref = target_sha
+        client.pull_requests[state.binding.pull_request_number] = replace(
+            client.pull_requests[state.binding.pull_request_number], head_oid=target_sha,
+        )
+        client.pr_comments[state.binding.pull_request_number].append(
+            IssueAnchorControllerTests.comment(claim.render(), database_id=3_001),
+        )
+        client.authority_reads = []
+        client.pr_inventory_reads = 0
+        client.issue_metadata_reads = []
+        client.pull_request_metadata_reads = []
+        client.issue_comment_reads = []
+        client.ref_reads = []
+        client.generated_ref_reads = []
+        return client, issue, anchor_comment, lease, state, claim
+
+    @staticmethod
+    def commit_message_client(sha, message):
+        class MarkerClient:
+            def __init__(self):
+                self.reads = []
+
+            def get_git_commit_object(self, repository, requested_sha):
+                self.reads.append((repository, requested_sha))
+                identity = GitCommitIdentity("Author", "author@example.test", "2026-10-05T00:00:00Z")
+                return GitCommitObject(requested_sha, message, "b" * 40, (), identity, identity)
+
+        return MarkerClient()
+
+    @staticmethod
+    def marker(**changes):
+        fields = dict(
+            claim_kind="ISSUE_BRANCH_LEASE",
+            role="ISSUE_ACTIVE",
+            owner_kind="ISSUE",
+            owner_key="R_central:700:I_issue:7",
+            claim_generation_id="1" * 64,
+            carrier_nonce="2" * 64,
+            transition_kind="INITIAL",
+        )
+        fields.update(changes)
+        return ClaimedHeadMarker(**fields)
+
+    def test_active_and_historical_issue_branch_lease_use_real_provenance_path(self):
+        client, _issue, _anchor_comment, lease = self.make_client()
+        client.authority_reads = []
+        legacy_reads = []
+        self.assertEqual(
+            self.resolve(client, lease.lease.initial_head_sha,
+                         lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT),
+            ShaCarrierResolution(CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE,
+                                 controller_module._lease_marker_for(lease.lease)),
+        )
+        self.assertEqual(legacy_reads, [])
+        self.assertEqual(client.commit_object_reads[0], (self.CENTRAL, lease.lease.initial_head_sha))
+        self.assertEqual(client.authority_reads[0], "commit")
+        self.assertEqual(client.pr_inventory_reads, 0)
+
+        client.current_ref = "f" * 40
+        historical = self.resolve(client, lease.lease.initial_head_sha,
+                                  lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT)
+        self.assertEqual(historical.activation, CarrierActivation.RESERVED_INACTIVE)
+        self.assertEqual(historical.role, CarrierRole.ISSUE_ACTIVE)
+        self.assertEqual(legacy_reads, [])
+
+    def test_active_and_historical_issue_head_claim_use_real_production_validators(self):
+        client, _issue, _anchor_comment, _lease, state, claim = self.make_claim_client()
+        client.pr_inventory_reads = 0
+        legacy_reads = []
+        active = self.resolve(
+            client, claim.to_head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+        self.assertEqual(active.activation, CarrierActivation.ACTIVE)
+        self.assertEqual(active.role, CarrierRole.ISSUE_ACTIVE)
+        self.assertEqual(active.marker, controller_module._issue_head_claim_marker(claim))
+        self.assertEqual(client.authority_reads[0], "commit")
+        self.assertEqual(legacy_reads, [])
+        self.assertEqual(client.pr_inventory_reads, 0)
+
+        # An unrelated PR topology that mentions H cannot alter the exact bound claim.
+        client.pull_requests[82] = replace(client.pull_requests[state.binding.pull_request_number], number=82)
+        same_head = self.resolve(client, claim.to_head_sha, LegacyEvidenceDisposition.ABSENT)
+        self.assertEqual(same_head, active)
+        client.current_ref = claim.from_head_sha
+        reserved = self.resolve(client, claim.to_head_sha, LegacyEvidenceDisposition.ABSENT)
+        self.assertEqual(reserved.activation, CarrierActivation.RESERVED_INACTIVE)
+        self.assertEqual(reserved.role, CarrierRole.ISSUE_ACTIVE)
+
+    def test_race1_owning_issue_closes_after_exact_claim_provenance(self):
+        client, issue, _anchor, _lease, _state, claim = self.make_claim_client()
+        client.issue_metadata_sequences[issue.number] = [
+            issue,
+            issue,
+            replace(issue, state="closed"),
+        ]
+        legacy_reads = []
+        result = self.resolve(
+            client,
+            claim.to_head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+
+        owning_issue_reads = [
+            state for number, state in client.issue_metadata_reads if number == issue.number
+        ]
+        self.assertEqual(owning_issue_reads, ["open", "open", "closed"])
+        self.assertEqual(client.issue_metadata_sequences[issue.number], [])
+        self.assertEqual(
+            result,
+            ShaCarrierResolution(
+                CarrierActivation.RESERVED_INACTIVE,
+                CarrierRole.ISSUE_ACTIVE,
+                controller_module._issue_head_claim_marker(claim),
+            ),
+        )
+        self.assertNotEqual(result.activation, CarrierActivation.ACTIVE)
+        self.assertEqual(legacy_reads, [])
+
+    def test_race2_bound_pr_closes_before_final_activation_read(self):
+        client, _issue, _anchor, _lease, state, claim = self.make_claim_client()
+        pr_number = state.binding.pull_request_number
+        open_pr_issue = client.pull_request_issues[pr_number]
+        client.issue_metadata_sequences[pr_number] = [
+            open_pr_issue,
+            replace(open_pr_issue, state="closed"),
+        ]
+        legacy_reads = []
+        result = self.resolve(
+            client,
+            claim.to_head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+
+        pr_lifecycle_reads = [
+            lifecycle for number, lifecycle in client.issue_metadata_reads if number == pr_number
+        ]
+        self.assertEqual(pr_lifecycle_reads, ["open", "closed"])
+        self.assertEqual(result.activation, CarrierActivation.RESERVED_INACTIVE)
+        self.assertEqual(result.role, CarrierRole.ISSUE_ACTIVE)
+        self.assertEqual(legacy_reads, [])
+
+    def test_race3_bound_pr_head_moves_before_final_activation_read(self):
+        client, _issue, _anchor, _lease, state, claim = self.make_claim_client()
+        pr_number = state.binding.pull_request_number
+        initial_pr = client.pull_requests[pr_number]
+        moved_pr = replace(initial_pr, head_oid="f" * 40)
+        client.pull_request_metadata_sequences[pr_number] = [initial_pr, moved_pr]
+        legacy_reads = []
+        result = self.resolve(
+            client,
+            claim.to_head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+
+        self.assertEqual(
+            [head for number, head in client.pull_request_metadata_reads if number == pr_number],
+            [claim.to_head_sha, "f" * 40],
+        )
+        self.assertEqual(result.activation, CarrierActivation.RESERVED_INACTIVE)
+        self.assertEqual(result.role, CarrierRole.ISSUE_ACTIVE)
+        self.assertEqual(legacy_reads, [])
+
+    def test_race4_generated_ref_moves_before_final_activation_read(self):
+        client, _issue, _anchor, _lease, state, claim = self.make_claim_client()
+        branch = state.lease.lease.branch_ref.removeprefix("refs/heads/")
+        client.generated_ref_sequence = [claim.to_head_sha, claim.from_head_sha]
+        legacy_reads = []
+        result = self.resolve(
+            client,
+            claim.to_head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+
+        self.assertEqual(client.ref_reads, [branch, branch])
+        self.assertEqual(
+            client.generated_ref_reads,
+            [(branch, claim.to_head_sha), (branch, claim.from_head_sha)],
+        )
+        self.assertEqual(result.activation, CarrierActivation.RESERVED_INACTIVE)
+        self.assertEqual(result.role, CarrierRole.ISSUE_ACTIVE)
+        self.assertEqual(legacy_reads, [])
+
+    def test_race5_immutable_binding_drift_is_conflicting(self):
+        client, issue, _anchor, _lease, state, claim = self.make_claim_client()
+        original_comments = tuple(client.comments)
+        drifted_comments = list(original_comments)
+        binding_index = next(
+            index for index, item in enumerate(drifted_comments)
+            if item.body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER)
+        )
+        changed_binding_fields = {
+            name: value for name, value in state.binding.__dict__.items()
+            if name != "binding_id"
+        }
+        changed_binding_fields["pull_request_number"] += 1
+        changed_binding = IssuePRBinding.create(**changed_binding_fields)
+        drifted_comments[binding_index] = replace(
+            drifted_comments[binding_index],
+            body=changed_binding.render_issue_binding(),
+        )
+        client.issue_comment_sequences[issue.number] = [
+            original_comments,
+            original_comments,
+            tuple(drifted_comments),
+        ]
+        legacy_reads = []
+        result = self.resolve(
+            client,
+            claim.to_head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+
+        self.assertEqual(
+            [count for number, count in client.issue_comment_reads if number == issue.number],
+            [len(original_comments), len(original_comments), len(drifted_comments)],
+        )
+        self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+        self.assertEqual(legacy_reads, [])
+
+    def test_race6_final_activation_ref_failure_is_conflicting(self):
+        client, _issue, _anchor, _lease, state, claim = self.make_claim_client()
+        branch = state.lease.lease.branch_ref.removeprefix("refs/heads/")
+        client.generated_ref_sequence = [claim.to_head_sha, RuntimeError("final ref unavailable")]
+        legacy_reads = []
+        result = self.resolve(
+            client,
+            claim.to_head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+
+        self.assertEqual(client.ref_reads, [branch, branch])
+        self.assertEqual(
+            client.generated_ref_reads,
+            [(branch, claim.to_head_sha), (branch, "ERROR")],
+        )
+        self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+        self.assertEqual(legacy_reads, [])
+
+    def test_race7_stable_exact_post_provenance_state_remains_active(self):
+        client, issue, _anchor, _lease, state, claim = self.make_claim_client()
+        pr_number = state.binding.pull_request_number
+        client.issue_metadata_sequences[issue.number] = [issue, issue, issue]
+        client.issue_metadata_sequences[pr_number] = [
+            client.pull_request_issues[pr_number],
+            client.pull_request_issues[pr_number],
+        ]
+        current_pr = client.pull_requests[pr_number]
+        client.pull_request_metadata_sequences[pr_number] = [current_pr, current_pr]
+        client.generated_ref_sequence = [claim.to_head_sha, claim.to_head_sha]
+        legacy_reads = []
+        result = self.resolve(
+            client,
+            claim.to_head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+
+        self.assertEqual(
+            [lifecycle for number, lifecycle in client.issue_metadata_reads if number == issue.number],
+            ["open", "open", "open"],
+        )
+        self.assertEqual(
+            [lifecycle for number, lifecycle in client.issue_metadata_reads if number == pr_number],
+            ["open", "open"],
+        )
+        self.assertEqual(
+            [head for number, head in client.pull_request_metadata_reads if number == pr_number],
+            [claim.to_head_sha, claim.to_head_sha],
+        )
+        self.assertEqual(
+            client.generated_ref_reads,
+            [(state.lease.lease.branch_ref.removeprefix("refs/heads/"), claim.to_head_sha)] * 2,
+        )
+        self.assertEqual(result.activation, CarrierActivation.ACTIVE)
+        self.assertEqual(result.role, CarrierRole.ISSUE_ACTIVE)
+        self.assertEqual(legacy_reads, [])
+
+    def test_race8_correction_01_static_historical_cases_remain_reserved(self):
+        scenarios = (
+            "issue-closed",
+            "pr-closed",
+            "issue-and-pr-closed",
+            "issue-closed-ref-moved",
+            "pr-closed-head-moved",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                client, issue, _anchor, _lease, state, claim = self.make_claim_client()
+                if scenario in {"issue-closed", "issue-and-pr-closed", "issue-closed-ref-moved"}:
+                    client.issue = replace(issue, state="closed")
+                if scenario in {"pr-closed", "issue-and-pr-closed", "pr-closed-head-moved"}:
+                    client.pull_request_issues[state.binding.pull_request_number] = replace(
+                        client.pull_request_issues[state.binding.pull_request_number],
+                        state="closed",
+                    )
+                if scenario == "issue-closed-ref-moved":
+                    client.current_ref = claim.from_head_sha
+                if scenario == "pr-closed-head-moved":
+                    client.pull_requests[state.binding.pull_request_number] = replace(
+                        client.pull_requests[state.binding.pull_request_number],
+                        head_oid="f" * 40,
+                    )
+
+                legacy_reads = []
+                result = self.resolve(
+                    client,
+                    claim.to_head_sha,
+                    lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+                )
+                self.assertEqual(result.activation, CarrierActivation.RESERVED_INACTIVE)
+                self.assertEqual(result.role, CarrierRole.ISSUE_ACTIVE)
+                self.assertEqual(result.marker, controller_module._issue_head_claim_marker(claim))
+                self.assertNotEqual(result.activation, CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+                self.assertEqual(legacy_reads, [])
+
+    def test_race8_broken_claim_provenance_remains_conflicting(self):
+        for corruption in ("missing", "edited"):
+            with self.subTest(corruption=corruption):
+                client, issue, _anchor, _lease, state, claim = self.make_claim_client()
+                client.issue = replace(issue, state="closed")
+                client.pull_request_issues[state.binding.pull_request_number] = replace(
+                    client.pull_request_issues[state.binding.pull_request_number],
+                    state="closed",
+                )
+                comments = client.pr_comments[state.binding.pull_request_number]
+                if corruption == "missing":
+                    client.pr_comments[state.binding.pull_request_number] = [
+                        item for item in comments
+                        if not item.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+                    ]
+                else:
+                    client.pr_comments[state.binding.pull_request_number] = [
+                        replace(item, editor_id=self.APP.bot_node_id)
+                        if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER) else item
+                        for item in comments
+                    ]
+
+                legacy_reads = []
+                result = self.resolve(
+                    client,
+                    claim.to_head_sha,
+                    lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+                )
+                self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+                self.assertEqual(legacy_reads, [])
+
+    def test_race9_managed_issue_pr_binding_default_still_requires_open_lifecycle(self):
+        client, issue, _anchor, _lease, state, _claim = self.make_claim_client()
+        client.issue = replace(issue, state="closed")
+        with self.assertRaises(R02Error):
+            controller_module._read_managed_issue_pr_binding_state(
+                client,
+                self.CENTRAL,
+                issue.number,
+                self.APP,
+                self.CENTRAL_NODE_ID,
+                lambda _request, _request_class: None,
+                validate_fresh_source_authority=False,
+            )
+
+        client, _issue, _anchor, _lease, state, _claim = self.make_claim_client()
+        client.pull_request_issues[state.binding.pull_request_number] = replace(
+            client.pull_request_issues[state.binding.pull_request_number],
+            state="closed",
+        )
+        with self.assertRaises(R02Error):
+            controller_module._read_managed_issue_pr_binding_state(
+                client,
+                self.CENTRAL,
+                state.issue_anchor.anchor.issue_number,
+                self.APP,
+                self.CENTRAL_NODE_ID,
+                lambda _request, _request_class: None,
+                validate_fresh_source_authority=False,
+            )
+
+    def test_race10_false_lifecycle_override_is_resolver_only(self):
+        source = Path(controller_module.__file__).read_text(encoding="utf-8")
+        module_ast = ast.parse(source)
+
+        class FalseLifecycleCallCollector(ast.NodeVisitor):
+            def __init__(self):
+                self.functions = []
+                self.call_owners = []
+
+            def visit_FunctionDef(self, node):
+                self.functions.append(node.name)
+                self.generic_visit(node)
+                self.functions.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Call(self, node):
+                if any(
+                    keyword.arg == "require_open_lifecycle"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is False
+                    for keyword in node.keywords
+                ):
+                    self.call_owners.append(self.functions[-1] if self.functions else None)
+                self.generic_visit(node)
+
+        collector = FalseLifecycleCallCollector()
+        collector.visit(module_ast)
+        self.assertEqual(len(collector.call_owners), 2)
+        self.assertEqual(set(collector.call_owners), {"resolve_sha_carrier_role"})
+
+    def test_reserved_namespace_versions_and_malformed_markers_never_consult_legacy(self):
+        valid = self.marker().render()
+        unknown_messages = (
+            "swiftstream-federation-head:v0\n",
+            "swiftstream-federation-head:v1\n",
+            "swiftstream-federation-head:v3\n",
+            "swiftstream-federation-head:v999\n",
+            "swiftstream-federation-head:future\n",
+            "swiftstream-federation-head:\n",
+            "swiftstream-federation-head:v2x\n",
+            "swiftstream-federation-head:v2\n" + valid,
+            valid.replace("claim-kind=ISSUE_BRANCH_LEASE", "claim-kind=FUTURE"),
+            valid.replace("role=ISSUE_ACTIVE", "role=FUTURE"),
+            valid.replace("role=ISSUE_ACTIVE\n", "owner-kind=ISSUE\nrole=ISSUE_ACTIVE\n"),
+        )
+        for message in unknown_messages:
+            with self.subTest(message=message[:48]):
+                client = self.commit_message_client("a" * 40, message)
+                legacy_reads = []
+                result = self.resolve(
+                    client, "a" * 40,
+                    lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+                )
+                self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+                self.assertEqual(legacy_reads, [])
+                self.assertEqual(client.reads, [(self.CENTRAL, "a" * 40)])
+
+    def test_copied_v2_marker_and_missing_or_edited_issue_provenance_conflict(self):
+        client, issue, anchor_comment, lease = self.make_client()
+        head_sha = lease.lease.initial_head_sha
+        legacy_reads = []
+
+        missing_lease = list(client.comments)
+        missing_lease.pop()
+        client.comments = missing_lease
+        copied = self.resolve(
+            client, head_sha,
+            lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+        self.assertEqual(copied.activation, CarrierActivation.CONFLICTING)
+        self.assertEqual(legacy_reads, [])
+
+        client, _issue, anchor_comment, lease = self.make_client()
+        client.comments = [lease.comment]
+        missing_anchor = self.resolve(client, lease.lease.initial_head_sha)
+        self.assertEqual(missing_anchor.activation, CarrierActivation.CONFLICTING)
+
+        client, _issue, anchor_comment, lease = self.make_client()
+        client.comments[0] = replace(client.comments[0], editor_id=self.APP.bot_node_id)
+        edited_anchor = self.resolve(client, lease.lease.initial_head_sha)
+        self.assertEqual(edited_anchor.activation, CarrierActivation.CONFLICTING)
+
+        client, _issue, anchor_comment, lease = self.make_client()
+        client.comments[-1] = replace(client.comments[-1], editor_id=self.APP.bot_node_id)
+        edited_lease = self.resolve(client, lease.lease.initial_head_sha)
+        self.assertEqual(edited_lease.activation, CarrierActivation.CONFLICTING)
+
+    def test_conflicting_duplicate_lease_provenance_fails_real_history_validation(self):
+        first, _issue, anchor_comment, first_lease = self.make_client("c" * 64)
+        second, _issue2, _anchor2, second_lease = self.make_client("d" * 64)
+        second_head = second_lease.lease.initial_head_sha
+        first.commit_metadata[second_head] = second.commit_metadata[second_head]
+        first.commit_messages[second_head] = second.commit_messages[second_head]
+        first.commit_trees[second_head] = second.commit_trees[second_head]
+        first.comments.append(replace(second_lease.comment, database_id=999))
+        result = self.resolve(first, first_lease.lease.initial_head_sha)
+        self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+
+    def test_missing_and_edited_head_claim_comments_fail_through_real_validators(self):
+        client, _issue, _anchor, _lease, state, claim = self.make_claim_client()
+        comments = client.pr_comments[state.binding.pull_request_number]
+        client.pr_comments[state.binding.pull_request_number] = [
+            item for item in comments if not item.body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+        ]
+        missing = self.resolve(client, claim.to_head_sha)
+        self.assertEqual(missing.activation, CarrierActivation.CONFLICTING)
+
+        client, _issue, _anchor, _lease, state, claim = self.make_claim_client()
+        comments = client.pr_comments[state.binding.pull_request_number]
+        client.pr_comments[state.binding.pull_request_number] = [
+            replace(item, editor_id=self.APP.bot_node_id)
+            if item.body.startswith(ISSUE_HEAD_CLAIM_MARKER) else item
+            for item in comments
+        ]
+        edited = self.resolve(client, claim.to_head_sha)
+        self.assertEqual(edited.activation, CarrierActivation.CONFLICTING)
+
+    def test_future_reserved_claim_kinds_fail_closed_and_legacy_dispositions_are_explicit(self):
+        legacy_reads = []
+        for claim_kind, role in (
+            ("REQUIRED_STATUS_EPOCH", "ISSUE_FINALIZING"),
+            ("ISSUE_FINALIZATION_EPOCH", "ISSUE_FINALIZING"),
+            ("ISSUE_CANCELLATION_FENCE", "ISSUE_CANCEL"),
+            ("MACHINE_REF_CLAIM", "MACHINE_PUBLICATION"),
+        ):
+            marker = self.marker(claim_kind=claim_kind, role=role).render()
+            client = self.commit_message_client("a" * 40, marker)
+            result = self.resolve(
+                client, "a" * 40,
+                lambda: legacy_reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+            )
+            self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+        self.assertEqual(legacy_reads, [])
+
+        client = self.commit_message_client("a" * 40, "ordinary commit\n")
+        for disposition, expected in (
+            (LegacyEvidenceDisposition.QUARANTINE, CarrierActivation.LEGACY_CUTOVER_QUARANTINE),
+            (LegacyEvidenceDisposition.CONFLICTING, CarrierActivation.CONFLICTING),
+            (LegacyEvidenceDisposition.ABSENT, CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION),
+        ):
+            with self.subTest(disposition=disposition):
+                self.assertEqual(self.resolve(client, "a" * 40, disposition).activation, expected)
+
+        callback_client = self.commit_message_client("a" * 40, "no reserved family\n")
+        reads = []
+        result = self.resolve(
+            callback_client, "a" * 40,
+            lambda: reads.append("called") or LegacyEvidenceDisposition.ABSENT,
+        )
+        self.assertEqual(result.activation, CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+        self.assertEqual(reads, ["called"])
+        with self.assertRaises(TypeError):
+            resolve_sha_carrier_role(callback_client, self.CENTRAL, "a" * 40, self.APP.slug)
+        with self.assertRaises(R02Error):
+            self.resolve(callback_client, "a" * 40, None)
+
+    def test_external_writer_emits_only_exact_201_pr_independent_tuple(self):
+        sha = "a" * 40
+        repo = RepositoryMetadata(22, self.CENTRAL_NODE_ID, self.CENTRAL, "main")
+        unclaimed = ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+        digest = external_status_evidence_digest(repo.id, repo.node_id, repo.full_name, sha)
+        description = render_status_description(StatusClass.EXTERNAL, digest)
+        route = f"/repos/{self.CENTRAL}/statuses/{sha}"
+
+        def payload(status_id=1, *, creator=None):
+            return {
+                "id": status_id,
+                "node_id": f"STATUS_{status_id}",
+                "state": "success",
+                "context": "federation/trusted-validation",
+                "description": description,
+                "target_url": None,
+                "creator": creator or {
+                    "id": self.APP.bot_id,
+                    "node_id": self.APP.bot_node_id,
+                    "login": self.APP.bot_login,
+                    "type": "Bot",
+                },
+                "created_at": "2026-10-05T12:00:00Z",
+                "updated_at": "2026-10-05T12:00:01Z",
+            }
+
+        class StatusTransport:
+            def __init__(inner_self, codes=(201,), values=None):
+                inner_self.codes = list(codes)
+                inner_self.values = list(values or [payload(index + 1) for index in range(len(codes))])
+                inner_self.calls = []
+
+            def request(inner_self, method, url, headers, body, timeout):
+                inner_self.calls.append((method, url, body))
+                code = inner_self.codes.pop(0)
+                value = inner_self.values.pop(0)
+                return HttpResponse(code, url, json.dumps(value).encode("utf-8"))
+
+        transport = StatusTransport(codes=(201, 201), values=(payload(1), payload(2)))
+        client = GitHubClient(None, transport)
+        first = publish_unclaimed_external_success(client, repo, sha, unclaimed, self.APP)
+        second = publish_unclaimed_external_success(client, repo, sha, unclaimed, self.APP)
+        self.assertEqual(first.requested_description, description)
+        self.assertEqual(first.requested_target_url, None)
+        self.assertEqual(first.returned_status.creator_type, "Bot")
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual([call[0:2] for call in transport.calls], [
+            ("POST", REST_BASE_URL + route), ("POST", REST_BASE_URL + route),
+        ])
+        self.assertEqual(json.loads(transport.calls[0][2]), json.loads(transport.calls[1][2]))
+        self.assertEqual(first.requested_context, second.requested_context)
+        self.assertEqual(first.requested_description, second.requested_description)
+        self.assertTrue(all(set(json.loads(call[2])) == {"state", "context", "description", "target_url"} for call in transport.calls))
+
+        for activation in (
+            CarrierActivation.ACTIVE,
+            CarrierActivation.RESERVED_INACTIVE,
+            CarrierActivation.LEGACY_CUTOVER_QUARANTINE,
+            CarrierActivation.CONFLICTING,
+        ):
+            resolution = ShaCarrierResolution(
+                activation,
+                CarrierRole.ISSUE_ACTIVE if activation in {CarrierActivation.ACTIVE, CarrierActivation.RESERVED_INACTIVE} else None,
+            )
+            with self.subTest(activation=activation), self.assertRaises(R02Error):
+                publish_unclaimed_external_success(client, repo, sha, resolution, self.APP)
+
+    def test_external_writer_rejects_creator_receipt_mismatch_and_non_201_without_reads(self):
+        sha = "a" * 40
+        repo = RepositoryMetadata(22, self.CENTRAL_NODE_ID, self.CENTRAL, "main")
+        resolution = ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+        description = render_status_description(
+            StatusClass.EXTERNAL,
+            external_status_evidence_digest(repo.id, repo.node_id, repo.full_name, sha),
+        )
+        route = f"/repos/{self.CENTRAL}/statuses/{sha}"
+        payload = {
+            "id": 1, "node_id": "S_1", "state": "success",
+            "context": "federation/trusted-validation", "description": description,
+            "target_url": None,
+            "creator": {"id": 99, "node_id": "other", "login": "other[bot]", "type": "Bot"},
+            "created_at": "2026-10-05T12:00:00Z", "updated_at": "2026-10-05T12:00:01Z",
+        }
+
+        class OneResponse:
+            def __init__(inner_self, response):
+                inner_self.response = response
+                inner_self.calls = []
+
+            def request(inner_self, method, url, headers, body, timeout):
+                inner_self.calls.append((method, url, body))
+                return HttpResponse(inner_self.response, url, json.dumps(payload).encode())
+
+        for code in (200, 202, 204):
+            transport = OneResponse(code)
+            with self.subTest(status=code), self.assertRaises(UnexpectedStatusError):
+                publish_unclaimed_external_success(GitHubClient(None, transport), repo, sha, resolution, self.APP)
+            self.assertEqual(len(transport.calls), 1)
+            self.assertEqual(transport.calls[0][0], "POST")
+
+        rejected = OneResponse(422)
+        with self.assertRaises(UnprocessableError):
+            publish_unclaimed_external_success(GitHubClient(None, rejected), repo, sha, resolution, self.APP)
+        self.assertEqual(len(rejected.calls), 1)
+
+        transport = OneResponse(201)
+        with self.assertRaises(R02Error):
+            publish_unclaimed_external_success(GitHubClient(None, transport), repo, sha, resolution, self.APP)
+        self.assertEqual(len(transport.calls), 1)
+
+        valid_status = CommitStatus(
+            1, "S_1", "success", "federation/trusted-validation", description, None,
+            self.APP.bot_id, self.APP.bot_node_id, self.APP.bot_login, "Bot",
+            "2026-10-05T12:00:00Z", "2026-10-05T12:00:01Z",
+        )
+        wrong_repo_receipt = StatusWriteReceipt(
+            "other/repository", sha, "POST", f"/repos/other/repository/statuses/{sha}",
+            "success", "federation/trusted-validation", description, None, valid_status,
+        )
+        wrong_sha = "b" * 40
+        wrong_sha_receipt = StatusWriteReceipt(
+            self.CENTRAL, wrong_sha, "POST", f"/repos/{self.CENTRAL}/statuses/{wrong_sha}",
+            "success", "federation/trusted-validation", description, None, valid_status,
+        )
+
+        class WrongReceiptClient:
+            def __init__(inner_self, receipt):
+                inner_self.receipt = receipt
+                inner_self.calls = []
+
+            def create_commit_status(inner_self, *args):
+                inner_self.calls.append(args)
+                return inner_self.receipt
+
+        for wrong_receipt in (wrong_repo_receipt, wrong_sha_receipt):
+            fake = WrongReceiptClient(wrong_receipt)
+            with self.subTest(receipt=wrong_receipt), self.assertRaises(R02Error):
+                publish_unclaimed_external_success(fake, repo, sha, resolution, self.APP)
+            self.assertEqual(len(fake.calls), 1)
+
+        class FailedTransport:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            def request(inner_self, method, url, headers, body, timeout):
+                inner_self.calls.append((method, url, body))
+                raise TransportError("ambiguous write")
+
+        failed = FailedTransport()
+        with self.assertRaises(TransportError):
+            publish_unclaimed_external_success(GitHubClient(None, failed), repo, sha, resolution, self.APP)
+        self.assertEqual(len(failed.calls), 1)
+        self.assertEqual(failed.calls[0][0], "POST")
+
+    def test_wave05_resolver_and_external_writer_are_not_runtime_activated(self):
+        source = Path(controller_module.__file__).read_text(encoding="utf-8")
+        module_ast = ast.parse(source)
+        main = next(node for node in module_ast.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        main_names = {node.id for node in ast.walk(main) if isinstance(node, ast.Name)}
+        self.assertNotIn("resolve_sha_carrier_role", main_names)
+        self.assertNotIn("publish_unclaimed_external_success", main_names)
+        self.assertIn("def upsert_trusted_validation_check(", source)
+        self.assertIn("allow_create=True, allow_green=False", source)
+        self.assertIn("allow_create=True, allow_green=True", source)
 
 
 if __name__ == "__main__":
