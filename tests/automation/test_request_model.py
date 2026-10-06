@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts import federate as c02
+from automation.federation import request_model as rm
 from automation.federation.request_model import (
     ANCHOR_MARKER,
     ISSUE_REQUEST_ANCHOR_MARKER,
@@ -2254,6 +2255,244 @@ class Wave06EpochModelTests(unittest.TestCase):
             ):
                 with self.subTest(parser=parse.__name__, invalid=invalid[:80]), self.assertRaises(RequestModelError):
                     parse(invalid)
+
+
+class Wave07CancellationModelTests(unittest.TestCase):
+    @staticmethod
+    def status_snapshot(*, queried_sha="3" * 40, status_class=StatusClass.ISSUE_FINAL, state="success", digest="a" * 64):
+        return rm.ExactAppRequiredStatusSnapshot.present_status(
+            queried_sha=queried_sha,
+            status_id=901,
+            status_node_id="SC_kwDOStatus",
+            creator_database_id=4834068,
+            creator_node_id="MDM6QXBwNDgzNDA2OA",
+            creator_login="swiftstream-federation[bot]",
+            creator_type="Bot",
+            context="federation/trusted-validation",
+            state=state,
+            description=render_status_description(status_class, digest),
+            target_url=None,
+            created_at="2026-10-05T10:11:12Z",
+            updated_at="2026-10-05T10:11:12.123Z",
+        )
+
+    @classmethod
+    def fence_fields(cls, **changes):
+        fields = dict(
+            issue_number=7,
+            issue_database_id=700,
+            issue_node_id="I_kwDOIssue",
+            issue_request_anchor_comment_database_id=101,
+            issue_request_anchor_sha256="a" * 64,
+            issue_branch_lease_comment_database_id=102,
+            issue_branch_lease_sha256="b" * 64,
+            binding_authority="c" * 64,
+            source_id="owner-repo",
+            source_repository_id=41,
+            branch_ref=issue_branch_ref(7),
+            pull_request_number=8,
+            pull_request_database_id=800,
+            pull_request_node_id="PR_kwDOPull",
+            central_repository_node_id="R_central",
+            base_repository_node_id="R_central",
+            base_ref="main",
+            original_head_sha="3" * 40,
+            original_head_tree_sha="4" * 40,
+            original_head_claim_kind="ISSUE_HEAD_CLAIM",
+            original_head_claim_role="ISSUE_ACTIVE",
+            original_head_artifact_comment_database_id=201,
+            original_head_artifact_id="5" * 64,
+            original_head_artifact_sha256="6" * 64,
+            cancellation_carrier_nonce="7" * 64,
+            cancellation_head_sha="8" * 40,
+            cancellation_head_tree_sha="4" * 40,
+            pre_fence_required_status=rm.ExactAppRequiredStatusSnapshot.absent("3" * 40),
+            pre_fence_success_may_exist=False,
+        )
+        fields.update(changes)
+        return fields
+
+    @classmethod
+    def fence(cls, **changes):
+        return rm.IssueCancellationFence.create(**cls.fence_fields(**changes))
+
+    @staticmethod
+    def stage(operation, **changes):
+        fields = dict(
+            operation=operation,
+            client_mutation_id="g8-w07:stage:abc123",
+            pull_request_node_id="PR_kwDOPull",
+            pull_request_database_id=800,
+            pull_request_number=8,
+            state="OPEN",
+            is_draft=False,
+            merged=False,
+            merged_at=None,
+            head_ref_oid="8" * 40,
+            base_ref_oid="9" * 40,
+            head_ref_name="bot/federation/request/issue-7",
+            base_ref_name="main",
+            head_repository_node_id="R_central",
+            base_repository_node_id="R_central",
+        )
+        fields.update(changes)
+        return rm.ExactPullRequestStageMutationEvidence(**fields)
+
+    def test_status_snapshot_absent_and_present_are_explicit_canonical_values(self):
+        absent = rm.ExactAppRequiredStatusSnapshot.absent("3" * 40)
+        self.assertEqual(absent.disposition, "ABSENT")
+        self.assertEqual(rm.parse_exact_app_required_status_snapshot(absent.render()), absent)
+        self.assertTrue(all(value is None for key, value in absent.as_value().items() if key not in ("disposition", "queriedSha")))
+        present = self.status_snapshot()
+        self.assertEqual(present.status_class, StatusClass.ISSUE_FINAL)
+        self.assertEqual(rm.parse_exact_app_required_status_snapshot(present.render()), present)
+        value = present.as_value()
+        value["parsedStatusClass"] = StatusClass.EXTERNAL.value
+        with self.assertRaises(RequestModelError):
+            rm.ExactAppRequiredStatusSnapshot.from_value(value)
+        for change in ({"creator_type": "User"}, {"queried_sha": "A" * 40}, {"state": "neutral"}):
+            fields = dict(
+                queried_sha="3" * 40, status_id=901, status_node_id="SC_kwDOStatus",
+                creator_database_id=4834068, creator_node_id="MDM6QXBwNDgzNDA2OA",
+                creator_login="swiftstream-federation[bot]", creator_type="Bot",
+                context="federation/trusted-validation", state="success",
+                description=render_status_description(StatusClass.ISSUE_FINAL, "a" * 64),
+                target_url=None, created_at="2026-10-05T10:11:12Z", updated_at="2026-10-05T10:11:12Z",
+            )
+            fields.update(change)
+            with self.subTest(change=change), self.assertRaises(RequestModelError):
+                rm.ExactAppRequiredStatusSnapshot.present_status(**fields)
+
+    def test_stage_mutation_evidence_is_exact_transport_independent_data(self):
+        evidence = self.stage(rm.PullRequestStageMutationOperation.CONVERT_TO_DRAFT, is_draft=True)
+        self.assertEqual(rm.ExactPullRequestStageMutationEvidence.from_value(evidence.as_value()), evidence)
+        for change in ({"state": "MERGED"}, {"head_ref_oid": "A" * 40}, {"pull_request_database_id": 0}, {"merged_at": "2026-10-05T10:11:12Z"}):
+            values = evidence.as_value()
+            key = {
+                "state": "state", "head_ref_oid": "headRefOid", "pull_request_database_id": "pullRequestDatabaseId", "merged_at": "mergedAt",
+            }[next(iter(change))]
+            values[key] = next(iter(change.values()))
+            with self.subTest(change=change), self.assertRaises(RequestModelError):
+                rm.ExactPullRequestStageMutationEvidence.from_value(values)
+        self.assertEqual(set(rm.PullRequestStageMutationOperation), {
+            rm.PullRequestStageMutationOperation.REOPEN, rm.PullRequestStageMutationOperation.READY_FOR_REVIEW,
+            rm.PullRequestStageMutationOperation.CONVERT_TO_DRAFT, rm.PullRequestStageMutationOperation.CLOSE,
+        })
+
+    def test_fence_binding_authority_claim_marker_and_target_independence(self):
+        for authority in ("PRE_BINDING", "c" * 64):
+            fields = self.fence_fields(binding_authority=authority)
+            if authority == "PRE_BINDING":
+                fields.update(original_head_claim_kind="ISSUE_BRANCH_LEASE", original_head_claim_role="ISSUE_ACTIVE")
+            fence = rm.IssueCancellationFence.create(**fields)
+            self.assertEqual(rm.parse_issue_cancellation_fence(fence.render()), fence)
+            marker = ClaimedHeadMarker(
+                "ISSUE_CANCELLATION_FENCE", "ISSUE_CANCEL", "ISSUE",
+                issue_owner_key("R_central", 700, "I_kwDOIssue", 7), fence.claim_generation_id,
+                fence.cancellation_carrier_nonce, "TERMINAL_CANCELLATION",
+            ).render()
+            self.assertIn("generation=" + fence.claim_generation_id, marker)
+            self.assertNotIn(fence.fence_id, marker)
+            self.assertNotIn(fence.cancellation_head_sha, marker)
+            self.assertEqual(fence.cancellation_head_tree_sha, fence.original_head_tree_sha)
+        with self.assertRaises(RequestModelError):
+            self.fence(original_head_claim_kind="UNKNOWN")
+        with self.assertRaises(RequestModelError):
+            self.fence(original_head_claim_role="ISSUE_FINALIZING", pre_fence_success_may_exist=False)
+        visible_success = self.status_snapshot()
+        with self.assertRaises(RequestModelError):
+            self.fence(pre_fence_required_status=visible_success, pre_fence_success_may_exist=False)
+        self.assertNotEqual(self.fence().fence_id, self.fence(cancellation_head_sha="a" * 40).fence_id)
+        self.assertNotEqual(
+            self.fence().fence_id,
+            self.fence(pre_fence_required_status=self.status_snapshot(), pre_fence_success_may_exist=True).fence_id,
+        )
+
+    def test_cancel_digest_binds_exact_identity_and_description_length(self):
+        fence = self.fence()
+        args = dict(
+            central_repository_node_id="R_central", issue_number=7, issue_database_id=700,
+            issue_node_id="I_kwDOIssue", fence_id=fence.fence_id, cancellation_head_sha="8" * 40,
+            binding_authority=fence.binding_authority, pull_request_number=8,
+            pull_request_database_id=800, pull_request_node_id="PR_kwDOPull",
+        )
+        digest = rm.cancel_status_evidence_digest(**args)
+        self.assertEqual(len(render_status_description(StatusClass.CANCEL, digest).encode("ascii")), 81)
+        for key, replacement in (("central_repository_node_id", "R_other"), ("fence_id", "d" * 64), ("cancellation_head_sha", "e" * 40), ("pull_request_database_id", 801), ("pull_request_node_id", "PR_other")):
+            self.assertNotEqual(rm.cancel_status_evidence_digest(**{**args, key: replacement}), digest)
+
+    def test_draft_witness_and_terminal_result_require_same_response_evidence(self):
+        fence = self.fence()
+        digest = rm.cancel_status_evidence_digest(
+            central_repository_node_id="R_central", issue_number=7, issue_database_id=700, issue_node_id="I_kwDOIssue",
+            fence_id=fence.fence_id, cancellation_head_sha="8" * 40, binding_authority=fence.binding_authority,
+            pull_request_number=8, pull_request_database_id=800, pull_request_node_id="PR_kwDOPull",
+        )
+        current = self.status_snapshot(queried_sha="8" * 40, status_class=StatusClass.CANCEL, state="failure", digest=digest)
+        draft = self.stage(rm.PullRequestStageMutationOperation.CONVERT_TO_DRAFT, is_draft=True)
+        witness_fields = dict(
+            issue_number=7, issue_database_id=700, issue_node_id="I_kwDOIssue",
+            issue_request_anchor_comment_database_id=101, issue_request_anchor_sha256="a" * 64,
+            issue_branch_lease_comment_database_id=102, issue_branch_lease_sha256="b" * 64,
+            fence_comment_database_id=103, fence_sha256="c" * 64, fence_id=fence.fence_id,
+            binding_authority=fence.binding_authority, source_id="owner-repo", source_repository_id=41,
+            branch_ref=issue_branch_ref(7), pull_request_number=8, pull_request_database_id=800,
+            pull_request_node_id="PR_kwDOPull", original_head_sha="3" * 40, cancellation_head_sha="8" * 40,
+            anchored_accepted_base_sha="1" * 40, base_repository_node_id="R_central", base_ref="main",
+            returned_base_ref_oid="9" * 40, head_repository_node_id="R_central", reopen_evidence=None,
+            ready_evidence=None, draft_evidence=draft, current_required_status=current,
+        )
+        witness = rm.IssueCancellationDraftWitness.create(**witness_fields)
+        self.assertEqual(rm.parse_issue_cancellation_draft_witness(witness.render()), witness)
+        with self.assertRaises(RequestModelError):
+            rm.IssueCancellationDraftWitness.create(**{**witness_fields, "draft_evidence": self.stage(rm.PullRequestStageMutationOperation.READY_FOR_REVIEW)})
+        close = self.stage(rm.PullRequestStageMutationOperation.CLOSE, state="CLOSED", is_draft=True)
+        terminal = rm.IssueTerminalCancelledResult.create(
+            issue_number=7, issue_database_id=700, issue_node_id="I_kwDOIssue",
+            issue_request_anchor_comment_database_id=101, issue_request_anchor_sha256="a" * 64,
+            issue_branch_lease_comment_database_id=102, issue_branch_lease_sha256="b" * 64,
+            binding_authority=fence.binding_authority, source_id="owner-repo", source_repository_id=41,
+            branch_ref=issue_branch_ref(7), pull_request_number=8, pull_request_database_id=800,
+            pull_request_node_id="PR_kwDOPull", original_head_sha="3" * 40, cancellation_head_sha="8" * 40,
+            base_repository_node_id="R_central", base_ref="main", fence_comment_database_id=103,
+            fence_sha256="c" * 64, fence_id=fence.fence_id, draft_witness_comment_database_id=104,
+            draft_witness_sha256="d" * 64, witness_id=witness.witness_id, current_failure_status=current,
+            close_evidence=close,
+            proof_kind=rm.IssueTerminalCancelledProofKind.PR_BACKED_FULL_BINDING,
+        )
+        self.assertEqual(rm.parse_issue_terminal_cancelled_result(terminal.render()), terminal)
+        tampered = json.loads(terminal.render().splitlines()[1])
+        tampered["closeEvidence"]["state"] = "OPEN"
+        bad_text = rm.ISSUE_TERMINAL_CANCELLED_RESULT_MARKER + "\n" + json.dumps(tampered, sort_keys=True, separators=(",", ":")) + "\n"
+        with self.assertRaises(RequestModelError):
+            rm.parse_issue_terminal_cancelled_result(bad_text)
+
+    def test_no_pr_terminal_result_conditional_schemas_round_trip(self):
+        common = dict(
+            issue_number=7, issue_database_id=700, issue_node_id="I_kwDOIssue",
+            issue_request_anchor_comment_database_id=101, issue_request_anchor_sha256="a" * 64,
+            source_id="owner-repo", source_repository_id=41,
+        )
+        anchor = rm.IssueNoPRCancelledResult.create(**common, proof_kind=rm.IssueNoPRCancelledProofKind.ANCHOR_ONLY)
+        lease = dict(
+            lease_comment_database_id=102, lease_sha256="b" * 64, lease_id="c" * 64,
+            branch_ref=issue_branch_ref(7), lease_initial_head_sha="3" * 40,
+            all_state_pr_enumeration_digest="d" * 64,
+        )
+        absent = rm.IssueNoPRCancelledResult.create(**common, **lease, proof_kind=rm.IssueNoPRCancelledProofKind.LEASE_REF_ABSENT)
+        zero = rm.IssueNoPRCancelledResult.create(
+            **common, **lease, proof_kind=rm.IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS,
+            required_status=rm.ExactAppRequiredStatusSnapshot.absent("3" * 40),
+            legacy_carrier_evidence_digest="e" * 64, cleanup_before_oid="3" * 40, cleanup_ref_absent_after=True,
+        )
+        for result in (anchor, absent, zero):
+            self.assertEqual(rm.parse_issue_no_pr_cancelled_result(result.render()), result)
+        self.assertNotIn("leaseId", anchor.as_value())
+        value = anchor.as_value()
+        value["leaseId"] = "c" * 64
+        text = rm.ISSUE_NO_PR_CANCELLED_RESULT_MARKER + "\n" + json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        with self.assertRaises(RequestModelError):
+            rm.parse_issue_no_pr_cancelled_result(text)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from .github_api import (
     MergeResult,
     NotFoundError,
     PullRequestMetadata,
+    PullRequestStageMutationReceipt,
     RefCASConflict,
     RefUpdate,
     RepositoryMetadata,
@@ -45,6 +46,10 @@ from .request_model import (
     ISSUE_HEAD_CLAIM_MARKER,
     REQUIRED_STATUS_EPOCH_MARKER,
     ISSUE_FINALIZATION_EPOCH_MARKER,
+    ISSUE_CANCELLATION_FENCE_MARKER,
+    ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+    ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
+    ISSUE_NO_PR_CANCELLED_RESULT_MARKER,
     ISSUE_INTERNAL_PR_BINDING_MARKER,
     PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
@@ -59,6 +64,15 @@ from .request_model import (
     RequiredStatusEpoch,
     RequiredStatusEpochReason,
     IssueFinalizationEpoch,
+    IssueCancellationFence,
+    IssueCancellationDraftWitness,
+    IssueTerminalCancelledResult,
+    IssueTerminalCancelledProofKind,
+    IssueNoPRCancelledResult,
+    IssueNoPRCancelledProofKind,
+    ExactPullRequestStageMutationEvidence,
+    PullRequestStageMutationOperation,
+    ExactAppRequiredStatusSnapshot,
     ExactAppRequiredStatusEvidence,
     IssuePatchProjection,
     ClaimedHeadMarker,
@@ -88,6 +102,7 @@ from .request_model import (
     issue_owner_key,
     parse_issue_owner_key,
     external_status_evidence_digest,
+    cancel_status_evidence_digest,
     claim_generation_id,
     new_carrier_nonce,
     parse_anchor,
@@ -98,6 +113,10 @@ from .request_model import (
     parse_issue_head_claim,
     parse_required_status_epoch,
     parse_issue_finalization_epoch,
+    parse_issue_cancellation_fence,
+    parse_issue_cancellation_draft_witness,
+    parse_issue_terminal_cancelled_result,
+    parse_issue_no_pr_cancelled_result,
     parse_issue_patch_projection,
     parse_claimed_head_marker,
     render_status_description,
@@ -513,6 +532,199 @@ def _conflicting_sha_carrier(marker: ClaimedHeadMarker | None = None) -> ShaCarr
     return ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=marker)
 
 
+def _issue_pr_binding_matches_cancellation_identity(
+    binding: IssuePRBinding,
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment,
+    pr_number: int,
+    pr_issue: IssueMetadata,
+    central_repository_node_id: str,
+) -> bool:
+    actual = (
+        binding.issue_number,
+        binding.issue_database_id,
+        binding.issue_node_id,
+        binding.issue_request_anchor_comment_database_id,
+        binding.issue_request_anchor_sha256,
+        binding.issue_branch_lease_comment_database_id,
+        binding.issue_branch_lease_sha256,
+        binding.source_id,
+        binding.source_repository_id,
+        binding.branch_ref,
+        binding.pull_request_number,
+        binding.pull_request_database_id,
+        binding.pull_request_node_id,
+        binding.initial_head_sha,
+        binding.base_ref,
+        binding.central_repository_node_id,
+    )
+    expected = (
+        anchor.anchor.issue_number,
+        anchor.anchor.issue_database_id,
+        anchor.anchor.issue_node_id,
+        anchor.comment.database_id,
+        anchor.anchor.canonical_sha256(),
+        lease.comment.database_id,
+        _binding_comment_sha256(lease.comment),
+        anchor.anchor.source_id,
+        anchor.anchor.source_repository_id,
+        lease.lease.branch_ref,
+        pr_number,
+        pr_issue.database_id,
+        pr_issue.node_id,
+        lease.lease.initial_head_sha,
+        "main",
+        central_repository_node_id,
+    )
+    return actual == expected
+
+
+def _fresh_issue_cancellation_authority(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    *,
+    require_prebinding_lease_root: bool = False,
+    allow_pr_stage_state: bool = False,
+) -> _IssueCancellationAuthority:
+    cancellation_allows_closed_lifecycle = False
+    central = client.get_repository_metadata(repository)
+    if (
+        type(central) is not RepositoryMetadata
+        or central.full_name != repository
+        or central.default_branch != "main"
+        or not central.node_id
+    ):
+        raise R02Error("cancellation requires exact central repository identity and main default branch")
+    intake = _read_issue_pr_intake(
+        client, repository, issue_number, app, central.node_id,
+        lambda _request, _request_class: None,
+        validate_fresh_source_authority=False,
+        require_open_lifecycle=cancellation_allows_closed_lifecycle,
+    )
+    owning_issue, _issue_comments, anchor, lease, _repo, issue_bindings = intake
+    short_ref = lease.lease.branch_ref.removeprefix("refs/heads/")
+    candidates = _enumerate_issue_pr_candidates(
+        client, repository, short_ref, app, anchor, lease, central.node_id,
+    )
+    if len(candidates) != 1:
+        raise R02Error("cancellation requires exactly one central App-created reserved-head PR")
+    candidate = candidates[0]
+    pr = candidate.pr
+    try:
+        pr_issue = client.get_issue_metadata(repository, pr.number)
+        all_prs = tuple(client.list_pull_requests(repository, state="all"))
+    except Exception as error:
+        raise StaleAuthorityError(f"cancellation PR-as-Issue authority is unavailable: {_bounded_reason(error)}") from None
+    raw_matches = [item for item in all_prs if type(item) is dict and item.get("number") == pr.number]
+    if len(raw_matches) != 1:
+        raise R02Error("cancellation PR enumeration did not uniquely identify the exact PR")
+    raw = raw_matches[0]
+    raw_state = raw.get("state")
+    raw_merged = raw.get("merged")
+    if type(raw_merged) is not bool and "merged_at" in raw:
+        merged_at = raw.get("merged_at")
+        if merged_at is None:
+            raw_merged = False
+        elif type(merged_at) is str and merged_at:
+            raw_merged = True
+        else:
+            raw_merged = None
+    if type(raw_state) is not str or raw_state not in {"open", "closed"} or type(raw_merged) is not bool:
+        raise R02Error("cancellation PR enumeration omitted exact state/merged evidence")
+    expected_body = render_request_body(anchor.anchor.initial_request)
+    if (
+        type(pr) is not PullRequestMetadata
+        or pr.number != candidate.pr.number
+        or pr.author_id != app.bot_node_id
+        or pr.author_login != app.bot_login
+        or pr.head_ref != short_ref
+        or pr.head_repository_id != central.node_id
+        or pr.head_repository != repository
+        or pr.base_repository_id != central.node_id
+        or pr.base_repository != repository
+        or pr.base_ref != "main"
+        or type(pr.draft) is not bool
+        or (not allow_pr_stage_state and pr.draft is not False)
+        or pr.body != expected_body
+        or pr.last_edited_at is not None
+        or pr.includes_created_edit is not False
+        or type(pr_issue) is not IssueMetadata
+        or pr_issue.is_pull_request is not True
+        or pr_issue.number != pr.number
+        or type(pr_issue.database_id) is not int
+        or pr_issue.database_id <= 0
+        or type(pr_issue.node_id) is not str
+        or not pr_issue.node_id
+        or pr_issue.author_id != app.bot_node_id
+        or pr_issue.author_login != app.bot_login
+        or pr_issue.body != pr.body
+        or pr_issue.state != raw_state
+    ):
+        raise R02Error("cancellation PR is not the exact immutable central PR-as-Issue")
+    pr_comments = tuple(client.list_issue_comments(repository, pr.number))
+    _issue_pr_authority_fence(pr_comments, app, allow_cancellation_fence=True)
+    pr_bindings = _binding_comment_candidates(
+        pr_comments, app, PR_ISSUE_ORIGIN_BINDING_MARKER,
+        parse_pr_issue_origin_binding, "PRIssueOriginBinding",
+    )
+    issue_binding = issue_bindings[0] if issue_bindings else None
+    pr_binding = pr_bindings[0] if pr_bindings else None
+    for item in (issue_binding, pr_binding):
+        if item is not None and not _issue_pr_binding_matches_cancellation_identity(
+            item.binding, anchor, lease, pr.number, pr_issue, central.node_id,
+        ):
+            raise R02Error("partial IssuePRBinding does not match the exact PR-as-Issue identity triple")
+    if issue_binding is not None and pr_binding is not None:
+        if issue_binding.binding != pr_binding.binding:
+            raise R02Error("two-sided IssuePRBinding disagrees across Issue and PR comments")
+        binding_state = _read_managed_issue_pr_binding_state(
+            client, repository, issue_number, app, central.node_id,
+            lambda _request, _request_class: None,
+            validate_fresh_source_authority=False,
+            require_open_lifecycle=cancellation_allows_closed_lifecycle,
+            allow_cancellation_fence=True,
+            allow_pr_stage_state=allow_pr_stage_state,
+        )
+        binding = binding_state.binding
+        if (
+            binding != issue_binding.binding
+            or binding.pull_request_node_id != pr_issue.node_id
+            or binding.pull_request_database_id != pr_issue.database_id
+            or binding.pull_request_number != pr_issue.number
+        ):
+            raise R02Error("complete IssuePRBinding does not match central PR-as-Issue identity")
+        binding_authority = "FULL_BINDING"
+    else:
+        binding = None
+        binding_state = None
+        binding_authority = "PRE_BINDING"
+    authority = _IssueCancellationAuthority(
+        issue_anchor=anchor,
+        lease=lease,
+        binding_authority=binding_authority,
+        pull_request_number=pr.number,
+        pull_request_database_id=pr_issue.database_id,
+        pull_request_node_id=pr_issue.node_id,
+        central_repository_node_id=central.node_id,
+        base_repository_node_id=central.node_id,
+        pr=pr,
+        pr_issue=pr_issue,
+        owning_issue=owning_issue,
+        pr_comments=pr_comments,
+        binding=binding,
+        binding_state=binding_state,
+        raw_pr_state=raw_state.upper(),
+        raw_pr_merged=raw_merged,
+    )
+    if authority.binding_authority == "PRE_BINDING" and require_prebinding_lease_root:
+        current_ref = _read_issue_branch_ref(client, repository, short_ref)
+        if current_ref != lease.lease.initial_head_sha or pr.head_oid != lease.lease.initial_head_sha:
+            raise R02Error("PRE_BINDING cancellation requires the exact lease-root PR/ref before fence activation")
+    return authority
+
+
 def resolve_sha_carrier_role(
     client: GitHubClient,
     repository: str,
@@ -563,6 +775,7 @@ def resolve_sha_carrier_role(
         "ISSUE_HEAD_CLAIM": CarrierRole.ISSUE_ACTIVE.value,
         "REQUIRED_STATUS_EPOCH": CarrierRole.ISSUE_ACTIVE.value,
         "ISSUE_FINALIZATION_EPOCH": CarrierRole.ISSUE_FINALIZING.value,
+        "ISSUE_CANCELLATION_FENCE": CarrierRole.ISSUE_CANCEL.value,
     }
     if (
         marker.owner_kind != "ISSUE"
@@ -614,6 +827,11 @@ def resolve_sha_carrier_role(
             )
             activation = CarrierActivation.ACTIVE if current_ref == head_sha else CarrierActivation.RESERVED_INACTIVE
             return ShaCarrierResolution(activation, CarrierRole.ISSUE_ACTIVE, marker)
+
+        if marker.claim_kind == "ISSUE_CANCELLATION_FENCE":
+            return _resolve_issue_cancellation_carrier(
+                client, repository, head_sha, app, marker,
+            )
 
         state = _read_managed_issue_pr_binding_state(
             client,
@@ -667,6 +885,92 @@ def resolve_sha_carrier_role(
         activation = CarrierActivation.ACTIVE if active else CarrierActivation.RESERVED_INACTIVE
         result_role = CarrierRole(supported_roles[marker.claim_kind])
         return ShaCarrierResolution(activation, result_role, marker)
+    except Exception:
+        return _conflicting_sha_carrier(marker)
+
+
+def _resolve_issue_cancellation_carrier(
+    client: GitHubClient,
+    repository: str,
+    head_sha: str,
+    app: AppIdentity,
+    marker: ClaimedHeadMarker,
+) -> ShaCarrierResolution:
+    try:
+        owner_central_node_id, _issue_database_id, _issue_node_id, issue_number = parse_issue_owner_key(marker.owner_key)
+        authority = _fresh_issue_cancellation_authority(
+            client, repository, issue_number, app, allow_pr_stage_state=True,
+        )
+        if authority.central_repository_node_id != owner_central_node_id:
+            return _conflicting_sha_carrier(marker)
+        if authority.binding_authority == "PRE_BINDING" and (
+            authority.pr.head_oid != authority.lease.lease.initial_head_sha
+            and authority.pr.head_oid != head_sha
+        ):
+            return _conflicting_sha_carrier(marker)
+        current_ref = _read_issue_branch_ref(
+            client, repository, authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        fences = _issue_cancellation_fence_comments(
+            client, repository, authority.pr_comments, app, authority, current_ref or ZERO_OID,
+        )
+        if len(fences) != 1 or fences[0].fence.cancellation_head_sha != head_sha:
+            return _conflicting_sha_carrier(marker)
+        fence_item = fences[0]
+        if _issue_cancellation_fence_marker(fence_item.fence) != marker:
+            return _conflicting_sha_carrier(marker)
+        if authority.binding_authority == "FULL_BINDING":
+            assert authority.binding_state is not None
+            history = _issue_authority_history(
+                client, repository, authority.pr_comments, app,
+                authority.binding_state, current_ref or ZERO_OID,
+            )
+            exact_nodes = tuple(
+                node for node in history
+                if node.target_head_sha == head_sha
+                and node.claim_kind == "ISSUE_CANCELLATION_FENCE"
+                and node.artifact == fence_item.fence
+                and node.comment.database_id == fence_item.comment.database_id
+            )
+            if len(exact_nodes) != 1:
+                return _conflicting_sha_carrier(marker)
+        elif (
+            fence_item.fence.binding_authority != "PRE_BINDING"
+            or fence_item.fence.original_head_claim_kind != "ISSUE_BRANCH_LEASE"
+            or fence_item.fence.original_head_claim_role != CarrierRole.ISSUE_ACTIVE.value
+            or fence_item.fence.original_head_sha != authority.lease.lease.initial_head_sha
+        ):
+            return _conflicting_sha_carrier(marker)
+
+        # Re-read every identity input after provenance. The resolver never uses
+        # graph reachability alone as ACTIVE evidence.
+        final_authority = _fresh_issue_cancellation_authority(
+            client, repository, issue_number, app, allow_pr_stage_state=True,
+        )
+        if (
+            final_authority.binding_authority != authority.binding_authority
+            or final_authority.issue_anchor.anchor != authority.issue_anchor.anchor
+            or final_authority.issue_anchor.comment.database_id != authority.issue_anchor.comment.database_id
+            or final_authority.lease.lease != authority.lease.lease
+            or final_authority.lease.comment.database_id != authority.lease.comment.database_id
+            or final_authority.pull_request_number != authority.pull_request_number
+            or final_authority.pull_request_database_id != authority.pull_request_database_id
+            or final_authority.pull_request_node_id != authority.pull_request_node_id
+            or final_authority.binding != authority.binding
+        ):
+            return _conflicting_sha_carrier(marker)
+        final_ref = _read_issue_branch_ref(
+            client, repository, final_authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        active = (
+            final_ref == head_sha
+            and final_authority.pr.head_oid == head_sha
+            and final_authority.raw_pr_state in {"OPEN", "CLOSED"}
+            and final_authority.raw_pr_merged is False
+            and final_authority.pr_issue.state == final_authority.raw_pr_state.lower()
+        )
+        activation = CarrierActivation.ACTIVE if active else CarrierActivation.RESERVED_INACTIVE
+        return ShaCarrierResolution(activation, CarrierRole.ISSUE_CANCEL, marker)
     except Exception:
         return _conflicting_sha_carrier(marker)
 
@@ -779,6 +1083,183 @@ def _latest_exact_issue_final_status_evidence(
         )
     except RequestModelError:
         return None
+
+
+def _read_latest_exact_app_required_status_snapshot(
+    client: GitHubClient,
+    repository: str,
+    head_sha: str,
+    app: AppIdentity,
+) -> tuple[ExactAppRequiredStatusSnapshot, bool, bool, CommitStatus | None]:
+    try:
+        statuses = tuple(client.list_commit_statuses(repository, head_sha))
+    except Exception as error:
+        raise StaleAuthorityError(f"exact-App status snapshot is unavailable: {_bounded_reason(error)}") from None
+    matching = [
+        status for status in statuses
+        if type(status) is CommitStatus
+        and status.creator_database_id == app.bot_id
+        and status.creator_node_id == app.bot_node_id
+        and status.creator_login == app.bot_login
+        and status.creator_type == "Bot"
+        and status.context == "federation/trusted-validation"
+    ]
+    issue_final_success = False
+    exact_app_success = False
+    for status in matching:
+        if status.state != "success":
+            continue
+        exact_app_success = True
+        if status.description is None:
+            continue
+        try:
+            issue_final_success = issue_final_success or (
+                parse_status_description(status.description).status_class is StatusClass.ISSUE_FINAL
+            )
+        except RequestModelError:
+            continue
+    if not matching:
+        return ExactAppRequiredStatusSnapshot.absent(head_sha), issue_final_success, exact_app_success, None
+    latest = max(matching, key=lambda item: (item.updated_at, item.created_at, item.id))
+    if latest.description is None:
+        raise R02Error("latest exact-App required status has no canonical description")
+    try:
+        parsed = parse_status_description(latest.description)
+        snapshot = ExactAppRequiredStatusSnapshot.present_status(
+            queried_sha=head_sha,
+            status_id=latest.id,
+            status_node_id=latest.node_id,
+            creator_database_id=latest.creator_database_id,
+            creator_node_id=latest.creator_node_id,
+            creator_login=latest.creator_login,
+            creator_type=latest.creator_type,
+            context=latest.context,
+            state=latest.state,
+            description=latest.description,
+            target_url=latest.target_url,
+            created_at=latest.created_at,
+            updated_at=latest.updated_at,
+            parsed_status_class=parsed.status_class,
+            parsed_evidence_digest=parsed.evidence_digest,
+        )
+    except RequestModelError as error:
+        raise R02Error(f"latest exact-App required status is not snapshot-safe: {_bounded_reason(error)}") from None
+    return snapshot, issue_final_success, exact_app_success, latest
+
+
+def _latest_exact_cancel_status_evidence(
+    client: GitHubClient,
+    repository: str,
+    fence: IssueCancellationFence,
+    app: AppIdentity,
+) -> ExactAppRequiredStatusSnapshot | None:
+    snapshot, _issue_final_success, any_exact_app_success, latest = _read_latest_exact_app_required_status_snapshot(
+        client, repository, fence.cancellation_head_sha, app,
+    )
+    if any_exact_app_success:
+        raise StaleAuthorityError("any exact-App success on ISSUE_CANCEL blocks cancellation continuation")
+    if not snapshot.is_present:
+        return None
+    desired_digest = cancel_status_evidence_digest(
+        central_repository_node_id=fence.central_repository_node_id,
+        issue_number=fence.issue_number,
+        issue_database_id=fence.issue_database_id,
+        issue_node_id=fence.issue_node_id,
+        fence_id=fence.fence_id,
+        cancellation_head_sha=fence.cancellation_head_sha,
+        binding_authority=fence.binding_authority,
+        pull_request_number=fence.pull_request_number,
+        pull_request_database_id=fence.pull_request_database_id,
+        pull_request_node_id=fence.pull_request_node_id,
+    )
+    if snapshot.state == "success":
+        raise StaleAuthorityError("exact-App success on ISSUE_CANCEL blocks cancellation failure continuation")
+    if snapshot.status_class is StatusClass.CANCEL:
+        if (
+            snapshot.state != "failure"
+            or snapshot.evidence_digest != desired_digest
+            or snapshot.target_url is not None
+        ):
+            raise StaleAuthorityError("latest exact-App cancel status does not match this fence")
+        return snapshot
+    return None
+
+
+def _snapshot_required_status_row(
+    status: CommitStatus,
+    queried_sha: str,
+) -> ExactAppRequiredStatusSnapshot:
+    if type(status) is not CommitStatus or status.description is None:
+        raise R02Error("exact required status row is missing or malformed")
+    try:
+        parsed = parse_status_description(status.description)
+        return ExactAppRequiredStatusSnapshot.present_status(
+            queried_sha=queried_sha,
+            status_id=status.id,
+            status_node_id=status.node_id,
+            creator_database_id=status.creator_database_id,
+            creator_node_id=status.creator_node_id,
+            creator_login=status.creator_login,
+            creator_type=status.creator_type,
+            context=status.context,
+            state=status.state,
+            description=status.description,
+            target_url=status.target_url,
+            created_at=status.created_at,
+            updated_at=status.updated_at,
+            parsed_status_class=parsed.status_class,
+            parsed_evidence_digest=parsed.evidence_digest,
+        )
+    except RequestModelError as error:
+        raise R02Error(f"exact required status row cannot be snapshotted: {_bounded_reason(error)}") from None
+
+
+def _validate_issue_cancel_status_receipt(
+    receipt: StatusWriteReceipt,
+    repository: RepositoryMetadata,
+    fence: IssueCancellationFence,
+    app: AppIdentity,
+) -> CommitStatus:
+    digest = cancel_status_evidence_digest(
+        central_repository_node_id=repository.node_id,
+        issue_number=fence.issue_number,
+        issue_database_id=fence.issue_database_id,
+        issue_node_id=fence.issue_node_id,
+        fence_id=fence.fence_id,
+        cancellation_head_sha=fence.cancellation_head_sha,
+        binding_authority=fence.binding_authority,
+        pull_request_number=fence.pull_request_number,
+        pull_request_database_id=fence.pull_request_database_id,
+        pull_request_node_id=fence.pull_request_node_id,
+    )
+    description = render_status_description(StatusClass.CANCEL, digest)
+    if len(description.encode("ascii")) != 81:
+        raise R02Error("canonical cancellation status description must be exactly 81 ASCII bytes")
+    expected_route = f"/repos/{repository.full_name}/statuses/{fence.cancellation_head_sha}"
+    if type(receipt) is not StatusWriteReceipt or (
+        receipt.repository != repository.full_name
+        or receipt.requested_sha != fence.cancellation_head_sha
+        or receipt.method != "POST"
+        or receipt.route != expected_route
+        or receipt.requested_state != "failure"
+        or receipt.requested_context != "federation/trusted-validation"
+        or receipt.requested_description != description
+        or receipt.requested_target_url is not None
+    ):
+        raise R02Error("cancel status receipt does not match the exact requested tuple")
+    status = receipt.returned_status
+    if type(status) is not CommitStatus or (
+        status.state != "failure"
+        or status.context != "federation/trusted-validation"
+        or status.description != description
+        or status.target_url is not None
+        or status.creator_database_id != app.bot_id
+        or status.creator_node_id != app.bot_node_id
+        or status.creator_login != app.bot_login
+        or status.creator_type != "Bot"
+    ):
+        raise R02Error("cancel status response does not match the exact App Bot failure tuple")
+    return status
 
 
 def _validate_issue_final_status_receipt(
@@ -1193,6 +1674,107 @@ class IssueFinalizationEpochComment:
     epoch: IssueFinalizationEpoch
     comment: IssueComment
     active: bool
+
+
+@dataclass(frozen=True)
+class IssueCancellationFenceComment:
+    fence: IssueCancellationFence
+    comment: IssueComment
+    active: bool
+
+
+@dataclass(frozen=True)
+class IssueCancellationDraftWitnessComment:
+    witness: IssueCancellationDraftWitness
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
+class IssueTerminalCancelledResultComment:
+    result: IssueTerminalCancelledResult
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
+class IssueNoPRCancelledResultComment:
+    result: IssueNoPRCancelledResult
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
+class _IssueCancellationAuthority:
+    """Fresh central ownership inputs; binding stays absent for PRE_BINDING."""
+
+    issue_anchor: IssueAnchorComment
+    lease: IssueBranchLeaseComment
+    binding_authority: str
+    pull_request_number: int
+    pull_request_database_id: int
+    pull_request_node_id: str
+    central_repository_node_id: str
+    base_repository_node_id: str
+    pr: PullRequestMetadata
+    pr_issue: IssueMetadata
+    owning_issue: IssueMetadata
+    pr_comments: tuple[IssueComment, ...]
+    binding: IssuePRBinding | None
+    binding_state: IssuePRBindingState | None
+    raw_pr_state: str
+    raw_pr_merged: bool
+
+
+class IssueCancellationClass(Enum):
+    A_ANCHOR_ONLY = "A_ANCHOR_ONLY"
+    B_LEASE_REF_ABSENT = "B_LEASE_REF_ABSENT"
+    C_LEASE_ZERO_PR = "C_LEASE_ZERO_PR"
+    D_PRE_BINDING_ONE_PR = "D_PRE_BINDING_ONE_PR"
+    E_FULL_BINDING = "E_FULL_BINDING"
+    F_CONFLICTING = "F_CONFLICTING"
+
+
+@dataclass(frozen=True)
+class _IssueCancellationPRCandidate:
+    pr: PullRequestMetadata
+    pr_issue: IssueMetadata
+    comments: tuple[IssueComment, ...]
+    raw_state: str
+    raw_merged: bool
+    raw_merged_at: str | None
+    issue_binding: _IssuePRBindingComment | None
+    pr_binding: _IssuePRBindingComment | None
+
+
+@dataclass(frozen=True)
+class IssueCancellationState:
+    """Fresh central-only classification and immutable cancellation evidence."""
+
+    classification: IssueCancellationClass
+    repository: RepositoryMetadata
+    issue: IssueMetadata
+    issue_comments: tuple[IssueComment, ...]
+    issue_anchor: IssueAnchorComment
+    lease: IssueBranchLeaseComment | None
+    branch_ref_oid: str | None
+    all_state_pr_enumeration_digest: str
+    pr_candidates: tuple[_IssueCancellationPRCandidate, ...]
+    cancellation_authority: _IssueCancellationAuthority | None
+    fence_items: tuple[IssueCancellationFenceComment, ...]
+    witness_items: tuple[IssueCancellationDraftWitnessComment, ...]
+    terminal_result_items: tuple[IssueTerminalCancelledResultComment, ...]
+    no_pr_results: tuple[IssueNoPRCancelledResult, ...]
+    merge_observed: bool
+
+
+def _cancellation_binding_authority_id(authority: _IssueCancellationAuthority) -> str:
+    if authority.binding_authority == "PRE_BINDING":
+        if authority.binding is not None or authority.binding_state is not None:
+            raise R02Error("PRE_BINDING cancellation authority must not carry a fabricated IssuePRBinding")
+        return "PRE_BINDING"
+    if authority.binding_authority == "FULL_BINDING":
+        if authority.binding is None or authority.binding_state is None or authority.binding_state.binding != authority.binding:
+            raise R02Error("FULL_BINDING cancellation authority requires the exact persisted IssuePRBinding")
+        return authority.binding.binding_id
+    raise R02Error("IssueCancellationFence binding authority is unsupported")
 
 
 @dataclass(frozen=True)
@@ -1690,7 +2272,12 @@ def create_or_validate_issue_branch_lease(
         raise R02Error(f"IssueBranchLease creation failed closed: {_bounded_reason(error)}") from None
 
 
-def _issue_pr_authority_fence(comments: Iterable[IssueComment], app: AppIdentity) -> None:
+def _issue_pr_authority_fence(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    *,
+    allow_cancellation_fence: bool = False,
+) -> None:
     allowed = (
         ISSUE_REQUEST_ANCHOR_MARKER,
         ISSUE_BRANCH_LEASE_MARKER,
@@ -1699,11 +2286,26 @@ def _issue_pr_authority_fence(comments: Iterable[IssueComment], app: AppIdentity
         ISSUE_HEAD_CLAIM_MARKER,
         REQUIRED_STATUS_EPOCH_MARKER,
         ISSUE_FINALIZATION_EPOCH_MARKER,
+    ) + ((
+        ISSUE_CANCELLATION_FENCE_MARKER,
+        ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+        ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
+        ISSUE_NO_PR_CANCELLED_RESULT_MARKER,
+    ) if allow_cancellation_fence else ())
+    cancellation_markers = (
+        ISSUE_CANCELLATION_FENCE_MARKER,
+        ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+        ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
+        ISSUE_NO_PR_CANCELLED_RESULT_MARKER,
     )
     reserved_prefix = "<!-- swiftstream-federation-issue-"
     for comment in comments:
         if type(comment.body) is not str or not comment.body.startswith(reserved_prefix):
             continue
+        if any(comment.body.startswith(marker) for marker in cancellation_markers) and not allow_cancellation_fence:
+            raise StaleAuthorityError(
+                "persisted cancellation authority is a one-way gate for non-cancellation progression"
+            )
         if (
             comment.author_id != app.bot_node_id
             or comment.author_login != app.bot_login
@@ -1711,7 +2313,15 @@ def _issue_pr_authority_fence(comments: Iterable[IssueComment], app: AppIdentity
             or _issue_comment_edited(comment)
         ):
             continue
-        if not any(comment.body.startswith(marker) for marker in allowed):
+        permitted = allowed + (
+            (
+                ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+                ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
+                ISSUE_NO_PR_CANCELLED_RESULT_MARKER,
+            )
+            if allow_cancellation_fence else ()
+        )
+        if not any(comment.body.startswith(marker) for marker in permitted):
             raise R02Error("unrecognized reserved Issue authority marker blocks Wave 03 progression")
 
 
@@ -2207,6 +2817,596 @@ def _issue_finalization_epoch_comments(
     return tuple(sorted(result, key=lambda item: (item.comment.database_id, item.epoch.claim_generation_id)))
 
 
+def _issue_cancellation_fence_marker(fence: IssueCancellationFence) -> ClaimedHeadMarker:
+    if type(fence) is not IssueCancellationFence:
+        raise R02Error("IssueCancellationFence marker requires its exact parsed artifact")
+    return ClaimedHeadMarker(
+        "ISSUE_CANCELLATION_FENCE",
+        "ISSUE_CANCEL",
+        "ISSUE",
+        issue_owner_key(
+            fence.central_repository_node_id,
+            fence.issue_database_id,
+            fence.issue_node_id,
+            fence.issue_number,
+        ),
+        fence.claim_generation_id,
+        fence.cancellation_carrier_nonce,
+        "TERMINAL_CANCELLATION",
+    )
+
+
+def _validate_issue_cancellation_fence_target(
+    client: GitHubClient,
+    repository: str,
+    fence: IssueCancellationFence,
+) -> None:
+    marker = _issue_cancellation_fence_marker(fence)
+    marker_text = marker.render()
+    if parse_claimed_head_marker(marker_text) != marker:
+        raise R02Error("IssueCancellationFence marker does not parse canonically")
+    if hashlib.sha256(marker_text.encode("utf-8")).hexdigest() != fence.marker_digest:
+        raise R02Error("IssueCancellationFence marker digest does not match")
+    original, original_tree, _original_entries = _lease_tree_snapshot(
+        client, repository, fence.original_head_sha,
+    )
+    if original.sha != fence.original_head_sha or original_tree != fence.original_head_tree_sha:
+        raise R02Error("IssueCancellationFence original head/tree identity is invalid")
+    target, target_tree, _target_entries = _lease_tree_snapshot(
+        client, repository, fence.cancellation_head_sha,
+    )
+    if (
+        target.sha != fence.cancellation_head_sha
+        or target.parents != (fence.original_head_sha,)
+        or target.tree_sha != fence.original_head_tree_sha
+        or target_tree != fence.original_head_tree_sha
+        or fence.cancellation_head_tree_sha != fence.original_head_tree_sha
+    ):
+        raise R02Error("IssueCancellationFence target is not an exact direct no-tree-change child")
+    try:
+        commit = client.get_git_commit_object(repository, fence.cancellation_head_sha)
+    except Exception as error:
+        raise R02Error(f"IssueCancellationFence exact target commit is unavailable: {_bounded_reason(error)}") from None
+    if type(commit) is not GitCommitObject or (
+        commit.sha != fence.cancellation_head_sha
+        or commit.message != marker_text
+        or commit.tree_sha != fence.original_head_tree_sha
+        or commit.parents != (fence.original_head_sha,)
+        or commit.author.name != "Swift Stream Federation"
+        or commit.author.email != "automation@swiftstream.invalid"
+        or commit.committer.name != "Swift Stream Federation"
+        or commit.committer.email != "automation@swiftstream.invalid"
+        or commit.author.date != commit.committer.date
+    ):
+        raise R02Error("IssueCancellationFence exact target marker/identity is invalid")
+    try:
+        parsed_marker = parse_claimed_head_marker(commit.message)
+    except RequestModelError as error:
+        raise R02Error(f"IssueCancellationFence target marker is malformed: {_bounded_reason(error)}") from None
+    if parsed_marker != marker or _expected_deterministic_commit_sha(
+        commit.tree_sha, fence.original_head_sha, marker_text, commit.author.date,
+    ) != fence.cancellation_head_sha:
+        raise R02Error("IssueCancellationFence target SHA does not bind its exact marker and Bot identity")
+
+
+def _validate_issue_cancellation_fence_context(
+    fence: IssueCancellationFence,
+    authority: _IssueCancellationAuthority,
+) -> None:
+    anchor = authority.issue_anchor
+    lease = authority.lease
+    expected = (
+        anchor.anchor.issue_number,
+        anchor.anchor.issue_database_id,
+        anchor.anchor.issue_node_id,
+        anchor.comment.database_id,
+        anchor.anchor.canonical_sha256(),
+        lease.comment.database_id,
+        _binding_comment_sha256(lease.comment),
+        _cancellation_binding_authority_id(authority),
+        anchor.anchor.source_id,
+        anchor.anchor.source_repository_id,
+        lease.lease.branch_ref,
+        authority.pull_request_number,
+        authority.pull_request_database_id,
+        authority.pull_request_node_id,
+        authority.central_repository_node_id,
+        authority.base_repository_node_id,
+        "main",
+    )
+    actual = (
+        fence.issue_number,
+        fence.issue_database_id,
+        fence.issue_node_id,
+        fence.issue_request_anchor_comment_database_id,
+        fence.issue_request_anchor_sha256,
+        fence.issue_branch_lease_comment_database_id,
+        fence.issue_branch_lease_sha256,
+        fence.binding_authority,
+        fence.source_id,
+        fence.source_repository_id,
+        fence.branch_ref,
+        fence.pull_request_number,
+        fence.pull_request_database_id,
+        fence.pull_request_node_id,
+        fence.central_repository_node_id,
+        fence.base_repository_node_id,
+        fence.base_ref,
+    )
+    if actual != expected:
+        raise R02Error("IssueCancellationFence does not match exact central Issue/lease/PR-as-Issue identity")
+    if (
+        authority.pr.number != authority.pull_request_number
+        or authority.pr_issue.number != authority.pull_request_number
+        or authority.pr_issue.database_id != authority.pull_request_database_id
+        or authority.pr_issue.node_id != authority.pull_request_node_id
+    ):
+        raise R02Error("IssueCancellationFence PR node/database/number cross-check failed")
+    if authority.binding_authority == "FULL_BINDING":
+        binding = authority.binding
+        state = authority.binding_state
+        if binding is None or state is None or state.binding != binding:
+            raise R02Error("FULL_BINDING cancellation authority requires the exact persisted two-sided binding")
+        if (
+            binding.pull_request_number != authority.pull_request_number
+            or binding.pull_request_database_id != authority.pull_request_database_id
+            or binding.pull_request_node_id != authority.pull_request_node_id
+        ):
+            raise R02Error("FULL_BINDING does not cross-check the exact PR-as-Issue identity triple")
+    elif authority.binding_authority == "PRE_BINDING":
+        if authority.binding is not None or authority.binding_state is not None:
+            raise R02Error("PRE_BINDING cancellation authority must not fabricate an IssuePRBinding")
+    else:
+        raise R02Error("IssueCancellationFence binding authority is unsupported")
+
+
+def _require_exact_cancellation_stage_receipt_identity(
+    receipt: PullRequestStageMutationReceipt,
+    authority: _IssueCancellationAuthority,
+    fence: IssueCancellationFence,
+) -> PullRequestStageMutationReceipt:
+    if type(receipt) is not PullRequestStageMutationReceipt:
+        raise R02Error("cancellation stage authority requires an exact PR-stage mutation receipt")
+    expected = (
+        authority.pull_request_node_id,
+        authority.pull_request_database_id,
+        authority.pull_request_number,
+    )
+    actual = (
+        receipt.pull_request_node_id,
+        receipt.pull_request_database_id,
+        receipt.pull_request_number,
+    )
+    fence_identity = (
+        fence.pull_request_node_id,
+        fence.pull_request_database_id,
+        fence.pull_request_number,
+    )
+    if actual != expected or expected != fence_identity:
+        raise R02Error("stage mutation receipt PR node/database/number differs from exact PR-as-Issue and fence")
+    return receipt
+
+
+def _issue_cancellation_fence_comments(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    authority: _IssueCancellationAuthority,
+    current_ref: str,
+) -> tuple[IssueCancellationFenceComment, ...]:
+    grouped: dict[str, list[tuple[IssueCancellationFence, IssueComment]]] = {}
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_CANCELLATION_FENCE_MARKER):
+            continue
+        try:
+            fence = parse_issue_cancellation_fence(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueCancellationFence comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueCancellationFence")
+        _validate_issue_cancellation_fence_context(fence, authority)
+        if fence.binding_authority == "PRE_BINDING":
+            lease = authority.lease.lease
+            if (
+                fence.original_head_claim_kind != "ISSUE_BRANCH_LEASE"
+                or fence.original_head_claim_role != CarrierRole.ISSUE_ACTIVE.value
+                or fence.original_head_sha != lease.initial_head_sha
+                or fence.original_head_tree_sha != lease.initial_head_tree_sha
+                or fence.original_head_artifact_comment_database_id != authority.lease.comment.database_id
+                or fence.original_head_artifact_id != lease.lease_id
+                or fence.original_head_artifact_sha256 != _binding_comment_sha256(authority.lease.comment)
+            ):
+                raise R02Error("PRE_BINDING IssueCancellationFence must use the exact active lease-root predecessor")
+        _validate_issue_cancellation_fence_target(client, repository, fence)
+        grouped.setdefault(fence.fence_id, []).append((fence, comment))
+    if len(grouped) > 1:
+        raise R02Error("conflicting IssueCancellationFence payloads exist for one request attempt")
+    result: list[IssueCancellationFenceComment] = []
+    for equivalent in grouped.values():
+        renders = {item.render() for item, _comment in equivalent}
+        if len(renders) != 1:
+            raise R02Error("IssueCancellationFence ID collision has non-identical payloads")
+        fence, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result.append(IssueCancellationFenceComment(
+            fence, comment, current_ref == fence.cancellation_head_sha,
+        ))
+    return tuple(result)
+
+
+_CANCELLATION_STAGE_SPECS: Mapping[str, tuple[str, PullRequestStageMutationOperation]] = {
+    "DRAFT_REOPEN": ("reopen_pull_request", PullRequestStageMutationOperation.REOPEN),
+    "DRAFT_READY": ("mark_pull_request_ready_for_review", PullRequestStageMutationOperation.READY_FOR_REVIEW),
+    "DRAFT_CONVERT": ("convert_pull_request_to_draft", PullRequestStageMutationOperation.CONVERT_TO_DRAFT),
+    "CLOSE_REOPEN": ("reopen_pull_request", PullRequestStageMutationOperation.REOPEN),
+    "TERMINAL_CLOSE": ("close_pull_request", PullRequestStageMutationOperation.CLOSE),
+}
+
+
+def _cancellation_stage_client_mutation_id(fence: IssueCancellationFence, stage: str) -> str:
+    if stage not in _CANCELLATION_STAGE_SPECS:
+        raise R02Error("cancellation PR mutation stage is unsupported")
+    operation = _CANCELLATION_STAGE_SPECS[stage][1].value
+    payload = {
+        "cancellationHeadSha": fence.cancellation_head_sha,
+        "fenceId": fence.fence_id,
+        "operation": operation,
+        "pullRequestNodeId": fence.pull_request_node_id,
+        "stage": stage,
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    digest = hashlib.sha256(
+        ("swiftstream-federation:cancellation-pr-stage-mutation:v1\n" + encoded).encode("ascii"),
+    ).hexdigest()
+    client_mutation_id = f"g8w07-{digest}"
+    if len(client_mutation_id.encode("ascii")) > 256:
+        raise R02Error("deterministic cancellation clientMutationId exceeds the bounded transport limit")
+    return client_mutation_id
+
+
+def _exact_cancellation_stage_evidence(
+    receipt: PullRequestStageMutationReceipt,
+    authority: _IssueCancellationAuthority,
+    fence: IssueCancellationFence,
+    stage: str,
+) -> ExactPullRequestStageMutationEvidence:
+    try:
+        _method_name, operation = _CANCELLATION_STAGE_SPECS[stage]
+    except KeyError:
+        raise R02Error("cancellation PR mutation stage is unsupported") from None
+    _require_exact_cancellation_stage_receipt_identity(receipt, authority, fence)
+    expected_id = _cancellation_stage_client_mutation_id(fence, stage)
+    if (
+        receipt.operation != operation.value
+        or receipt.requested_pull_request_node_id != fence.pull_request_node_id
+        or receipt.requested_client_mutation_id != expected_id
+        or receipt.returned_client_mutation_id != expected_id
+    ):
+        raise R02Error("same-response PR-stage receipt operation or clientMutationId differs from the exact logical stage")
+    try:
+        evidence = ExactPullRequestStageMutationEvidence(
+            operation=operation,
+            client_mutation_id=receipt.returned_client_mutation_id,
+            pull_request_node_id=receipt.pull_request_node_id,
+            pull_request_database_id=receipt.pull_request_database_id,
+            pull_request_number=receipt.pull_request_number,
+            state=receipt.state,
+            is_draft=receipt.is_draft,
+            merged=receipt.merged,
+            merged_at=receipt.merged_at,
+            head_ref_oid=receipt.head_oid,
+            base_ref_oid=receipt.base_oid,
+            head_ref_name=receipt.head_ref,
+            base_ref_name=receipt.base_ref,
+            head_repository_node_id=receipt.head_repository_node_id,
+            base_repository_node_id=receipt.base_repository_node_id,
+        )
+    except RequestModelError as error:
+        raise R02Error(f"same-response PR-stage evidence is invalid: {_bounded_reason(error)}") from None
+    expected_state = "CLOSED" if operation is PullRequestStageMutationOperation.CLOSE else "OPEN"
+    expected_draft = {
+        "DRAFT_READY": False,
+        "DRAFT_CONVERT": True,
+    }.get(stage)
+    if (
+        evidence.pull_request_node_id != authority.pull_request_node_id
+        or evidence.pull_request_database_id != authority.pull_request_database_id
+        or evidence.pull_request_number != authority.pull_request_number
+        or evidence.pull_request_node_id != fence.pull_request_node_id
+        or evidence.pull_request_database_id != fence.pull_request_database_id
+        or evidence.pull_request_number != fence.pull_request_number
+        or evidence.head_ref_oid != fence.cancellation_head_sha
+        or evidence.head_ref_name != fence.branch_ref.removeprefix("refs/heads/")
+        or evidence.base_ref_name != "main"
+        or evidence.head_repository_node_id != fence.central_repository_node_id
+        or evidence.base_repository_node_id != fence.base_repository_node_id
+        or evidence.state != expected_state
+        or (expected_draft is not None and evidence.is_draft is not expected_draft)
+        or evidence.merged
+        or evidence.merged_at is not None
+    ):
+        raise R02Error("same-response PR-stage evidence differs from exact cancellation PR/HC/base authority")
+    return evidence
+
+
+def _cancellation_witness_expected_fields(
+    authority: _IssueCancellationAuthority,
+    fence_item: IssueCancellationFenceComment,
+    status: ExactAppRequiredStatusSnapshot,
+) -> dict[str, Any]:
+    anchor = authority.issue_anchor
+    lease = authority.lease
+    fence = fence_item.fence
+    return {
+        "issue_number": anchor.anchor.issue_number,
+        "issue_database_id": anchor.anchor.issue_database_id,
+        "issue_node_id": anchor.anchor.issue_node_id,
+        "issue_request_anchor_comment_database_id": anchor.comment.database_id,
+        "issue_request_anchor_sha256": anchor.anchor.canonical_sha256(),
+        "issue_branch_lease_comment_database_id": lease.comment.database_id,
+        "issue_branch_lease_sha256": _binding_comment_sha256(lease.comment),
+        "fence_comment_database_id": fence_item.comment.database_id,
+        "fence_sha256": _binding_comment_sha256(fence_item.comment),
+        "fence_id": fence.fence_id,
+        "binding_authority": _cancellation_binding_authority_id(authority),
+        "source_id": anchor.anchor.source_id,
+        "source_repository_id": anchor.anchor.source_repository_id,
+        "branch_ref": lease.lease.branch_ref,
+        "pull_request_number": authority.pull_request_number,
+        "pull_request_database_id": authority.pull_request_database_id,
+        "pull_request_node_id": authority.pull_request_node_id,
+        "original_head_sha": fence.original_head_sha,
+        "cancellation_head_sha": fence.cancellation_head_sha,
+        "anchored_accepted_base_sha": lease.lease.accepted_base_sha,
+        "base_repository_node_id": fence.base_repository_node_id,
+        "base_ref": "main",
+        "head_repository_node_id": fence.central_repository_node_id,
+        "current_required_status": status,
+    }
+
+
+def _validate_cancellation_witness_stage_ids(
+    witness: IssueCancellationDraftWitness,
+    fence: IssueCancellationFence,
+) -> None:
+    stages = (
+        (witness.reopen_evidence, "DRAFT_REOPEN"),
+        (witness.ready_evidence, "DRAFT_READY"),
+        (witness.draft_evidence, "DRAFT_CONVERT"),
+    )
+    for evidence, stage in stages:
+        if evidence is not None and evidence.client_mutation_id != _cancellation_stage_client_mutation_id(fence, stage):
+            raise R02Error("draft witness contains a noncanonical cancellation clientMutationId")
+
+
+def _issue_cancellation_draft_witness_comments(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    authority: _IssueCancellationAuthority,
+    fence_item: IssueCancellationFenceComment,
+    status: ExactAppRequiredStatusSnapshot,
+) -> tuple[IssueCancellationDraftWitnessComment, ...]:
+    grouped: dict[str, list[tuple[IssueCancellationDraftWitness, IssueComment]]] = {}
+    expected = _cancellation_witness_expected_fields(authority, fence_item, status)
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER):
+            continue
+        try:
+            witness = parse_issue_cancellation_draft_witness(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueCancellationDraftWitness comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueCancellationDraftWitness")
+        if any(getattr(witness, name) != value for name, value in expected.items()):
+            raise R02Error("IssueCancellationDraftWitness does not match exact anchor/lease/fence/PR/status authority")
+        _validate_cancellation_witness_stage_ids(witness, fence_item.fence)
+        grouped.setdefault(witness.witness_id, []).append((witness, comment))
+    if len(grouped) > 1:
+        raise R02Error("conflicting IssueCancellationDraftWitness payloads exist")
+    result: list[IssueCancellationDraftWitnessComment] = []
+    for equivalent in grouped.values():
+        if len({item.render() for item, _comment in equivalent}) != 1:
+            raise R02Error("IssueCancellationDraftWitness ID collision has non-identical payloads")
+        witness, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result.append(IssueCancellationDraftWitnessComment(witness, comment))
+    return tuple(result)
+
+
+def _cancellation_terminal_result_expected_fields(
+    authority: _IssueCancellationAuthority,
+    fence_item: IssueCancellationFenceComment,
+    witness_item: IssueCancellationDraftWitnessComment,
+    status: ExactAppRequiredStatusSnapshot,
+) -> dict[str, Any]:
+    anchor = authority.issue_anchor
+    lease = authority.lease
+    fence = fence_item.fence
+    return {
+        "issue_number": anchor.anchor.issue_number,
+        "issue_database_id": anchor.anchor.issue_database_id,
+        "issue_node_id": anchor.anchor.issue_node_id,
+        "issue_request_anchor_comment_database_id": anchor.comment.database_id,
+        "issue_request_anchor_sha256": anchor.anchor.canonical_sha256(),
+        "issue_branch_lease_comment_database_id": lease.comment.database_id,
+        "issue_branch_lease_sha256": _binding_comment_sha256(lease.comment),
+        "binding_authority": _cancellation_binding_authority_id(authority),
+        "source_id": anchor.anchor.source_id,
+        "source_repository_id": anchor.anchor.source_repository_id,
+        "branch_ref": lease.lease.branch_ref,
+        "pull_request_number": authority.pull_request_number,
+        "pull_request_database_id": authority.pull_request_database_id,
+        "pull_request_node_id": authority.pull_request_node_id,
+        "original_head_sha": fence.original_head_sha,
+        "cancellation_head_sha": fence.cancellation_head_sha,
+        "base_repository_node_id": fence.base_repository_node_id,
+        "base_ref": "main",
+        "fence_comment_database_id": fence_item.comment.database_id,
+        "fence_sha256": _binding_comment_sha256(fence_item.comment),
+        "fence_id": fence.fence_id,
+        "draft_witness_comment_database_id": witness_item.comment.database_id,
+        "draft_witness_sha256": _binding_comment_sha256(witness_item.comment),
+        "witness_id": witness_item.witness.witness_id,
+        "current_failure_status": status,
+    }
+
+
+def _issue_terminal_cancelled_result_comments(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    authority: _IssueCancellationAuthority,
+    fence_item: IssueCancellationFenceComment,
+    witness_item: IssueCancellationDraftWitnessComment,
+    status: ExactAppRequiredStatusSnapshot,
+) -> tuple[IssueTerminalCancelledResultComment, ...]:
+    grouped: dict[str, list[tuple[IssueTerminalCancelledResult, IssueComment]]] = {}
+    expected = _cancellation_terminal_result_expected_fields(authority, fence_item, witness_item, status)
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_TERMINAL_CANCELLED_RESULT_MARKER):
+            continue
+        try:
+            result = parse_issue_terminal_cancelled_result(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueTerminalCancelledResult comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueTerminalCancelledResult")
+        if any(getattr(result, name) != value for name, value in expected.items()):
+            raise R02Error("IssueTerminalCancelledResult does not match exact fence/witness/status/PR authority")
+        if (
+            result.close_evidence.head_repository_node_id != fence_item.fence.central_repository_node_id
+            or result.close_evidence.base_repository_node_id != fence_item.fence.base_repository_node_id
+            or result.close_evidence.head_ref_name != fence_item.fence.branch_ref.removeprefix("refs/heads/")
+            or result.close_evidence.base_ref_name != "main"
+            or result.close_evidence.client_mutation_id != _cancellation_stage_client_mutation_id(
+                fence_item.fence, "TERMINAL_CLOSE",
+            )
+        ):
+            raise R02Error("terminal close evidence does not bind exact same-response PR stage authority")
+        grouped.setdefault(result.terminal_result_id, []).append((result, comment))
+    if len(grouped) > 1:
+        raise R02Error("conflicting IssueTerminalCancelledResult payloads exist")
+    result_items: list[IssueTerminalCancelledResultComment] = []
+    for equivalent in grouped.values():
+        if len({item.render() for item, _comment in equivalent}) != 1:
+            raise R02Error("IssueTerminalCancelledResult ID collision has non-identical payloads")
+        result, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result_items.append(IssueTerminalCancelledResultComment(result, comment))
+    return tuple(result_items)
+
+
+def _issue_no_pr_cancelled_result_comments(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment | None,
+) -> tuple[IssueNoPRCancelledResultComment, ...]:
+    grouped: dict[str, list[tuple[IssueNoPRCancelledResult, IssueComment]]] = {}
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_NO_PR_CANCELLED_RESULT_MARKER):
+            continue
+        try:
+            result = parse_issue_no_pr_cancelled_result(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueNoPRCancelledResult comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueNoPRCancelledResult")
+        identity_matches = (
+            result.issue_number == anchor.anchor.issue_number
+            and result.issue_database_id == anchor.anchor.issue_database_id
+            and result.issue_node_id == anchor.anchor.issue_node_id
+            and result.issue_request_anchor_comment_database_id == anchor.comment.database_id
+            and result.issue_request_anchor_sha256 == anchor.anchor.canonical_sha256()
+            and result.source_id == anchor.anchor.source_id
+            and result.source_repository_id == anchor.anchor.source_repository_id
+        )
+        if not identity_matches:
+            raise R02Error("IssueNoPRCancelledResult does not match exact immutable IssueRequestAnchor")
+        if lease is None:
+            if result.proof_kind is not IssueNoPRCancelledProofKind.ANCHOR_ONLY:
+                raise R02Error("lease-backed no-PR result exists without its exact IssueBranchLease")
+        else:
+            if (
+                result.proof_kind is IssueNoPRCancelledProofKind.ANCHOR_ONLY
+                or result.lease_comment_database_id != lease.comment.database_id
+                or result.lease_sha256 != _binding_comment_sha256(lease.comment)
+                or result.lease_id != lease.lease.lease_id
+                or result.branch_ref != lease.lease.branch_ref
+                or result.lease_initial_head_sha != lease.lease.initial_head_sha
+            ):
+                raise R02Error("lease-backed no-PR result does not match exact immutable IssueBranchLease")
+        grouped.setdefault(result.no_pr_result_id, []).append((result, comment))
+    if len(grouped) > 1:
+        raise R02Error("conflicting immutable IssueNoPRCancelledResult payloads exist")
+    result_items: list[IssueNoPRCancelledResultComment] = []
+    for equivalent in grouped.values():
+        if len({item.render() for item, _comment in equivalent}) != 1:
+            raise R02Error("IssueNoPRCancelledResult ID collision has non-identical payloads")
+        result, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result_items.append(IssueNoPRCancelledResultComment(result, comment))
+    return tuple(result_items)
+
+
+def _issue_cancellation_fence_predecessor_matches(
+    node: _IssueAuthorityNode,
+    fence: IssueCancellationFence,
+) -> bool:
+    return (
+        fence.original_head_claim_kind == node.claim_kind
+        and fence.original_head_claim_role == node.role.value
+        and fence.original_head_sha == node.target_head_sha
+        and fence.original_head_tree_sha == node.tree_sha
+        and fence.original_head_artifact_comment_database_id == node.comment.database_id
+        and fence.original_head_artifact_id == node.artifact_id
+        and fence.original_head_artifact_sha256 == node.artifact_sha256
+    )
+
+
+def _resolve_issue_cancellation_original_node(
+    client: GitHubClient,
+    repository: str,
+    authority: _IssueCancellationAuthority,
+    app: AppIdentity,
+    original_head_sha: str,
+) -> _IssueAuthorityNode:
+    if authority.binding_authority == "PRE_BINDING":
+        lease = authority.lease.lease
+        if original_head_sha != lease.initial_head_sha:
+            raise R02Error("PRE_BINDING cancellation predecessor must be the exact lease root")
+        marker = _lease_marker_for(lease)
+        resolution = resolve_sha_carrier_role(
+            client, repository, original_head_sha, app.slug, LegacyEvidenceDisposition.CONFLICTING,
+        )
+        if (
+            resolution.role is not CarrierRole.ISSUE_ACTIVE
+            or resolution.marker != marker
+            or resolution.activation is not CarrierActivation.ACTIVE
+        ):
+            raise R02Error("PRE_BINDING lease-root predecessor is not the exact current ISSUE_ACTIVE carrier")
+        return _IssueAuthorityNode(
+            "ISSUE_BRANCH_LEASE", CarrierRole.ISSUE_ACTIVE, lease.initial_head_sha, None,
+            lease.initial_head_tree_sha, "INITIAL", lease.lease_id,
+            _binding_comment_sha256(authority.lease.comment), authority.lease.comment,
+            lease, active=True,
+        )
+    state = authority.binding_state
+    if state is None:
+        raise R02Error("FULL_BINDING cancellation predecessor requires the exact persisted IssuePRBinding")
+    comments = tuple(client.list_issue_comments(repository, authority.pull_request_number))
+    current_ref = _read_issue_branch_ref(
+        client, repository, authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+    )
+    if current_ref != original_head_sha or authority.pr.head_oid != original_head_sha:
+        raise StaleAuthorityError("FULL_BINDING cancellation predecessor is not the exact current ref/PR head")
+    history = _issue_authority_history(client, repository, comments, app, state, current_ref)
+    matches = tuple(node for node in history if node.target_head_sha == original_head_sha)
+    if len(matches) != 1:
+        raise R02Error("FULL_BINDING cancellation has no unique real unified-history predecessor")
+    node = matches[0]
+    if (node.claim_kind, node.role) not in {
+        ("ISSUE_HEAD_CLAIM", CarrierRole.ISSUE_ACTIVE),
+        ("REQUIRED_STATUS_EPOCH", CarrierRole.ISSUE_ACTIVE),
+        ("ISSUE_FINALIZATION_EPOCH", CarrierRole.ISSUE_FINALIZING),
+        ("ISSUE_BRANCH_LEASE", CarrierRole.ISSUE_ACTIVE),
+    }:
+        raise R02Error("FULL_BINDING cancellation predecessor kind/role is unsupported")
+    return node
+
+
 def _issue_authority_history(
     client: GitHubClient,
     repository: str,
@@ -2238,6 +3438,27 @@ def _issue_authority_history(
         claims.append(IssueHeadClaimComment(claim, comment, current_ref == claim.to_head_sha))
     required_epochs = _required_status_epoch_comments(client, repository, comment_list, app, state, current_ref)
     finalization_epochs = _issue_finalization_epoch_comments(client, repository, comment_list, app, state, current_ref)
+    cancellation_authority = _IssueCancellationAuthority(
+        issue_anchor=state.issue_anchor,
+        lease=state.lease,
+        binding_authority="FULL_BINDING",
+        pull_request_number=state.binding.pull_request_number,
+        pull_request_database_id=state.binding.pull_request_database_id,
+        pull_request_node_id=state.binding.pull_request_node_id,
+        central_repository_node_id=state.binding.central_repository_node_id,
+        base_repository_node_id=state.binding.central_repository_node_id,
+        pr=state.pr,
+        pr_issue=state.pr_issue,
+        owning_issue=state.owning_issue,
+        pr_comments=comment_list,
+        binding=state.binding,
+        binding_state=state,
+        raw_pr_state="OPEN",
+        raw_pr_merged=False,
+    )
+    cancellation_fences = _issue_cancellation_fence_comments(
+        client, repository, comment_list, app, cancellation_authority, current_ref,
+    )
 
     lease = state.lease.lease
     root = _IssueAuthorityNode(
@@ -2268,6 +3489,14 @@ def _issue_authority_history(
             epoch.final_tree_sha, epoch.transition_kind, epoch.epoch_id,
             _binding_comment_sha256(item.comment), item.comment, epoch, active=item.active,
         ))
+    for item in cancellation_fences:
+        fence = item.fence
+        nodes.append(_IssueAuthorityNode(
+            "ISSUE_CANCELLATION_FENCE", CarrierRole.ISSUE_CANCEL,
+            fence.cancellation_head_sha, fence.original_head_sha,
+            fence.cancellation_head_tree_sha, fence.transition_kind, fence.fence_id,
+            _binding_comment_sha256(item.comment), item.comment, fence, active=item.active,
+        ))
 
     by_target: dict[str, _IssueAuthorityNode] = {}
     for node in nodes:
@@ -2291,6 +3520,8 @@ def _issue_authority_history(
             if parent is None:
                 remaining.append(node)
                 continue
+            if parent.claim_kind == "ISSUE_CANCELLATION_FENCE":
+                raise R02Error("IssueCancellationFence is terminal and cannot have Issue authority descendants")
             if node.claim_kind == "ISSUE_HEAD_CLAIM":
                 claim = node.artifact
                 if parent.role is not CarrierRole.ISSUE_ACTIVE or parent.claim_kind == "ISSUE_FINALIZATION_EPOCH":
@@ -2352,6 +3583,19 @@ def _issue_authority_history(
                     or epoch.fresh_proposal_scope_evidence_digest != origin.artifact.target_evidence_digest
                 ):
                     raise R02Error("IssueFinalizationEpoch proposal-origin/scope evidence mismatch")
+            elif node.claim_kind == "ISSUE_CANCELLATION_FENCE":
+                fence = node.artifact
+                if parent.role not in {CarrierRole.ISSUE_ACTIVE, CarrierRole.ISSUE_FINALIZING} or parent.claim_kind not in {
+                    "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH", "ISSUE_FINALIZATION_EPOCH", "ISSUE_BRANCH_LEASE",
+                }:
+                    raise R02Error("IssueCancellationFence predecessor is not an allowed active/finalizing authority")
+                if fence.binding_authority != state.binding.binding_id:
+                    raise R02Error("PRE_BINDING IssueCancellationFence cannot enter full-binding unified history")
+                if not _issue_cancellation_fence_predecessor_matches(parent, fence):
+                    raise R02Error("IssueCancellationFence does not bind the exact reachable predecessor provenance")
+                if parent.role is CarrierRole.ISSUE_FINALIZING and fence.pre_fence_success_may_exist is not True:
+                    raise R02Error("finalizing predecessor requires preFenceSuccessMayExist")
+                origin = parent.proposal_origin
             else:
                 raise R02Error("unsupported Issue-owned history node kind")
             if node.target_head_sha in reachable:
@@ -3136,6 +4380,8 @@ def _read_managed_issue_pr_binding_state(
     *,
     validate_fresh_source_authority: bool = True,
     require_open_lifecycle: bool = True,
+    allow_cancellation_fence: bool = False,
+    allow_pr_stage_state: bool = False,
 ) -> IssuePRBindingState:
     intake = _read_issue_pr_intake(
         client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
@@ -3159,7 +4405,9 @@ def _read_managed_issue_pr_binding_state(
         pr_comments = tuple(client.list_issue_comments(repository, pr_number))
     except Exception as error:
         raise StaleAuthorityError(f"bound Issue PR state is unavailable: {_bounded_reason(error)}") from None
-    _issue_pr_authority_fence(pr_comments, app)
+    _issue_pr_authority_fence(
+        pr_comments, app, allow_cancellation_fence=allow_cancellation_fence,
+    )
     _validate_issue_binding_cross_link(binding, anchor, lease, central_repository_node_id)
     if (
         type(pr) is not PullRequestMetadata
@@ -3172,7 +4420,8 @@ def _read_managed_issue_pr_binding_state(
         or pr.base_repository_id != central_repository_node_id
         or pr.base_repository != repository
         or pr.base_ref != "main"
-        or pr.draft is not False
+        or type(pr.draft) is not bool
+        or (not allow_pr_stage_state and pr.draft is not False)
         or pr.body != render_request_body(anchor.anchor.initial_request)
         or pr.last_edited_at is not None
         or pr.includes_created_edit is not False
@@ -4663,6 +5912,7 @@ class R02Controller:
             self.app,
             source_authority_resolver,
         )
+        self._require_no_issue_cancellation_fence(state, historical_ref)
         request_class = state.issue_anchor.anchor.request_class
         _ensure_managed_issue_pr_request_anchor(
             self.client, self.central_repository, state, request_class, self.app,
@@ -5034,6 +6284,7 @@ class R02Controller:
         return IssueManagedRouteResult("CLAIM_READY", claim.transition_kind, claim.request_class)
 
     def _persist_issue_head_claim(self, state: IssuePRBindingState, claim: IssueHeadClaim) -> IssueHeadClaimComment:
+        self._require_no_issue_cancellation_fence(state, claim.from_head_sha)
         body = claim.render()
         if len(body.encode("utf-8")) > 16_384:
             raise R02Error("IssueHeadClaim comment exceeds the generic Issue-comment bound")
@@ -5072,6 +6323,7 @@ class R02Controller:
         claim: IssueHeadClaim,
         expected_ref: str,
     ) -> None:
+        self._require_no_issue_cancellation_fence(state, expected_ref)
         branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
         before = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
         if before == claim.to_head_sha:
@@ -5280,6 +6532,7 @@ class R02Controller:
         artifact: IssueFinalizationEpoch | RequiredStatusEpoch,
         expected_ref: str,
     ) -> IssueComment:
+        self._require_no_issue_cancellation_fence(state, expected_ref)
         body = artifact.render()
         if len(body.encode("utf-8")) > 16_384:
             raise R02Error("Issue epoch comment exceeds the generic Issue-comment bound")
@@ -5334,6 +6587,7 @@ class R02Controller:
         target_head_sha: str,
         expected_ref: str,
     ) -> None:
+        self._require_no_issue_cancellation_fence(state, expected_ref)
         branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
         before = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
         if before == target_head_sha:
@@ -5367,6 +6621,1476 @@ class R02Controller:
         if after != target_head_sha:
             raise StaleAuthorityError("Issue epoch CAS did not read back the exact target head")
 
+    def _require_no_issue_cancellation_fence(
+        self,
+        state: IssuePRBindingState,
+        current_ref: str,
+        comments: Iterable[IssueComment] | None = None,
+    ) -> None:
+        if comments is not None:
+            # _read_issue_epoch_snapshot has already validated these exact
+            # comments through the unified provenance reader.
+            if any(
+                type(comment.body) is str
+                and comment.body.startswith(ISSUE_CANCELLATION_FENCE_MARKER)
+                for comment in comments
+            ):
+                raise StaleAuthorityError("persisted IssueCancellationFence is a one-way gate for non-cancellation progression")
+            return
+        fresh_comments = tuple(
+            self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number)
+        )
+        if any(
+            type(comment.body) is str
+            and comment.body.startswith(ISSUE_CANCELLATION_FENCE_MARKER)
+            for comment in fresh_comments
+        ):
+            raise StaleAuthorityError("persisted IssueCancellationFence is a one-way gate for non-cancellation progression")
+
+    def _read_issue_cancellation_fences(
+        self,
+        authority: _IssueCancellationAuthority,
+        current_ref: str,
+    ) -> tuple[tuple[IssueCancellationFenceComment, ...], tuple[IssueComment, ...]]:
+        comments = tuple(self.client.list_issue_comments(
+            self.central_repository, authority.pull_request_number,
+        ))
+        _issue_pr_authority_fence(comments, self.app, allow_cancellation_fence=True)
+        fences = _issue_cancellation_fence_comments(
+            self.client, self.central_repository, comments, self.app, authority, current_ref,
+        )
+        if authority.binding_authority == "FULL_BINDING":
+            if authority.binding_state is None:
+                raise R02Error("FULL_BINDING cancellation history lost its exact binding state")
+            history = _issue_authority_history(
+                self.client, self.central_repository, comments, self.app,
+                authority.binding_state, current_ref,
+            )
+            for item in fences:
+                if sum(
+                    node.claim_kind == "ISSUE_CANCELLATION_FENCE"
+                    and node.artifact == item.fence
+                    and node.comment.database_id == item.comment.database_id
+                    for node in history
+                ) != 1:
+                    raise R02Error("persisted full-binding fence is not reachable from exact unified history")
+        return fences, comments
+
+    def _persist_issue_cancellation_fence(
+        self,
+        authority: _IssueCancellationAuthority,
+        fence: IssueCancellationFence,
+        expected_ref: str,
+    ) -> IssueCancellationFenceComment:
+        body = fence.render()
+        existing, _existing_comments = self._read_issue_cancellation_fences(
+            authority, expected_ref,
+        )
+        matches = tuple(item for item in existing if item.fence.render() == body)
+        if matches:
+            if len(matches) != 1:
+                raise R02Error("equivalent cancellation fence comments did not collapse to one canonical record")
+            return matches[0]
+        try:
+            self.client.create_issue_comment(
+                self.central_repository, authority.pull_request_number, body,
+            )
+        except Exception as error:
+            # An ambiguous POST is usable only when exact readback proves that
+            # this same immutable fence was persisted.
+            try:
+                fences, _comments = self._read_issue_cancellation_fences(authority, expected_ref)
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous cancellation-fence POST cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            matches = tuple(item for item in fences if item.fence.render() == body)
+            if len(matches) == 1:
+                return matches[0]
+            raise StaleAuthorityError(
+                f"cancellation-fence POST was not confirmed by exact readback: {_bounded_reason(error)}"
+            ) from None
+        fences, _comments = self._read_issue_cancellation_fences(authority, expected_ref)
+        matches = tuple(item for item in fences if item.fence.render() == body)
+        if len(matches) != 1:
+            raise StaleAuthorityError("persisted cancellation fence is absent or differs from the exact intended payload")
+        return matches[0]
+
+    def prepare_issue_cancellation_fence(
+        self,
+        issue_number: int,
+        *,
+        classification: str | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> IssueCancellationFence:
+        """Persist and activate one immutable D/E cancellation fence; publish no status."""
+        if type(issue_number) is not int or not 1 <= issue_number <= 9_223_372_036_854_775_807:
+            raise R02Error("cancellation Issue number must be a positive signed-64 integer")
+        authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+            require_prebinding_lease_root=True,
+        )
+        expected_classification = "D" if authority.binding_authority == "PRE_BINDING" else "E"
+        if classification is not None and classification != expected_classification:
+            raise R02Error("cancellation fence accepts only the exact PR-backed D/E classification")
+        if authority.owning_issue.state != "closed":
+            raise R02Error("PR-backed cancellation fence requires a terminal closed owning Issue")
+        if authority.raw_pr_merged:
+            raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+        if authority.raw_pr_state != "OPEN" or authority.pr_issue.state != "open":
+            raise R02Error("new cancellation fence requires the exact open unmerged generated PR")
+        branch_short = authority.lease.lease.branch_ref.removeprefix("refs/heads/")
+        original_head_sha = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if original_head_sha is None or authority.pr.head_oid != original_head_sha:
+            raise StaleAuthorityError("cancellation requires the exact current generated ref and PR head")
+        if authority.binding_authority == "PRE_BINDING" and original_head_sha != authority.lease.lease.initial_head_sha:
+            raise R02Error("PRE_BINDING cancellation must originate from the exact lease-root head")
+        original = _resolve_issue_cancellation_original_node(
+            self.client, self.central_repository, authority, self.app, original_head_sha,
+        )
+        if (original.claim_kind, original.role) not in {
+            ("ISSUE_BRANCH_LEASE", CarrierRole.ISSUE_ACTIVE),
+            ("ISSUE_HEAD_CLAIM", CarrierRole.ISSUE_ACTIVE),
+            ("REQUIRED_STATUS_EPOCH", CarrierRole.ISSUE_ACTIVE),
+            ("ISSUE_FINALIZATION_EPOCH", CarrierRole.ISSUE_FINALIZING),
+        }:
+            raise R02Error("cancellation original authority has an unsupported exact kind/role")
+
+        # Existing immutable evidence is inspected before taking a new status
+        # snapshot or nonce. This makes crash replay reuse the original tuple.
+        persisted, _comments = self._read_issue_cancellation_fences(authority, original_head_sha)
+        fence: IssueCancellationFence | None = None
+        if persisted:
+            fence = persisted[0].fence
+            if (
+                fence.original_head_sha != original_head_sha
+                or not _issue_cancellation_fence_predecessor_matches(original, fence)
+                or fence.binding_authority != _cancellation_binding_authority_id(authority)
+            ):
+                raise StaleAuthorityError("persisted cancellation fence belongs to a different original authority")
+            current_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            if current_ref == fence.cancellation_head_sha:
+                resolution = resolve_sha_carrier_role(
+                    self.client, self.central_repository, fence.cancellation_head_sha,
+                    self.app.slug, LegacyEvidenceDisposition.CONFLICTING,
+                )
+                if resolution != ShaCarrierResolution(
+                    CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL,
+                    _issue_cancellation_fence_marker(fence),
+                ):
+                    raise StaleAuthorityError("persisted cancellation fence is not ACTIVE under the real resolver")
+                return fence
+            if current_ref != original_head_sha:
+                raise StaleAuthorityError("persisted cancellation fence lost to a different generated ref head")
+        else:
+            current_ref = original_head_sha
+
+        if fence is None:
+            pre_fence_status, visible_issue_final_success, _any_exact_app_success, _latest_status = _read_latest_exact_app_required_status_snapshot(
+                self.client, self.central_repository, original_head_sha, self.app,
+            )
+            success_may_exist = (
+                original.role is CarrierRole.ISSUE_FINALIZING
+                or visible_issue_final_success
+                or (
+                    pre_fence_status.is_present
+                    and pre_fence_status.state == "success"
+                    and pre_fence_status.status_class is StatusClass.ISSUE_FINAL
+                )
+            )
+            # Fence read immediately before nonce generation closes the POST race.
+            latest_persisted, _latest_comments = self._read_issue_cancellation_fences(
+                authority, original_head_sha,
+            )
+            if latest_persisted:
+                fence = latest_persisted[0].fence
+                if (
+                    fence.original_head_sha != original_head_sha
+                    or fence.pre_fence_required_status != pre_fence_status
+                    or not _issue_cancellation_fence_predecessor_matches(original, fence)
+                ):
+                    raise StaleAuthorityError("concurrent cancellation fence does not match this exact status/predecessor")
+            else:
+                nonce = (nonce_factory or new_carrier_nonce)()
+                if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{64}", nonce):
+                    raise R02Error("IssueCancellationFence nonce must be lowercase 256-bit hex")
+                anchor = authority.issue_anchor
+                lease = authority.lease
+                fields = dict(
+                    schema_version=1,
+                    issue_number=anchor.anchor.issue_number,
+                    issue_database_id=anchor.anchor.issue_database_id,
+                    issue_node_id=anchor.anchor.issue_node_id,
+                    issue_request_anchor_comment_database_id=anchor.comment.database_id,
+                    issue_request_anchor_sha256=anchor.anchor.canonical_sha256(),
+                    issue_branch_lease_comment_database_id=lease.comment.database_id,
+                    issue_branch_lease_sha256=_binding_comment_sha256(lease.comment),
+                    binding_authority=_cancellation_binding_authority_id(authority),
+                    source_id=anchor.anchor.source_id,
+                    source_repository_id=anchor.anchor.source_repository_id,
+                    branch_ref=lease.lease.branch_ref,
+                    pull_request_number=authority.pull_request_number,
+                    pull_request_database_id=authority.pull_request_database_id,
+                    pull_request_node_id=authority.pull_request_node_id,
+                    central_repository_node_id=authority.central_repository_node_id,
+                    base_repository_node_id=authority.base_repository_node_id,
+                    base_ref="main",
+                    original_head_sha=original_head_sha,
+                    original_head_tree_sha=original.tree_sha,
+                    original_head_claim_kind=original.claim_kind,
+                    original_head_claim_role=original.role.value,
+                    original_head_artifact_comment_database_id=original.comment.database_id,
+                    original_head_artifact_id=original.artifact_id,
+                    original_head_artifact_sha256=original.artifact_sha256,
+                    cancellation_carrier_nonce=nonce,
+                    cancellation_head_sha=("f" * 40 if original_head_sha != "f" * 40 else "e" * 40),
+                    cancellation_head_tree_sha=original.tree_sha,
+                    pre_fence_required_status=pre_fence_status,
+                    pre_fence_success_may_exist=success_may_exist,
+                )
+                prepared = IssueCancellationFence.create(**fields)
+                marker_text = _issue_cancellation_fence_marker(prepared).render()
+                timestamp = self.client.bot_commit_timestamp_after(
+                    self.central_repository, original_head_sha,
+                )
+                wrapper = self.client.create_commit(
+                    self.central_repository, marker_text, original.tree_sha,
+                    [original_head_sha], timestamp=timestamp,
+                )
+                fence = IssueCancellationFence.create(**{
+                    **fields,
+                    "cancellation_head_sha": wrapper.sha,
+                })
+                _validate_issue_cancellation_fence_target(
+                    self.client, self.central_repository, fence,
+                )
+
+        assert fence is not None
+        self._persist_issue_cancellation_fence(authority, fence, original_head_sha)
+        latest_authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+            require_prebinding_lease_root=True,
+        )
+        if (
+            latest_authority.binding_authority != authority.binding_authority
+            or latest_authority.issue_anchor.anchor != authority.issue_anchor.anchor
+            or latest_authority.issue_anchor.comment.database_id != authority.issue_anchor.comment.database_id
+            or latest_authority.lease.lease != authority.lease.lease
+            or latest_authority.pull_request_number != authority.pull_request_number
+            or latest_authority.pull_request_database_id != authority.pull_request_database_id
+            or latest_authority.pull_request_node_id != authority.pull_request_node_id
+            or latest_authority.binding != authority.binding
+            or latest_authority.raw_pr_state != "OPEN"
+            or latest_authority.raw_pr_merged
+            or latest_authority.owning_issue.state != "closed"
+        ):
+            raise StaleAuthorityError("central cancellation ownership/PR lifecycle changed after fence persistence")
+        before_cas = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if before_cas != original_head_sha or latest_authority.pr.head_oid != original_head_sha:
+            raise StaleAuthorityError("cancellation fence was persisted but original ref/PR head changed before CAS")
+        persisted_again, _comments = self._read_issue_cancellation_fences(
+            latest_authority, original_head_sha,
+        )
+        if not persisted_again or persisted_again[0].fence != fence:
+            raise StaleAuthorityError("exact persisted cancellation fence changed before ref exposure")
+        _fresh_original = _resolve_issue_cancellation_original_node(
+            self.client, self.central_repository, latest_authority, self.app, original_head_sha,
+        )
+        if not _issue_cancellation_fence_predecessor_matches(_fresh_original, fence):
+            raise StaleAuthorityError("cancellation predecessor changed before ref exposure")
+
+        update = RefUpdate(fence.branch_ref, original_head_sha, fence.cancellation_head_sha, force=False)
+        try:
+            self.client.update_refs(fence.central_repository_node_id, [update])
+        except Exception as first_error:
+            after_error = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            if after_error == fence.cancellation_head_sha:
+                pass
+            elif after_error == original_head_sha:
+                try:
+                    # Retry only the byte-identical persisted target.
+                    self.client.update_refs(fence.central_repository_node_id, [update])
+                except Exception as second_error:
+                    after_retry = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+                    if after_retry != fence.cancellation_head_sha:
+                        raise StaleAuthorityError(
+                            f"same-target cancellation CAS did not activate: {_bounded_reason(second_error)}"
+                        ) from None
+                else:
+                    after_retry = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+                    if after_retry != fence.cancellation_head_sha:
+                        raise StaleAuthorityError("same-target cancellation CAS did not read back exact HC")
+            else:
+                raise StaleAuthorityError(
+                    f"cancellation CAS lost to a different ref head: {_bounded_reason(first_error)}"
+                ) from None
+        after_cas = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if after_cas != fence.cancellation_head_sha:
+            raise StaleAuthorityError("cancellation CAS did not read back exact cancellationHeadSha")
+        final_authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+        )
+        if (
+            final_authority.binding_authority != authority.binding_authority
+            or final_authority.binding != authority.binding
+            or final_authority.pr.head_oid != fence.cancellation_head_sha
+            or final_authority.raw_pr_state != "OPEN"
+            or final_authority.raw_pr_merged
+        ):
+            raise StaleAuthorityError("post-CAS cancellation PR/ownership readback is not the exact unmerged HC")
+        final_resolution = resolve_sha_carrier_role(
+            self.client, self.central_repository, fence.cancellation_head_sha,
+            self.app.slug, LegacyEvidenceDisposition.CONFLICTING,
+        )
+        if final_resolution != ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL,
+            _issue_cancellation_fence_marker(fence),
+        ):
+            raise StaleAuthorityError("cancellation HC is not ACTIVE under the real SHA-global resolver")
+        return fence
+
+    def publish_issue_cancel_failure(
+        self,
+        issue_number: int,
+        fence: IssueCancellationFence,
+    ) -> ExactAppRequiredStatusSnapshot:
+        """Publish/reuse only the exact App failure tuple for an ACTIVE cancellation fence."""
+        if type(fence) is not IssueCancellationFence or fence.issue_number != issue_number:
+            raise R02Error("cancel status publication requires the exact IssueCancellationFence")
+        authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+        )
+        current_ref = _read_issue_branch_ref(
+            self.client, self.central_repository, fence.branch_ref.removeprefix("refs/heads/"),
+        )
+        fences, _comments = self._read_issue_cancellation_fences(authority, current_ref or ZERO_OID)
+        if not fences or fences[0].fence != fence or current_ref != fence.cancellation_head_sha:
+            raise StaleAuthorityError("cancel status requires the exact persisted current HC fence")
+        if (
+            _cancellation_binding_authority_id(authority) != fence.binding_authority
+            or authority.pull_request_number != fence.pull_request_number
+            or authority.pull_request_database_id != fence.pull_request_database_id
+            or authority.pull_request_node_id != fence.pull_request_node_id
+            or authority.pr.head_oid != fence.cancellation_head_sha
+            or authority.raw_pr_state != "OPEN"
+            or authority.raw_pr_merged
+        ):
+            raise StaleAuthorityError("cancel status requires exact current unmerged central PR authority")
+        resolution = resolve_sha_carrier_role(
+            self.client, self.central_repository, fence.cancellation_head_sha,
+            self.app.slug, LegacyEvidenceDisposition.CONFLICTING,
+        )
+        if resolution != ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL,
+            _issue_cancellation_fence_marker(fence),
+        ):
+            raise StaleAuthorityError("cancel status requires ACTIVE(ISSUE_CANCEL) under the real resolver")
+        reused = _latest_exact_cancel_status_evidence(
+            self.client, self.central_repository, fence, self.app,
+        )
+        if reused is not None:
+            return reused
+        repository = self.client.get_repository_metadata(self.central_repository)
+        if (
+            type(repository) is not RepositoryMetadata
+            or repository.full_name != self.central_repository
+            or repository.node_id != fence.central_repository_node_id
+        ):
+            raise StaleAuthorityError("cancel status central repository identity changed")
+        digest = cancel_status_evidence_digest(
+            central_repository_node_id=repository.node_id,
+            issue_number=fence.issue_number,
+            issue_database_id=fence.issue_database_id,
+            issue_node_id=fence.issue_node_id,
+            fence_id=fence.fence_id,
+            cancellation_head_sha=fence.cancellation_head_sha,
+            binding_authority=fence.binding_authority,
+            pull_request_number=fence.pull_request_number,
+            pull_request_database_id=fence.pull_request_database_id,
+            pull_request_node_id=fence.pull_request_node_id,
+        )
+        description = render_status_description(StatusClass.CANCEL, digest)
+        if len(description.encode("ascii")) != 81:
+            raise R02Error("canonical cancel description must be exactly 81 ASCII bytes")
+        receipt = self.client.create_commit_status(
+            self.central_repository,
+            fence.cancellation_head_sha,
+            "failure",
+            "federation/trusted-validation",
+            description,
+            None,
+        )
+        status = _validate_issue_cancel_status_receipt(receipt, repository, fence, self.app)
+        return _snapshot_required_status_row(status, fence.cancellation_head_sha)
+
+    def _fresh_cancellation_fence_state(
+        self,
+        issue_number: int,
+        expected_fence: IssueCancellationFence | None = None,
+    ) -> tuple[_IssueCancellationAuthority, IssueCancellationFenceComment, tuple[IssueComment, ...], str | None]:
+        authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+            allow_pr_stage_state=True,
+        )
+        current_ref = _read_issue_branch_ref(
+            self.client, self.central_repository,
+            authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        fences, comments = self._read_issue_cancellation_fences(
+            authority, current_ref or ZERO_OID,
+        )
+        if len(fences) != 1:
+            raise StaleAuthorityError("exact persisted IssueCancellationFence is required")
+        fence_item = fences[0]
+        fence = fence_item.fence
+        if expected_fence is not None and fence != expected_fence:
+            raise StaleAuthorityError("persisted IssueCancellationFence differs from the requested fence")
+        if _cancellation_binding_authority_id(authority) != fence.binding_authority:
+            raise StaleAuthorityError("current cancellation binding authority differs from its exact fence")
+        if not authority.raw_pr_merged and (
+            current_ref != fence.cancellation_head_sha
+            or authority.pr.head_oid != fence.cancellation_head_sha
+        ):
+            raise StaleAuthorityError("exact cancellation fence is not the current generated ref and PR head")
+        return authority, fence_item, comments, current_ref
+
+    def _require_current_cancel_failure(
+        self,
+        fence: IssueCancellationFence,
+        expected: ExactAppRequiredStatusSnapshot | None = None,
+    ) -> ExactAppRequiredStatusSnapshot:
+        status = _latest_exact_cancel_status_evidence(
+            self.client, self.central_repository, fence, self.app,
+        )
+        if status is None:
+            raise StaleAuthorityError("latest exact-App status is not the exact cancellation failure for this fence")
+        if expected is not None and status != expected:
+            raise StaleAuthorityError("latest exact-App cancellation failure changed during cancellation progression")
+        return status
+
+    def _require_active_issue_cancel(self, fence: IssueCancellationFence) -> None:
+        resolution = resolve_sha_carrier_role(
+            self.client, self.central_repository, fence.cancellation_head_sha,
+            self.app.slug, LegacyEvidenceDisposition.CONFLICTING,
+        )
+        if resolution != ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL,
+            _issue_cancellation_fence_marker(fence),
+        ):
+            raise StaleAuthorityError("cancellation stage mutation requires ACTIVE(ISSUE_CANCEL) authority")
+
+    def _run_cancellation_pr_stage(
+        self,
+        authority: _IssueCancellationAuthority,
+        fence: IssueCancellationFence,
+        stage: str,
+    ) -> ExactPullRequestStageMutationEvidence:
+        try:
+            method_name, _operation = _CANCELLATION_STAGE_SPECS[stage]
+        except KeyError:
+            raise R02Error("cancellation PR mutation stage is unsupported") from None
+        method = getattr(self.client, method_name, None)
+        if not callable(method):
+            raise R02Error("fixed PR-stage transport method is unavailable")
+        client_mutation_id = _cancellation_stage_client_mutation_id(fence, stage)
+        try:
+            receipt = method(fence.pull_request_node_id, client_mutation_id)
+        except Exception as error:
+            # A later read may classify a merge race, but can never replace the
+            # missing same-response receipt or create witness/terminal evidence.
+            try:
+                observed = _fresh_issue_cancellation_authority(
+                    self.client, self.central_repository, fence.issue_number,
+                    self.app, allow_pr_stage_state=True,
+                )
+            except Exception:
+                observed = None
+            if observed is not None and observed.raw_pr_merged:
+                raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED") from None
+            raise StaleAuthorityError(
+                f"same-response cancellation {stage} receipt is unavailable: {_bounded_reason(error)}"
+            ) from None
+        return _exact_cancellation_stage_evidence(receipt, authority, fence, stage)
+
+    def _persist_issue_cancellation_draft_witness(
+        self,
+        authority: _IssueCancellationAuthority,
+        fence_item: IssueCancellationFenceComment,
+        status: ExactAppRequiredStatusSnapshot,
+        witness: IssueCancellationDraftWitness,
+    ) -> IssueCancellationDraftWitnessComment:
+        body = witness.render()
+        comments = tuple(self.client.list_issue_comments(
+            self.central_repository, authority.pull_request_number,
+        ))
+        existing = _issue_cancellation_draft_witness_comments(
+            comments, self.app, authority, fence_item, status,
+        )
+        if existing:
+            if existing[0].witness.render() != body:
+                raise StaleAuthorityError("a different immutable cancellation draft witness is already persisted")
+            return existing[0]
+        try:
+            self.client.create_issue_comment(
+                self.central_repository, authority.pull_request_number, body,
+            )
+        except Exception as error:
+            try:
+                readback = tuple(self.client.list_issue_comments(
+                    self.central_repository, authority.pull_request_number,
+                ))
+                witnesses = _issue_cancellation_draft_witness_comments(
+                    readback, self.app, authority, fence_item, status,
+                )
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous draft witness POST cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            if len(witnesses) == 1 and witnesses[0].witness.render() == body:
+                return witnesses[0]
+            raise StaleAuthorityError(
+                f"draft witness POST lacks exact same-response authority: {_bounded_reason(error)}"
+            ) from None
+        readback = tuple(self.client.list_issue_comments(
+            self.central_repository, authority.pull_request_number,
+        ))
+        witnesses = _issue_cancellation_draft_witness_comments(
+            readback, self.app, authority, fence_item, status,
+        )
+        if len(witnesses) != 1 or witnesses[0].witness.render() != body:
+            raise StaleAuthorityError("persisted cancellation draft witness is absent or differs from exact payload")
+        return witnesses[0]
+
+    def _persist_issue_terminal_cancelled_result(
+        self,
+        authority: _IssueCancellationAuthority,
+        fence_item: IssueCancellationFenceComment,
+        witness_item: IssueCancellationDraftWitnessComment,
+        status: ExactAppRequiredStatusSnapshot,
+        result: IssueTerminalCancelledResult,
+    ) -> IssueTerminalCancelledResultComment:
+        body = result.render()
+        comments = tuple(self.client.list_issue_comments(
+            self.central_repository, authority.pull_request_number,
+        ))
+        existing = _issue_terminal_cancelled_result_comments(
+            comments, self.app, authority, fence_item, witness_item, status,
+        )
+        if existing:
+            if existing[0].result.render() != body:
+                raise StaleAuthorityError("a different immutable terminal cancellation result is already persisted")
+            return existing[0]
+        try:
+            self.client.create_issue_comment(
+                self.central_repository, authority.pull_request_number, body,
+            )
+        except Exception as error:
+            try:
+                readback = tuple(self.client.list_issue_comments(
+                    self.central_repository, authority.pull_request_number,
+                ))
+                results = _issue_terminal_cancelled_result_comments(
+                    readback, self.app, authority, fence_item, witness_item, status,
+                )
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous terminal result POST cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            if len(results) == 1 and results[0].result.render() == body:
+                return results[0]
+            raise StaleAuthorityError(
+                f"terminal result POST lacks exact canonical readback: {_bounded_reason(error)}"
+            ) from None
+        readback = tuple(self.client.list_issue_comments(
+            self.central_repository, authority.pull_request_number,
+        ))
+        results = _issue_terminal_cancelled_result_comments(
+            readback, self.app, authority, fence_item, witness_item, status,
+        )
+        if len(results) != 1 or results[0].result.render() != body:
+            raise StaleAuthorityError("persisted terminal cancellation result is absent or differs from exact payload")
+        return results[0]
+
+    def establish_issue_cancellation_draft_witness(
+        self,
+        issue_number: int,
+    ) -> IssueCancellationDraftWitness:
+        """Normalize the exact cancellation PR to draft using only same-response proof."""
+        authority, fence_item, comments, current_ref = self._fresh_cancellation_fence_state(issue_number)
+        fence = fence_item.fence
+        if authority.raw_pr_merged:
+            raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+        if current_ref != fence.cancellation_head_sha or authority.pr.head_oid != fence.cancellation_head_sha:
+            raise StaleAuthorityError("draft witness requires exact current HC ref and PR head")
+        self._require_active_issue_cancel(fence)
+        status = self._require_current_cancel_failure(fence)
+        witnesses = _issue_cancellation_draft_witness_comments(
+            comments, self.app, authority, fence_item, status,
+        )
+        if witnesses:
+            # A replayed witness survives PR ready/close state changes. Only a
+            # merge or immutable identity/head drift can make it unusable.
+            latest_authority, latest_fence, _latest_comments, latest_ref = self._fresh_cancellation_fence_state(
+                issue_number, fence,
+            )
+            if latest_authority.raw_pr_merged:
+                raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+            if latest_ref != fence.cancellation_head_sha or latest_authority.pr.head_oid != fence.cancellation_head_sha:
+                raise StaleAuthorityError("persisted draft witness no longer matches exact current HC")
+            if self._require_current_cancel_failure(fence) != status:
+                raise StaleAuthorityError("current cancellation failure changed during witness replay")
+            return witnesses[0].witness
+
+        reopen_evidence: ExactPullRequestStageMutationEvidence | None = None
+        ready_evidence: ExactPullRequestStageMutationEvidence | None = None
+        is_draft = authority.pr.draft
+        if authority.raw_pr_state == "CLOSED":
+            reopen_evidence = self._run_cancellation_pr_stage(authority, fence, "DRAFT_REOPEN")
+            is_draft = reopen_evidence.is_draft
+            self._require_active_issue_cancel(fence)
+        elif authority.raw_pr_state != "OPEN":
+            raise R02Error("cancellation draft normalization requires exact OPEN or CLOSED PR state")
+        if is_draft:
+            ready_evidence = self._run_cancellation_pr_stage(authority, fence, "DRAFT_READY")
+            is_draft = ready_evidence.is_draft
+        if authority.raw_pr_state == "CLOSED" and reopen_evidence is None:
+            raise R02Error("closed PR normalization lacks its exact same-response reopen receipt")
+        if is_draft:
+            raise StaleAuthorityError("draft PR did not return to OPEN ready state before draft conversion")
+        status_before_convert = self._require_current_cancel_failure(fence, status)
+        draft_evidence = self._run_cancellation_pr_stage(authority, fence, "DRAFT_CONVERT")
+        try:
+            witness = IssueCancellationDraftWitness.create(
+                schema_version=1,
+                **_cancellation_witness_expected_fields(authority, fence_item, status_before_convert),
+                returned_base_ref_oid=draft_evidence.base_ref_oid,
+                reopen_evidence=reopen_evidence,
+                ready_evidence=ready_evidence,
+                draft_evidence=draft_evidence,
+            )
+        except RequestModelError as error:
+            raise R02Error(f"same-response cancellation draft witness is invalid: {_bounded_reason(error)}") from None
+        persisted = self._persist_issue_cancellation_draft_witness(
+            authority, fence_item, status_before_convert, witness,
+        )
+        latest_authority, latest_fence, latest_comments, latest_ref = self._fresh_cancellation_fence_state(
+            issue_number, fence,
+        )
+        if latest_authority.raw_pr_merged:
+            raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+        if latest_ref != fence.cancellation_head_sha:
+            raise StaleAuthorityError("persisted draft witness lost exact generated ref HC")
+        latest_status = self._require_current_cancel_failure(fence, status_before_convert)
+        witnesses = _issue_cancellation_draft_witness_comments(
+            latest_comments, self.app, latest_authority, latest_fence, latest_status,
+        )
+        if len(witnesses) != 1 or witnesses[0].witness != persisted.witness:
+            raise StaleAuthorityError("draft witness readback differs from the exact same-response evidence")
+        return persisted.witness
+
+    def establish_issue_terminal_cancelled_result(
+        self,
+        issue_number: int,
+    ) -> IssueTerminalCancelledResult:
+        """Close the witnessed unmerged PR and persist exact same-response terminal proof."""
+        authority, fence_item, comments, current_ref = self._fresh_cancellation_fence_state(issue_number)
+        fence = fence_item.fence
+        if current_ref != fence.cancellation_head_sha:
+            raise StaleAuthorityError("terminal cancellation requires exact current ref HC")
+        status = self._require_current_cancel_failure(fence)
+        witnesses = _issue_cancellation_draft_witness_comments(
+            comments, self.app, authority, fence_item, status,
+        )
+        if len(witnesses) != 1:
+            raise StaleAuthorityError("exact persisted cancellation draft witness is required before terminal close")
+        witness_item = witnesses[0]
+        results = _issue_terminal_cancelled_result_comments(
+            comments, self.app, authority, fence_item, witness_item, status,
+        )
+        if results:
+            if authority.pr.head_oid != fence.cancellation_head_sha:
+                raise StaleAuthorityError("persisted terminal result PR head no longer matches HC")
+            if self._require_current_cancel_failure(fence) != status:
+                raise StaleAuthorityError("current cancellation failure changed during terminal-result replay")
+            return results[0].result
+        if authority.raw_pr_merged:
+            raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+        if authority.pr.head_oid != fence.cancellation_head_sha:
+            raise StaleAuthorityError("terminal close requires exact current PR head HC")
+        reopen_evidence: ExactPullRequestStageMutationEvidence | None = None
+        if authority.raw_pr_state == "CLOSED":
+            reopen_evidence = self._run_cancellation_pr_stage(authority, fence, "CLOSE_REOPEN")
+        elif authority.raw_pr_state != "OPEN":
+            raise R02Error("terminal close normalization requires exact OPEN or CLOSED PR state")
+        current_status = self._require_current_cancel_failure(fence, status)
+        close_evidence = self._run_cancellation_pr_stage(authority, fence, "TERMINAL_CLOSE")
+        if close_evidence.state != "CLOSED":
+            raise StaleAuthorityError("terminal close same-response evidence did not return CLOSED")
+        # The exact close response is the proof. A fresh merged read can veto
+        # cancellation, but it can never replace a missing or contradictory receipt.
+        latest_authority, latest_fence, latest_comments, latest_ref = self._fresh_cancellation_fence_state(
+            issue_number, fence,
+        )
+        if latest_authority.raw_pr_merged:
+            raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+        if latest_ref != fence.cancellation_head_sha or latest_authority.pr.head_oid != fence.cancellation_head_sha:
+            raise StaleAuthorityError("post-close cancellation authority/ref no longer matches exact HC")
+        latest_status = self._require_current_cancel_failure(fence, current_status)
+        latest_witnesses = _issue_cancellation_draft_witness_comments(
+            latest_comments, self.app, latest_authority, latest_fence, latest_status,
+        )
+        if len(latest_witnesses) != 1 or latest_witnesses[0].witness != witness_item.witness:
+            raise StaleAuthorityError("draft witness changed during terminal close")
+        try:
+            proof_kind = (
+                IssueTerminalCancelledProofKind.PR_BACKED_PRE_BINDING
+                if _cancellation_binding_authority_id(latest_authority) == "PRE_BINDING"
+                else IssueTerminalCancelledProofKind.PR_BACKED_FULL_BINDING
+            )
+            result = IssueTerminalCancelledResult.create(
+                schema_version=1,
+                **_cancellation_terminal_result_expected_fields(
+                    latest_authority, latest_fence, latest_witnesses[0], latest_status,
+                ),
+                close_evidence=close_evidence,
+                proof_kind=proof_kind,
+            )
+        except RequestModelError as error:
+            raise R02Error(f"same-response terminal close result is invalid: {_bounded_reason(error)}") from None
+        persisted = self._persist_issue_terminal_cancelled_result(
+            latest_authority, latest_fence, latest_witnesses[0], latest_status, result,
+        )
+        final_authority, final_fence, final_comments, final_ref = self._fresh_cancellation_fence_state(
+            issue_number, fence,
+        )
+        if final_ref != fence.cancellation_head_sha:
+            raise StaleAuthorityError("terminal result readback no longer has exact generated ref HC")
+        final_status = self._require_current_cancel_failure(fence, latest_status)
+        final_witnesses = _issue_cancellation_draft_witness_comments(
+            final_comments, self.app, final_authority, final_fence, final_status,
+        )
+        if len(final_witnesses) != 1:
+            raise StaleAuthorityError("terminal-result replay lost the exact persisted draft witness")
+        final_results = _issue_terminal_cancelled_result_comments(
+            final_comments, self.app, final_authority, final_fence, final_witnesses[0], final_status,
+        )
+        if len(final_results) != 1 or final_results[0].result != persisted.result:
+            raise StaleAuthorityError("terminal cancellation result readback differs from exact close receipt")
+        return persisted.result
+
+    def _persist_issue_no_pr_cancelled_result(
+        self,
+        issue_number: int,
+        anchor: IssueAnchorComment,
+        lease: IssueBranchLeaseComment | None,
+        result: IssueNoPRCancelledResult,
+    ) -> IssueNoPRCancelledResult:
+        body = result.render()
+        try:
+            comments = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+        except Exception as error:
+            raise StaleAuthorityError(f"no-PR result target Issue comments are unavailable: {_bounded_reason(error)}") from None
+        existing = _issue_no_pr_cancelled_result_comments(comments, self.app, anchor, lease)
+        if existing:
+            if existing[0].result != result:
+                raise StaleAuthorityError("a different immutable no-PR cancellation result is already persisted")
+            return existing[0].result
+        try:
+            self.client.create_issue_comment(self.central_repository, issue_number, body)
+        except Exception as error:
+            try:
+                readback = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+                persisted = _issue_no_pr_cancelled_result_comments(readback, self.app, anchor, lease)
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous no-PR result POST cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            if len(persisted) == 1 and persisted[0].result.render() == body:
+                return persisted[0].result
+            raise StaleAuthorityError(
+                f"no-PR result POST lacks exact canonical readback: {_bounded_reason(error)}"
+            ) from None
+        try:
+            readback = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+            persisted = _issue_no_pr_cancelled_result_comments(readback, self.app, anchor, lease)
+        except Exception as error:
+            raise StaleAuthorityError(f"persisted no-PR result could not be verified: {_bounded_reason(error)}") from None
+        if len(persisted) != 1 or persisted[0].result.render() != body:
+            raise StaleAuthorityError("persisted no-PR result is absent or differs from exact canonical payload")
+        return persisted[0].result
+
+    @staticmethod
+    def _no_pr_cancelled_result_fields(
+        state: IssueCancellationState,
+        proof_kind: IssueNoPRCancelledProofKind,
+        *,
+        status: ExactAppRequiredStatusSnapshot | None = None,
+        legacy_digest: str | None = None,
+        cleanup_before_oid: str | None = None,
+        cleanup_ref_absent_after: bool | None = None,
+    ) -> dict[str, Any]:
+        anchor = state.issue_anchor
+        fields: dict[str, Any] = {
+            "schema_version": 1,
+            "issue_number": anchor.anchor.issue_number,
+            "issue_database_id": anchor.anchor.issue_database_id,
+            "issue_node_id": anchor.anchor.issue_node_id,
+            "issue_request_anchor_comment_database_id": anchor.comment.database_id,
+            "issue_request_anchor_sha256": anchor.anchor.canonical_sha256(),
+            "source_id": anchor.anchor.source_id,
+            "source_repository_id": anchor.anchor.source_repository_id,
+            "proof_kind": proof_kind,
+        }
+        if proof_kind is not IssueNoPRCancelledProofKind.ANCHOR_ONLY:
+            if state.lease is None:
+                raise R02Error("lease-backed no-PR result requires the exact IssueBranchLease")
+            fields.update({
+                "lease_comment_database_id": state.lease.comment.database_id,
+                "lease_sha256": _binding_comment_sha256(state.lease.comment),
+                "lease_id": state.lease.lease.lease_id,
+                "branch_ref": state.lease.lease.branch_ref,
+                "lease_initial_head_sha": state.lease.lease.initial_head_sha,
+                "all_state_pr_enumeration_digest": state.all_state_pr_enumeration_digest,
+            })
+        if proof_kind is IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS:
+            fields.update({
+                "required_status": status,
+                "legacy_carrier_evidence_digest": legacy_digest,
+                "cleanup_before_oid": cleanup_before_oid,
+                "cleanup_ref_absent_after": cleanup_ref_absent_after,
+            })
+        return fields
+
+    def cancel_issue_without_pr(self, issue_number: int) -> IssueNoPRCancelledResult:
+        """Persist exact A/B no-PR terminal evidence or CAS-delete an exact zero-PR lease root."""
+        state = self._read_issue_cancellation_state(issue_number)
+        if state.classification not in {
+            IssueCancellationClass.A_ANCHOR_ONLY,
+            IssueCancellationClass.B_LEASE_REF_ABSENT,
+            IssueCancellationClass.C_LEASE_ZERO_PR,
+        }:
+            raise StaleAuthorityError("no-PR cancellation is limited to exact classes A/B/C")
+        if state.pr_candidates:
+            raise R02Error("no-PR cancellation cannot proceed while any exact reserved-branch PR exists")
+
+        existing = state.no_pr_results
+        if len(existing) > 1:
+            raise R02Error("conflicting no-PR terminal results block cancellation")
+        if existing:
+            result = existing[0]
+            if state.classification is IssueCancellationClass.A_ANCHOR_ONLY:
+                expected = IssueNoPRCancelledProofKind.ANCHOR_ONLY
+            elif state.classification is IssueCancellationClass.B_LEASE_REF_ABSENT:
+                expected = result.proof_kind
+                if expected not in {
+                    IssueNoPRCancelledProofKind.LEASE_REF_ABSENT,
+                    IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS,
+                }:
+                    raise R02Error("existing no-PR result proof kind does not match the absent-ref class")
+            else:
+                raise R02Error("lease root was restored after a durable no-PR terminal result")
+            if result.proof_kind is not expected:
+                raise R02Error("existing no-PR result proof kind differs from exact current cancellation class")
+            return result
+
+        if state.issue.state != "closed":
+            raise StaleAuthorityError("a fresh no-PR cancellation result requires the exact Issue to be closed")
+
+        if state.classification is IssueCancellationClass.A_ANCHOR_ONLY:
+            result = IssueNoPRCancelledResult.create(**self._no_pr_cancelled_result_fields(
+                state, IssueNoPRCancelledProofKind.ANCHOR_ONLY,
+            ))
+            latest = self._read_issue_cancellation_state(issue_number)
+            if (
+                latest.classification is not IssueCancellationClass.A_ANCHOR_ONLY
+                or latest.issue.state != "closed"
+                or latest.issue_anchor != state.issue_anchor
+                or latest.no_pr_results
+            ):
+                raise StaleAuthorityError("anchor-only cancellation classification changed before result persistence")
+            return self._persist_issue_no_pr_cancelled_result(
+                issue_number, latest.issue_anchor, latest.lease, result,
+            )
+
+        if state.classification is IssueCancellationClass.B_LEASE_REF_ABSENT:
+            result = IssueNoPRCancelledResult.create(**self._no_pr_cancelled_result_fields(
+                state, IssueNoPRCancelledProofKind.LEASE_REF_ABSENT,
+            ))
+            latest = self._read_issue_cancellation_state(issue_number)
+            if (
+                latest.classification is not IssueCancellationClass.B_LEASE_REF_ABSENT
+                or latest.issue.state != "closed"
+                or latest.issue_anchor != state.issue_anchor
+                or latest.lease != state.lease
+                or latest.no_pr_results
+            ):
+                raise StaleAuthorityError("absent-ref cancellation classification changed before result persistence")
+            result = IssueNoPRCancelledResult.create(**self._no_pr_cancelled_result_fields(
+                latest, IssueNoPRCancelledProofKind.LEASE_REF_ABSENT,
+            ))
+            return self._persist_issue_no_pr_cancelled_result(
+                issue_number, latest.issue_anchor, latest.lease, result,
+            )
+
+        if state.lease is None:
+            raise R02Error("zero-PR lease-root cancellation has no exact IssueBranchLease")
+        lease = state.lease.lease
+        lease_head = lease.initial_head_sha
+        lease_marker = _lease_marker_for(lease)
+        resolution = resolve_sha_carrier_role(
+            self.client, self.central_repository, lease_head, self.app.slug,
+            LegacyEvidenceDisposition.CONFLICTING,
+        )
+        if resolution != ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE, lease_marker,
+        ):
+            raise StaleAuthorityError("unbound lease root is not the exact active IssueBranchLease carrier")
+        if any(
+            type(comment.body) is str
+            and comment.body.startswith(ISSUE_FINALIZATION_EPOCH_MARKER)
+            for comment in state.issue_comments
+        ):
+            raise StaleAuthorityError("IssueFinalizationEpoch provenance forbids no-PR lease-root cleanup")
+
+        status, issue_final_success, _any_exact_app_success, _latest_status = (
+            _read_latest_exact_app_required_status_snapshot(
+                self.client, self.central_repository, lease_head, self.app,
+            )
+        )
+        if status.is_present and status.state == "success":
+            raise StaleAuthorityError("latest exact-App required status success blocks lease-root cancellation")
+        if issue_final_success:
+            raise StaleAuthorityError("exact-App success provenance blocks no-PR lease-root cleanup")
+        try:
+            raw_checks = tuple(self.client.list_check_runs(self.central_repository, lease_head))
+        except Exception as error:
+            raise StaleAuthorityError(f"lease-root legacy Check Run inventory is unavailable: {_bounded_reason(error)}") from None
+        if any(type(check) is not CheckRun for check in raw_checks):
+            raise R02Error("lease-root Check Run inventory contains a malformed record")
+        exact_checks = tuple(sorted((
+            check for check in raw_checks
+            if check.name == TRUSTED_VALIDATION_NAME
+            and check.head_sha == lease_head
+            and check.app_id == self.app.app_id
+        ), key=lambda check: check.id))
+        if len(exact_checks) > 1:
+            raise StaleAuthorityError("multiple exact-App legacy trusted-validation Check Runs are ambiguous")
+        if status.is_present and exact_checks:
+            raise StaleAuthorityError("commit status and Check Run carriers are mixed on the unbound lease root")
+        for check in exact_checks:
+            if check.conclusion in {"success", "neutral", "skipped"}:
+                raise StaleAuthorityError("merge-satisfying exact-App legacy Check Run blocks lease-root cancellation")
+            if check.status not in {"queued", "in_progress", "completed", "waiting", "pending", "requested"}:
+                raise R02Error("legacy trusted-validation Check Run has an unknown state")
+            if check.status == "completed" and check.conclusion is None:
+                raise R02Error("completed legacy trusted-validation Check Run lacks a conclusion")
+        legacy_digest_payload = {
+            "checks": [
+                {
+                    "appId": check.app_id,
+                    "conclusion": check.conclusion,
+                    "headSha": check.head_sha,
+                    "id": check.id,
+                    "name": check.name,
+                    "status": check.status,
+                }
+                for check in exact_checks
+            ],
+            "issueFinalSuccess": issue_final_success,
+            "latestStatus": status.as_value(),
+        }
+        legacy_digest = hashlib.sha256(json.dumps(
+            legacy_digest_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")).hexdigest()
+
+        # This second all-state inventory is intentionally the last authority
+        # read before the exact non-force ref deletion.
+        latest = self._read_issue_cancellation_state(issue_number)
+        if (
+            latest.classification is not IssueCancellationClass.C_LEASE_ZERO_PR
+            or latest.issue.state != "closed"
+            or latest.issue_anchor != state.issue_anchor
+            or latest.lease != state.lease
+            or latest.branch_ref_oid != lease_head
+            or latest.pr_candidates
+            or latest.no_pr_results
+        ):
+            raise StaleAuthorityError("zero-PR lease-root proof changed immediately before exact CAS cleanup")
+        update = RefUpdate(lease.branch_ref, lease_head, ZERO_OID, force=False)
+        try:
+            self.client.update_refs(latest.repository.node_id, [update])
+        except Exception as error:
+            try:
+                self._read_issue_cancellation_state(issue_number)
+            except Exception as reclassify_error:
+                raise StaleAuthorityError(
+                    f"lease-root CAS failed and fresh reclassification is unavailable: {_bounded_reason(reclassify_error)}"
+                ) from None
+            raise StaleAuthorityError(
+                f"lease-root exact CAS did not produce terminal proof: {_bounded_reason(error)}"
+            ) from None
+        if _read_issue_branch_ref(
+            self.client, self.central_repository, lease.branch_ref.removeprefix("refs/heads/"),
+        ) is not None:
+            raise StaleAuthorityError("exact lease-root CAS returned without verifying branch-ref absence")
+        result = IssueNoPRCancelledResult.create(**self._no_pr_cancelled_result_fields(
+            latest,
+            IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS,
+            status=status,
+            legacy_digest=legacy_digest,
+            cleanup_before_oid=lease_head,
+            cleanup_ref_absent_after=True,
+        ))
+        return self._persist_issue_no_pr_cancelled_result(
+            issue_number, latest.issue_anchor, latest.lease, result,
+        )
+
+    def _validated_pr_cancellation_cleanup(
+        self,
+        state: IssueCancellationState,
+    ) -> tuple[_IssueCancellationAuthority, IssueCancellationFenceComment,
+               IssueCancellationDraftWitnessComment, IssueTerminalCancelledResult]:
+        if state.classification not in {
+            IssueCancellationClass.D_PRE_BINDING_ONE_PR,
+            IssueCancellationClass.E_FULL_BINDING,
+        } or state.cancellation_authority is None or len(state.pr_candidates) != 1:
+            raise StaleAuthorityError("PR-backed cleanup requires exact classified D/E central ownership")
+        if state.merge_observed or state.cancellation_authority.raw_pr_merged:
+            if state.classification is IssueCancellationClass.E_FULL_BINDING:
+                raise StaleAuthorityError("MERGE_OBSERVED_POST_MERGE_REQUIRED")
+            raise StaleAuthorityError("MERGED_PRE_BINDING_PRESERVE_WITHOUT_POST_MERGE_AUTHORITY")
+        if len(state.fence_items) != 1 or len(state.witness_items) != 1 or len(state.terminal_result_items) != 1:
+            raise StaleAuthorityError("PR-backed cleanup requires exact fence, witness, and terminal result")
+        authority = state.cancellation_authority
+        candidate = state.pr_candidates[0]
+        fence_item = state.fence_items[0]
+        witness_item = state.witness_items[0]
+        terminal = state.terminal_result_items[0].result
+        fence = fence_item.fence
+        expected_kind = (
+            IssueTerminalCancelledProofKind.PR_BACKED_PRE_BINDING
+            if state.classification is IssueCancellationClass.D_PRE_BINDING_ONE_PR
+            else IssueTerminalCancelledProofKind.PR_BACKED_FULL_BINDING
+        )
+        if (
+            terminal.proof_kind is not expected_kind
+            or terminal.binding_authority != fence.binding_authority
+            or terminal.pull_request_number != authority.pull_request_number
+            or terminal.pull_request_database_id != authority.pull_request_database_id
+            or terminal.pull_request_node_id != authority.pull_request_node_id
+            or candidate.pr.head_oid != fence.cancellation_head_sha
+            or candidate.pr.base_ref != "main"
+            or candidate.pr.base_repository_id != state.repository.node_id
+        ):
+            raise StaleAuthorityError("terminal cancellation result differs from exact current D/E fence/PR authority")
+        if state.classification is IssueCancellationClass.D_PRE_BINDING_ONE_PR:
+            if (
+                authority.binding_authority != "PRE_BINDING"
+                or authority.binding is not None
+                or authority.binding_state is not None
+                or fence.binding_authority != "PRE_BINDING"
+                or fence.original_head_sha != authority.lease.lease.initial_head_sha
+            ):
+                raise StaleAuthorityError("PRE_BINDING Mode B cleanup gained complete binding or lost exact lease-root authority")
+        elif (
+            authority.binding_authority != "FULL_BINDING"
+            or authority.binding is None
+            or fence.binding_authority != authority.binding.binding_id
+        ):
+            raise StaleAuthorityError("Mode A cleanup requires the exact full two-sided binding")
+        current_failure = self._require_current_cancel_failure(fence, terminal.current_failure_status)
+        if current_failure != terminal.current_failure_status:
+            raise StaleAuthorityError("current exact-App cancellation failure differs from terminal result snapshot")
+        if state.branch_ref_oid not in {None, fence.cancellation_head_sha}:
+            raise StaleAuthorityError("reserved branch ref moved from exact cancellation HC")
+        if state.branch_ref_oid is None and candidate.pr.head_oid != fence.cancellation_head_sha:
+            raise StaleAuthorityError("absent-ref terminal cleanup no longer matches exact PR head HC")
+        return authority, fence_item, witness_item, terminal
+
+    def cleanup_issue_cancelled_branch(self, issue_number: int) -> IssueTerminalCancelledResult | str:
+        """Delete only an exact terminal D/E cancellation head with non-force compare-and-swap."""
+        state = self._read_issue_cancellation_state(issue_number)
+        if state.merge_observed:
+            if state.classification is IssueCancellationClass.E_FULL_BINDING:
+                return "MERGE_OBSERVED_POST_MERGE_REQUIRED"
+            if state.classification is IssueCancellationClass.D_PRE_BINDING_ONE_PR:
+                raise StaleAuthorityError("MERGED_PRE_BINDING_PRESERVE_WITHOUT_POST_MERGE_AUTHORITY")
+            raise StaleAuthorityError("merged cancellation state is not an exact PR-backed D/E class")
+        _authority, fence_item, _witness_item, terminal = self._validated_pr_cancellation_cleanup(state)
+        fence = fence_item.fence
+        if state.branch_ref_oid is None:
+            return terminal
+        if state.branch_ref_oid != fence.cancellation_head_sha:
+            raise StaleAuthorityError("PR-backed branch cleanup ref differs from exact cancellation HC")
+
+        # Re-read every central proof and the exact current cancellation failure
+        # immediately before deleting the one named branch ref.
+        latest = self._read_issue_cancellation_state(issue_number)
+        _latest_authority, latest_fence_item, _latest_witness, latest_terminal = (
+            self._validated_pr_cancellation_cleanup(latest)
+        )
+        if (
+            latest.classification is not state.classification
+            or latest_fence_item.fence != fence
+            or latest_terminal != terminal
+            or latest.branch_ref_oid != fence.cancellation_head_sha
+        ):
+            raise StaleAuthorityError("PR-backed terminal cancellation authority changed immediately before CAS cleanup")
+        update = RefUpdate(fence.branch_ref, fence.cancellation_head_sha, ZERO_OID, force=False)
+        try:
+            self.client.update_refs(latest.repository.node_id, [update])
+        except Exception as error:
+            try:
+                after_error = self._read_issue_cancellation_state(issue_number)
+                _after_authority, _after_fence, _after_witness, after_terminal = (
+                    self._validated_pr_cancellation_cleanup(after_error)
+                )
+            except Exception as reclassify_error:
+                raise StaleAuthorityError(
+                    f"terminal cleanup CAS failed and fresh reclassification is unavailable: {_bounded_reason(reclassify_error)}"
+                ) from None
+            if after_error.branch_ref_oid is None and after_terminal == terminal:
+                return terminal
+            raise StaleAuthorityError(
+                f"terminal cleanup exact CAS did not remove the authorized HC: {_bounded_reason(error)}"
+            ) from None
+        if _read_issue_branch_ref(
+            self.client, self.central_repository, fence.branch_ref.removeprefix("refs/heads/"),
+        ) is not None:
+            raise StaleAuthorityError("terminal cleanup CAS returned without verifying branch-ref absence")
+        final_state = self._read_issue_cancellation_state(issue_number)
+        _final_authority, _final_fence, _final_witness, final_terminal = (
+            self._validated_pr_cancellation_cleanup(final_state)
+        )
+        if final_state.branch_ref_oid is not None or final_terminal != terminal:
+            raise StaleAuthorityError("terminal cleanup readback lost exact terminal proof or ref absence")
+        return final_terminal
+
+    def _read_issue_cancellation_state(self, issue_number: int) -> IssueCancellationState:
+        """Classify a terminal Issue from fresh central authority without source lookup."""
+        if type(issue_number) is not int or not 1 <= issue_number <= 9_223_372_036_854_775_807:
+            raise R02Error("cancellation Issue number must be a positive signed-64 integer")
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            issue = self.client.get_issue_metadata(self.central_repository, issue_number)
+            issue_comments = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+        except Exception as error:
+            raise StaleAuthorityError(f"central cancellation classification authority is unavailable: {_bounded_reason(error)}") from None
+        if (
+            type(repository) is not RepositoryMetadata
+            or repository.full_name != self.central_repository
+            or repository.default_branch != "main"
+            or not repository.node_id
+            or current_app != self.app
+            or type(issue) is not IssueMetadata
+            or issue.number != issue_number
+            or issue.is_pull_request
+        ):
+            raise StaleAuthorityError("exact central repository/App/Issue identity changed during cancellation classification")
+        anchor = validate_unique_issue_anchor(issue_comments, issue, self.app)
+        _issue_pr_authority_fence(issue_comments, self.app, allow_cancellation_fence=True)
+        lease = _resolve_issue_branch_lease_class(
+            self.client, self.central_repository, issue_comments, self.app,
+            anchor.anchor, anchor.comment.database_id, repository.node_id,
+        )
+        issue_bindings = _binding_comment_candidates(
+            issue_comments, self.app, ISSUE_INTERNAL_PR_BINDING_MARKER,
+            parse_issue_internal_pr_binding, "IssueInternalPRBinding",
+        )
+        binding_conflict = lease is None and bool(issue_bindings)
+        for binding_item in issue_bindings:
+            if lease is None:
+                binding_conflict = True
+                continue
+            try:
+                _validate_issue_binding_cross_link(binding_item.binding, anchor, lease, repository.node_id)
+            except R02Error:
+                binding_conflict = True
+        no_pr_results = tuple(
+            item.result for item in _issue_no_pr_cancelled_result_comments(
+                issue_comments, self.app, anchor, lease,
+            )
+        )
+
+        branch_ref = issue_branch_ref(issue_number)
+        short_ref = branch_ref.removeprefix("refs/heads/")
+        current_ref = _read_issue_branch_ref(self.client, self.central_repository, short_ref)
+        try:
+            inventory = self.client.list_pull_requests(self.central_repository, state="all")
+        except Exception as error:
+            raise StaleAuthorityError(f"bounded all-state PR enumeration failed: {_bounded_reason(error)}") from None
+        if type(inventory) not in {tuple, list}:
+            raise R02Error("all-state PR enumeration must return a sequence")
+        numbers: list[int] = []
+        seen_numbers: set[int] = set()
+        candidates: list[_IssueCancellationPRCandidate] = []
+        topology_conflict = False
+        for raw in inventory:
+            if (
+                type(raw) is not dict
+                or type(raw.get("number")) is not int
+                or not 1 <= raw["number"] <= 9_223_372_036_854_775_807
+                or raw["number"] in seen_numbers
+            ):
+                raise R02Error("all-state PR enumeration contains an invalid or duplicate PR number")
+            number = raw["number"]
+            numbers.append(number)
+            seen_numbers.add(number)
+            try:
+                pr = self.client.get_pull_request_metadata(self.central_repository, number)
+            except Exception as error:
+                raise StaleAuthorityError(f"all-state PR metadata is unavailable: {_bounded_reason(error)}") from None
+            if type(pr) is not PullRequestMetadata or pr.number != number:
+                raise R02Error("all-state PR metadata differs from its enumerated number")
+            if pr.head_ref != short_ref:
+                continue
+            if pr.head_repository_id != repository.node_id:
+                topology_conflict = True
+                continue
+            if (
+                pr.head_repository != self.central_repository
+                or pr.base_repository_id != repository.node_id
+                or pr.base_repository != self.central_repository
+                or pr.base_ref != "main"
+                or pr.author_id != self.app.bot_node_id
+                or pr.author_login != self.app.bot_login
+                or pr.body != render_request_body(anchor.anchor.initial_request)
+                or pr.last_edited_at is not None
+                or pr.includes_created_edit is not False
+                or type(pr.draft) is not bool
+            ):
+                topology_conflict = True
+                continue
+            raw_state = raw.get("state")
+            raw_merged = raw.get("merged")
+            raw_merged_at = raw.get("merged_at")
+            if type(raw_merged) is not bool and "merged_at" in raw:
+                if raw_merged_at is None:
+                    raw_merged = False
+                elif type(raw_merged_at) is str and raw_merged_at:
+                    raw_merged = True
+                else:
+                    raw_merged = None
+            if (
+                type(raw_state) is not str
+                or raw_state not in {"open", "closed"}
+                or type(raw_merged) is not bool
+                or (raw_merged and (type(raw_merged_at) is not str or not raw_merged_at))
+                or (not raw_merged and raw_merged_at is not None)
+            ):
+                topology_conflict = True
+                continue
+            try:
+                pr_issue = self.client.get_issue_metadata(self.central_repository, number)
+                pr_comments = tuple(self.client.list_issue_comments(self.central_repository, number))
+            except Exception as error:
+                raise StaleAuthorityError(f"reserved-branch PR-as-Issue authority is unavailable: {_bounded_reason(error)}") from None
+            if (
+                type(pr_issue) is not IssueMetadata
+                or pr_issue.is_pull_request is not True
+                or pr_issue.number != number
+                or type(pr_issue.database_id) is not int
+                or pr_issue.database_id <= 0
+                or type(pr_issue.node_id) is not str
+                or not pr_issue.node_id
+                or pr_issue.author_id != self.app.bot_node_id
+                or pr_issue.author_login != self.app.bot_login
+                or pr_issue.body != pr.body
+                or pr_issue.state != raw_state
+            ):
+                topology_conflict = True
+                continue
+            _issue_pr_authority_fence(pr_comments, self.app, allow_cancellation_fence=True)
+            pr_bindings = _binding_comment_candidates(
+                pr_comments, self.app, PR_ISSUE_ORIGIN_BINDING_MARKER,
+                parse_pr_issue_origin_binding, "PRIssueOriginBinding",
+            )
+            issue_binding = issue_bindings[0] if issue_bindings else None
+            pr_binding = pr_bindings[0] if pr_bindings else None
+            for item in (issue_binding, pr_binding):
+                if item is not None:
+                    if lease is None:
+                        binding_conflict = True
+                    else:
+                        try:
+                            _validate_issue_binding_cross_link(item.binding, anchor, lease, repository.node_id)
+                        except R02Error:
+                            binding_conflict = True
+                    if (
+                        item.binding.pull_request_number != number
+                        or item.binding.pull_request_database_id != pr_issue.database_id
+                        or item.binding.pull_request_node_id != pr_issue.node_id
+                    ):
+                        binding_conflict = True
+            if issue_binding is not None and pr_binding is not None and issue_binding.binding != pr_binding.binding:
+                binding_conflict = True
+            candidates.append(_IssueCancellationPRCandidate(
+                pr, pr_issue, pr_comments, raw_state.upper(), raw_merged,
+                raw_merged_at, issue_binding, pr_binding,
+            ))
+
+        enum_payload = {
+            "branchRef": branch_ref,
+            "centralRepositoryNodeId": repository.node_id,
+            "listedPullRequestNumbers": sorted(numbers),
+            "reservedBranchCandidates": [
+                {
+                    "baseRef": item.pr.base_ref,
+                    "headRef": item.pr.head_ref,
+                    "headSha": item.pr.head_oid,
+                    "merged": item.raw_merged,
+                    "mergedAt": item.raw_merged_at,
+                    "number": item.pr.number,
+                    "state": item.raw_state,
+                }
+                for item in sorted(candidates, key=lambda candidate: candidate.pr.number)
+            ],
+        }
+        enumeration_digest = hashlib.sha256(json.dumps(
+            enum_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")).hexdigest()
+
+        def conflicting_state() -> IssueCancellationState:
+            return IssueCancellationState(
+                IssueCancellationClass.F_CONFLICTING, repository, issue, issue_comments,
+                anchor, lease, current_ref, enumeration_digest, tuple(candidates), None,
+                (), (), (), no_pr_results, any(item.raw_merged for item in candidates),
+            )
+
+        if binding_conflict or topology_conflict:
+            return conflicting_state()
+
+        if lease is None:
+            if current_ref is not None or candidates:
+                return conflicting_state()
+            if any(result.proof_kind is not IssueNoPRCancelledProofKind.ANCHOR_ONLY for result in no_pr_results):
+                raise R02Error("anchor-only cancellation has a lease-backed no-PR result")
+            return IssueCancellationState(
+                IssueCancellationClass.A_ANCHOR_ONLY, repository, issue, issue_comments,
+                anchor, None, None, enumeration_digest, (), None, (), (), (), no_pr_results, False,
+            )
+
+        if not candidates:
+            if current_ref is None:
+                if any(result.proof_kind not in {
+                    IssueNoPRCancelledProofKind.LEASE_REF_ABSENT,
+                    IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS,
+                } for result in no_pr_results):
+                    raise R02Error("absent-ref cancellation has an incompatible no-PR proof kind")
+                return IssueCancellationState(
+                    IssueCancellationClass.B_LEASE_REF_ABSENT, repository, issue, issue_comments,
+                    anchor, lease, None, enumeration_digest, (), None, (), (), (), no_pr_results, False,
+                )
+            if current_ref == lease.lease.initial_head_sha:
+                if issue_bindings:
+                    return conflicting_state()
+                if no_pr_results:
+                    return conflicting_state()
+                return IssueCancellationState(
+                    IssueCancellationClass.C_LEASE_ZERO_PR, repository, issue, issue_comments,
+                    anchor, lease, current_ref, enumeration_digest, (), None, (), (), (), no_pr_results, False,
+                )
+            return conflicting_state()
+        if no_pr_results:
+            return conflicting_state()
+        if len(candidates) != 1:
+            return conflicting_state()
+
+        candidate = candidates[0]
+        full_binding = (
+            candidate.issue_binding is not None
+            and candidate.pr_binding is not None
+            and candidate.issue_binding.binding == candidate.pr_binding.binding
+        )
+        authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+            allow_pr_stage_state=True,
+        )
+        if (
+            authority.issue_anchor.anchor != anchor.anchor
+            or authority.issue_anchor.comment.database_id != anchor.comment.database_id
+            or authority.lease.lease != lease.lease
+            or authority.lease.comment.database_id != lease.comment.database_id
+            or authority.pull_request_number != candidate.pr.number
+            or authority.pull_request_database_id != candidate.pr_issue.database_id
+            or authority.pull_request_node_id != candidate.pr_issue.node_id
+            or authority.raw_pr_state != candidate.raw_state
+            or authority.raw_pr_merged is not candidate.raw_merged
+            or (authority.binding_authority == "FULL_BINDING") != full_binding
+        ):
+            raise StaleAuthorityError("fresh cancellation PR/anchor/lease/binding identity changed during classification")
+        refreshed_ref = _read_issue_branch_ref(self.client, self.central_repository, short_ref)
+        if refreshed_ref != current_ref:
+            raise StaleAuthorityError("reserved Issue branch ref changed during cancellation classification")
+
+        history_ref = current_ref or candidate.pr.head_oid
+        fence_items, pr_comments = self._read_issue_cancellation_fences(authority, history_ref)
+        if len(fence_items) > 1:
+            raise R02Error("conflicting IssueCancellationFence comments block classification")
+        if fence_items:
+            fence = fence_items[0].fence
+            if candidate.pr.head_oid not in {fence.original_head_sha, fence.cancellation_head_sha}:
+                raise R02Error("reserved PR head differs from exact fence original/HC")
+            if current_ref not in {None, fence.original_head_sha, fence.cancellation_head_sha}:
+                raise R02Error("reserved branch ref differs from exact fence original/HC")
+        elif candidate.pr.head_oid != current_ref:
+            raise R02Error("reserved PR head and exact branch ref differ")
+
+        witness_items: tuple[IssueCancellationDraftWitnessComment, ...] = ()
+        terminal_items: tuple[IssueTerminalCancelledResultComment, ...] = ()
+        if fence_items:
+            current_status = _latest_exact_cancel_status_evidence(
+                self.client, self.central_repository, fence_items[0].fence, self.app,
+            )
+            has_witness_marker = any(
+                type(item.body) is str and item.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER)
+                for item in pr_comments
+            )
+            has_terminal_marker = any(
+                type(item.body) is str and item.body.startswith(ISSUE_TERMINAL_CANCELLED_RESULT_MARKER)
+                for item in pr_comments
+            )
+            if has_witness_marker and current_status is None:
+                raise R02Error("persisted draft witness has no exact current cancellation failure")
+            if current_status is not None:
+                witness_items = _issue_cancellation_draft_witness_comments(
+                    pr_comments, self.app, authority, fence_items[0], current_status,
+                )
+            if has_terminal_marker and (current_status is None or len(witness_items) != 1):
+                raise R02Error("persisted terminal result lacks exact current failure or draft witness")
+            if has_terminal_marker:
+                terminal_items = _issue_terminal_cancelled_result_comments(
+                    pr_comments, self.app, authority, fence_items[0], witness_items[0], current_status,
+                )
+
+        merge_observed = candidate.raw_merged
+        if merge_observed:
+            classification = IssueCancellationClass.E_FULL_BINDING if full_binding else IssueCancellationClass.D_PRE_BINDING_ONE_PR
+        else:
+            if current_ref is None:
+                if not terminal_items or candidate.pr.head_oid != terminal_items[0].result.cancellation_head_sha:
+                    raise R02Error("reserved PR branch is absent without durable terminal cancellation authority")
+            elif candidate.pr.head_oid != current_ref:
+                raise R02Error("reserved PR head and exact branch ref differ")
+            if not full_binding:
+                valid_prebinding_head = candidate.pr.head_oid == lease.lease.initial_head_sha
+                if fence_items:
+                    valid_prebinding_head = valid_prebinding_head or candidate.pr.head_oid == fence_items[0].fence.cancellation_head_sha
+                    valid_prebinding_head = valid_prebinding_head or (
+                        current_ref == fence_items[0].fence.original_head_sha == candidate.pr.head_oid
+                    )
+                if not valid_prebinding_head:
+                    raise R02Error("PRE_BINDING PR head exceeds exact lease-root/fence authority")
+                classification = IssueCancellationClass.D_PRE_BINDING_ONE_PR
+            else:
+                classification = IssueCancellationClass.E_FULL_BINDING
+        return IssueCancellationState(
+            classification, repository, issue, issue_comments, anchor, lease,
+            current_ref, enumeration_digest, tuple(candidates), authority,
+            fence_items, witness_items, terminal_items, no_pr_results, merge_observed,
+        )
+
     def prepare_issue_finalization_epoch(
         self,
         issue_number: int,
@@ -5378,6 +8102,9 @@ class R02Controller:
         """Persist and CAS one exact HA -> HF finalization epoch; publish no status."""
         snapshot = self._read_issue_epoch_snapshot(
             issue_number, source_authority_resolver, semantic_validator,
+        )
+        self._require_no_issue_cancellation_fence(
+            snapshot.state, snapshot.current_ref, snapshot.pr_comments,
         )
         current = snapshot.current_authority
 
@@ -5537,6 +8264,9 @@ class R02Controller:
         before_cas = self._read_issue_epoch_snapshot(
             issue_number, source_authority_resolver, semantic_validator,
         )
+        self._require_no_issue_cancellation_fence(
+            before_cas.state, before_cas.current_ref, before_cas.pr_comments,
+        )
         _require_same_managed_issue_pr_binding(state, before_cas.state)
         if (
             before_cas.current_ref != snapshot.current_ref
@@ -5652,6 +8382,9 @@ class R02Controller:
             issue_number, source_authority_resolver, semantic_validator,
             allow_source_mismatch=True,
             allow_base_mismatch=True,
+        )
+        self._require_no_issue_cancellation_fence(
+            snapshot.state, snapshot.current_ref, snapshot.pr_comments,
         )
         current = snapshot.current_authority
         if current.claim_kind == "REQUIRED_STATUS_EPOCH":
@@ -5782,6 +8515,9 @@ class R02Controller:
             issue_number, source_authority_resolver, semantic_validator,
             allow_source_mismatch=True,
             allow_base_mismatch=True,
+        )
+        self._require_no_issue_cancellation_fence(
+            before_cas.state, before_cas.current_ref, before_cas.pr_comments,
         )
         _require_same_managed_issue_pr_binding(snapshot.state, before_cas.state)
         if (

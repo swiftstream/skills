@@ -42,6 +42,9 @@ from automation.federation.request_model import (
     ISSUE_HEAD_CLAIM_MARKER,
     REQUIRED_STATUS_EPOCH_MARKER,
     ISSUE_FINALIZATION_EPOCH_MARKER,
+    ISSUE_CANCELLATION_FENCE_MARKER,
+    ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+    ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
     ISSUE_INTERNAL_PR_BINDING_MARKER,
     PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
@@ -51,6 +54,11 @@ from automation.federation.request_model import (
     RequiredStatusEpoch,
     RequiredStatusEpochReason,
     IssueFinalizationEpoch,
+    IssueCancellationFence,
+    IssueCancellationDraftWitness,
+    IssueTerminalCancelledResult,
+    IssueNoPRCancelledProofKind,
+    ExactAppRequiredStatusSnapshot,
     IssuePRBinding,
     IssueBranchLease,
     ClaimedHeadMarker,
@@ -79,8 +87,13 @@ from automation.federation.request_model import (
     render_status_description,
     parse_required_status_epoch,
     parse_issue_finalization_epoch,
+    parse_issue_cancellation_fence,
+    parse_issue_cancellation_draft_witness,
+    parse_issue_terminal_cancelled_result,
+    cancel_status_evidence_digest,
 )
 from automation.federation.github_api import (
+    CheckRun,
     GitHubAPIError,
     GitHubClient,
     GitCommitMetadata,
@@ -93,6 +106,7 @@ from automation.federation.github_api import (
     IssueMetadata,
     NotFoundError,
     PullRequestMetadata,
+    PullRequestStageMutationReceipt,
     RefCASConflict,
     RepositoryMetadata,
     AppMetadata,
@@ -2320,6 +2334,9 @@ class IssueHeadClaimControllerTests(unittest.TestCase):
             def get_ref_oid(_self, _repository, _branch):
                 return _self.ref
 
+            def list_issue_comments(_self, _repository, _number):
+                return ()
+
             def update_refs(_self, _repository_id, updates):
                 _self.updates.append(tuple(updates))
                 update = updates[0]
@@ -2666,7 +2683,9 @@ class Wave05ShaCarrierResolverTests(unittest.TestCase):
             self.commit_object_reads.append((repository, sha))
             self.authority_reads.append("commit")
             metadata = self.commit_metadata[sha]
-            identity = GitCommitIdentity("Swift Stream Bot", "bot@example.test", metadata.author_date)
+            identity = GitCommitIdentity(
+                "Swift Stream Federation", "automation@swiftstream.invalid", metadata.author_date,
+            )
             return GitCommitObject(
                 sha, self.commit_messages[sha], metadata.tree_sha, metadata.parents, identity, identity,
             )
@@ -2741,7 +2760,15 @@ class Wave05ShaCarrierResolverTests(unittest.TestCase):
 
         def list_pull_requests(self, repository, *, state="open", max_pages=100):
             self.pr_inventory_reads += 1
-            return super().list_pull_requests(repository, state=state, max_pages=max_pages)
+            return tuple(
+                {
+                    "number": item["number"],
+                    "state": getattr(self, "raw_pr_state", "open"),
+                    "merged": getattr(self, "raw_pr_merged", False),
+                    "merged_at": getattr(self, "raw_pr_merged_at", None),
+                }
+                for item in super().list_pull_requests(repository, state=state, max_pages=max_pages)
+            )
 
     @staticmethod
     def make_client(nonce="c" * 64):
@@ -5231,6 +5258,1294 @@ class IssueEpochControllerComponentTests(unittest.TestCase):
         self.assertNotIn("publish_issue_final_success", called)
         self.assertNotIn("revoke_required_status_epoch", called)
         self.assertIn("def finalize_one_manual_pr(", source)
+
+
+class Wave07CancellationControllerTests(unittest.TestCase):
+    APP = Wave05ShaCarrierResolverTests.APP
+    CENTRAL = Wave05ShaCarrierResolverTests.CENTRAL
+    CENTRAL_NODE_ID = Wave05ShaCarrierResolverTests.CENTRAL_NODE_ID
+
+    def _fixture(self, *, binding="FULL_BINDING", predecessor="CLAIM"):
+        if binding == "PRE_BINDING":
+            client, issue, anchor, lease = Wave05ShaCarrierResolverTests.make_client()
+            state = None
+        elif predecessor == "FINALIZING":
+            client, issue, anchor, lease, state, _claim, _immediate, _epoch = (
+                Wave05ShaCarrierResolverTests().make_finalization_epoch_client()
+            )
+        else:
+            client, issue, anchor, lease, state, _claim = (
+                Wave05ShaCarrierResolverTests().make_claim_client()
+            )
+        client.issue = replace(issue, state="closed")
+        client.raw_pr_state = "open"
+        client.raw_pr_merged = False
+        client.status_rows = {}
+        client.status_reads = []
+        client.status_posts = []
+        client.stage_calls = []
+        client.stage_errors = {}
+        client.stage_receipt_overrides = {}
+        client.stage_accepts_before_error = set()
+        client.events = []
+        client.cas_outcomes = []
+        client.cancel_comment_ids = []
+        client.list_commit_statuses = lambda _repository, sha: (
+            client.status_reads.append(sha) or tuple(client.status_rows.get(sha, ()))
+        )
+
+        original_create_comment = client.create_issue_comment
+
+        def create_comment(repository, number, body):
+            if body.startswith(ISSUE_CANCELLATION_FENCE_MARKER):
+                client.events.append(("fence-comment", number, body))
+                result = original_create_comment(repository, number, body)
+                client.cancel_comment_ids.append(result.database_id)
+                return result
+            return original_create_comment(repository, number, body)
+
+        client.create_issue_comment = create_comment
+
+        def update_refs(repository_id, updates):
+            update = tuple(updates)[0]
+            client.events.append(("cas", repository_id, update))
+            outcome = client.cas_outcomes.pop(0) if client.cas_outcomes else "success"
+            if outcome == "other-head":
+                client.current_ref = "3" * 40
+                if client.pull_requests:
+                    number = next(iter(client.pull_requests))
+                    client.pull_requests[number] = replace(client.pull_requests[number], head_oid=client.current_ref)
+                raise RefCASConflict("simulated competing writer")
+            if outcome == "raise-nochange":
+                raise RefCASConflict("simulated lost response without ref update")
+            if (
+                repository_id != self.CENTRAL_NODE_ID
+                or update.name != issue_branch_ref(issue.number)
+                or update.before_oid != client.current_ref
+                or update.force is not False
+            ):
+                raise AssertionError("cancellation CAS must be exact and non-force")
+            client.current_ref = None if update.after_oid == ZERO_OID else update.after_oid
+            if client.pull_requests and update.after_oid != ZERO_OID:
+                number = next(iter(client.pull_requests))
+                client.pull_requests[number] = replace(client.pull_requests[number], head_oid=update.after_oid)
+            return {}
+
+        client.update_refs = update_refs
+
+        def create_status(repository, sha, state, context, description, target_url=None):
+            client.status_posts.append((repository, sha, state, context, description, target_url))
+            if getattr(client, "status_write_error", None) is not None:
+                raise client.status_write_error
+            status = CommitStatus(
+                201, "S201", state,
+                context, description, target_url, self.APP.bot_id, self.APP.bot_node_id,
+                self.APP.bot_login, "Bot", "2026-10-06T00:00:00Z", "2026-10-06T00:00:00Z",
+            )
+            if getattr(client, "status_receipt_override", None) is not None:
+                return client.status_receipt_override
+            client.status_rows[sha] = tuple(client.status_rows.get(sha, ())) + (status,)
+            receipt = StatusWriteReceipt(
+                repository, sha, "POST", f"/repos/{repository}/statuses/{sha}",
+                state, context, description, target_url, status,
+            )
+            return receipt
+
+        client.create_commit_status = create_status
+
+        def stage_mutation(operation, pull_request_node_id, client_mutation_id):
+            client.stage_calls.append((operation, pull_request_node_id, client_mutation_id))
+            if operation in client.stage_errors and operation not in client.stage_accepts_before_error:
+                raise client.stage_errors[operation]
+            number = next(iter(client.pull_requests))
+            current_pr = client.pull_requests[number]
+            current_issue = client.pull_request_issues[number]
+            if operation == "REOPEN":
+                state, draft = "open", current_pr.draft
+            elif operation == "READY_FOR_REVIEW":
+                state, draft = "open", False
+            elif operation == "CONVERT_TO_DRAFT":
+                state, draft = "open", True
+            elif operation == "CLOSE":
+                state, draft = "closed", current_pr.draft
+            else:
+                raise AssertionError(f"unexpected PR-stage operation: {operation}")
+            client.raw_pr_state = state
+            client.pull_request_issues[number] = replace(current_issue, state=state)
+            client.pull_requests[number] = replace(current_pr, draft=draft)
+            database_id = client.pull_request_issues[number].database_id
+            receipt = PullRequestStageMutationReceipt(
+                operation,
+                pull_request_node_id,
+                client_mutation_id,
+                client_mutation_id,
+                current_issue.node_id,
+                database_id,
+                number,
+                state.upper(),
+                draft,
+                False,
+                None,
+                current_pr.head_oid,
+                current_pr.base_oid,
+                current_pr.head_ref,
+                current_pr.base_ref,
+                current_pr.head_repository_id,
+                current_pr.base_repository_id,
+            )
+            override = client.stage_receipt_overrides.get(operation)
+            if override is not None:
+                if callable(override):
+                    return override(receipt)
+                return override
+            if operation in client.stage_errors:
+                raise client.stage_errors[operation]
+            return receipt
+
+        client.reopen_pull_request = lambda node_id, mutation_id: stage_mutation(
+            "REOPEN", node_id, mutation_id,
+        )
+        client.mark_pull_request_ready_for_review = lambda node_id, mutation_id: stage_mutation(
+            "READY_FOR_REVIEW", node_id, mutation_id,
+        )
+        client.convert_pull_request_to_draft = lambda node_id, mutation_id: stage_mutation(
+            "CONVERT_TO_DRAFT", node_id, mutation_id,
+        )
+        client.close_pull_request = lambda node_id, mutation_id: stage_mutation(
+            "CLOSE", node_id, mutation_id,
+        )
+        controller = controller_module.R02Controller.__new__(controller_module.R02Controller)
+        controller.client = client
+        controller.central_repository = self.CENTRAL
+        controller.app = self.APP
+        controller.candidate_builder = None
+        controller.environ = {}
+        return client, issue, anchor, lease, state, controller
+
+    def _no_pr_fixture(self, *, with_lease=True, ref_state="absent", issue_state="closed"):
+        client, issue, anchor, lease = Wave05ShaCarrierResolverTests.make_client()
+        client.issue = replace(issue, state=issue_state)
+        client.pull_requests.clear()
+        client.pull_request_issues.clear()
+        client.pr_comments.clear()
+        if not with_lease:
+            client.comments = [
+                item for item in client.comments
+                if not item.body.startswith(ISSUE_BRANCH_LEASE_MARKER)
+            ]
+            client.current_ref = None
+            lease = None
+        elif ref_state == "absent":
+            client.current_ref = None
+        elif ref_state == "root":
+            client.current_ref = lease.lease.initial_head_sha
+        elif ref_state == "drift":
+            client.current_ref = "f" * 40
+        else:
+            raise AssertionError(ref_state)
+        client.status_rows = {}
+        client.status_reads = []
+        client.check_rows = []
+        client.list_commit_statuses = lambda _repository, sha: (
+            client.status_reads.append(sha) or tuple(client.status_rows.get(sha, ()))
+        )
+        client.list_check_runs = lambda _repository, sha: tuple(
+            check for check in client.check_rows if check.head_sha == sha
+        )
+        client.no_pr_ref_updates = []
+        client.no_pr_cas_error = None
+
+        def delete_lease_ref(repository_id, updates):
+            updates = tuple(updates)
+            client.no_pr_ref_updates.append((repository_id, updates))
+            if (
+                repository_id != self.CENTRAL_NODE_ID
+                or len(updates) != 1
+                or updates[0].name != issue_branch_ref(issue.number)
+                or updates[0].before_oid != client.current_ref
+                or updates[0].after_oid != ZERO_OID
+                or updates[0].force is not False
+            ):
+                raise AssertionError("no-PR cleanup must use the exact non-force lease-ref CAS")
+            if client.no_pr_cas_error is not None:
+                raise client.no_pr_cas_error
+            client.current_ref = None
+
+        client.update_refs = delete_lease_ref
+        controller = controller_module.R02Controller.__new__(controller_module.R02Controller)
+        controller.client = client
+        controller.central_repository = self.CENTRAL
+        controller.app = self.APP
+        controller.candidate_builder = None
+        controller.environ = {}
+        return client, issue, anchor, lease, controller
+
+    def _prepare(self, *, binding="FULL_BINDING", predecessor="CLAIM", nonce="a" * 64):
+        client, issue, anchor, lease, state, controller = self._fixture(
+            binding=binding, predecessor=predecessor,
+        )
+        fence = controller.prepare_issue_cancellation_fence(
+            issue.number,
+            classification="D" if binding == "PRE_BINDING" else "E",
+            nonce_factory=lambda: nonce,
+        )
+        return client, issue, anchor, lease, state, controller, fence
+
+    @staticmethod
+    def _exact_app_status(sha, *, state="success", status_class=StatusClass.ISSUE_FINAL, digest="a" * 64, status_id=10):
+        return CommitStatus(
+            status_id, f"S{status_id}", state, "federation/trusted-validation",
+            render_status_description(status_class, digest), None,
+            Wave07CancellationControllerTests.APP.bot_id,
+            Wave07CancellationControllerTests.APP.bot_node_id,
+            Wave07CancellationControllerTests.APP.bot_login,
+            "Bot", "2026-10-06T00:00:00Z", "2026-10-06T00:00:00Z",
+        )
+
+    def _publish_cancel_failure(self, binding="FULL_BINDING", nonce="a" * 64):
+        client, issue, anchor, lease, state, controller, fence = self._prepare(
+            binding=binding, nonce=nonce,
+        )
+        status = controller.publish_issue_cancel_failure(issue.number, fence)
+        return client, issue, anchor, lease, state, controller, fence, status
+
+    @staticmethod
+    def _set_pr_stage(client, *, state="open", draft=False, merged=False):
+        number = next(iter(client.pull_requests))
+        client.raw_pr_state = state
+        client.raw_pr_merged = merged
+        client.pull_request_issues[number] = replace(
+            client.pull_request_issues[number], state=state,
+        )
+        client.pull_requests[number] = replace(
+            client.pull_requests[number], draft=draft,
+        )
+
+    def test_full_and_prebinding_fence_creation_persists_before_nonforce_cas(self):
+        for binding in ("FULL_BINDING", "PRE_BINDING"):
+            with self.subTest(binding=binding):
+                client, issue, _anchor, _lease, _state, _controller, fence = self._prepare(binding=binding)
+                if binding == "PRE_BINDING":
+                    self.assertEqual(fence.binding_authority, "PRE_BINDING")
+                else:
+                    self.assertEqual(fence.binding_authority, _state.binding.binding_id)
+                self.assertEqual(fence.pre_fence_required_status.disposition, "ABSENT")
+                self.assertEqual(fence.original_head_sha, fence.pre_fence_required_status.queried_sha)
+                self.assertEqual(fence.original_head_tree_sha, fence.cancellation_head_tree_sha)
+                self.assertEqual(client.current_ref, fence.cancellation_head_sha)
+                self.assertEqual([event[0] for event in client.events], ["fence-comment", "cas"])
+                resolution = Wave05ShaCarrierResolverTests.resolve(client, fence.cancellation_head_sha)
+                self.assertEqual(
+                    resolution,
+                    ShaCarrierResolution(
+                        CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL,
+                        controller_module._issue_cancellation_fence_marker(fence),
+                    ),
+                )
+                self.assertEqual(client.status_posts, [])
+
+    def test_prebinding_never_fabricates_binding_and_crosschecks_central_pr_identity(self):
+        client, issue, _anchor, _lease, _state, controller, fence = self._prepare(binding="PRE_BINDING")
+        authority = controller_module._fresh_issue_cancellation_authority(
+            client, self.CENTRAL, issue.number, self.APP,
+        )
+        self.assertIsNone(authority.binding)
+        self.assertIsNone(authority.binding_state)
+        self.assertEqual(
+            (fence.pull_request_node_id, fence.pull_request_database_id, fence.pull_request_number),
+            (authority.pr_issue.node_id, authority.pr_issue.database_id, authority.pr_issue.number),
+        )
+        changed_pr_issue = replace(authority.pr_issue, database_id=authority.pr_issue.database_id + 1)
+        bad_authority = replace(authority, pr_issue=changed_pr_issue)
+        with self.assertRaises(R02Error):
+            controller_module._validate_issue_cancellation_fence_context(fence, bad_authority)
+
+    def test_fence_comment_reader_accepts_exact_duplicates_and_rejects_foreign_edited_or_conflicting(self):
+        client, issue, _anchor, _lease, _state, controller, fence = self._prepare()
+        authority = controller_module._fresh_issue_cancellation_authority(
+            client, self.CENTRAL, issue.number, self.APP,
+        )
+        comments = client.list_issue_comments(self.CENTRAL, fence.pull_request_number)
+        duplicate = IssueAnchorControllerTests.comment(fence.render(), database_id=max(c.database_id for c in comments) + 1)
+        client.pr_comments[fence.pull_request_number].append(duplicate)
+        found = controller_module._issue_cancellation_fence_comments(
+            client, self.CENTRAL, client.list_issue_comments(self.CENTRAL, fence.pull_request_number),
+            self.APP, authority, fence.cancellation_head_sha,
+        )
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].comment.database_id, client.cancel_comment_ids[0])
+
+        human = IssueAnchorControllerTests.comment(
+            fence.render(), database_id=20_001, author_id="U_human", author_login="human", author_type="User",
+        )
+        with self.assertRaises(R02Error):
+            controller_module._issue_cancellation_fence_comments(
+                client, self.CENTRAL, (*client.list_issue_comments(self.CENTRAL, fence.pull_request_number), human),
+                self.APP, authority, fence.cancellation_head_sha,
+            )
+        edited = replace(duplicate, editor_id="B_editor", editor_login=self.APP.bot_login, editor_type="Bot")
+        with self.assertRaises(R02Error):
+            controller_module._issue_cancellation_fence_comments(
+                client, self.CENTRAL, (edited,), self.APP, authority, fence.cancellation_head_sha,
+            )
+
+        fields = fence._fields()
+        fields["cancellation_carrier_nonce"] = "d" * 64
+        fields["cancellation_head_sha"] = "f" * 40 if fence.original_head_sha != "f" * 40 else "e" * 40
+        seed = IssueCancellationFence.create(**fields)
+        message = controller_module._issue_cancellation_fence_marker(seed).render()
+        timestamp = IssueBranchLeaseControllerTests.CLAIM_DATE
+        target = client.create_commit(
+            self.CENTRAL, message, fence.original_head_tree_sha,
+            [fence.original_head_sha], timestamp=timestamp,
+        )
+        alternate = IssueCancellationFence.create(**{**fields, "cancellation_head_sha": target.sha})
+        controller_module._validate_issue_cancellation_fence_target(client, self.CENTRAL, alternate)
+        conflict_comment = IssueAnchorControllerTests.comment(alternate.render(), database_id=20_002)
+        with self.assertRaises(R02Error):
+            controller_module._issue_cancellation_fence_comments(
+                client, self.CENTRAL,
+                (*client.list_issue_comments(self.CENTRAL, fence.pull_request_number), conflict_comment),
+                self.APP, authority, fence.cancellation_head_sha,
+            )
+
+    def test_fence_target_parent_tree_and_marker_are_exact(self):
+        client, _issue, _anchor, _lease, _state, _controller, fence = self._prepare()
+        target = fence.cancellation_head_sha
+        original = client.commit_metadata[target]
+        for changed in (
+            replace(original, parents=("5" * 40,)),
+            replace(original, tree_sha="6" * 40),
+        ):
+            client.commit_metadata[target] = changed
+            with self.assertRaises(R02Error):
+                controller_module._validate_issue_cancellation_fence_target(client, self.CENTRAL, fence)
+        client.commit_metadata[target] = original
+        old_message = client.commit_messages[target]
+        client.commit_messages[target] = old_message.replace(fence.cancellation_carrier_nonce, "b" * 64)
+        with self.assertRaises(R02Error):
+            controller_module._validate_issue_cancellation_fence_target(client, self.CENTRAL, fence)
+        client.commit_messages[target] = old_message
+        changed_fields = fence.as_value()
+        changed_fields["claimGenerationId"] = "0" * 64
+        # A copied marker cannot become a fence merely by retaining the target SHA.
+        with self.assertRaises(Exception):
+            parse_issue_cancellation_fence(
+                ISSUE_CANCELLATION_FENCE_MARKER + "\n" + json.dumps(changed_fields, separators=(",", ":"), sort_keys=True) + "\n",
+            )
+
+    def test_pre_fence_success_snapshot_and_finalizing_predecessor_semantics(self):
+        client, issue, _anchor, _lease, _state, controller = self._fixture()
+        claim_head = client.current_ref
+        client.status_rows[claim_head] = (
+            self._exact_app_status(claim_head, status_id=80),
+        )
+        fence = controller.prepare_issue_cancellation_fence(
+            issue.number, classification="E", nonce_factory=lambda: "b" * 64,
+        )
+        self.assertTrue(fence.pre_fence_success_may_exist)
+        self.assertEqual(fence.pre_fence_required_status.status_class, StatusClass.ISSUE_FINAL)
+
+        final_client, final_issue, _a, _l, _s, final_controller = self._fixture(predecessor="FINALIZING")
+        final_fence = final_controller.prepare_issue_cancellation_fence(
+            final_issue.number, classification="E", nonce_factory=lambda: "c" * 64,
+        )
+        self.assertEqual(final_fence.original_head_claim_kind, "ISSUE_FINALIZATION_EPOCH")
+        self.assertEqual(final_fence.original_head_claim_role, "ISSUE_FINALIZING")
+        self.assertTrue(final_fence.pre_fence_success_may_exist)
+        self.assertEqual(final_fence.pre_fence_required_status.disposition, "ABSENT")
+
+    def test_merge_observed_blocks_without_fence_nonce_comment_or_cas(self):
+        client, issue, _anchor, _lease, _state, controller = self._fixture()
+        client.raw_pr_merged = True
+        nonce_calls = []
+        with self.assertRaisesRegex(StaleAuthorityError, "CANCELLATION_MERGED_OBSERVED"):
+            controller.prepare_issue_cancellation_fence(
+                issue.number, classification="E",
+                nonce_factory=lambda: nonce_calls.append("called") or "d" * 64,
+            )
+        self.assertEqual(nonce_calls, [])
+        self.assertEqual(client.cancel_comment_ids, [])
+        self.assertFalse(any(event[0] == "cas" for event in client.events))
+
+    def test_crash_after_fence_post_reuses_exact_snapshot_nonce_and_target(self):
+        client, issue, _anchor, _lease, state, controller = self._fixture()
+        client.cas_outcomes = ["raise-nochange", "raise-nochange"]
+        with self.assertRaises(StaleAuthorityError):
+            controller.prepare_issue_cancellation_fence(
+                issue.number, classification="E", nonce_factory=lambda: "e" * 64,
+            )
+        first_fence = parse_issue_cancellation_fence(
+            next(item.body for item in client.pr_comments[81] if item.body.startswith(ISSUE_CANCELLATION_FENCE_MARKER)),
+        )
+        self.assertEqual(len(client.status_reads), 1)
+        client.cas_outcomes = []
+        replay = controller.prepare_issue_cancellation_fence(
+            issue.number, classification="E",
+            nonce_factory=lambda: self.fail("replay must not request a new nonce"),
+        )
+        self.assertEqual(replay, first_fence)
+        self.assertEqual(client.status_reads, [first_fence.original_head_sha])
+        self.assertEqual(client.cancel_comment_ids, [client.cancel_comment_ids[0]])
+        self.assertEqual(client.current_ref, first_fence.cancellation_head_sha)
+
+    def test_losing_cas_to_other_head_leaves_only_historical_fence_and_blocks_progression(self):
+        client, issue, _anchor, _lease, state, controller = self._fixture()
+        client.cas_outcomes = ["other-head"]
+        with self.assertRaises(StaleAuthorityError):
+            controller.prepare_issue_cancellation_fence(
+                issue.number, classification="E", nonce_factory=lambda: "f" * 64,
+            )
+        self.assertEqual(len(client.cancel_comment_ids), 1)
+        self.assertEqual(client.status_posts, [])
+        self.assertEqual(client.current_ref, "3" * 40)
+        # The persisted fence blocks after the owner Issue is reopened as well.
+        client.issue = replace(client.issue, state="open")
+        with self.assertRaises(StaleAuthorityError):
+            controller._require_no_issue_cancellation_fence(state, state.pr.head_oid)
+        self.assertEqual(client.status_posts, [])
+
+    def test_pending_fence_is_one_way_gate_for_proposal_finalization_and_revocation(self):
+        client, issue, _anchor, _lease, state, controller = self._fixture()
+        original_ref = client.current_ref
+        client.cas_outcomes = ["raise-nochange", "raise-nochange"]
+        with self.assertRaises(StaleAuthorityError):
+            controller.prepare_issue_cancellation_fence(
+                issue.number, classification="E", nonce_factory=lambda: "9" * 64,
+            )
+        client.issue = replace(client.issue, state="open")
+        controller.candidate_builder = object()
+        with self.assertRaises(StaleAuthorityError):
+            controller.interactive_issue_managed_proposal(issue.number, IssueAnchorControllerTests.resolver())
+        with self.assertRaises(StaleAuthorityError):
+            controller.prepare_issue_finalization_epoch(issue.number, IssueAnchorControllerTests.resolver())
+        with self.assertRaises(StaleAuthorityError):
+            controller.revoke_required_status_epoch(
+                issue.number, RequiredStatusEpochReason.ACTIVE_REVALIDATION,
+                IssueAnchorControllerTests.resolver(),
+            )
+        self.assertEqual(client.current_ref, original_ref)
+        self.assertEqual(client.status_posts, [])
+
+    def test_exact_cancel_failure_receipt_and_idempotent_status_recovery(self):
+        client, issue, _anchor, _lease, _state, controller, fence = self._prepare()
+        evidence = controller.publish_issue_cancel_failure(issue.number, fence)
+        self.assertEqual(evidence.queried_sha, fence.cancellation_head_sha)
+        self.assertEqual(evidence.state, "failure")
+        self.assertEqual(evidence.status_class, StatusClass.CANCEL)
+        self.assertEqual(len(evidence.description.encode("ascii")), 81)
+        self.assertEqual(
+            client.status_posts,
+            [(self.CENTRAL, fence.cancellation_head_sha, "failure", "federation/trusted-validation", evidence.description, None)],
+        )
+        row = self._exact_app_status(
+            fence.cancellation_head_sha, state="failure", status_class=StatusClass.CANCEL,
+            digest=evidence.evidence_digest, status_id=201,
+        )
+        client.status_rows[fence.cancellation_head_sha] = (row, row)
+        reused = controller.publish_issue_cancel_failure(issue.number, fence)
+        self.assertEqual(reused, evidence)
+        self.assertEqual(len(client.status_posts), 1)
+
+    def test_cancel_status_blocks_success_and_wrong_digest_and_never_reads_after_transport_error(self):
+        for current in (
+            self._exact_app_status("a" * 40, state="success", status_class=StatusClass.ISSUE_FINAL),
+            self._exact_app_status("a" * 40, state="failure", status_class=StatusClass.CANCEL, digest="0" * 64),
+        ):
+            client, issue, _anchor, _lease, _state, controller, fence = self._prepare(nonce="7" * 64)
+            client.status_rows[fence.cancellation_head_sha] = (replace(current, id=401, node_id="S401"),)
+            with self.assertRaises(StaleAuthorityError):
+                controller.publish_issue_cancel_failure(issue.number, fence)
+            self.assertEqual(client.status_posts, [])
+
+        client, issue, _anchor, _lease, _state, controller, fence = self._prepare(nonce="8" * 64)
+        client.status_reads.clear()
+        client.status_write_error = TransportError("response lost")
+        with self.assertRaises(TransportError):
+            controller.publish_issue_cancel_failure(issue.number, fence)
+        self.assertEqual(client.status_reads, [fence.cancellation_head_sha])
+        self.assertEqual(len(client.status_posts), 1)
+
+    def test_stage_mutation_receipts_crosscheck_node_database_and_number_in_both_authorities(self):
+        for binding in ("PRE_BINDING", "FULL_BINDING"):
+            with self.subTest(binding=binding):
+                client, issue, _anchor, _lease, _state, controller, fence = self._prepare(binding=binding)
+                authority = controller_module._fresh_issue_cancellation_authority(
+                    client, self.CENTRAL, issue.number, self.APP,
+                )
+                receipt = PullRequestStageMutationReceipt(
+                    "CLOSE", fence.pull_request_node_id, "mutation-1", "mutation-1",
+                    fence.pull_request_node_id, fence.pull_request_database_id, fence.pull_request_number,
+                    "CLOSED", False, False, None, fence.cancellation_head_sha,
+                    authority.pr.base_oid, authority.pr.head_ref, authority.pr.base_ref,
+                    authority.central_repository_node_id, authority.central_repository_node_id,
+                )
+                self.assertIs(
+                    controller_module._require_exact_cancellation_stage_receipt_identity(receipt, authority, fence),
+                    receipt,
+                )
+                for bad in (
+                    replace(receipt, pull_request_database_id=receipt.pull_request_database_id + 1),
+                    replace(receipt, pull_request_number=receipt.pull_request_number + 1),
+                    replace(
+                        receipt,
+                        requested_pull_request_node_id="PR_wrong",
+                        pull_request_node_id="PR_wrong",
+                    ),
+                ):
+                    with self.assertRaises(R02Error):
+                        controller_module._require_exact_cancellation_stage_receipt_identity(bad, authority, fence)
+
+    def test_draft_witness_normalizes_open_ready_pr_from_exact_convert_receipt(self):
+        client, issue, _anchor, _lease, state, controller, fence, status = self._publish_cancel_failure()
+        witness = controller.establish_issue_cancellation_draft_witness(issue.number)
+        self.assertEqual([row[0] for row in client.stage_calls], ["CONVERT_TO_DRAFT"])
+        self.assertEqual(witness.binding_authority, state.binding.binding_id)
+        self.assertEqual(witness.current_required_status.status_id, status.status_id)
+        self.assertEqual(witness.draft_evidence.pull_request_database_id, fence.pull_request_database_id)
+        self.assertEqual(witness.draft_evidence.pull_request_node_id, fence.pull_request_node_id)
+        self.assertEqual(witness.draft_evidence.state, "OPEN")
+        self.assertTrue(witness.draft_evidence.is_draft)
+        persisted = [
+            parse_issue_cancellation_draft_witness(item.body)
+            for item in client.pr_comments[fence.pull_request_number]
+            if item.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER)
+        ]
+        self.assertEqual(persisted, [witness])
+
+    def test_draft_witness_ready_reopen_and_prebinding_stage_sequences(self):
+        scenarios = (
+            ("open", True, "FULL_BINDING", ["READY_FOR_REVIEW", "CONVERT_TO_DRAFT"]),
+            ("closed", False, "FULL_BINDING", ["REOPEN", "CONVERT_TO_DRAFT"]),
+            ("closed", True, "FULL_BINDING", ["REOPEN", "READY_FOR_REVIEW", "CONVERT_TO_DRAFT"]),
+            ("open", False, "PRE_BINDING", ["CONVERT_TO_DRAFT"]),
+        )
+        for state_name, draft, binding, operations in scenarios:
+            with self.subTest(state=state_name, draft=draft, binding=binding):
+                nonce = ("b" if state_name == "open" and draft else "c") * 64
+                client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(
+                    binding=binding, nonce=nonce,
+                )
+                self._set_pr_stage(client, state=state_name, draft=draft)
+                witness = controller.establish_issue_cancellation_draft_witness(issue.number)
+                self.assertEqual([row[0] for row in client.stage_calls], operations)
+                self.assertEqual(witness.binding_authority, binding if binding == "PRE_BINDING" else _s.binding.binding_id)
+                self.assertEqual(witness.reopen_evidence is not None, state_name == "closed")
+                self.assertEqual(witness.ready_evidence is not None, draft)
+                self.assertEqual(witness.draft_evidence.pull_request_database_id, fence.pull_request_database_id)
+
+    def test_terminal_cancelled_result_closes_exact_witnessed_pr_and_replays_without_mutation(self):
+        for binding in ("FULL_BINDING", "PRE_BINDING"):
+            with self.subTest(binding=binding):
+                nonce = "d" * 64 if binding == "FULL_BINDING" else "e" * 64
+                client, issue, _a, _l, _state, controller, fence, _status = self._publish_cancel_failure(
+                    binding=binding, nonce=nonce,
+                )
+                controller.establish_issue_cancellation_draft_witness(issue.number)
+                result = controller.establish_issue_terminal_cancelled_result(issue.number)
+                self.assertEqual([row[0] for row in client.stage_calls], ["CONVERT_TO_DRAFT", "CLOSE"])
+                self.assertEqual(result.binding_authority, binding if binding == "PRE_BINDING" else _state.binding.binding_id)
+                self.assertEqual(result.close_evidence.pull_request_database_id, fence.pull_request_database_id)
+                self.assertEqual(result.close_evidence.pull_request_node_id, fence.pull_request_node_id)
+                self.assertEqual(result.close_evidence.state, "CLOSED")
+                self.assertFalse(result.close_evidence.merged)
+                self.assertEqual(result.proof_kind.value, "PR_BACKED_PRE_BINDING" if binding == "PRE_BINDING" else "PR_BACKED_FULL_BINDING")
+                replay = controller.establish_issue_terminal_cancelled_result(issue.number)
+                self.assertEqual(replay, result)
+                self.assertEqual([row[0] for row in client.stage_calls], ["CONVERT_TO_DRAFT", "CLOSE"])
+
+    def test_terminal_result_reopens_closed_pr_and_closes_with_same_response_evidence(self):
+        client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(nonce="f" * 64)
+        controller.establish_issue_cancellation_draft_witness(issue.number)
+        self._set_pr_stage(client, state="closed", draft=True)
+        result = controller.establish_issue_terminal_cancelled_result(issue.number)
+        self.assertEqual([row[0] for row in client.stage_calls], ["CONVERT_TO_DRAFT", "REOPEN", "CLOSE"])
+        self.assertEqual(result.close_evidence.pull_request_number, fence.pull_request_number)
+        self.assertEqual(result.close_evidence.pull_request_database_id, fence.pull_request_database_id)
+        self.assertEqual(result.close_evidence.state, "CLOSED")
+
+    def test_draft_witness_requires_current_failure_and_active_unmerged_authority(self):
+        client, issue, _a, _l, _s, controller, fence = self._prepare(nonce="1" * 64)
+        self._set_pr_stage(client, draft=True)
+        with self.assertRaises(StaleAuthorityError):
+            controller.establish_issue_cancellation_draft_witness(issue.number)
+        self.assertEqual(client.stage_calls, [])
+        self.assertFalse(any(
+            item.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER)
+            for item in client.pr_comments[fence.pull_request_number]
+        ))
+
+        client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(nonce="2" * 64)
+        self._set_pr_stage(client, merged=True)
+        with self.assertRaises(StaleAuthorityError):
+            controller.establish_issue_cancellation_draft_witness(issue.number)
+        self.assertEqual(client.stage_calls, [])
+        self.assertFalse(any(
+            item.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER)
+            for item in client.pr_comments[fence.pull_request_number]
+        ))
+
+    def test_draft_witness_mutation_errors_and_wrong_same_response_are_never_inferred_from_get(self):
+        cases = (
+            ("REOPEN", "closed", False, None),
+            ("READY_FOR_REVIEW", "open", True, None),
+            ("CONVERT_TO_DRAFT", "open", False, None),
+            ("CONVERT_TO_DRAFT", "open", False, "wrong-head"),
+            ("CONVERT_TO_DRAFT", "open", False, "wrong-database-id"),
+            ("CONVERT_TO_DRAFT", "open", False, "wrong-node-id"),
+            ("CONVERT_TO_DRAFT", "open", False, "wrong-number"),
+            ("CONVERT_TO_DRAFT", "open", False, "wrong-base"),
+            ("CONVERT_TO_DRAFT", "open", False, "wrong-repository"),
+            ("CONVERT_TO_DRAFT", "open", False, "wrong-stage-state"),
+            ("CONVERT_TO_DRAFT", "open", False, "merged"),
+        )
+        for index, (operation, pr_state, is_draft, response_fault) in enumerate(cases, 1):
+            with self.subTest(operation=operation, fault=response_fault):
+                nonce = f"{index:064x}"
+                client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(nonce=nonce)
+                self._set_pr_stage(client, state=pr_state, draft=is_draft)
+                error = TransportError("mutation response unavailable")
+                client.stage_errors[operation] = error
+                if response_fault is not None:
+                    client.stage_errors.pop(operation, None)
+
+                    def corrupt(receipt, fault=response_fault):
+                        if fault == "wrong-head":
+                            return replace(receipt, head_oid="f" * 40 if receipt.head_oid != "f" * 40 else "e" * 40)
+                        if fault == "wrong-database-id":
+                            return replace(receipt, pull_request_database_id=receipt.pull_request_database_id + 1)
+                        if fault == "wrong-node-id":
+                            return replace(
+                                receipt, requested_pull_request_node_id="PR_wrong",
+                                pull_request_node_id="PR_wrong",
+                            )
+                        if fault == "wrong-number":
+                            return replace(receipt, pull_request_number=receipt.pull_request_number + 1)
+                        if fault == "wrong-base":
+                            return replace(receipt, base_ref="release")
+                        if fault == "wrong-repository":
+                            return replace(receipt, head_repository_node_id="R_other")
+                        if fault == "wrong-stage-state":
+                            return replace(receipt, is_draft=False)
+                        if fault == "merged":
+                            return replace(receipt, merged=True, merged_at="2026-10-06T01:00:00Z")
+                        raise AssertionError(fault)
+
+                    client.stage_receipt_overrides[operation] = corrupt
+                with self.assertRaises((R02Error, StaleAuthorityError)):
+                    controller.establish_issue_cancellation_draft_witness(issue.number)
+                self.assertFalse(any(
+                    item.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER)
+                    for item in client.pr_comments[fence.pull_request_number]
+                ))
+
+    def test_draft_witness_rechecks_failure_after_ready_and_lost_convert_requires_real_retry(self):
+        client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(nonce="3" * 64)
+        self._set_pr_stage(client, draft=True)
+        original_ready = client.mark_pull_request_ready_for_review
+
+        def ready_then_success(node_id, mutation_id):
+            receipt = original_ready(node_id, mutation_id)
+            client.status_rows[fence.cancellation_head_sha] = (
+                self._exact_app_status(
+                    fence.cancellation_head_sha, state="success", status_class=StatusClass.CANCEL,
+                    digest=controller_module.cancel_status_evidence_digest(
+                        central_repository_node_id=fence.central_repository_node_id,
+                        issue_number=fence.issue_number, issue_database_id=fence.issue_database_id,
+                        issue_node_id=fence.issue_node_id, fence_id=fence.fence_id,
+                        cancellation_head_sha=fence.cancellation_head_sha,
+                        binding_authority=fence.binding_authority,
+                        pull_request_number=fence.pull_request_number,
+                        pull_request_database_id=fence.pull_request_database_id,
+                        pull_request_node_id=fence.pull_request_node_id,
+                    ), status_id=902,
+                ),
+            )
+            return receipt
+
+        client.mark_pull_request_ready_for_review = ready_then_success
+        with self.assertRaises(StaleAuthorityError):
+            controller.establish_issue_cancellation_draft_witness(issue.number)
+        self.assertEqual([row[0] for row in client.stage_calls], ["READY_FOR_REVIEW"])
+        self.assertFalse(any(
+            item.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER)
+            for item in client.pr_comments[fence.pull_request_number]
+        ))
+
+        client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(nonce="4" * 64)
+        client.stage_errors["CONVERT_TO_DRAFT"] = TransportError("accepted response lost")
+        client.stage_accepts_before_error.add("CONVERT_TO_DRAFT")
+        with self.assertRaises(StaleAuthorityError):
+            controller.establish_issue_cancellation_draft_witness(issue.number)
+        self.assertTrue(client.pull_requests[fence.pull_request_number].draft)
+        self.assertFalse(any(
+            item.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER)
+            for item in client.pr_comments[fence.pull_request_number]
+        ))
+        client.stage_errors.clear()
+        client.stage_accepts_before_error.clear()
+        witness = controller.establish_issue_cancellation_draft_witness(issue.number)
+        self.assertEqual([row[0] for row in client.stage_calls], [
+            "CONVERT_TO_DRAFT", "READY_FOR_REVIEW", "CONVERT_TO_DRAFT",
+        ])
+        self.assertTrue(witness.draft_evidence.is_draft)
+
+    def test_existing_witness_is_immutable_across_pr_state_and_duplicate_exact_comments(self):
+        client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(nonce="5" * 64)
+        witness = controller.establish_issue_cancellation_draft_witness(issue.number)
+        original_calls = list(client.stage_calls)
+        witness_comment = next(
+            item for item in client.pr_comments[fence.pull_request_number]
+            if item.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER)
+        )
+        client.pr_comments[fence.pull_request_number].append(
+            replace(witness_comment, database_id=witness_comment.database_id + 50_000),
+        )
+        self._set_pr_stage(client, state="closed", draft=False)
+        self.assertEqual(controller.establish_issue_cancellation_draft_witness(issue.number), witness)
+        self.assertEqual(client.stage_calls, original_calls)
+
+        conflicting_base_oid = "8" * 40 if witness.returned_base_ref_oid != "8" * 40 else "9" * 40
+        conflicting = IssueCancellationDraftWitness.create(
+            **{
+                **witness._fields(),
+                "witness_id": "0" * 64,
+                "returned_base_ref_oid": conflicting_base_oid,
+                "draft_evidence": replace(witness.draft_evidence, base_ref_oid=conflicting_base_oid),
+            },
+        )
+        client.pr_comments[fence.pull_request_number].append(
+            IssueAnchorControllerTests.comment(
+                conflicting.render(), database_id=witness_comment.database_id + 60_000,
+            ),
+        )
+        with self.assertRaises(R02Error):
+            controller.establish_issue_cancellation_draft_witness(issue.number)
+
+    def test_terminal_result_rejects_wrong_close_receipt_status_change_and_merge_race(self):
+        for index, fault in enumerate(("wrong-head", "wrong-base", "wrong-repository", "wrong-db", "merged", "status-before", "status-after", "merged-after", "close-response-lost"), 1):
+            with self.subTest(fault=fault):
+                client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(
+                    nonce=f"{index + 10:064x}",
+                )
+                controller.establish_issue_cancellation_draft_witness(issue.number)
+                if fault == "status-before":
+                    self._set_pr_stage(client, state="closed", draft=True)
+                    original_reopen = client.reopen_pull_request
+
+                    def reopen_then_success(node_id, mutation_id):
+                        receipt = original_reopen(node_id, mutation_id)
+                        client.status_rows[fence.cancellation_head_sha] = (
+                            self._exact_app_status(
+                                fence.cancellation_head_sha, state="success", status_class=StatusClass.CANCEL,
+                                digest="0" * 64, status_id=950,
+                            ),
+                        )
+                        return receipt
+
+                    client.reopen_pull_request = reopen_then_success
+                elif fault == "status-after":
+                    original_close = client.close_pull_request
+
+                    def close_then_success(node_id, mutation_id):
+                        receipt = original_close(node_id, mutation_id)
+                        client.status_rows[fence.cancellation_head_sha] = (
+                            self._exact_app_status(
+                                fence.cancellation_head_sha, state="failure", status_class=StatusClass.CANCEL,
+                                digest="0" * 64, status_id=951,
+                            ),
+                        )
+                        return receipt
+
+                    client.close_pull_request = close_then_success
+                elif fault == "merged-after":
+                    original_close = client.close_pull_request
+
+                    def close_then_merge(node_id, mutation_id):
+                        receipt = original_close(node_id, mutation_id)
+                        client.raw_pr_merged = True
+                        return receipt
+
+                    client.close_pull_request = close_then_merge
+                elif fault == "close-response-lost":
+                    client.stage_errors["CLOSE"] = TransportError("close accepted but response lost")
+                    client.stage_accepts_before_error.add("CLOSE")
+                else:
+                    def corrupt_close(receipt):
+                        if fault == "wrong-head":
+                            return replace(receipt, head_oid="f" * 40 if receipt.head_oid != "f" * 40 else "e" * 40)
+                        if fault == "wrong-base":
+                            return replace(receipt, base_ref="release")
+                        if fault == "wrong-repository":
+                            return replace(receipt, base_repository_node_id="R_other")
+                        if fault == "wrong-db":
+                            return replace(receipt, pull_request_database_id=receipt.pull_request_database_id + 1)
+                        if fault == "merged":
+                            return replace(receipt, merged=True, merged_at="2026-10-06T01:00:00Z")
+                        raise AssertionError(fault)
+
+                    client.stage_receipt_overrides["CLOSE"] = corrupt_close
+                with self.assertRaises((R02Error, StaleAuthorityError)):
+                    controller.establish_issue_terminal_cancelled_result(issue.number)
+                self.assertFalse(any(
+                    item.body.startswith(ISSUE_TERMINAL_CANCELLED_RESULT_MARKER)
+                    for item in client.pr_comments[fence.pull_request_number]
+                ))
+
+    def test_cancellation_stage_mutation_ids_are_exactly_replayable_and_stage_specific(self):
+        _client, _issue, _a, _l, _s, _controller, fence = self._prepare(nonce="7" * 64)
+        convert_id = controller_module._cancellation_stage_client_mutation_id(fence, "DRAFT_CONVERT")
+        self.assertEqual(
+            controller_module._cancellation_stage_client_mutation_id(fence, "DRAFT_CONVERT"),
+            convert_id,
+        )
+        self.assertNotEqual(
+            convert_id,
+            controller_module._cancellation_stage_client_mutation_id(fence, "TERMINAL_CLOSE"),
+        )
+        other_fence = IssueCancellationFence.create(
+            **{**fence._fields(), "fence_id": "0" * 64, "cancellation_carrier_nonce": "8" * 64},
+        )
+        self.assertNotEqual(
+            convert_id,
+            controller_module._cancellation_stage_client_mutation_id(other_fence, "DRAFT_CONVERT"),
+        )
+
+    def test_terminal_result_conflicts_replay_and_human_ready_do_not_reacquire_witness_or_close(self):
+        client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(nonce="6" * 64)
+        witness = controller.establish_issue_cancellation_draft_witness(issue.number)
+        self._set_pr_stage(client, draft=False)
+        result = controller.establish_issue_terminal_cancelled_result(issue.number)
+        calls_after_close = list(client.stage_calls)
+        self.assertEqual([row[0] for row in calls_after_close], ["CONVERT_TO_DRAFT", "CLOSE"])
+        self.assertEqual(result.witness_id, witness.witness_id)
+        self.assertEqual(controller.establish_issue_terminal_cancelled_result(issue.number), result)
+        self.assertEqual(client.stage_calls, calls_after_close)
+
+        result_comment = next(
+            item for item in client.pr_comments[fence.pull_request_number]
+            if item.body.startswith(ISSUE_TERMINAL_CANCELLED_RESULT_MARKER)
+        )
+        client.pr_comments[fence.pull_request_number].append(
+            replace(result_comment, database_id=result_comment.database_id + 70_000),
+        )
+        self.assertEqual(controller.establish_issue_terminal_cancelled_result(issue.number), result)
+
+        bad = parse_issue_terminal_cancelled_result(result_comment.body)
+        changed_fields = {**bad._fields(), "terminal_result_id": "0" * 64, "outcome": "CANCELLED"}
+        # A canonical but conflicting terminal claim cannot replace the first.
+        changed_fields["draft_witness_comment_database_id"] = bad.draft_witness_comment_database_id + 1
+        conflicting = IssueTerminalCancelledResult.create(**changed_fields)
+        client.pr_comments[fence.pull_request_number].append(
+            IssueAnchorControllerTests.comment(
+                conflicting.render(), database_id=result_comment.database_id + 80_000,
+            ),
+        )
+        with self.assertRaises(R02Error):
+            controller.establish_issue_terminal_cancelled_result(issue.number)
+
+    def test_task04_components_do_not_delete_branches(self):
+        source = Path(controller_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        names = {item.name: item for item in tree.body if isinstance(item, ast.ClassDef)}
+        controller = names["R02Controller"]
+        methods = {
+            node.name: node for node in controller.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        selected = (
+            "establish_issue_cancellation_draft_witness",
+            "establish_issue_terminal_cancelled_result",
+            "_persist_issue_cancellation_draft_witness",
+            "_persist_issue_terminal_cancelled_result",
+        )
+        for name in selected:
+            with self.subTest(method=name):
+                called = {
+                    item.func.attr if isinstance(item.func, ast.Attribute) else item.func.id
+                    for item in ast.walk(methods[name])
+                    if isinstance(item, ast.Call)
+                    and (isinstance(item.func, ast.Attribute) or isinstance(item.func, ast.Name))
+                }
+                self.assertFalse(called & {"delete_ref", "delete_branch", "delete_git_ref"})
+
+    def test_cancellation_callables_are_not_activated_by_main_or_workflows(self):
+        source = Path(controller_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "main")
+        called = {
+            item.func.attr if isinstance(item.func, ast.Attribute) else item.func.id
+            for item in ast.walk(main)
+            if isinstance(item, ast.Call)
+            and (isinstance(item.func, ast.Attribute) or isinstance(item.func, ast.Name))
+        }
+        self.assertNotIn("prepare_issue_cancellation_fence", called)
+        self.assertNotIn("publish_issue_cancel_failure", called)
+        self.assertNotIn("establish_issue_cancellation_draft_witness", called)
+        self.assertNotIn("establish_issue_terminal_cancelled_result", called)
+
+    def test_terminal_classifier_classifies_A_through_E_without_source_eligibility(self):
+        cases = (
+            (*self._no_pr_fixture(with_lease=False), controller_module.IssueCancellationClass.A_ANCHOR_ONLY),
+            (*self._no_pr_fixture(with_lease=True, ref_state="absent"), controller_module.IssueCancellationClass.B_LEASE_REF_ABSENT),
+            (*self._no_pr_fixture(with_lease=True, ref_state="root"), controller_module.IssueCancellationClass.C_LEASE_ZERO_PR),
+        )
+        for client, _issue, _anchor, _lease, controller, expected in cases:
+            with self.subTest(expected=expected):
+                with patch.object(controller_module, "resolve_issue_source_authority", side_effect=AssertionError("source lookup forbidden")):
+                    state = controller._read_issue_cancellation_state(7)
+                self.assertIs(state.classification, expected)
+                self.assertFalse(state.pr_candidates)
+
+        for binding, expected in (
+            ("PRE_BINDING", controller_module.IssueCancellationClass.D_PRE_BINDING_ONE_PR),
+            ("FULL_BINDING", controller_module.IssueCancellationClass.E_FULL_BINDING),
+        ):
+            with self.subTest(binding=binding):
+                client, issue, _a, _l, _s, controller, _fence = self._prepare(binding=binding)
+                with patch.object(controller_module, "resolve_issue_source_authority", side_effect=AssertionError("source lookup forbidden")):
+                    state = controller._read_issue_cancellation_state(issue.number)
+                self.assertIs(state.classification, expected)
+                self.assertEqual(len(state.pr_candidates), 1)
+                client.raw_pr_merged = True
+                client.raw_pr_merged_at = "2026-10-06T01:00:00Z"
+                merged = controller._read_issue_cancellation_state(issue.number)
+                self.assertTrue(merged.merge_observed)
+                self.assertIs(merged.classification, expected)
+
+    def test_terminal_classifier_rejects_hidden_pr_ref_drift_multiple_and_inconsistent_binding(self):
+        client, _issue, _anchor, _lease, controller = self._no_pr_fixture(with_lease=False)
+        client.add_candidate()
+        self.assertIs(
+            controller._read_issue_cancellation_state(7).classification,
+            controller_module.IssueCancellationClass.F_CONFLICTING,
+        )
+
+        client, _issue, _anchor, _lease, controller = self._no_pr_fixture(ref_state="drift")
+        self.assertIs(
+            controller._read_issue_cancellation_state(7).classification,
+            controller_module.IssueCancellationClass.F_CONFLICTING,
+        )
+
+        client, _issue, _anchor, _lease, _state, controller, _fence = self._prepare(binding="PRE_BINDING")
+        client.add_candidate(number=82)
+        self.assertIs(
+            controller._read_issue_cancellation_state(7).classification,
+            controller_module.IssueCancellationClass.F_CONFLICTING,
+        )
+
+        client, _issue, _anchor, _lease, _state, controller, _fence = self._prepare(binding="PRE_BINDING")
+        number = next(iter(client.pull_requests))
+        client.pull_requests[number] = replace(client.pull_requests[number], head_repository_id="R_foreign")
+        self.assertIs(
+            controller._read_issue_cancellation_state(7).classification,
+            controller_module.IssueCancellationClass.F_CONFLICTING,
+        )
+
+        client, _issue, _anchor, _lease, _state, controller, _fence = self._prepare(binding="FULL_BINDING")
+        original = next(item for item in client.comments if item.body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER))
+        binding = parse_issue_internal_pr_binding(original.body)
+        binding_fields = binding.as_value(include_binding_id=False)
+        inconsistent = IssuePRBinding.create(**{
+            "schema_version": binding_fields["schemaVersion"],
+            "issue_number": binding_fields["issueNumber"],
+            "issue_database_id": binding_fields["issueDatabaseId"],
+            "issue_node_id": binding_fields["issueNodeId"],
+            "issue_request_anchor_comment_database_id": binding_fields["issueRequestAnchorCommentDatabaseId"],
+            "issue_request_anchor_sha256": binding_fields["issueRequestAnchorSha256"],
+            "issue_branch_lease_comment_database_id": binding_fields["issueBranchLeaseCommentDatabaseId"],
+            "issue_branch_lease_sha256": binding_fields["issueBranchLeaseSha256"],
+            "source_id": binding_fields["sourceId"],
+            "source_repository_id": binding_fields["sourceRepositoryId"],
+            "branch_ref": binding_fields["branchRef"],
+            "pull_request_number": binding_fields["pullRequestNumber"],
+            "pull_request_database_id": binding_fields["pullRequestDatabaseId"] + 1,
+            "pull_request_node_id": binding_fields["pullRequestNodeId"],
+            "initial_head_sha": binding_fields["initialHeadSha"],
+            "base_ref": binding_fields["baseRef"],
+            "central_repository_node_id": binding_fields["centralRepositoryNodeId"],
+        })
+        client.comments[client.comments.index(original)] = replace(
+            original, body=inconsistent.render_issue_binding(),
+        )
+        self.assertIs(
+            controller._read_issue_cancellation_state(7).classification,
+            controller_module.IssueCancellationClass.F_CONFLICTING,
+        )
+
+    def test_no_pr_A_B_results_are_exact_idempotent_and_do_not_mutate_refs(self):
+        client, issue, _anchor, _lease, controller = self._no_pr_fixture(with_lease=False)
+        result = controller.cancel_issue_without_pr(issue.number)
+        self.assertIs(result.proof_kind, IssueNoPRCancelledProofKind.ANCHOR_ONLY)
+        self.assertEqual(controller.cancel_issue_without_pr(issue.number), result)
+        self.assertEqual(client.no_pr_ref_updates, [])
+        client.issue = replace(client.issue, state="open")
+        self.assertEqual(controller.cancel_issue_without_pr(issue.number), result)
+
+        client, issue, _anchor, _lease, controller = self._no_pr_fixture(ref_state="absent")
+        result = controller.cancel_issue_without_pr(issue.number)
+        self.assertIs(result.proof_kind, IssueNoPRCancelledProofKind.LEASE_REF_ABSENT)
+        self.assertIsNone(client.current_ref)
+        self.assertEqual(client.no_pr_ref_updates, [])
+        self.assertEqual(controller.cancel_issue_without_pr(issue.number), result)
+
+    def test_no_pr_C_uses_exact_zero_pr_status_check_and_nonforce_cas_proof(self):
+        for status_state in (None, "pending", "failure", "error"):
+            with self.subTest(status_state=status_state):
+                client, issue, _anchor, lease, controller = self._no_pr_fixture(ref_state="root")
+                if status_state is not None:
+                    client.status_rows[lease.lease.initial_head_sha] = (
+                        self._exact_app_status(
+                            lease.lease.initial_head_sha, state=status_state,
+                            status_class=StatusClass.ISSUE_FINAL, status_id=301,
+                        ),
+                    )
+                inventory_reads = []
+                original_inventory = client.list_pull_requests
+
+                def count_inventory(repository, *, state="all", max_pages=100):
+                    inventory_reads.append(state)
+                    return original_inventory(repository, state=state, max_pages=max_pages)
+
+                client.list_pull_requests = count_inventory
+                result = controller.cancel_issue_without_pr(issue.number)
+                self.assertIs(result.proof_kind, IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS)
+                self.assertEqual(result.cleanup_before_oid, lease.lease.initial_head_sha)
+                self.assertTrue(result.cleanup_ref_absent_after)
+                self.assertEqual(result.required_status.queried_sha, lease.lease.initial_head_sha)
+                self.assertGreaterEqual(len(inventory_reads), 2)
+                self.assertTrue(all(item == "all" for item in inventory_reads))
+                self.assertIsNone(client.current_ref)
+                repository_id, updates = client.no_pr_ref_updates[0]
+                self.assertEqual(repository_id, self.CENTRAL_NODE_ID)
+                self.assertEqual(len(updates), 1)
+                self.assertEqual(updates[0].before_oid, lease.lease.initial_head_sha)
+                self.assertEqual(updates[0].after_oid, ZERO_OID)
+                self.assertFalse(updates[0].force)
+                self.assertEqual(controller.cancel_issue_without_pr(issue.number), result)
+
+    def test_no_pr_C_success_check_mixed_carrier_and_cas_conflict_never_persist_result(self):
+        cases = ("status-success", "check-success", "mixed", "cas-conflict")
+        for case in cases:
+            with self.subTest(case=case):
+                client, issue, _anchor, lease, controller = self._no_pr_fixture(ref_state="root")
+                if case in {"status-success", "mixed"}:
+                    client.status_rows[lease.lease.initial_head_sha] = (
+                        self._exact_app_status(
+                            lease.lease.initial_head_sha, state="success",
+                            status_class=StatusClass.ISSUE_FINAL, status_id=401,
+                        ),
+                    )
+                if case in {"check-success", "mixed"}:
+                    client.check_rows = [CheckRun(
+                        11, "federation/trusted-validation", lease.lease.initial_head_sha,
+                        "completed", "success", self.APP.app_id,
+                    )]
+                if case == "cas-conflict":
+                    client.no_pr_cas_error = RefCASConflict("competing lease-ref deletion")
+                with self.assertRaises((R02Error, StaleAuthorityError)):
+                    controller.cancel_issue_without_pr(issue.number)
+                self.assertEqual(client.current_ref, lease.lease.initial_head_sha if case == "cas-conflict" else lease.lease.initial_head_sha)
+                self.assertFalse(any(item.body.startswith(controller_module.ISSUE_NO_PR_CANCELLED_RESULT_MARKER) for item in client.comments))
+
+    def test_no_pr_C_reclassifies_when_pr_appears_and_rejects_bad_lease_marker(self):
+        client, issue, _anchor, lease, controller = self._no_pr_fixture(ref_state="root")
+        original_inventory = client.list_pull_requests
+        calls = []
+
+        def add_pr_on_recheck(repository, *, state="all", max_pages=100):
+            calls.append(state)
+            if len(calls) == 2:
+                client.add_candidate()
+            return original_inventory(repository, state=state, max_pages=max_pages)
+
+        client.list_pull_requests = add_pr_on_recheck
+        with self.assertRaises((R02Error, StaleAuthorityError)):
+            controller.cancel_issue_without_pr(issue.number)
+        self.assertEqual(client.no_pr_ref_updates, [])
+        self.assertEqual(client.current_ref, lease.lease.initial_head_sha)
+        self.assertFalse(any(item.body.startswith(controller_module.ISSUE_NO_PR_CANCELLED_RESULT_MARKER) for item in client.comments))
+
+        client, issue, _anchor, lease, controller = self._no_pr_fixture(ref_state="root")
+        client.commit_messages[lease.lease.initial_head_sha] += " altered"
+        with self.assertRaises((R02Error, StaleAuthorityError)):
+            controller.cancel_issue_without_pr(issue.number)
+        self.assertEqual(client.no_pr_ref_updates, [])
+
+    def test_pr_backed_cleanup_deletes_exact_D_E_HC_and_replays_without_stage_mutations(self):
+        for binding in ("PRE_BINDING", "FULL_BINDING"):
+            with self.subTest(binding=binding):
+                client, issue, _a, lease, _state, controller, fence, _status = self._publish_cancel_failure(
+                    binding=binding, nonce=("b" if binding == "PRE_BINDING" else "c") * 64,
+                )
+                controller.establish_issue_cancellation_draft_witness(issue.number)
+                terminal = controller.establish_issue_terminal_cancelled_result(issue.number)
+                prior_stages = list(client.stage_calls)
+                with patch.object(controller_module, "resolve_issue_source_authority", side_effect=AssertionError("source lookup forbidden")):
+                    cleaned = controller.cleanup_issue_cancelled_branch(issue.number)
+                self.assertEqual(cleaned, terminal)
+                self.assertIsNone(client.current_ref)
+                self.assertEqual(client.stage_calls, prior_stages)
+                update = next(
+                    event[2] for event in client.events
+                    if event[0] == "cas" and event[2].after_oid == ZERO_OID
+                )
+                self.assertEqual(update.name, lease.lease.branch_ref)
+                self.assertEqual(update.before_oid, fence.cancellation_head_sha)
+                self.assertEqual(update.after_oid, ZERO_OID)
+                self.assertFalse(update.force)
+                with patch.object(controller_module, "resolve_issue_source_authority", side_effect=AssertionError("source lookup forbidden")):
+                    self.assertEqual(controller.cleanup_issue_cancelled_branch(issue.number), terminal)
+                self.assertEqual(client.stage_calls, prior_stages)
+                if binding == "PRE_BINDING":
+                    self.assertFalse(any(item.body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER) for item in client.comments))
+
+    def test_pr_backed_cleanup_blocks_missing_proof_wrong_status_drift_merge_and_cas_conflict(self):
+        for case in ("missing-result", "success-status", "drift", "merge", "cas-conflict"):
+            with self.subTest(case=case):
+                client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(nonce=f"{len(case):064x}")
+                controller.establish_issue_cancellation_draft_witness(issue.number)
+                terminal = controller.establish_issue_terminal_cancelled_result(issue.number)
+                if case == "missing-result":
+                    client.pr_comments[fence.pull_request_number] = [
+                        item for item in client.pr_comments[fence.pull_request_number]
+                        if not item.body.startswith(ISSUE_TERMINAL_CANCELLED_RESULT_MARKER)
+                    ]
+                elif case == "success-status":
+                    client.status_rows[fence.cancellation_head_sha] = (
+                        self._exact_app_status(
+                            fence.cancellation_head_sha, state="success",
+                            status_class=StatusClass.CANCEL, digest=terminal.current_failure_status.evidence_digest,
+                            status_id=701,
+                        ),
+                    )
+                elif case == "drift":
+                    client.current_ref = "3" * 40
+                    number = fence.pull_request_number
+                    client.pull_requests[number] = replace(client.pull_requests[number], head_oid=client.current_ref)
+                elif case == "merge":
+                    client.raw_pr_merged = True
+                    client.raw_pr_merged_at = "2026-10-06T01:00:00Z"
+                else:
+                    client.cas_outcomes = ["raise-nochange"]
+                deletion_cas_count = len([
+                    event for event in client.events
+                    if event[0] == "cas" and event[2].after_oid == ZERO_OID
+                ])
+                if case == "merge":
+                    self.assertEqual(
+                        controller.cleanup_issue_cancelled_branch(issue.number),
+                        "MERGE_OBSERVED_POST_MERGE_REQUIRED",
+                    )
+                else:
+                    with self.assertRaises((R02Error, StaleAuthorityError)):
+                        controller.cleanup_issue_cancelled_branch(issue.number)
+                self.assertEqual(
+                    len([event for event in client.events if event[0] == "cas" and event[2].after_oid == ZERO_OID])
+                    - deletion_cas_count,
+                    0 if case in {"missing-result", "success-status", "drift", "merge"} else 1,
+                )
+
+    def test_terminal_cleanup_reclassifies_binding_and_preserves_merged_E(self):
+        client, issue, _a, _l, _s, controller, fence, _status = self._publish_cancel_failure(
+            binding="PRE_BINDING", nonce="d" * 64,
+        )
+        controller.establish_issue_cancellation_draft_witness(issue.number)
+        controller.establish_issue_terminal_cancelled_result(issue.number)
+        pr = client.pull_requests[fence.pull_request_number]
+        full_binding = IssuePRBinding.create(
+            issue_number=issue.number,
+            issue_database_id=client.binding_anchor.anchor.issue_database_id,
+            issue_node_id=client.binding_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=client.binding_anchor.comment.database_id,
+            issue_request_anchor_sha256=client.binding_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=client.binding_lease.comment.database_id,
+            issue_branch_lease_sha256=hashlib.sha256(client.binding_lease.comment.body.encode("utf-8")).hexdigest(),
+            source_id=client.binding_anchor.anchor.source_id,
+            source_repository_id=client.binding_anchor.anchor.source_repository_id,
+            branch_ref=client.binding_lease.lease.branch_ref,
+            pull_request_number=pr.number,
+            pull_request_database_id=client.pull_request_issues[pr.number].database_id,
+            pull_request_node_id=client.pull_request_issues[pr.number].node_id,
+            initial_head_sha=client.binding_lease.lease.initial_head_sha,
+            base_ref="main",
+            central_repository_node_id=self.CENTRAL_NODE_ID,
+        )
+        client.comments.append(IssueAnchorControllerTests.comment(
+            full_binding.render_issue_binding(), database_id=90_001,
+        ))
+        client.pr_comments[pr.number].append(IssueAnchorControllerTests.comment(
+            full_binding.render_pr_origin_binding(), database_id=90_002,
+        ))
+        with self.assertRaises((R02Error, StaleAuthorityError)):
+            controller.cleanup_issue_cancelled_branch(issue.number)
+        self.assertEqual(client.current_ref, fence.cancellation_head_sha)
+        self.assertFalse(any(event[0] == "cas" and event[2].after_oid == ZERO_OID for event in client.events))
+
+        client, issue, _a, _l, _s, controller, _fence, _status = self._publish_cancel_failure(
+            binding="FULL_BINDING", nonce="e" * 64,
+        )
+        controller.establish_issue_cancellation_draft_witness(issue.number)
+        controller.establish_issue_terminal_cancelled_result(issue.number)
+        client.raw_pr_merged = True
+        client.raw_pr_merged_at = "2026-10-06T01:00:00Z"
+        self.assertEqual(
+            controller.cleanup_issue_cancelled_branch(issue.number),
+            "MERGE_OBSERVED_POST_MERGE_REQUIRED",
+        )
+        self.assertFalse(any(event[0] == "cas" and event[2].after_oid == ZERO_OID for event in client.events))
+
+        client, issue, _a, _l, _s, controller, _fence, _status = self._publish_cancel_failure(
+            binding="PRE_BINDING", nonce="f" * 64,
+        )
+        controller.establish_issue_cancellation_draft_witness(issue.number)
+        controller.establish_issue_terminal_cancelled_result(issue.number)
+        client.raw_pr_merged = True
+        client.raw_pr_merged_at = "2026-10-06T01:00:00Z"
+        with self.assertRaisesRegex(StaleAuthorityError, "MERGED_PRE_BINDING_PRESERVE"):
+            controller.cleanup_issue_cancelled_branch(issue.number)
+        self.assertFalse(any(event[0] == "cas" and event[2].after_oid == ZERO_OID for event in client.events))
+
+    def test_new_cancellation_cleanup_callables_remain_inert_and_source_free(self):
+        source = Path(controller_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "main")
+        called = {
+            item.func.attr if isinstance(item.func, ast.Attribute) else item.func.id
+            for item in ast.walk(main)
+            if isinstance(item, ast.Call)
+            and (isinstance(item.func, ast.Attribute) or isinstance(item.func, ast.Name))
+        }
+        for name in (
+            "prepare_issue_cancellation_fence",
+            "publish_issue_cancel_failure",
+            "establish_issue_cancellation_draft_witness",
+            "establish_issue_terminal_cancelled_result",
+            "cleanup_issue_cancelled_branch",
+            "cancel_issue_without_pr",
+        ):
+            self.assertNotIn(name, called)
+        controller_class = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "R02Controller")
+        methods = {item.name: item for item in controller_class.body if isinstance(item, ast.FunctionDef)}
+        for name in ("cleanup_issue_cancelled_branch", "cancel_issue_without_pr", "_read_issue_cancellation_state"):
+            source_calls = {
+                item.func.attr if isinstance(item.func, ast.Attribute) else item.func.id
+                for item in ast.walk(methods[name])
+                if isinstance(item, ast.Call)
+                and (isinstance(item.func, ast.Attribute) or isinstance(item.func, ast.Name))
+            }
+            self.assertFalse(source_calls & {
+                "resolve_issue_source_authority", "_fresh_issue_source_authority",
+                "current_issue_source_authority", "source_authority_resolver",
+            })
+        for client, issue, _anchor, _lease, controller in (
+            self._no_pr_fixture(with_lease=False),
+            self._no_pr_fixture(ref_state="absent"),
+        ):
+            with patch.object(controller_module, "resolve_issue_source_authority", side_effect=AssertionError("source lookup forbidden")):
+                state = controller._read_issue_cancellation_state(issue.number)
+                if state.issue.state == "closed":
+                    controller.cancel_issue_without_pr(issue.number)
 
 
 if __name__ == "__main__":

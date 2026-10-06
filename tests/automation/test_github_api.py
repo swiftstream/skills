@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from automation.federation import github_api as github_api_module
 from automation.federation.github_api import (
+    REOPEN_PULL_REQUEST_MUTATION,
+    MARK_PULL_REQUEST_READY_FOR_REVIEW_MUTATION,
+    CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION,
+    CLOSE_PULL_REQUEST_MUTATION,
     GRAPHQL_ENDPOINT,
     ISSUE_ROUTING_AFTER_QUERY,
     ISSUE_ROUTING_BEFORE_QUERY,
@@ -17,6 +22,7 @@ from automation.federation.github_api import (
     UPDATE_REFS_MUTATION,
     ZERO_OID,
     GitHubClient,
+    PullRequestStageMutationReceipt,
     GitHubAPIError,
     IssueMetadata,
     GitTreeEntry,
@@ -1890,6 +1896,186 @@ class Wave05CommitStatusAPITests(unittest.TestCase):
             with self.subTest(max_pages=max_pages), self.assertRaises(GitHubAPIError):
                 GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=max_pages)
             self.assertEqual(transport.calls, [])
+
+
+class Wave07PullRequestStageMutationTests(unittest.TestCase):
+    operations = {
+        "REOPEN": (REOPEN_PULL_REQUEST_MUTATION, "reopenPullRequest", "reopen_pull_request"),
+        "READY_FOR_REVIEW": (MARK_PULL_REQUEST_READY_FOR_REVIEW_MUTATION, "markPullRequestReadyForReview", "mark_pull_request_ready_for_review"),
+        "CONVERT_TO_DRAFT": (CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION, "convertPullRequestToDraft", "convert_pull_request_to_draft"),
+        "CLOSE": (CLOSE_PULL_REQUEST_MUTATION, "closePullRequest", "close_pull_request"),
+    }
+
+    @staticmethod
+    def pull(**changes):
+        value = {
+            "id": "PR_kwDOPull",
+            "fullDatabaseId": "800",
+            "number": 8,
+            "state": "OPEN",
+            "isDraft": False,
+            "merged": False,
+            "mergedAt": None,
+            "headRefOid": "a" * 40,
+            "baseRefOid": "b" * 40,
+            "headRefName": "bot/federation/request/issue-7",
+            "baseRefName": "main",
+            "headRepository": {"id": "R_central"},
+            "baseRepository": {"id": "R_central"},
+        }
+        value.update(changes)
+        return value
+
+    @classmethod
+    def response(cls, operation, *, client_mutation_id="mutation-123", pull=None, payload_changes=None, data_changes=None):
+        _, mutation_field, _ = cls.operations[operation]
+        payload = {"clientMutationId": client_mutation_id, "pullRequest": cls.pull() if pull is None else pull}
+        payload.update(payload_changes or {})
+        data = {mutation_field: payload}
+        data.update(data_changes or {})
+        return HttpResponse(200, GRAPHQL_ENDPOINT, json.dumps({"data": data}).encode())
+
+    def invoke(self, operation, response, *, node_id="PR_kwDOPull", client_mutation_id="mutation-123"):
+        _, _, method_name = self.operations[operation]
+        client = GitHubClient("token", FakeTransport(response))
+        return getattr(client, method_name)(node_id, client_mutation_id)
+
+    def test_all_four_static_documents_are_allowlisted_and_select_only_full_database_id(self):
+        documents = [item[0] for item in self.operations.values()]
+        self.assertEqual(len(documents), 4)
+        self.assertEqual(len(set(documents)), 4)
+        for document in documents:
+            with self.subTest(document=document.splitlines()[0]):
+                self.assertIn("$pullRequestId: ID!", document)
+                self.assertIn("$clientMutationId: String!", document)
+                self.assertIn("pullRequestId: $pullRequestId", document)
+                self.assertIn("clientMutationId: $clientMutationId", document)
+                self.assertIn("fullDatabaseId", document)
+                self.assertNotRegex(document, r"(?<!full)databaseId")
+                self.assertNotIn("PR_kwDOPull", document)
+                client = GitHubClient(None, FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, b'{"data":{}}')))
+                client._graphql(document, {"pullRequestId": "PR_kwDOPull", "clientMutationId": "mutation-123"})
+
+        transport = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, b'{"data":{}}'))
+        client = GitHubClient(None, transport)
+        for document in documents:
+            with self.assertRaises(GitHubAPIError):
+                client._graphql(document + "\n# caller suffix", {})
+        self.assertEqual(len(transport.calls), 0)
+
+    def test_public_methods_send_only_variables_and_return_exact_receipts(self):
+        for operation in self.operations:
+            with self.subTest(operation=operation):
+                pull = self.pull()
+                node_id = 'PR_" } mutation { deleteRepository(id: "x") { id } #'
+                pull["id"] = node_id
+                if operation == "CONVERT_TO_DRAFT":
+                    pull["isDraft"] = True
+                elif operation == "CLOSE":
+                    pull["state"] = "CLOSED"
+                response = self.response(operation, client_mutation_id="exact-mutation-id", pull=pull)
+                transport = FakeTransport(response)
+                _, document, method_name = self.operations[operation]
+                receipt = getattr(GitHubClient(None, transport), method_name)(node_id, "exact-mutation-id")
+                self.assertIsInstance(receipt, PullRequestStageMutationReceipt)
+                self.assertEqual(receipt.operation, operation)
+                self.assertEqual(receipt.requested_pull_request_node_id, node_id)
+                self.assertEqual(receipt.pull_request_database_id, 800)
+                self.assertEqual(receipt.returned_client_mutation_id, "exact-mutation-id")
+                self.assertEqual(len(transport.calls), 1)
+                call = transport.calls[0]
+                payload = json.loads(call[3])
+                self.assertEqual(payload["query"], self.operations[operation][0])
+                self.assertEqual(payload["variables"], {"pullRequestId": node_id, "clientMutationId": "exact-mutation-id"})
+                self.assertNotIn(node_id, payload["query"])
+
+    def test_full_database_id_parser_is_ascii_canonical_and_lossless(self):
+        self.assertEqual(github_api_module._positive_graphql_bigint("1"), 1)
+        self.assertEqual(github_api_module._positive_graphql_bigint("2147483648"), 2_147_483_648)
+        huge = "9" * 100
+        self.assertEqual(github_api_module._positive_graphql_bigint(huge), int(huge))
+        for invalid in ("0", "-1", "+1", "01", " 1", "1 ", "1.0", "1e3", "", "١", 1, True, 1.0, None, "1_0"):
+            with self.subTest(invalid=repr(invalid)), self.assertRaises(InvalidResponseError):
+                github_api_module._positive_graphql_bigint(invalid)
+
+    def test_exact_receipt_shapes_reject_identity_and_database_id_failures(self):
+        for operation in self.operations:
+            pull = self.pull()
+            if operation == "CONVERT_TO_DRAFT":
+                pull["isDraft"] = True
+            elif operation == "CLOSE":
+                pull["state"] = "CLOSED"
+            good = self.response(operation, pull=pull)
+            with self.subTest(operation=operation):
+                self.assertEqual(self.invoke(operation, good).pull_request_node_id, "PR_kwDOPull")
+
+        bad_cases = (
+            ("missing fullDatabaseId", {key: value for key, value in self.pull().items() if key != "fullDatabaseId"}),
+            ("deprecated only", {**{key: value for key, value in self.pull().items() if key != "fullDatabaseId"}, "databaseId": "800"}),
+            ("null PR node", self.pull(id=None)),
+            ("bad PR number", self.pull(number=True)),
+            ("bad head OID", self.pull(headRefOid=None)),
+            ("bad base OID", self.pull(baseRefOid="A" * 40)),
+            ("null head repository", self.pull(headRepository=None)),
+            ("extra repository key", self.pull(headRepository={"id": "R_central", "name": "repo"})),
+        )
+        for label, pull in bad_cases:
+            with self.subTest(label=label), self.assertRaises(InvalidResponseError):
+                self.invoke("REOPEN", self.response("REOPEN", pull=pull))
+
+        for database_value in ("0", "-1", "+1", "01", " 1", "1 ", "1.0", "1e3", "", "١", 1, True, 1.0, None):
+            with self.subTest(database_value=repr(database_value)), self.assertRaises(InvalidResponseError):
+                self.invoke("REOPEN", self.response("REOPEN", pull=self.pull(fullDatabaseId=database_value)))
+        for payload_changes, data_changes in (
+            ({"unexpected": "x"}, None),
+            ({"pullRequest": None}, None),
+            (None, {"anotherMutation": {}}),
+        ):
+            with self.subTest(payload_changes=payload_changes, data_changes=data_changes), self.assertRaises(InvalidResponseError):
+                self.invoke("REOPEN", self.response("REOPEN", payload_changes=payload_changes, data_changes=data_changes))
+
+    def test_client_mutation_id_and_requested_pr_node_must_match_exactly(self):
+        for response, node_id, mutation_id in (
+            (self.response("REOPEN", client_mutation_id="other"), "PR_kwDOPull", "mutation-123"),
+            (self.response("REOPEN", pull=self.pull(id="PR_other")), "PR_kwDOPull", "mutation-123"),
+        ):
+            with self.assertRaises(InvalidResponseError):
+                self.invoke("REOPEN", response, node_id=node_id, client_mutation_id=mutation_id)
+        for node_id, mutation_id in (("", "ok"), ("PR_ok", ""), ("PR_ok", "x" * 257), ("PR_ok", "bad\nvalue")):
+            transport = FakeTransport(self.response("REOPEN"))
+            with self.subTest(node_id=node_id, mutation_id=mutation_id), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).reopen_pull_request(node_id, mutation_id)
+            self.assertEqual(transport.calls, [])
+
+    def test_operation_state_predicates_fail_closed(self):
+        cases = (
+            ("REOPEN", self.pull(state="CLOSED")),
+            ("REOPEN", self.pull(merged=True, mergedAt="2026-10-05T10:11:12Z")),
+            ("READY_FOR_REVIEW", self.pull(isDraft=True)),
+            ("CONVERT_TO_DRAFT", self.pull(isDraft=False)),
+            ("CLOSE", self.pull(state="OPEN")),
+            ("REOPEN", self.pull(mergedAt="2026-10-05T10:11:12Z")),
+        )
+        for operation, pull in cases:
+            with self.subTest(operation=operation, pull=pull), self.assertRaises(InvalidResponseError):
+                self.invoke(operation, self.response(operation, pull=pull))
+
+    def test_graphql_errors_nulls_and_transport_errors_do_not_retry_or_fallback(self):
+        for body in (b'{"errors":[{"type":"FORBIDDEN"}]}', b'{"data":{"reopenPullRequest":null}}', b'{}'):
+            transport = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, body))
+            with self.subTest(body=body), self.assertRaises((GraphQLError, InvalidResponseError)):
+                GitHubClient(None, transport).reopen_pull_request("PR_kwDOPull", "mutation-123")
+            self.assertEqual(len(transport.calls), 1)
+        class TimeoutTransport:
+            def __init__(self):
+                self.calls = []
+            def request(self, *args):
+                self.calls.append(args)
+                raise TimeoutError("secret")
+        transport = TimeoutTransport()
+        with self.assertRaises(TransportError):
+            GitHubClient(None, transport).close_pull_request("PR_kwDOPull", "mutation-123")
+        self.assertEqual(len(transport.calls), 1)
 
 
 if __name__ == "__main__":

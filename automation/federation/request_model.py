@@ -3756,3 +3756,1140 @@ def parse_issue_branch_lease(text: str) -> IssueBranchLease:
     if lines[1] != _canonical_json(lease.as_value()) or text != lease.render():
         _fail("IssueBranchLease representation is not canonical")
     return lease
+
+# G8 Wave 07 cancellation artifacts are transport-independent canonical models.
+ISSUE_CANCELLATION_FENCE_MARKER = "<!-- swiftstream-federation-issue-cancellation-fence:v1 -->"
+ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER = "<!-- swiftstream-federation-issue-cancellation-draft-witness:v1 -->"
+ISSUE_TERMINAL_CANCELLED_RESULT_MARKER = "<!-- swiftstream-federation-terminal-cancelled-result:v1 -->"
+ISSUE_NO_PR_CANCELLED_RESULT_MARKER = "<!-- swiftstream-federation-no-pr-cancelled-result:v1 -->"
+ISSUE_CANCELLATION_FENCE_AUTHORITY_PREFIX = "swiftstream-federation:issue-cancellation-fence:authority:v1\n"
+ISSUE_CANCELLATION_FENCE_ID_PREFIX = "swiftstream-federation:issue-cancellation-fence:id:v1\n"
+CANCEL_STATUS_EVIDENCE_PREFIX = "swiftstream-federation:cancel-status-evidence:v1\n"
+EXACT_APP_REQUIRED_STATUS_SNAPSHOT_PREFIX = "swiftstream-federation:exact-app-required-status-snapshot:v1\n"
+EXACT_PR_STAGE_MUTATION_EVIDENCE_PREFIX = "swiftstream-federation:pr-stage-mutation-evidence:v1\n"
+ISSUE_CANCELLATION_DRAFT_WITNESS_ID_PREFIX = "swiftstream-federation:issue-cancellation-draft-witness:v1\n"
+ISSUE_TERMINAL_CANCELLED_CLOSE_RESPONSE_PREFIX = "swiftstream-federation:terminal-cancelled-close-response:v1\n"
+ISSUE_TERMINAL_CANCELLED_RESULT_ID_PREFIX = "swiftstream-federation:terminal-cancelled-result:v1\n"
+ISSUE_NO_PR_CANCELLED_RESULT_ID_PREFIX = "swiftstream-federation:no-pr-cancelled-result:v1\n"
+
+
+def _cancel_binding_authority(value: Any) -> str:
+    if value == "PRE_BINDING" and type(value) is str:
+        return value
+    if type(value) is str and _SHA256_RE.fullmatch(value):
+        return value
+    _fail("bindingAuthority must be PRE_BINDING or a lowercase bindingId")
+
+
+def _cancel_source_id(value: Any) -> str:
+    if type(value) is not str:
+        _fail("sourceId is invalid")
+    try:
+        c02.validate_source_id(value)
+    except (TypeError, c02.FederationError):
+        _fail("sourceId is invalid")
+    return value
+
+
+def _cancel_optional_url(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    return _issue_bounded_text(value, label, 2_048)
+
+
+def _cancel_parse_record(text: Any, marker: str, label: str, expected_keys: set[str] | frozenset[str]) -> dict[str, Any]:
+    if type(text) is not str or not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _fail(f"{label} must use exact LF-terminated lines")
+    lines = text[:-1].split("\n")
+    if len(lines) != 2 or lines[0] != marker or not lines[1]:
+        _fail(f"{label} marker or JSON line is invalid")
+    try:
+        value = c02.decode_json(lines[1])
+    except Exception as error:
+        _fail(f"invalid {label} JSON: {error}")
+    if type(value) is not dict or set(value) != set(expected_keys):
+        _fail(f"{label} has invalid exact keys")
+    return value
+
+
+def _cancel_status_fields_value(snapshot: "ExactAppRequiredStatusSnapshot") -> dict[str, Any]:
+    return snapshot.as_value()
+
+
+@dataclass(frozen=True)
+class ExactAppRequiredStatusSnapshot:
+    """Exact queried-route association and same-response App status snapshot."""
+
+    disposition: str
+    queried_sha: str
+    status_id: int | None = None
+    status_node_id: str | None = None
+    creator_database_id: int | None = None
+    creator_node_id: str | None = None
+    creator_login: str | None = None
+    creator_type: str | None = None
+    context: str | None = None
+    state: str | None = None
+    description: str | None = None
+    target_url: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    parsed_status_class: StatusClass | None = None
+    parsed_evidence_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.disposition not in ("ABSENT", "PRESENT") or type(self.disposition) is not str:
+            _fail("required status snapshot disposition must be ABSENT or PRESENT")
+        _lease_sha(self.queried_sha, "queriedSha", git=True)
+        names = (
+            "status_id", "status_node_id", "creator_database_id", "creator_node_id",
+            "creator_login", "creator_type", "context", "state", "description",
+            "target_url", "created_at", "updated_at", "parsed_status_class", "parsed_evidence_digest",
+        )
+        if self.disposition == "ABSENT":
+            if any(getattr(self, name) is not None for name in names):
+                _fail("ABSENT required status snapshot must explicitly null every status field")
+            return
+        _issue_positive_int(self.status_id, "statusId")
+        if self.status_node_id is not None:
+            _lease_node_id(self.status_node_id, "statusNodeId", delimiter_free=True)
+        _issue_positive_int(self.creator_database_id, "creatorDatabaseId")
+        _lease_node_id(self.creator_node_id, "creatorNodeId", delimiter_free=True)
+        _issue_bounded_text(self.creator_login, "creatorLogin", 256)
+        if self.creator_type != "Bot":
+            _fail("required status creator type must be exact Bot")
+        if self.context != "federation/trusted-validation":
+            _fail("required status context must be exact federation/trusted-validation")
+        if self.state not in ("error", "failure", "pending", "success") or type(self.state) is not str:
+            _fail("required status state is invalid")
+        parsed = parse_status_description(self.description)
+        if parsed.render() != self.description:
+            _fail("required status description is not canonical")
+        if type(self.parsed_status_class) is not StatusClass or self.parsed_status_class is not parsed.status_class:
+            _fail("required status parsed StatusClass does not match description")
+        _lease_sha(self.parsed_evidence_digest, "parsedEvidenceDigest")
+        if self.parsed_evidence_digest != parsed.evidence_digest:
+            _fail("required status parsed evidence digest does not match description")
+        _cancel_optional_url(self.target_url, "targetUrl")
+        _canonical_utc_timestamp(self.created_at, "createdAt")
+        _canonical_utc_timestamp(self.updated_at, "updatedAt")
+
+    @property
+    def is_present(self) -> bool:
+        return self.disposition == "PRESENT"
+
+    @property
+    def status_class(self) -> StatusClass | None:
+        return self.parsed_status_class if self.is_present else None
+
+    @property
+    def evidence_digest(self) -> str | None:
+        return self.parsed_evidence_digest if self.is_present else None
+
+    @classmethod
+    def absent(cls, queried_sha: str) -> "ExactAppRequiredStatusSnapshot":
+        return cls("ABSENT", queried_sha)
+
+    @classmethod
+    def present_status(cls, **fields: Any) -> "ExactAppRequiredStatusSnapshot":
+        parsed = parse_status_description(fields["description"])
+        fields.setdefault("parsed_status_class", parsed.status_class)
+        fields.setdefault("parsed_evidence_digest", parsed.evidence_digest)
+        return cls("PRESENT", **fields)
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "context": self.context,
+            "createdAt": self.created_at,
+            "creatorDatabaseId": self.creator_database_id,
+            "creatorLogin": self.creator_login,
+            "creatorNodeId": self.creator_node_id,
+            "creatorType": self.creator_type,
+            "description": self.description,
+            "disposition": self.disposition,
+            "queriedSha": self.queried_sha,
+            "parsedStatusClass": self.parsed_status_class.value if self.parsed_status_class else None,
+            "parsedEvidenceDigest": self.parsed_evidence_digest,
+            "state": self.state,
+            "statusId": self.status_id,
+            "statusNodeId": self.status_node_id,
+            "targetUrl": self.target_url,
+            "updatedAt": self.updated_at,
+        }
+
+    def render(self) -> str:
+        return _canonical_json(self.as_value())
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256((EXACT_APP_REQUIRED_STATUS_SNAPSHOT_PREFIX + self.render()).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ExactAppRequiredStatusSnapshot":
+        expected = {
+            "disposition", "queriedSha", "statusId", "statusNodeId", "creatorDatabaseId",
+            "creatorNodeId", "creatorLogin", "creatorType", "context", "state",
+            "description", "targetUrl", "createdAt", "updatedAt",
+            "parsedStatusClass", "parsedEvidenceDigest",
+        }
+        if type(value) is not dict or set(value) != expected:
+            _fail("required status snapshot has invalid exact keys")
+        try:
+            parsed_class = StatusClass(value["parsedStatusClass"]) if value["parsedStatusClass"] is not None else None
+        except (ValueError, TypeError):
+            _fail("required status parsed StatusClass is invalid")
+        return cls(
+            value["disposition"], value["queriedSha"], value["statusId"], value["statusNodeId"],
+            value["creatorDatabaseId"], value["creatorNodeId"], value["creatorLogin"],
+            value["creatorType"], value["context"], value["state"], value["description"],
+            value["targetUrl"], value["createdAt"], value["updatedAt"], parsed_class, value["parsedEvidenceDigest"],
+        )
+
+
+def parse_exact_app_required_status_snapshot(text: str) -> ExactAppRequiredStatusSnapshot:
+    if type(text) is not str or "\r" in text or "\x00" in text:
+        _fail("required status snapshot must be exact canonical JSON")
+    try:
+        value = c02.decode_json(text)
+    except Exception as error:
+        _fail(f"invalid required status snapshot JSON: {error}")
+    snapshot = ExactAppRequiredStatusSnapshot.from_value(value)
+    if snapshot.render() != text:
+        _fail("required status snapshot representation is not canonical")
+    return snapshot
+
+
+class PullRequestStageMutationOperation(Enum):
+    REOPEN = "REOPEN"
+    READY_FOR_REVIEW = "READY_FOR_REVIEW"
+    CONVERT_TO_DRAFT = "CONVERT_TO_DRAFT"
+    CLOSE = "CLOSE"
+
+
+@dataclass(frozen=True)
+class ExactPullRequestStageMutationEvidence:
+    """Canonical transport-independent fields returned by one PR-stage mutation."""
+
+    operation: PullRequestStageMutationOperation
+    client_mutation_id: str
+    pull_request_node_id: str
+    pull_request_database_id: int
+    pull_request_number: int
+    state: str
+    is_draft: bool
+    merged: bool
+    merged_at: str | None
+    head_ref_oid: str
+    base_ref_oid: str
+    head_ref_name: str
+    base_ref_name: str
+    head_repository_node_id: str
+    base_repository_node_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not PullRequestStageMutationOperation:
+            _fail("stage mutation operation must be a closed operation enum")
+        _issue_bounded_text(self.client_mutation_id, "clientMutationId", 256)
+        _lease_node_id(self.pull_request_node_id, "pullRequestNodeId", delimiter_free=True)
+        _issue_positive_int(self.pull_request_database_id, "pullRequestDatabaseId")
+        _issue_positive_int(self.pull_request_number, "pullRequestNumber")
+        if self.state not in ("OPEN", "CLOSED") or type(self.state) is not str:
+            _fail("stage mutation state must be OPEN or CLOSED")
+        if type(self.is_draft) is not bool or type(self.merged) is not bool:
+            _fail("stage mutation draft/merged fields must be exact booleans")
+        if self.merged_at is None:
+            if self.merged:
+                _fail("merged stage evidence requires mergedAt")
+        else:
+            _canonical_utc_timestamp(self.merged_at, "mergedAt")
+            if not self.merged:
+                _fail("unmerged stage evidence requires null mergedAt")
+        _lease_sha(self.head_ref_oid, "headRefOid", git=True)
+        _lease_sha(self.base_ref_oid, "baseRefOid", git=True)
+        _issue_bounded_text(self.head_ref_name, "headRefName", 256)
+        _issue_bounded_text(self.base_ref_name, "baseRefName", 256)
+        _lease_node_id(self.head_repository_node_id, "headRepositoryNodeId", delimiter_free=True)
+        _lease_node_id(self.base_repository_node_id, "baseRepositoryNodeId", delimiter_free=True)
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "baseRefName": self.base_ref_name,
+            "baseRefOid": self.base_ref_oid,
+            "baseRepositoryNodeId": self.base_repository_node_id,
+            "clientMutationId": self.client_mutation_id,
+            "headRefName": self.head_ref_name,
+            "headRefOid": self.head_ref_oid,
+            "headRepositoryNodeId": self.head_repository_node_id,
+            "isDraft": self.is_draft,
+            "merged": self.merged,
+            "mergedAt": self.merged_at,
+            "number": self.pull_request_number,
+            "operation": self.operation.value,
+            "pullRequestDatabaseId": self.pull_request_database_id,
+            "pullRequestNodeId": self.pull_request_node_id,
+            "state": self.state,
+        }
+
+    def render(self) -> str:
+        return _canonical_json(self.as_value())
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256((EXACT_PR_STAGE_MUTATION_EVIDENCE_PREFIX + self.render()).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def from_value(cls, value: Any) -> "ExactPullRequestStageMutationEvidence":
+        expected = {
+            "operation", "clientMutationId", "pullRequestNodeId", "pullRequestDatabaseId", "number",
+            "state", "isDraft", "merged", "mergedAt", "headRefOid", "baseRefOid", "headRefName",
+            "baseRefName", "headRepositoryNodeId", "baseRepositoryNodeId",
+        }
+        if type(value) is not dict or set(value) != expected:
+            _fail("stage mutation evidence has invalid exact keys")
+        try:
+            operation = PullRequestStageMutationOperation(value["operation"])
+        except (ValueError, TypeError):
+            _fail("stage mutation operation is invalid")
+        return cls(
+            operation, value["clientMutationId"], value["pullRequestNodeId"],
+            value["pullRequestDatabaseId"], value["number"], value["state"], value["isDraft"],
+            value["merged"], value["mergedAt"], value["headRefOid"], value["baseRefOid"],
+            value["headRefName"], value["baseRefName"], value["headRepositoryNodeId"],
+            value["baseRepositoryNodeId"],
+        )
+
+
+def cancel_status_evidence_digest(
+    *, central_repository_node_id: str, issue_number: int, issue_database_id: int,
+    issue_node_id: str, fence_id: str, cancellation_head_sha: str,
+    binding_authority: str, pull_request_number: int, pull_request_database_id: int,
+    pull_request_node_id: str,
+) -> str:
+    central = _lease_node_id(central_repository_node_id, "centralRepositoryNodeId", delimiter_free=True)
+    issue_number = _issue_positive_int(issue_number, "issueNumber")
+    issue_database_id = _issue_positive_int(issue_database_id, "issueDatabaseId")
+    issue_node_id = _lease_node_id(issue_node_id, "issueNodeId", delimiter_free=True)
+    _lease_sha(fence_id, "fenceId")
+    _lease_sha(cancellation_head_sha, "cancellationHeadSha", git=True)
+    authority = _cancel_binding_authority(binding_authority)
+    pull_request_number = _issue_positive_int(pull_request_number, "pullRequestNumber")
+    pull_request_database_id = _issue_positive_int(pull_request_database_id, "pullRequestDatabaseId")
+    pull_request_node_id = _lease_node_id(pull_request_node_id, "pullRequestNodeId", delimiter_free=True)
+    value = {
+        "bindingAuthority": authority,
+        "centralRepositoryNodeId": central,
+        "context": "federation/trusted-validation",
+        "fenceId": fence_id,
+        "issueDatabaseId": issue_database_id,
+        "issueNodeId": issue_node_id,
+        "issueNumber": issue_number,
+        "pullRequestDatabaseId": pull_request_database_id,
+        "pullRequestNodeId": pull_request_node_id,
+        "pullRequestNumber": pull_request_number,
+        "state": "failure",
+        "statusClass": "cancel",
+        "cancellationHeadSha": cancellation_head_sha,
+    }
+    return hashlib.sha256((CANCEL_STATUS_EVIDENCE_PREFIX + _canonical_json(value)).encode("utf-8")).hexdigest()
+
+
+def _cancellation_fence_authority_value(fields: Mapping[str, Any]) -> dict[str, Any]:
+    snapshot = fields["pre_fence_required_status"]
+    if type(snapshot) is not ExactAppRequiredStatusSnapshot:
+        _fail("preFenceRequiredStatus must be an ExactAppRequiredStatusSnapshot")
+    return {
+        "baseRef": fields["base_ref"],
+        "baseRepositoryNodeId": fields["base_repository_node_id"],
+        "bindingAuthority": fields["binding_authority"],
+        "branchRef": fields["branch_ref"],
+        "centralRepositoryNodeId": fields["central_repository_node_id"],
+        "issueBranchLeaseCommentDatabaseId": fields["issue_branch_lease_comment_database_id"],
+        "issueBranchLeaseSha256": fields["issue_branch_lease_sha256"],
+        "issueDatabaseId": fields["issue_database_id"],
+        "issueNodeId": fields["issue_node_id"],
+        "issueNumber": fields["issue_number"],
+        "issueRequestAnchorCommentDatabaseId": fields["issue_request_anchor_comment_database_id"],
+        "issueRequestAnchorSha256": fields["issue_request_anchor_sha256"],
+        "originalHeadArtifactCommentDatabaseId": fields["original_head_artifact_comment_database_id"],
+        "originalHeadArtifactId": fields["original_head_artifact_id"],
+        "originalHeadArtifactSha256": fields["original_head_artifact_sha256"],
+        "originalHeadClaimKind": fields["original_head_claim_kind"],
+        "originalHeadClaimRole": fields["original_head_claim_role"],
+        "originalHeadSha": fields["original_head_sha"],
+        "originalHeadTreeSha": fields["original_head_tree_sha"],
+        "preFenceRequiredStatus": snapshot.as_value(),
+        "preFenceSuccessMayExist": fields["pre_fence_success_may_exist"],
+        "pullRequestDatabaseId": fields["pull_request_database_id"],
+        "pullRequestNodeId": fields["pull_request_node_id"],
+        "pullRequestNumber": fields["pull_request_number"],
+        "reason": fields["reason"],
+        "schemaVersion": fields["schema_version"],
+        "sourceId": fields["source_id"],
+        "sourceRepositoryId": fields["source_repository_id"],
+    }
+
+
+def _cancellation_fence_authority_digest(fields: Mapping[str, Any]) -> str:
+    return hashlib.sha256((ISSUE_CANCELLATION_FENCE_AUTHORITY_PREFIX + _canonical_json(_cancellation_fence_authority_value(fields))).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class IssueCancellationFence:
+    schema_version: int
+    issue_number: int
+    issue_database_id: int
+    issue_node_id: str
+    issue_request_anchor_comment_database_id: int
+    issue_request_anchor_sha256: str
+    issue_branch_lease_comment_database_id: int
+    issue_branch_lease_sha256: str
+    binding_authority: str
+    source_id: str
+    source_repository_id: int
+    branch_ref: str
+    pull_request_number: int
+    pull_request_database_id: int
+    pull_request_node_id: str
+    central_repository_node_id: str
+    base_repository_node_id: str
+    base_ref: str
+    original_head_sha: str
+    original_head_tree_sha: str
+    original_head_claim_kind: str
+    original_head_claim_role: str
+    original_head_artifact_comment_database_id: int
+    original_head_artifact_id: str
+    original_head_artifact_sha256: str
+    claim_kind: str
+    claim_generation_id: str
+    cancellation_carrier_nonce: str
+    authority_preimage_digest: str
+    cancellation_head_sha: str
+    cancellation_head_tree_sha: str
+    transition_kind: str
+    pre_fence_required_status: ExactAppRequiredStatusSnapshot
+    pre_fence_success_may_exist: bool
+    reason: str
+    marker_digest: str
+    fence_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("IssueCancellationFence schemaVersion must be exact integer 1")
+        for name in (
+            "issue_number", "issue_database_id", "issue_request_anchor_comment_database_id",
+            "issue_branch_lease_comment_database_id", "source_repository_id", "pull_request_number",
+            "pull_request_database_id", "original_head_artifact_comment_database_id",
+        ):
+            _issue_positive_int(getattr(self, name), name)
+        for name in (
+            "issue_node_id", "pull_request_node_id", "central_repository_node_id", "base_repository_node_id",
+            "original_head_artifact_id",
+        ):
+            _lease_node_id(getattr(self, name), name, delimiter_free=True)
+        for name in (
+            "issue_request_anchor_sha256", "issue_branch_lease_sha256", "original_head_artifact_sha256",
+            "claim_generation_id", "cancellation_carrier_nonce", "authority_preimage_digest",
+            "marker_digest", "fence_id",
+        ):
+            _lease_sha(getattr(self, name), name)
+        _cancel_binding_authority(self.binding_authority)
+        _cancel_source_id(self.source_id)
+        if self.branch_ref != issue_branch_ref(self.issue_number):
+            _fail("branchRef must be the exact Issue branch ref")
+        if self.base_ref != "main":
+            _fail("baseRef must be exact main")
+        for name in ("original_head_sha", "original_head_tree_sha", "cancellation_head_sha", "cancellation_head_tree_sha"):
+            _lease_sha(getattr(self, name), name, git=True)
+        allowed = {
+            ("ISSUE_BRANCH_LEASE", "ISSUE_ACTIVE"),
+            ("ISSUE_HEAD_CLAIM", "ISSUE_ACTIVE"),
+            ("REQUIRED_STATUS_EPOCH", "ISSUE_ACTIVE"),
+            ("ISSUE_FINALIZATION_EPOCH", "ISSUE_FINALIZING"),
+        }
+        if (self.original_head_claim_kind, self.original_head_claim_role) not in allowed:
+            _fail("original head claim kind/role is unsupported")
+        if self.binding_authority == "PRE_BINDING" and (self.original_head_claim_kind, self.original_head_claim_role) != ("ISSUE_BRANCH_LEASE", "ISSUE_ACTIVE"):
+            _fail("PRE_BINDING fence must originate from ISSUE_BRANCH_LEASE/ISSUE_ACTIVE")
+        if self.claim_kind != "ISSUE_CANCELLATION_FENCE" or self.transition_kind != "TERMINAL_CANCELLATION":
+            _fail("fence claim kind or transition is invalid")
+        if self.cancellation_head_sha == self.original_head_sha:
+            _fail("cancellation head must be a fresh child SHA")
+        if self.cancellation_head_tree_sha != self.original_head_tree_sha:
+            _fail("cancellation head must preserve the exact original tree")
+        if type(self.pre_fence_required_status) is not ExactAppRequiredStatusSnapshot:
+            _fail("preFenceRequiredStatus must be an exact status snapshot")
+        if self.pre_fence_required_status.queried_sha != self.original_head_sha:
+            _fail("preFenceRequiredStatus must be queried on originalHeadSha")
+        if type(self.pre_fence_success_may_exist) is not bool:
+            _fail("preFenceSuccessMayExist must be an exact boolean")
+        if self.original_head_claim_role == "ISSUE_FINALIZING" and not self.pre_fence_success_may_exist:
+            _fail("ISSUE_FINALIZING fence must preserve possible success authority")
+        if self.pre_fence_required_status.is_present and self.pre_fence_required_status.status_class is StatusClass.ISSUE_FINAL and self.pre_fence_required_status.state == "success" and not self.pre_fence_success_may_exist:
+            _fail("visible issue-final success requires preFenceSuccessMayExist")
+        if self.reason != "ISSUE_REQUEST_TERMINAL_CANCELLATION":
+            _fail("fence reason is invalid")
+        owner = issue_owner_key(self.central_repository_node_id, self.issue_database_id, self.issue_node_id, self.issue_number)
+        expected_authority = _cancellation_fence_authority_digest(self._fields())
+        if self.authority_preimage_digest != expected_authority:
+            _fail("fence authorityPreimageDigest does not match canonical pre-SHA authority")
+        expected_generation = claim_generation_id(
+            authority_preimage_digest=self.authority_preimage_digest,
+            carrier_nonce=self.cancellation_carrier_nonce,
+            central_repository_node_id=self.central_repository_node_id,
+            owner_key=owner,
+            from_head_sha=self.original_head_sha,
+            from_tree_sha=self.original_head_tree_sha,
+            claim_kind=self.claim_kind,
+            role="ISSUE_CANCEL",
+            owner_kind="ISSUE",
+            transition_kind=self.transition_kind,
+        )
+        if self.claim_generation_id != expected_generation:
+            _fail("fence claimGenerationId does not match canonical pre-SHA generation")
+        marker = ClaimedHeadMarker(self.claim_kind, "ISSUE_CANCEL", "ISSUE", owner, self.claim_generation_id, self.cancellation_carrier_nonce, self.transition_kind)
+        if self.marker_digest != hashlib.sha256(marker.render().encode("utf-8")).hexdigest():
+            _fail("fence markerDigest does not match canonical claimed-head marker")
+        expected_fence_id = hashlib.sha256((ISSUE_CANCELLATION_FENCE_ID_PREFIX + _canonical_json(self.as_value(include_fence_id=False))).encode("utf-8")).hexdigest()
+        if self.fence_id != expected_fence_id:
+            _fail("fenceId does not match canonical final fence body")
+
+    def _fields(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__ if hasattr(self, name)}
+
+    def as_value(self, *, include_fence_id: bool = True) -> dict[str, Any]:
+        value = {
+            "schemaVersion": self.schema_version,
+            "issueNumber": self.issue_number,
+            "issueDatabaseId": self.issue_database_id,
+            "issueNodeId": self.issue_node_id,
+            "issueRequestAnchorCommentDatabaseId": self.issue_request_anchor_comment_database_id,
+            "issueRequestAnchorSha256": self.issue_request_anchor_sha256,
+            "issueBranchLeaseCommentDatabaseId": self.issue_branch_lease_comment_database_id,
+            "issueBranchLeaseSha256": self.issue_branch_lease_sha256,
+            "bindingAuthority": self.binding_authority,
+            "sourceId": self.source_id,
+            "sourceRepositoryId": self.source_repository_id,
+            "branchRef": self.branch_ref,
+            "pullRequestNumber": self.pull_request_number,
+            "pullRequestDatabaseId": self.pull_request_database_id,
+            "pullRequestNodeId": self.pull_request_node_id,
+            "centralRepositoryNodeId": self.central_repository_node_id,
+            "baseRepositoryNodeId": self.base_repository_node_id,
+            "baseRef": self.base_ref,
+            "originalHeadSha": self.original_head_sha,
+            "originalHeadTreeSha": self.original_head_tree_sha,
+            "originalHeadClaimKind": self.original_head_claim_kind,
+            "originalHeadClaimRole": self.original_head_claim_role,
+            "originalHeadArtifactCommentDatabaseId": self.original_head_artifact_comment_database_id,
+            "originalHeadArtifactId": self.original_head_artifact_id,
+            "originalHeadArtifactSha256": self.original_head_artifact_sha256,
+            "claimKind": self.claim_kind,
+            "claimGenerationId": self.claim_generation_id,
+            "cancellationCarrierNonce": self.cancellation_carrier_nonce,
+            "authorityPreimageDigest": self.authority_preimage_digest,
+            "cancellationHeadSha": self.cancellation_head_sha,
+            "cancellationHeadTreeSha": self.cancellation_head_tree_sha,
+            "transitionKind": self.transition_kind,
+            "preFenceRequiredStatus": self.pre_fence_required_status.as_value(),
+            "preFenceSuccessMayExist": self.pre_fence_success_may_exist,
+            "reason": self.reason,
+            "markerDigest": self.marker_digest,
+        }
+        if include_fence_id:
+            value["fenceId"] = self.fence_id
+        return value
+
+    def authority_preimage_value(self) -> dict[str, Any]:
+        return _cancellation_fence_authority_value(self._fields())
+
+    @classmethod
+    def create(cls, **fields: Any) -> "IssueCancellationFence":
+        body = dict(fields)
+        body.setdefault("schema_version", 1)
+        body.setdefault("claim_kind", "ISSUE_CANCELLATION_FENCE")
+        body.setdefault("transition_kind", "TERMINAL_CANCELLATION")
+        body.setdefault("reason", "ISSUE_REQUEST_TERMINAL_CANCELLATION")
+        body["authority_preimage_digest"] = _cancellation_fence_authority_digest(body)
+        body["claim_generation_id"] = claim_generation_id(
+            authority_preimage_digest=body["authority_preimage_digest"],
+            carrier_nonce=body["cancellation_carrier_nonce"],
+            central_repository_node_id=body["central_repository_node_id"],
+            owner_key=issue_owner_key(body["central_repository_node_id"], body["issue_database_id"], body["issue_node_id"], body["issue_number"]),
+            from_head_sha=body["original_head_sha"],
+            from_tree_sha=body["original_head_tree_sha"],
+            claim_kind=body["claim_kind"], role="ISSUE_CANCEL", owner_kind="ISSUE",
+            transition_kind=body["transition_kind"],
+        )
+        marker = ClaimedHeadMarker(
+            body["claim_kind"], "ISSUE_CANCEL", "ISSUE",
+            issue_owner_key(body["central_repository_node_id"], body["issue_database_id"], body["issue_node_id"], body["issue_number"]),
+            body["claim_generation_id"], body["cancellation_carrier_nonce"], body["transition_kind"],
+        )
+        body["marker_digest"] = hashlib.sha256(marker.render().encode("utf-8")).hexdigest()
+        provisional = cls.__new__(cls)
+        for name, value in body.items():
+            object.__setattr__(provisional, name, value)
+        body["fence_id"] = hashlib.sha256((ISSUE_CANCELLATION_FENCE_ID_PREFIX + _canonical_json(provisional.as_value(include_fence_id=False))).encode("utf-8")).hexdigest()
+        return cls(**body)
+
+    def render(self) -> str:
+        return f"{ISSUE_CANCELLATION_FENCE_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+def parse_issue_cancellation_fence(text: str) -> IssueCancellationFence:
+    keys = set(IssueCancellationFence.__dataclass_fields__)
+    key_map = {name: name for name in keys}
+    camel = {
+        "schemaVersion": "schema_version", "issueNumber": "issue_number", "issueDatabaseId": "issue_database_id",
+        "issueNodeId": "issue_node_id", "issueRequestAnchorCommentDatabaseId": "issue_request_anchor_comment_database_id",
+        "issueRequestAnchorSha256": "issue_request_anchor_sha256", "issueBranchLeaseCommentDatabaseId": "issue_branch_lease_comment_database_id",
+        "issueBranchLeaseSha256": "issue_branch_lease_sha256", "bindingAuthority": "binding_authority", "sourceId": "source_id",
+        "sourceRepositoryId": "source_repository_id", "branchRef": "branch_ref", "pullRequestNumber": "pull_request_number",
+        "pullRequestDatabaseId": "pull_request_database_id", "pullRequestNodeId": "pull_request_node_id",
+        "centralRepositoryNodeId": "central_repository_node_id", "baseRepositoryNodeId": "base_repository_node_id", "baseRef": "base_ref",
+        "originalHeadSha": "original_head_sha", "originalHeadTreeSha": "original_head_tree_sha", "originalHeadClaimKind": "original_head_claim_kind",
+        "originalHeadClaimRole": "original_head_claim_role", "originalHeadArtifactCommentDatabaseId": "original_head_artifact_comment_database_id",
+        "originalHeadArtifactId": "original_head_artifact_id", "originalHeadArtifactSha256": "original_head_artifact_sha256",
+        "claimKind": "claim_kind", "claimGenerationId": "claim_generation_id", "cancellationCarrierNonce": "cancellation_carrier_nonce",
+        "authorityPreimageDigest": "authority_preimage_digest", "cancellationHeadSha": "cancellation_head_sha",
+        "cancellationHeadTreeSha": "cancellation_head_tree_sha", "transitionKind": "transition_kind",
+        "preFenceRequiredStatus": "pre_fence_required_status", "preFenceSuccessMayExist": "pre_fence_success_may_exist",
+        "reason": "reason", "markerDigest": "marker_digest", "fenceId": "fence_id",
+    }
+    value = _cancel_parse_record(text, ISSUE_CANCELLATION_FENCE_MARKER, "IssueCancellationFence", set(camel))
+    body = {camel[key]: item for key, item in value.items()}
+    body["pre_fence_required_status"] = ExactAppRequiredStatusSnapshot.from_value(body["pre_fence_required_status"])
+    fence = IssueCancellationFence(**body)
+    if text != fence.render():
+        _fail("IssueCancellationFence representation is not canonical")
+    return fence
+
+
+def _stage_evidence_matches(
+    evidence: ExactPullRequestStageMutationEvidence, *, operation: PullRequestStageMutationOperation,
+    pull_request_node_id: str, pull_request_database_id: int, pull_request_number: int,
+    cancellation_head_sha: str, branch_ref: str, base_repository_node_id: str,
+    head_repository_node_id: str, base_ref: str = "main", expected_state: str = "OPEN",
+) -> None:
+    if type(evidence) is not ExactPullRequestStageMutationEvidence or evidence.operation is not operation:
+        _fail("stage mutation evidence operation is invalid")
+    exact = (
+        evidence.pull_request_node_id == pull_request_node_id
+        and evidence.pull_request_database_id == pull_request_database_id
+        and evidence.pull_request_number == pull_request_number
+        and evidence.head_ref_oid == cancellation_head_sha
+        and evidence.head_ref_name == branch_ref.removeprefix("refs/heads/")
+        and evidence.base_ref_name == base_ref
+        and evidence.base_repository_node_id == base_repository_node_id
+        and evidence.head_repository_node_id == head_repository_node_id
+        and evidence.state == expected_state and evidence.merged is False and evidence.merged_at is None
+    )
+    if not exact:
+        _fail("stage mutation evidence does not match exact PR/head/base authority")
+
+
+def _cancel_witness_value(fields: Mapping[str, Any], *, include_id: bool = True) -> dict[str, Any]:
+    values = {
+        "schemaVersion": fields["schema_version"], "issueNumber": fields["issue_number"],
+        "issueDatabaseId": fields["issue_database_id"], "issueNodeId": fields["issue_node_id"],
+        "issueRequestAnchorCommentDatabaseId": fields["issue_request_anchor_comment_database_id"],
+        "issueRequestAnchorSha256": fields["issue_request_anchor_sha256"],
+        "issueBranchLeaseCommentDatabaseId": fields["issue_branch_lease_comment_database_id"],
+        "issueBranchLeaseSha256": fields["issue_branch_lease_sha256"],
+        "fenceCommentDatabaseId": fields["fence_comment_database_id"], "fenceSha256": fields["fence_sha256"],
+        "fenceId": fields["fence_id"], "bindingAuthority": fields["binding_authority"],
+        "sourceId": fields["source_id"], "sourceRepositoryId": fields["source_repository_id"],
+        "branchRef": fields["branch_ref"], "pullRequestNumber": fields["pull_request_number"],
+        "pullRequestDatabaseId": fields["pull_request_database_id"], "pullRequestNodeId": fields["pull_request_node_id"],
+        "originalHeadSha": fields["original_head_sha"], "cancellationHeadSha": fields["cancellation_head_sha"],
+        "anchoredAcceptedBaseSha": fields["anchored_accepted_base_sha"], "baseRepositoryNodeId": fields["base_repository_node_id"],
+        "baseRef": fields["base_ref"], "returnedBaseRefOid": fields["returned_base_ref_oid"],
+        "headRepositoryNodeId": fields["head_repository_node_id"],
+        "reopenEvidence": fields["reopen_evidence"].as_value() if fields["reopen_evidence"] else None,
+        "readyEvidence": fields["ready_evidence"].as_value() if fields["ready_evidence"] else None,
+        "draftEvidence": fields["draft_evidence"].as_value(),
+        "currentRequiredStatus": fields["current_required_status"].as_value(),
+    }
+    if include_id:
+        values["witnessId"] = fields["witness_id"]
+    return values
+
+
+@dataclass(frozen=True)
+class IssueCancellationDraftWitness:
+    schema_version: int
+    issue_number: int
+    issue_database_id: int
+    issue_node_id: str
+    issue_request_anchor_comment_database_id: int
+    issue_request_anchor_sha256: str
+    issue_branch_lease_comment_database_id: int
+    issue_branch_lease_sha256: str
+    fence_comment_database_id: int
+    fence_sha256: str
+    fence_id: str
+    binding_authority: str
+    source_id: str
+    source_repository_id: int
+    branch_ref: str
+    pull_request_number: int
+    pull_request_database_id: int
+    pull_request_node_id: str
+    original_head_sha: str
+    cancellation_head_sha: str
+    anchored_accepted_base_sha: str
+    base_repository_node_id: str
+    base_ref: str
+    returned_base_ref_oid: str
+    head_repository_node_id: str
+    reopen_evidence: ExactPullRequestStageMutationEvidence | None
+    ready_evidence: ExactPullRequestStageMutationEvidence | None
+    draft_evidence: ExactPullRequestStageMutationEvidence
+    current_required_status: ExactAppRequiredStatusSnapshot
+    witness_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("IssueCancellationDraftWitness schemaVersion must be exact integer 1")
+        for name in ("issue_number", "issue_database_id", "issue_request_anchor_comment_database_id", "issue_branch_lease_comment_database_id", "fence_comment_database_id", "source_repository_id", "pull_request_number", "pull_request_database_id"):
+            _issue_positive_int(getattr(self, name), name)
+        for name in ("issue_node_id", "pull_request_node_id", "base_repository_node_id", "head_repository_node_id"):
+            _lease_node_id(getattr(self, name), name, delimiter_free=True)
+        for name in ("issue_request_anchor_sha256", "issue_branch_lease_sha256", "fence_sha256", "fence_id", "witness_id"):
+            _lease_sha(getattr(self, name), name)
+        _cancel_binding_authority(self.binding_authority)
+        _cancel_source_id(self.source_id)
+        if self.branch_ref != issue_branch_ref(self.issue_number) or self.base_ref != "main":
+            _fail("draft witness branch/base ref is invalid")
+        for name in ("original_head_sha", "cancellation_head_sha", "anchored_accepted_base_sha", "returned_base_ref_oid"):
+            _lease_sha(getattr(self, name), name, git=True)
+        if type(self.current_required_status) is not ExactAppRequiredStatusSnapshot or not self.current_required_status.is_present:
+            _fail("draft witness requires exact PRESENT current status evidence")
+        if self.current_required_status.queried_sha != self.cancellation_head_sha:
+            _fail("draft witness status must be queried on cancellationHeadSha")
+        expected_digest = cancel_status_evidence_digest(
+            central_repository_node_id=self.base_repository_node_id,
+            issue_number=self.issue_number, issue_database_id=self.issue_database_id, issue_node_id=self.issue_node_id,
+            fence_id=self.fence_id, cancellation_head_sha=self.cancellation_head_sha,
+            binding_authority=self.binding_authority, pull_request_number=self.pull_request_number,
+            pull_request_database_id=self.pull_request_database_id, pull_request_node_id=self.pull_request_node_id,
+        )
+        parsed = parse_status_description(self.current_required_status.description)
+        if self.current_required_status.context != "federation/trusted-validation" or self.current_required_status.state != "failure" or parsed.status_class is not StatusClass.CANCEL or parsed.evidence_digest != expected_digest:
+            _fail("draft witness current status does not prove exact cancel failure")
+        _stage_evidence_matches(
+            self.draft_evidence, operation=PullRequestStageMutationOperation.CONVERT_TO_DRAFT,
+            pull_request_node_id=self.pull_request_node_id, pull_request_database_id=self.pull_request_database_id,
+            pull_request_number=self.pull_request_number, cancellation_head_sha=self.cancellation_head_sha,
+            branch_ref=self.branch_ref, base_repository_node_id=self.base_repository_node_id,
+            head_repository_node_id=self.head_repository_node_id,
+        )
+        if not self.draft_evidence.is_draft or self.draft_evidence.base_ref_oid != self.returned_base_ref_oid:
+            _fail("draft evidence must prove same-response OPEN draft at returned base OID")
+        if self.reopen_evidence is not None:
+            _stage_evidence_matches(
+                self.reopen_evidence, operation=PullRequestStageMutationOperation.REOPEN,
+                pull_request_node_id=self.pull_request_node_id, pull_request_database_id=self.pull_request_database_id,
+                pull_request_number=self.pull_request_number, cancellation_head_sha=self.cancellation_head_sha,
+                branch_ref=self.branch_ref, base_repository_node_id=self.base_repository_node_id,
+                head_repository_node_id=self.head_repository_node_id,
+            )
+        if self.ready_evidence is not None:
+            _stage_evidence_matches(
+                self.ready_evidence, operation=PullRequestStageMutationOperation.READY_FOR_REVIEW,
+                pull_request_node_id=self.pull_request_node_id, pull_request_database_id=self.pull_request_database_id,
+                pull_request_number=self.pull_request_number, cancellation_head_sha=self.cancellation_head_sha,
+                branch_ref=self.branch_ref, base_repository_node_id=self.base_repository_node_id,
+                head_repository_node_id=self.head_repository_node_id,
+            )
+            if self.ready_evidence.is_draft:
+                _fail("ready normalization evidence must return isDraft=false")
+        if self.reopen_evidence is None and self.ready_evidence is not None:
+            pass
+        expected_id = hashlib.sha256((ISSUE_CANCELLATION_DRAFT_WITNESS_ID_PREFIX + _canonical_json(_cancel_witness_value(self._fields(), include_id=False))).encode("utf-8")).hexdigest()
+        if self.witness_id != expected_id:
+            _fail("draft witnessId does not match canonical witness")
+
+    def _fields(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__ if hasattr(self, name)}
+
+    def as_value(self, *, include_witness_id: bool = True) -> dict[str, Any]:
+        return _cancel_witness_value(self._fields(), include_id=include_witness_id)
+
+    @classmethod
+    def create(cls, **fields: Any) -> "IssueCancellationDraftWitness":
+        body = dict(fields)
+        body.setdefault("schema_version", 1)
+        provisional = cls.__new__(cls)
+        for name, value in body.items():
+            object.__setattr__(provisional, name, value)
+        body["witness_id"] = hashlib.sha256((ISSUE_CANCELLATION_DRAFT_WITNESS_ID_PREFIX + _canonical_json(provisional.as_value(include_witness_id=False))).encode("utf-8")).hexdigest()
+        return cls(**body)
+
+    def render(self) -> str:
+        return f"{ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+def parse_issue_cancellation_draft_witness(text: str) -> IssueCancellationDraftWitness:
+    mapping = {
+        "schemaVersion": "schema_version", "issueNumber": "issue_number", "issueDatabaseId": "issue_database_id", "issueNodeId": "issue_node_id",
+        "issueRequestAnchorCommentDatabaseId": "issue_request_anchor_comment_database_id", "issueRequestAnchorSha256": "issue_request_anchor_sha256",
+        "issueBranchLeaseCommentDatabaseId": "issue_branch_lease_comment_database_id", "issueBranchLeaseSha256": "issue_branch_lease_sha256",
+        "fenceCommentDatabaseId": "fence_comment_database_id", "fenceSha256": "fence_sha256", "fenceId": "fence_id",
+        "bindingAuthority": "binding_authority", "sourceId": "source_id", "sourceRepositoryId": "source_repository_id", "branchRef": "branch_ref",
+        "pullRequestNumber": "pull_request_number", "pullRequestDatabaseId": "pull_request_database_id", "pullRequestNodeId": "pull_request_node_id",
+        "originalHeadSha": "original_head_sha", "cancellationHeadSha": "cancellation_head_sha", "anchoredAcceptedBaseSha": "anchored_accepted_base_sha",
+        "baseRepositoryNodeId": "base_repository_node_id", "baseRef": "base_ref", "returnedBaseRefOid": "returned_base_ref_oid",
+        "headRepositoryNodeId": "head_repository_node_id", "reopenEvidence": "reopen_evidence", "readyEvidence": "ready_evidence",
+        "draftEvidence": "draft_evidence", "currentRequiredStatus": "current_required_status", "witnessId": "witness_id",
+    }
+    value = _cancel_parse_record(text, ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER, "IssueCancellationDraftWitness", set(mapping))
+    body = {mapping[key]: item for key, item in value.items()}
+    for key in ("reopen_evidence", "ready_evidence", "draft_evidence"):
+        body[key] = ExactPullRequestStageMutationEvidence.from_value(body[key]) if body[key] is not None else None
+    body["current_required_status"] = ExactAppRequiredStatusSnapshot.from_value(body["current_required_status"])
+    witness = IssueCancellationDraftWitness(**body)
+    if text != witness.render():
+        _fail("IssueCancellationDraftWitness representation is not canonical")
+    return witness
+
+
+class IssueTerminalCancelledProofKind(Enum):
+    PR_BACKED_PRE_BINDING = "PR_BACKED_PRE_BINDING"
+    PR_BACKED_FULL_BINDING = "PR_BACKED_FULL_BINDING"
+
+
+def _terminal_cancelled_value(fields: Mapping[str, Any], *, include_id: bool = True) -> dict[str, Any]:
+    value = {
+        "schemaVersion": fields["schema_version"], "issueNumber": fields["issue_number"],
+        "issueDatabaseId": fields["issue_database_id"], "issueNodeId": fields["issue_node_id"],
+        "issueRequestAnchorCommentDatabaseId": fields["issue_request_anchor_comment_database_id"],
+        "issueRequestAnchorSha256": fields["issue_request_anchor_sha256"],
+        "issueBranchLeaseCommentDatabaseId": fields["issue_branch_lease_comment_database_id"],
+        "issueBranchLeaseSha256": fields["issue_branch_lease_sha256"], "bindingAuthority": fields["binding_authority"],
+        "sourceId": fields["source_id"], "sourceRepositoryId": fields["source_repository_id"], "branchRef": fields["branch_ref"],
+        "pullRequestNumber": fields["pull_request_number"], "pullRequestDatabaseId": fields["pull_request_database_id"],
+        "pullRequestNodeId": fields["pull_request_node_id"], "originalHeadSha": fields["original_head_sha"],
+        "cancellationHeadSha": fields["cancellation_head_sha"], "baseRepositoryNodeId": fields["base_repository_node_id"],
+        "baseRef": fields["base_ref"], "fenceCommentDatabaseId": fields["fence_comment_database_id"],
+        "fenceSha256": fields["fence_sha256"], "fenceId": fields["fence_id"],
+        "draftWitnessCommentDatabaseId": fields["draft_witness_comment_database_id"],
+        "draftWitnessSha256": fields["draft_witness_sha256"], "witnessId": fields["witness_id"],
+        "currentFailureStatus": fields["current_failure_status"].as_value(),
+        "closeEvidence": fields["close_evidence"].as_value(), "closeResponseDigest": fields["close_response_digest"],
+        "outcome": fields["outcome"], "proofKind": fields["proof_kind"].value,
+    }
+    if include_id:
+        value["terminalResultId"] = fields["terminal_result_id"]
+    return value
+
+
+@dataclass(frozen=True)
+class IssueTerminalCancelledResult:
+    schema_version: int
+    issue_number: int
+    issue_database_id: int
+    issue_node_id: str
+    issue_request_anchor_comment_database_id: int
+    issue_request_anchor_sha256: str
+    issue_branch_lease_comment_database_id: int
+    issue_branch_lease_sha256: str
+    binding_authority: str
+    source_id: str
+    source_repository_id: int
+    branch_ref: str
+    pull_request_number: int
+    pull_request_database_id: int
+    pull_request_node_id: str
+    original_head_sha: str
+    cancellation_head_sha: str
+    base_repository_node_id: str
+    base_ref: str
+    fence_comment_database_id: int
+    fence_sha256: str
+    fence_id: str
+    draft_witness_comment_database_id: int
+    draft_witness_sha256: str
+    witness_id: str
+    current_failure_status: ExactAppRequiredStatusSnapshot
+    close_evidence: ExactPullRequestStageMutationEvidence
+    close_response_digest: str
+    outcome: str
+    proof_kind: IssueTerminalCancelledProofKind
+    terminal_result_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("IssueTerminalCancelledResult schemaVersion must be exact integer 1")
+        for name in ("issue_number", "issue_database_id", "issue_request_anchor_comment_database_id", "issue_branch_lease_comment_database_id", "source_repository_id", "pull_request_number", "pull_request_database_id", "fence_comment_database_id", "draft_witness_comment_database_id"):
+            _issue_positive_int(getattr(self, name), name)
+        for name in ("issue_node_id", "pull_request_node_id", "base_repository_node_id"):
+            _lease_node_id(getattr(self, name), name, delimiter_free=True)
+        for name in ("issue_request_anchor_sha256", "issue_branch_lease_sha256", "fence_sha256", "fence_id", "draft_witness_sha256", "witness_id", "close_response_digest", "terminal_result_id"):
+            _lease_sha(getattr(self, name), name)
+        _cancel_binding_authority(self.binding_authority)
+        _cancel_source_id(self.source_id)
+        if self.branch_ref != issue_branch_ref(self.issue_number) or self.base_ref != "main":
+            _fail("terminal result branch/base ref is invalid")
+        _lease_sha(self.original_head_sha, "originalHeadSha", git=True)
+        _lease_sha(self.cancellation_head_sha, "cancellationHeadSha", git=True)
+        expected_kind = IssueTerminalCancelledProofKind.PR_BACKED_PRE_BINDING if self.binding_authority == "PRE_BINDING" else IssueTerminalCancelledProofKind.PR_BACKED_FULL_BINDING
+        if type(self.proof_kind) is not IssueTerminalCancelledProofKind or self.proof_kind is not expected_kind:
+            _fail("terminal result proofKind does not match bindingAuthority")
+        if self.outcome != "CANCELLED":
+            _fail("terminal result outcome must be CANCELLED")
+        if type(self.current_failure_status) is not ExactAppRequiredStatusSnapshot or not self.current_failure_status.is_present or self.current_failure_status.queried_sha != self.cancellation_head_sha:
+            _fail("terminal result requires PRESENT current failure evidence on HC")
+        expected_status_digest = cancel_status_evidence_digest(
+            central_repository_node_id=self.base_repository_node_id, issue_number=self.issue_number,
+            issue_database_id=self.issue_database_id, issue_node_id=self.issue_node_id, fence_id=self.fence_id,
+            cancellation_head_sha=self.cancellation_head_sha, binding_authority=self.binding_authority,
+            pull_request_number=self.pull_request_number, pull_request_database_id=self.pull_request_database_id,
+            pull_request_node_id=self.pull_request_node_id,
+        )
+        status = parse_status_description(self.current_failure_status.description)
+        if self.current_failure_status.state != "failure" or self.current_failure_status.context != "federation/trusted-validation" or status.status_class is not StatusClass.CANCEL or status.evidence_digest != expected_status_digest:
+            _fail("terminal result current failure status does not match exact cancellation authority")
+        _stage_evidence_matches(
+            self.close_evidence, operation=PullRequestStageMutationOperation.CLOSE,
+            pull_request_node_id=self.pull_request_node_id, pull_request_database_id=self.pull_request_database_id,
+            pull_request_number=self.pull_request_number, cancellation_head_sha=self.cancellation_head_sha,
+            branch_ref=self.branch_ref, base_repository_node_id=self.base_repository_node_id,
+            head_repository_node_id=self.close_evidence.head_repository_node_id, expected_state="CLOSED",
+        )
+        if self.close_evidence.state != "CLOSED" or self.close_evidence.merged or self.close_evidence.merged_at is not None:
+            _fail("terminal result close evidence must be CLOSED and unmerged")
+        expected_close_digest = hashlib.sha256((ISSUE_TERMINAL_CANCELLED_CLOSE_RESPONSE_PREFIX + self.close_evidence.render()).encode("utf-8")).hexdigest()
+        if self.close_response_digest != expected_close_digest:
+            _fail("terminal result closeResponseDigest does not match close evidence")
+        expected_id = hashlib.sha256((ISSUE_TERMINAL_CANCELLED_RESULT_ID_PREFIX + _canonical_json(_terminal_cancelled_value(self._fields(), include_id=False))).encode("utf-8")).hexdigest()
+        if self.terminal_result_id != expected_id:
+            _fail("terminalResultId does not match canonical terminal result")
+
+    def _fields(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__ if hasattr(self, name)}
+
+    def as_value(self, *, include_terminal_result_id: bool = True) -> dict[str, Any]:
+        return _terminal_cancelled_value(self._fields(), include_id=include_terminal_result_id)
+
+    @classmethod
+    def create(cls, **fields: Any) -> "IssueTerminalCancelledResult":
+        body = dict(fields)
+        body.setdefault("schema_version", 1)
+        body.setdefault("outcome", "CANCELLED")
+        if isinstance(body.get("proof_kind"), str):
+            body["proof_kind"] = IssueTerminalCancelledProofKind(body["proof_kind"])
+        body["close_response_digest"] = hashlib.sha256((ISSUE_TERMINAL_CANCELLED_CLOSE_RESPONSE_PREFIX + body["close_evidence"].render()).encode("utf-8")).hexdigest()
+        provisional = cls.__new__(cls)
+        for name, value in body.items():
+            object.__setattr__(provisional, name, value)
+        body["terminal_result_id"] = hashlib.sha256((ISSUE_TERMINAL_CANCELLED_RESULT_ID_PREFIX + _canonical_json(provisional.as_value(include_terminal_result_id=False))).encode("utf-8")).hexdigest()
+        return cls(**body)
+
+    def render(self) -> str:
+        return f"{ISSUE_TERMINAL_CANCELLED_RESULT_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+def parse_issue_terminal_cancelled_result(text: str) -> IssueTerminalCancelledResult:
+    mapping = {
+        "schemaVersion": "schema_version", "issueNumber": "issue_number", "issueDatabaseId": "issue_database_id", "issueNodeId": "issue_node_id",
+        "issueRequestAnchorCommentDatabaseId": "issue_request_anchor_comment_database_id", "issueRequestAnchorSha256": "issue_request_anchor_sha256",
+        "issueBranchLeaseCommentDatabaseId": "issue_branch_lease_comment_database_id", "issueBranchLeaseSha256": "issue_branch_lease_sha256",
+        "bindingAuthority": "binding_authority", "sourceId": "source_id", "sourceRepositoryId": "source_repository_id", "branchRef": "branch_ref",
+        "pullRequestNumber": "pull_request_number", "pullRequestDatabaseId": "pull_request_database_id", "pullRequestNodeId": "pull_request_node_id",
+        "originalHeadSha": "original_head_sha", "cancellationHeadSha": "cancellation_head_sha", "baseRepositoryNodeId": "base_repository_node_id", "baseRef": "base_ref",
+        "fenceCommentDatabaseId": "fence_comment_database_id", "fenceSha256": "fence_sha256", "fenceId": "fence_id",
+        "draftWitnessCommentDatabaseId": "draft_witness_comment_database_id", "draftWitnessSha256": "draft_witness_sha256", "witnessId": "witness_id",
+        "currentFailureStatus": "current_failure_status", "closeEvidence": "close_evidence", "closeResponseDigest": "close_response_digest",
+        "outcome": "outcome", "proofKind": "proof_kind", "terminalResultId": "terminal_result_id",
+    }
+    value = _cancel_parse_record(text, ISSUE_TERMINAL_CANCELLED_RESULT_MARKER, "IssueTerminalCancelledResult", set(mapping))
+    body = {mapping[key]: item for key, item in value.items()}
+    body["current_failure_status"] = ExactAppRequiredStatusSnapshot.from_value(body["current_failure_status"])
+    body["close_evidence"] = ExactPullRequestStageMutationEvidence.from_value(body["close_evidence"])
+    try:
+        body["proof_kind"] = IssueTerminalCancelledProofKind(body["proof_kind"])
+    except (ValueError, TypeError):
+        _fail("terminal result proofKind is invalid")
+    result = IssueTerminalCancelledResult(**body)
+    if text != result.render():
+        _fail("IssueTerminalCancelledResult representation is not canonical")
+    return result
+
+
+class IssueNoPRCancelledProofKind(Enum):
+    ANCHOR_ONLY = "ANCHOR_ONLY"
+    LEASE_REF_ABSENT = "LEASE_REF_ABSENT"
+    LEASE_ZERO_PR_CAS = "LEASE_ZERO_PR_CAS"
+
+
+@dataclass(frozen=True)
+class IssueNoPRCancelledResult:
+    schema_version: int
+    issue_number: int
+    issue_database_id: int
+    issue_node_id: str
+    issue_request_anchor_comment_database_id: int
+    issue_request_anchor_sha256: str
+    source_id: str
+    source_repository_id: int
+    outcome: str
+    proof_kind: IssueNoPRCancelledProofKind
+    lease_comment_database_id: int | None = None
+    lease_sha256: str | None = None
+    lease_id: str | None = None
+    branch_ref: str | None = None
+    lease_initial_head_sha: str | None = None
+    required_status: ExactAppRequiredStatusSnapshot | None = None
+    all_state_pr_enumeration_digest: str | None = None
+    legacy_carrier_evidence_digest: str | None = None
+    cleanup_before_oid: str | None = None
+    cleanup_ref_absent_after: bool | None = None
+    no_pr_result_id: str = ""
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("IssueNoPRCancelledResult schemaVersion must be exact integer 1")
+        _issue_positive_int(self.issue_number, "issueNumber")
+        _issue_positive_int(self.issue_database_id, "issueDatabaseId")
+        _lease_node_id(self.issue_node_id, "issueNodeId", delimiter_free=True)
+        _issue_positive_int(self.issue_request_anchor_comment_database_id, "issueRequestAnchorCommentDatabaseId")
+        _lease_sha(self.issue_request_anchor_sha256, "issueRequestAnchorSha256")
+        _cancel_source_id(self.source_id)
+        _issue_positive_int(self.source_repository_id, "sourceRepositoryId")
+        if self.outcome != "CANCELLED":
+            _fail("no-PR result outcome must be CANCELLED")
+        if type(self.proof_kind) is not IssueNoPRCancelledProofKind:
+            _fail("no-PR proofKind must be a closed enum")
+        lease_fields = (self.lease_comment_database_id, self.lease_sha256, self.lease_id, self.branch_ref, self.lease_initial_head_sha, self.all_state_pr_enumeration_digest)
+        zero_fields = (self.required_status, self.legacy_carrier_evidence_digest, self.cleanup_before_oid, self.cleanup_ref_absent_after)
+        if self.proof_kind is IssueNoPRCancelledProofKind.ANCHOR_ONLY:
+            if any(item is not None for item in lease_fields + zero_fields):
+                _fail("ANCHOR_ONLY result cannot carry lease/ref evidence")
+        else:
+            _issue_positive_int(self.lease_comment_database_id, "leaseCommentDatabaseId")
+            _lease_sha(self.lease_sha256, "leaseSha256")
+            _lease_sha(self.lease_id, "leaseId")
+            if self.branch_ref != issue_branch_ref(self.issue_number):
+                _fail("no-PR result branchRef must be the exact Issue branch")
+            _lease_sha(self.lease_initial_head_sha, "leaseInitialHeadSha", git=True)
+            _lease_sha(self.all_state_pr_enumeration_digest, "allStatePREnumerationDigest")
+            if self.proof_kind is IssueNoPRCancelledProofKind.LEASE_REF_ABSENT:
+                if any(item is not None for item in zero_fields):
+                    _fail("LEASE_REF_ABSENT result cannot carry zero-PR CAS evidence")
+            else:
+                if type(self.required_status) is not ExactAppRequiredStatusSnapshot or self.required_status.queried_sha != self.lease_initial_head_sha:
+                    _fail("LEASE_ZERO_PR_CAS requires status snapshot on the exact leased head")
+                if self.required_status.is_present and self.required_status.state == "success":
+                    _fail("LEASE_ZERO_PR_CAS cannot carry a merge-satisfying status")
+                _lease_sha(self.legacy_carrier_evidence_digest, "legacyCarrierEvidenceDigest")
+                _lease_sha(self.cleanup_before_oid, "cleanupBeforeOid", git=True)
+                if self.cleanup_before_oid != self.lease_initial_head_sha or self.cleanup_ref_absent_after is not True:
+                    _fail("LEASE_ZERO_PR_CAS cleanup must delete the exact initial head and verify absence")
+        _lease_sha(self.no_pr_result_id, "noPrResultId")
+        expected_id = hashlib.sha256((ISSUE_NO_PR_CANCELLED_RESULT_ID_PREFIX + _canonical_json(self._body_without_id())).encode("utf-8")).hexdigest()
+        if self.no_pr_result_id != expected_id:
+            _fail("noPrResultId does not match canonical body")
+
+    def _body_without_id(self) -> dict[str, Any]:
+        value = self.as_value(include_no_pr_result_id=False)
+        return value
+
+    def as_value(self, *, include_no_pr_result_id: bool = True) -> dict[str, Any]:
+        value = {
+            "schemaVersion": self.schema_version, "issueNumber": self.issue_number, "issueDatabaseId": self.issue_database_id,
+            "issueNodeId": self.issue_node_id, "issueRequestAnchorCommentDatabaseId": self.issue_request_anchor_comment_database_id,
+            "issueRequestAnchorSha256": self.issue_request_anchor_sha256, "sourceId": self.source_id,
+            "sourceRepositoryId": self.source_repository_id, "outcome": self.outcome, "proofKind": self.proof_kind.value,
+        }
+        if self.proof_kind is not IssueNoPRCancelledProofKind.ANCHOR_ONLY:
+            value.update({
+                "leaseCommentDatabaseId": self.lease_comment_database_id, "leaseSha256": self.lease_sha256,
+                "leaseId": self.lease_id, "branchRef": self.branch_ref, "leaseInitialHeadSha": self.lease_initial_head_sha,
+                "allStatePREnumerationDigest": self.all_state_pr_enumeration_digest,
+            })
+        if self.proof_kind is IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS:
+            value.update({
+                "requiredStatus": self.required_status.as_value(),
+                "legacyCarrierEvidenceDigest": self.legacy_carrier_evidence_digest,
+                "cleanupBeforeOid": self.cleanup_before_oid,
+                "cleanupRefAbsentAfter": self.cleanup_ref_absent_after,
+            })
+        if include_no_pr_result_id:
+            value["noPrResultId"] = self.no_pr_result_id
+        return value
+
+    @classmethod
+    def create(cls, **fields: Any) -> "IssueNoPRCancelledResult":
+        body = dict(fields)
+        body.setdefault("schema_version", 1)
+        body.setdefault("outcome", "CANCELLED")
+        if isinstance(body.get("proof_kind"), str):
+            body["proof_kind"] = IssueNoPRCancelledProofKind(body["proof_kind"])
+        provisional = cls.__new__(cls)
+        for name, value in body.items():
+            object.__setattr__(provisional, name, value)
+        body["no_pr_result_id"] = hashlib.sha256((ISSUE_NO_PR_CANCELLED_RESULT_ID_PREFIX + _canonical_json(provisional._body_without_id())).encode("utf-8")).hexdigest()
+        return cls(**body)
+
+    def render(self) -> str:
+        return f"{ISSUE_NO_PR_CANCELLED_RESULT_MARKER}\n{_canonical_json(self.as_value())}\n"
+
+    def canonical_sha256(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+def parse_issue_no_pr_cancelled_result(text: str) -> IssueNoPRCancelledResult:
+    if type(text) is not str or not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _fail("IssueNoPRCancelledResult must use exact LF-terminated lines")
+    lines = text[:-1].split("\n")
+    if len(lines) != 2 or lines[0] != ISSUE_NO_PR_CANCELLED_RESULT_MARKER or not lines[1]:
+        _fail("IssueNoPRCancelledResult marker or JSON line is invalid")
+    try:
+        value = c02.decode_json(lines[1])
+    except Exception as error:
+        _fail(f"invalid IssueNoPRCancelledResult JSON: {error}")
+    if type(value) is not dict or "proofKind" not in value:
+        _fail("IssueNoPRCancelledResult has invalid schema")
+    try:
+        kind = IssueNoPRCancelledProofKind(value["proofKind"])
+    except (ValueError, TypeError):
+        _fail("IssueNoPRCancelledResult proofKind is invalid")
+    common = {"schemaVersion", "issueNumber", "issueDatabaseId", "issueNodeId", "issueRequestAnchorCommentDatabaseId", "issueRequestAnchorSha256", "sourceId", "sourceRepositoryId", "outcome", "proofKind", "noPrResultId"}
+    lease = {"leaseCommentDatabaseId", "leaseSha256", "leaseId", "branchRef", "leaseInitialHeadSha", "allStatePREnumerationDigest"}
+    zero = {"requiredStatus", "legacyCarrierEvidenceDigest", "cleanupBeforeOid", "cleanupRefAbsentAfter"}
+    expected = common | (lease if kind is not IssueNoPRCancelledProofKind.ANCHOR_ONLY else set()) | (zero if kind is IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS else set())
+    if set(value) != expected:
+        _fail("IssueNoPRCancelledResult has invalid exact conditional keys")
+    kwargs = {
+        "schema_version": value["schemaVersion"], "issue_number": value["issueNumber"],
+        "issue_database_id": value["issueDatabaseId"], "issue_node_id": value["issueNodeId"],
+        "issue_request_anchor_comment_database_id": value["issueRequestAnchorCommentDatabaseId"],
+        "issue_request_anchor_sha256": value["issueRequestAnchorSha256"], "source_id": value["sourceId"],
+        "source_repository_id": value["sourceRepositoryId"], "outcome": value["outcome"], "proof_kind": kind,
+        "no_pr_result_id": value["noPrResultId"],
+    }
+    if kind is not IssueNoPRCancelledProofKind.ANCHOR_ONLY:
+        kwargs.update({
+            "lease_comment_database_id": value["leaseCommentDatabaseId"], "lease_sha256": value["leaseSha256"],
+            "lease_id": value["leaseId"], "branch_ref": value["branchRef"],
+            "lease_initial_head_sha": value["leaseInitialHeadSha"], "all_state_pr_enumeration_digest": value["allStatePREnumerationDigest"],
+        })
+    if kind is IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS:
+        kwargs.update({
+            "required_status": ExactAppRequiredStatusSnapshot.from_value(value["requiredStatus"]),
+            "legacy_carrier_evidence_digest": value["legacyCarrierEvidenceDigest"],
+            "cleanup_before_oid": value["cleanupBeforeOid"], "cleanup_ref_absent_after": value["cleanupRefAbsentAfter"],
+        })
+    result = IssueNoPRCancelledResult(**kwargs)
+    if text != result.render():
+        _fail("IssueNoPRCancelledResult representation is not canonical")
+    return result

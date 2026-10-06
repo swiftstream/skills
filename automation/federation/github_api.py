@@ -46,6 +46,97 @@ UPDATE_REFS_MUTATION = """mutation FederationUpdateRefs($repositoryId: ID!, $ref
   }
 }"""
 
+REOPEN_PULL_REQUEST_MUTATION = """mutation FederationReopenPullRequest($pullRequestId: ID!, $clientMutationId: String!) {
+  reopenPullRequest(input: {pullRequestId: $pullRequestId, clientMutationId: $clientMutationId}) {
+    clientMutationId
+    pullRequest {
+      id
+      fullDatabaseId
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      headRepository { id }
+      baseRepository { id }
+    }
+  }
+}"""
+
+MARK_PULL_REQUEST_READY_FOR_REVIEW_MUTATION = """mutation FederationMarkPullRequestReadyForReview($pullRequestId: ID!, $clientMutationId: String!) {
+  markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId, clientMutationId: $clientMutationId}) {
+    clientMutationId
+    pullRequest {
+      id
+      fullDatabaseId
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      headRepository { id }
+      baseRepository { id }
+    }
+  }
+}"""
+
+CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION = """mutation FederationConvertPullRequestToDraft($pullRequestId: ID!, $clientMutationId: String!) {
+  convertPullRequestToDraft(input: {pullRequestId: $pullRequestId, clientMutationId: $clientMutationId}) {
+    clientMutationId
+    pullRequest {
+      id
+      fullDatabaseId
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      headRepository { id }
+      baseRepository { id }
+    }
+  }
+}"""
+
+CLOSE_PULL_REQUEST_MUTATION = """mutation FederationClosePullRequest($pullRequestId: ID!, $clientMutationId: String!) {
+  closePullRequest(input: {pullRequestId: $pullRequestId, clientMutationId: $clientMutationId}) {
+    clientMutationId
+    pullRequest {
+      id
+      fullDatabaseId
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      headRepository { id }
+      baseRepository { id }
+    }
+  }
+}"""
+
+_PULL_REQUEST_STAGE_MUTATIONS = {
+    "REOPEN": (REOPEN_PULL_REQUEST_MUTATION, "reopenPullRequest"),
+    "READY_FOR_REVIEW": (MARK_PULL_REQUEST_READY_FOR_REVIEW_MUTATION, "markPullRequestReadyForReview"),
+    "CONVERT_TO_DRAFT": (CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION, "convertPullRequestToDraft"),
+    "CLOSE": (CLOSE_PULL_REQUEST_MUTATION, "closePullRequest"),
+}
+
 # These documents are deliberately fixed strings.  All repository, login, ref,
 # and comment values enter as GraphQL variables; none can become query syntax.
 PULL_REQUEST_ROUTING_BEFORE_QUERY = """query FederationPullRequestRoutingBefore($owner: String!, $name: String!, $number: Int!) {
@@ -183,6 +274,40 @@ def _positive_id(value: Any, label: str) -> int:
     if type(value) is not int or type(value) is bool or not 1 <= value <= 9_223_372_036_854_775_807:
         raise InvalidResponseError(f"{label} must be a positive bounded integer")
     return value
+
+
+def _positive_graphql_bigint(value: Any, label: str = "PullRequest.fullDatabaseId") -> int:
+    """Parse GitHub BigInt JSON only from its canonical decimal string form."""
+    if type(value) is not str or re.fullmatch(r"[1-9][0-9]*", value) is None:
+        raise InvalidResponseError(f"{label} must be canonical positive decimal text")
+    try:
+        parsed = int(value)
+    except (ValueError, OverflowError):
+        raise InvalidResponseError(f"{label} is invalid") from None
+    if parsed <= 0:
+        raise InvalidResponseError(f"{label} must be positive")
+    return parsed
+
+
+def _canonical_stage_timestamp(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str or re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z", value
+    ) is None:
+        raise InvalidResponseError(f"{label} must be a canonical UTC timestamp or null")
+    try:
+        datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        raise InvalidResponseError(f"{label} must be a canonical UTC timestamp or null") from None
+    return value
+
+
+def _stage_client_mutation_id(value: Any, label: str) -> str:
+    text = _bounded_text(value, label, 256)
+    if len(text.encode("utf-8")) > 256:
+        raise InvalidResponseError(f"{label} exceeds 256 UTF-8 bytes")
+    return text
 
 
 def _optional_iso(value: Any, label: str) -> str | None:
@@ -353,6 +478,66 @@ class PullRequestMetadata:
     last_edited_at: str | None
     includes_created_edit: bool
     draft: bool
+
+
+@dataclass(frozen=True)
+class PullRequestStageMutationReceipt:
+    """Exact PR identity and topology returned by one fixed GraphQL mutation."""
+
+    operation: str
+    requested_pull_request_node_id: str
+    requested_client_mutation_id: str
+    returned_client_mutation_id: str
+    pull_request_node_id: str
+    pull_request_database_id: int
+    pull_request_number: int
+    state: str
+    is_draft: bool
+    merged: bool
+    merged_at: str | None
+    head_oid: str
+    base_oid: str
+    head_ref: str
+    base_ref: str
+    head_repository_node_id: str
+    base_repository_node_id: str
+
+    def __post_init__(self) -> None:
+        if self.operation not in _PULL_REQUEST_STAGE_MUTATIONS or type(self.operation) is not str:
+            raise InvalidResponseError("PR-stage operation is invalid")
+        _bounded_text(self.requested_pull_request_node_id, "requested pullRequestId", 256)
+        _stage_client_mutation_id(self.requested_client_mutation_id, "requested clientMutationId")
+        _stage_client_mutation_id(self.returned_client_mutation_id, "returned clientMutationId")
+        _bounded_text(self.pull_request_node_id, "pullRequest.id", 256)
+        if self.requested_pull_request_node_id != self.pull_request_node_id:
+            raise InvalidResponseError("PR-stage response node ID does not match requested PR")
+        if self.requested_client_mutation_id != self.returned_client_mutation_id:
+            raise InvalidResponseError("PR-stage response clientMutationId does not match request")
+        if type(self.pull_request_database_id) is not int or self.pull_request_database_id <= 0:
+            raise InvalidResponseError("pullRequest.fullDatabaseId must be a positive Python integer")
+        _positive_id(self.pull_request_number, "pullRequest.number")
+        if self.state not in {"OPEN", "CLOSED"} or type(self.state) is not str:
+            raise InvalidResponseError("pullRequest.state is invalid")
+        if type(self.is_draft) is not bool or type(self.merged) is not bool:
+            raise InvalidResponseError("pullRequest draft/merge fields must be exact booleans")
+        _canonical_stage_timestamp(self.merged_at, "pullRequest.mergedAt")
+        if not self.merged and self.merged_at is not None:
+            raise InvalidResponseError("unmerged PR-stage response must have null mergedAt")
+        for value, label in ((self.head_oid, "pullRequest.headRefOid"), (self.base_oid, "pullRequest.baseRefOid")):
+            if type(value) is not str or not _SHA40_RE.fullmatch(value):
+                raise InvalidResponseError(f"{label} must be lowercase 40-hex")
+        for value, label in ((self.head_ref, "pullRequest.headRefName"), (self.base_ref, "pullRequest.baseRefName")):
+            _bounded_text(value, label, 256)
+        _bounded_text(self.head_repository_node_id, "pullRequest.headRepository.id", 256)
+        _bounded_text(self.base_repository_node_id, "pullRequest.baseRepository.id", 256)
+        if self.operation == "REOPEN" and (self.state != "OPEN" or self.merged or self.merged_at is not None):
+            raise InvalidResponseError("reopen mutation did not return OPEN unmerged PR")
+        if self.operation == "READY_FOR_REVIEW" and (self.state != "OPEN" or self.is_draft or self.merged or self.merged_at is not None):
+            raise InvalidResponseError("ready mutation did not return OPEN ready unmerged PR")
+        if self.operation == "CONVERT_TO_DRAFT" and (self.state != "OPEN" or not self.is_draft or self.merged or self.merged_at is not None):
+            raise InvalidResponseError("draft mutation did not return OPEN draft unmerged PR")
+        if self.operation == "CLOSE" and (self.state != "CLOSED" or self.merged or self.merged_at is not None):
+            raise InvalidResponseError("close mutation did not return CLOSED unmerged PR")
 
 
 @dataclass(frozen=True)
@@ -874,6 +1059,10 @@ class GitHubClient:
             APP_QUERY,
             BOT_QUERY,
             UPDATE_REFS_MUTATION,
+            REOPEN_PULL_REQUEST_MUTATION,
+            MARK_PULL_REQUEST_READY_FOR_REVIEW_MUTATION,
+            CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION,
+            CLOSE_PULL_REQUEST_MUTATION,
         }:
             raise GitHubAPIError("GraphQL document is not an accepted trusted document")
         result = self._request("POST", GRAPHQL_ENDPOINT, {"query": document, "variables": dict(variables)})
@@ -886,6 +1075,66 @@ class GitHubClient:
         if set(result) != {"data"} or type(result["data"]) is not dict:
             raise InvalidResponseError("GraphQL response has invalid exact top-level shape")
         return result["data"]
+
+    @classmethod
+    def _parse_pull_request_stage_mutation(
+        cls, data: Any, *, operation: str, mutation_field: str,
+        requested_pull_request_node_id: str, requested_client_mutation_id: str,
+    ) -> PullRequestStageMutationReceipt:
+        if type(data) is not dict or set(data) != {mutation_field} or type(data.get(mutation_field)) is not dict:
+            raise InvalidResponseError("PR-stage mutation data has invalid exact shape")
+        payload = data[mutation_field]
+        if set(payload) != {"clientMutationId", "pullRequest"}:
+            raise InvalidResponseError("PR-stage mutation payload has invalid exact shape")
+        returned_client_mutation_id = _stage_client_mutation_id(payload["clientMutationId"], "clientMutationId")
+        pull = payload["pullRequest"]
+        pull_keys = {
+            "id", "fullDatabaseId", "number", "state", "isDraft", "merged", "mergedAt",
+            "headRefOid", "baseRefOid", "headRefName", "baseRefName", "headRepository", "baseRepository",
+        }
+        if type(pull) is not dict or set(pull) != pull_keys:
+            raise InvalidResponseError("PR-stage mutation PullRequest has invalid exact shape")
+        for key, label in (("headRepository", "headRepository"), ("baseRepository", "baseRepository")):
+            if type(pull[key]) is not dict or set(pull[key]) != {"id"}:
+                raise InvalidResponseError(f"PR-stage mutation {label} has invalid exact shape")
+        receipt = PullRequestStageMutationReceipt(
+            operation=operation,
+            requested_pull_request_node_id=requested_pull_request_node_id,
+            requested_client_mutation_id=requested_client_mutation_id,
+            returned_client_mutation_id=returned_client_mutation_id,
+            pull_request_node_id=_bounded_text(pull["id"], "pullRequest.id", 256),
+            pull_request_database_id=_positive_graphql_bigint(pull["fullDatabaseId"]),
+            pull_request_number=_positive_id(pull["number"], "pullRequest.number"),
+            state=pull["state"],
+            is_draft=pull["isDraft"],
+            merged=pull["merged"],
+            merged_at=_canonical_stage_timestamp(pull["mergedAt"], "pullRequest.mergedAt"),
+            head_oid=cls._sha(pull["headRefOid"], "pullRequest.headRefOid"),
+            base_oid=cls._sha(pull["baseRefOid"], "pullRequest.baseRefOid"),
+            head_ref=_bounded_text(pull["headRefName"], "pullRequest.headRefName", 256),
+            base_ref=_bounded_text(pull["baseRefName"], "pullRequest.baseRefName", 256),
+            head_repository_node_id=_bounded_text(pull["headRepository"]["id"], "headRepository.id", 256),
+            base_repository_node_id=_bounded_text(pull["baseRepository"]["id"], "baseRepository.id", 256),
+        )
+        return receipt
+
+    def _pull_request_stage_mutation(
+        self, operation: str, pull_request_node_id: str, client_mutation_id: str,
+    ) -> PullRequestStageMutationReceipt:
+        if operation not in _PULL_REQUEST_STAGE_MUTATIONS:
+            raise GitHubAPIError("unsupported PR-stage operation")
+        node_id = _bounded_text(pull_request_node_id, "pullRequestId", 256)
+        mutation_id = _stage_client_mutation_id(client_mutation_id, "clientMutationId")
+        document, mutation_field = _PULL_REQUEST_STAGE_MUTATIONS[operation]
+        data = self._graphql(
+            document,
+            {"pullRequestId": node_id, "clientMutationId": mutation_id},
+            operation=f"prStage{operation}",
+        )
+        return self._parse_pull_request_stage_mutation(
+            data, operation=operation, mutation_field=mutation_field,
+            requested_pull_request_node_id=node_id, requested_client_mutation_id=mutation_id,
+        )
 
     @staticmethod
     def _owner_repo(repository: str) -> tuple[str, str]:
@@ -1321,6 +1570,18 @@ class GitHubClient:
             before.includes_created_edit,
             before.draft,
         )
+
+    def reopen_pull_request(self, pull_request_node_id: str, client_mutation_id: str) -> PullRequestStageMutationReceipt:
+        return self._pull_request_stage_mutation("REOPEN", pull_request_node_id, client_mutation_id)
+
+    def mark_pull_request_ready_for_review(self, pull_request_node_id: str, client_mutation_id: str) -> PullRequestStageMutationReceipt:
+        return self._pull_request_stage_mutation("READY_FOR_REVIEW", pull_request_node_id, client_mutation_id)
+
+    def convert_pull_request_to_draft(self, pull_request_node_id: str, client_mutation_id: str) -> PullRequestStageMutationReceipt:
+        return self._pull_request_stage_mutation("CONVERT_TO_DRAFT", pull_request_node_id, client_mutation_id)
+
+    def close_pull_request(self, pull_request_node_id: str, client_mutation_id: str) -> PullRequestStageMutationReceipt:
+        return self._pull_request_stage_mutation("CLOSE", pull_request_node_id, client_mutation_id)
 
     @staticmethod
     def _parse_issue_routing(data: Mapping[str, Any], repository: str, number: int) -> _IssueRoutingSnapshot:
