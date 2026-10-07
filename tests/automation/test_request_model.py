@@ -39,6 +39,12 @@ from automation.federation.request_model import (
     CarrierActivation,
     CarrierRole,
     LegacyEvidenceDisposition,
+    LegacyQuarantineClass,
+    LegacyClassificationOutcome,
+    LegacyQuarantineEvidence,
+    LegacyClassificationResult,
+    LegacyRecoveryAction,
+    LegacyRecoveryDecision,
     ShaCarrierResolution,
     StatusClass,
     StatusEvidenceDescription,
@@ -67,6 +73,8 @@ from automation.federation.request_model import (
     issue_head_claim_authority_digest,
     issue_final_status_evidence_digest,
     external_status_evidence_digest,
+    legacy_status_evidence_digest,
+    legacy_recovery_decision,
     parse_status_description,
     render_status_description,
     classify_issue_head_claim_progression,
@@ -2493,6 +2501,195 @@ class Wave07CancellationModelTests(unittest.TestCase):
         text = rm.ISSUE_NO_PR_CANCELLED_RESULT_MARKER + "\n" + json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
         with self.assertRaises(RequestModelError):
             rm.parse_issue_no_pr_cancelled_result(text)
+
+
+class Wave09LegacyRequestModelTests(unittest.TestCase):
+    @staticmethod
+    def evidence(evidence_class=LegacyQuarantineClass.MACHINE, **changes):
+        values = dict(
+            schema_version=1,
+            evidence_class=evidence_class,
+            central_repository_database_id=12345,
+            central_repository_node_id="R_central",
+            central_repository_full_name="Owner/Repo",
+            head_sha="a" * 40,
+            evidence_payload_digest="b" * 64,
+        )
+        values.update(changes)
+        return LegacyQuarantineEvidence(**values)
+
+    def test_closed_legacy_enum_sets(self):
+        self.assertEqual(
+            {item.value for item in LegacyQuarantineClass},
+            {"LEGACY_MACHINE", "LEGACY_MANUAL", "LEGACY_CHECK_COLLISION"},
+        )
+        self.assertEqual(
+            {item.value for item in LegacyClassificationOutcome},
+            {"ABSENT", "QUARANTINE", "CONFLICTING"},
+        )
+        self.assertEqual(
+            {item.value for item in LegacyRecoveryAction},
+            {
+                "MACHINE_MIGRATION_REQUIRED",
+                "MANUAL_BLOCK_REQUIRES_ISSUE_FIRST",
+                "CHECK_COLLISION_REQUIRES_CLEAN_HEAD",
+            },
+        )
+        for enum_type in (LegacyQuarantineClass, LegacyClassificationOutcome, LegacyRecoveryAction):
+            with self.subTest(enum_type=enum_type.__name__), self.assertRaises(ValueError):
+                enum_type("UNKNOWN")
+
+    def test_evidence_exact_value_and_all_three_classes(self):
+        expected = {
+            "schemaVersion": 1,
+            "evidenceClass": "LEGACY_MACHINE",
+            "centralRepositoryDatabaseId": 12345,
+            "centralRepositoryNodeId": "R_central",
+            "centralRepositoryFullName": "Owner/Repo",
+            "headSha": "a" * 40,
+            "evidencePayloadDigest": "b" * 64,
+        }
+        for evidence_class in LegacyQuarantineClass:
+            evidence = self.evidence(evidence_class)
+            self.assertIs(type(evidence), LegacyQuarantineEvidence)
+            self.assertEqual(evidence.as_value(), {**expected, "evidenceClass": evidence_class.value})
+            self.assertEqual(evidence.render(), json.dumps(
+                {**expected, "evidenceClass": evidence_class.value},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ))
+
+    def test_evidence_rejects_invalid_exact_fields(self):
+        base = dict(
+            schema_version=1, evidence_class=LegacyQuarantineClass.MACHINE,
+            central_repository_database_id=12345, central_repository_node_id="R_central",
+            central_repository_full_name="Owner/Repo", head_sha="a" * 40,
+            evidence_payload_digest="b" * 64,
+        )
+        invalid = (
+            {**base, "schema_version": True},
+            {**base, "schema_version": 2},
+            {**base, "evidence_class": "LEGACY_MACHINE"},
+            {**base, "central_repository_database_id": 0},
+            {**base, "central_repository_database_id": True},
+            {**base, "central_repository_node_id": ""},
+            {**base, "central_repository_full_name": "Owner/"},
+            {**base, "central_repository_full_name": "Owner/Repo/Extra"},
+            *(
+                {**base, "central_repository_full_name": full_name}
+                for full_name in (
+                    "Owner Name/Repo", "Owner/Repo?", "-Owner/Repo", "Owner/-Repo",
+                    "Owner+/Repo", "Owner/Repo#", "Owner/ Repo", "Owner /Repo",
+                )
+            ),
+            {**base, "head_sha": "A" * 40},
+            {**base, "head_sha": "a" * 39},
+            {**base, "head_sha": "a" * 41},
+            {**base, "evidence_payload_digest": "B" * 64},
+            {**base, "evidence_payload_digest": "b" * 63},
+            {**base, "evidence_payload_digest": "b" * 65},
+        )
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(RequestModelError):
+                LegacyQuarantineEvidence(**values)
+
+    def test_evidence_preserves_canonical_repository_full_name_without_normalization(self):
+        for full_name in ("Owner/Repo", "Owner.Name/Repo_Name-1", "Owner_1/Repo.2-test"):
+            with self.subTest(full_name=full_name):
+                evidence = self.evidence(central_repository_full_name=full_name)
+                self.assertEqual(evidence.central_repository_full_name, full_name)
+                self.assertEqual(evidence.as_value()["centralRepositoryFullName"], full_name)
+
+    def test_classification_result_invariants_and_reason_grammar(self):
+        evidence = self.evidence()
+        valid = LegacyClassificationResult(
+            LegacyClassificationOutcome.QUARANTINE, evidence, "EXACT_LEGACY_MACHINE",
+        )
+        self.assertIs(valid.evidence, evidence)
+        for outcome, candidate in (
+            (LegacyClassificationOutcome.QUARANTINE, None),
+            (LegacyClassificationOutcome.ABSENT, evidence),
+            (LegacyClassificationOutcome.CONFLICTING, evidence),
+            ("QUARANTINE", evidence),
+        ):
+            with self.subTest(outcome=outcome), self.assertRaises(RequestModelError):
+                LegacyClassificationResult(outcome, candidate, "EXACT_LEGACY_MACHINE")
+        for reason in ("lower", "_BAD", "BAD-REASON", "A" * 129, ""):
+            with self.subTest(reason=reason), self.assertRaises(RequestModelError):
+                LegacyClassificationResult(LegacyClassificationOutcome.ABSENT, None, reason)
+        for reason in (
+            "EXACT_LEGACY_MACHINE", "EXACT_LEGACY_MANUAL", "EXACT_LEGACY_CHECK_COLLISION",
+            "EXACT_LEGACY_EVIDENCE_ABSENT", "AMBIGUOUS_LEGACY_EVIDENCE",
+            "CURRENT_LEGACY_EVIDENCE_UNAVAILABLE",
+        ):
+            LegacyClassificationResult(LegacyClassificationOutcome.ABSENT, None, reason)
+
+    def test_recovery_decision_exact_class_action_mapping(self):
+        actions = {
+            LegacyQuarantineClass.MACHINE: LegacyRecoveryAction.MACHINE_MIGRATION_REQUIRED,
+            LegacyQuarantineClass.MANUAL: LegacyRecoveryAction.MANUAL_BLOCK_REQUIRES_ISSUE_FIRST,
+            LegacyQuarantineClass.CHECK_COLLISION: LegacyRecoveryAction.CHECK_COLLISION_REQUIRES_CLEAN_HEAD,
+        }
+        for evidence_class, action in actions.items():
+            evidence = self.evidence(evidence_class)
+            classified = LegacyClassificationResult(
+                LegacyClassificationOutcome.QUARANTINE, evidence, "EXACT_LEGACY_MACHINE",
+            )
+            self.assertEqual(legacy_recovery_decision(classified), LegacyRecoveryDecision(evidence, action))
+            for wrong_action in set(LegacyRecoveryAction) - {action}:
+                with self.subTest(evidence_class=evidence_class, wrong_action=wrong_action), self.assertRaises(RequestModelError):
+                    LegacyRecoveryDecision(evidence, wrong_action)
+        for outcome in (LegacyClassificationOutcome.ABSENT, LegacyClassificationOutcome.CONFLICTING):
+            with self.assertRaises(RequestModelError):
+                legacy_recovery_decision(LegacyClassificationResult(outcome, None, "AMBIGUOUS_LEGACY_EVIDENCE"))
+
+    def test_legacy_status_digest_fixed_vector_and_sensitivity(self):
+        evidence = self.evidence()
+        boundary = "c" * 64
+        canonical_value = {
+            "schemaVersion": 1,
+            "activationBoundaryId": boundary,
+            "centralRepositoryDatabaseId": 12345,
+            "centralRepositoryNodeId": "R_central",
+            "centralRepositoryFullName": "Owner/Repo",
+            "headSha": "a" * 40,
+            "evidenceClass": "LEGACY_MACHINE",
+            "evidencePayloadDigest": "b" * 64,
+        }
+        expected_preimage = (
+            "swiftstream-federation-legacy-status-evidence:v1\n"
+            + json.dumps(canonical_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        ).encode("utf-8")
+        expected = hashlib.sha256(expected_preimage).hexdigest()
+        actual = legacy_status_evidence_digest(evidence, boundary)
+        self.assertEqual(actual, expected)
+        self.assertEqual(legacy_status_evidence_digest(evidence, boundary), expected)
+        self.assertEqual(len(actual), 64)
+        for other in (
+            legacy_status_evidence_digest(evidence, "d" * 64),
+            legacy_status_evidence_digest(self.evidence(head_sha="e" * 40), boundary),
+            legacy_status_evidence_digest(self.evidence(central_repository_database_id=12346), boundary),
+            legacy_status_evidence_digest(self.evidence(evidence_class=LegacyQuarantineClass.MANUAL), boundary),
+            legacy_status_evidence_digest(self.evidence(evidence_payload_digest="f" * 64), boundary),
+        ):
+            self.assertNotEqual(other, expected)
+        self.assertEqual(
+            tuple(inspect.signature(legacy_status_evidence_digest).parameters),
+            ("evidence", "activation_boundary_id"),
+        )
+        with self.assertRaises(TypeError):
+            legacy_status_evidence_digest(evidence, boundary, cutoverId="d" * 64)
+        for invalid in ("A" * 64, "a" * 63, None):
+            with self.subTest(invalid=invalid), self.assertRaises(RequestModelError):
+                legacy_status_evidence_digest(evidence, invalid)
+
+    def test_legacy_description_length_and_status_parser_regression(self):
+        description = render_status_description(StatusClass.LEGACY, "a" * 64)
+        self.assertEqual(len(description.encode("ascii")), 81)
+        self.assertEqual(parse_status_description(description), StatusEvidenceDescription(StatusClass.LEGACY, "a" * 64))
+        maintenance = f"ssf:v1 maintenance ev={'b' * 64}"
+        self.assertEqual(parse_status_description(maintenance).status_class, StatusClass.MAINTENANCE)
+        with self.assertRaises(RequestModelError):
+            render_status_description(StatusClass.MAINTENANCE, "b" * 64)
 
 
 if __name__ == "__main__":

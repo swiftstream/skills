@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import automation.federation.controller as controller_module
 from automation.federation.controller import (
+    _legacy_payload_digest,
     AppIdentity,
     C02CandidateBuilder,
     DuplicateAnchorError,
@@ -28,6 +29,7 @@ from automation.federation.controller import (
     StaleAuthorityError,
     classify_request,
     resolve_sha_carrier_role,
+    legacy_classification_disposition,
     publish_unclaimed_external_success,
     create_or_validate_issue_anchor,
     create_or_validate_issue_branch_lease,
@@ -66,6 +68,12 @@ from automation.federation.request_model import (
     CarrierActivation,
     CarrierRole,
     LegacyEvidenceDisposition,
+    LegacyQuarantineClass,
+    LegacyClassificationOutcome,
+    LegacyQuarantineEvidence,
+    LegacyClassificationResult,
+    LegacyRecoveryAction,
+    legacy_status_evidence_digest,
     ShaCarrierResolution,
     StatusClass,
     RequestClass,
@@ -100,6 +108,7 @@ from automation.federation.github_api import (
     GitCommitMetadata,
     GitCommitIdentity,
     GitCommitObject,
+    GitCommitIdentity,
     GitObject,
     GitTreeEntry,
     HttpResponse,
@@ -7948,6 +7957,1006 @@ class Wave08UniversalRecoveryTests(unittest.TestCase):
                 "publish_issue_final_success", "revoke_required_status_epoch",
                 "create_check_run", "update_check_run", "upsert_trusted_validation_check",
             })
+
+
+class Wave09LegacyClassifierTests(unittest.TestCase):
+    CENTRAL = "swiftstream/skills"
+    HEAD = "a" * 40
+    BASE = "b" * 40
+    APP = AppIdentity("swift-stream-federation", 10, "A_app", 11, "B_bot", "swift-stream-federation[bot]")
+    REPOSITORY = RepositoryMetadata(22, "R_central", CENTRAL, "main")
+
+    def setUp(self):
+        # Every exact machine-source fixture is deterministic and exercises the
+        # same public metadata seam used by the fresh identity check.
+        source_read = patch.object(
+            controller_module,
+            "read_public_source_metadata",
+            return_value=PublicSourceMetadata(41, "Owner/Repo", "main", None),
+        )
+        source_read.start()
+        self.addCleanup(source_read.stop)
+
+    class Client:
+        def __init__(self, message="ordinary commit\n"):
+            self.repository = Wave09LegacyClassifierTests.REPOSITORY
+            self.app = Wave09LegacyClassifierTests.APP
+            self.message = message
+            self.parents = (Wave09LegacyClassifierTests.BASE,)
+            self.class_reads = []
+            self.fail_reads = set()
+            self.prs = {}
+            self.comments = {}
+            self.files = {}
+            self.checks = ()
+            self.machine_refs = ()
+            self.mutations = []
+            self.status_calls = []
+            self.repository_reads = 0
+            self.receipt_builder = None
+
+        def get_repository_metadata(self, _repository):
+            self.repository_reads += 1
+            return self.repository
+
+        def get_git_commit_object(self, _repository, sha):
+            identity = GitCommitIdentity("Maintainer", "maintainer@example.com", "2026-10-01T00:00:00Z")
+            return GitCommitObject(sha, self.message, "c" * 40, self.parents, identity, identity)
+
+        def get_app_metadata(self, slug):
+            return AppMetadata(self.app.app_id, slug, self.app.app_node_id)
+
+        def get_bot_metadata(self, slug):
+            return BotMetadata(self.app.bot_id, self.app.bot_login, self.app.bot_node_id, "Bot")
+
+        def list_machine_refs(self, _repository):
+            self.class_reads.append("machine_refs")
+            if "machine_refs" in self.fail_reads:
+                raise RuntimeError("machine refs unavailable")
+            return self.machine_refs
+
+        def list_open_pull_requests(self, _repository):
+            self.class_reads.append("open_prs")
+            return tuple({"number": number} for number in self.prs)
+
+        def list_pull_requests(self, _repository, *, state="open"):
+            self.class_reads.append("all_prs")
+            if "all_prs" in self.fail_reads:
+                raise RuntimeError("PR inventory unavailable")
+            return tuple({"number": number} for number in self.prs)
+
+        def get_pull_request_metadata(self, _repository, number):
+            self.class_reads.append("pr_metadata")
+            return self.prs[number]
+
+        def list_issue_comments(self, _repository, number):
+            self.class_reads.append("comments")
+            if "comments" in self.fail_reads:
+                raise RuntimeError("comment inventory unavailable")
+            return self.comments.get(number, ())
+
+        def list_pull_request_files(self, _repository, number):
+            self.class_reads.append("files")
+            return self.files.get(number, ())
+
+        def list_check_runs(self, _repository, _sha):
+            self.class_reads.append("checks")
+            if "checks" in self.fail_reads:
+                raise RuntimeError("Check Run inventory unavailable")
+            return self.checks
+
+        def create_commit_status(self, repository, sha, state, context, description, target_url):
+            self.status_calls.append((repository, sha, state, context, description, target_url))
+            self.mutations.append("create_commit_status")
+            if self.receipt_builder is not None:
+                return self.receipt_builder(repository, sha, state, context, description, target_url)
+            status = CommitStatus(
+                901, "ST_status", state, context, description, target_url,
+                self.app.bot_id, self.app.bot_node_id, self.app.bot_login, "Bot",
+                "2026-10-07T00:00:00Z", "2026-10-07T00:00:00Z",
+            )
+            return StatusWriteReceipt(
+                repository, sha, "POST", f"/repos/{repository}/statuses/{sha}",
+                state, context, description, target_url, status,
+            )
+
+    @classmethod
+    def controller(cls, client=None):
+        return R02Controller(client or cls.Client(), cls.CENTRAL, cls.APP)
+
+    @classmethod
+    def manual_fixture(cls, *, request_class=RequestClass.UPDATE, author_id="U_human", author_login="alice",
+                       comment_id=700, comment_node="IC_anchor", comment_author_id="B_bot",
+                       comment_author_login="swift-stream-federation[bot]", comment_author_type="Bot",
+                       app=None, body_text=None, changed_paths=("federation.json",), description="Source"):
+        app = app or cls.APP
+        request = parse_request_body(
+            request_class,
+            "Repository URL:\nhttps://github.com/Owner/Repo\n"
+            f"Description:\n{description}\nBranch:\nmain\nSkills root:\nskills\n"
+            "Skill prefixes:\nowner\nPublication lines:\nrefs/heads/main=owner\n",
+        )
+        body = controller_module.render_request_body(request) if body_text is None else body_text
+        anchor = RequestAnchor(
+            81, request_class, author_id, author_login, body_sha256(body), request,
+        )
+        pr = PullRequestMetadata(
+            81, body, author_id, author_login, cls.HEAD, cls.BASE,
+            "legacy/topic", "main", "R_central", cls.CENTRAL,
+            "R_central", cls.CENTRAL, None, False, False,
+        )
+        comment = IssueComment(
+            comment_node, comment_id, anchor.render(), comment_author_id,
+            comment_author_login, comment_author_type, None, None, None, None, False,
+        )
+        client = cls.Client()
+        client.app = app
+        client.prs = {81: pr}
+        client.comments = {81: (comment,)}
+        client.files = {81: tuple({"filename": path} for path in changed_paths)}
+        return client, app, pr, anchor, comment
+
+    def test_reserved_family_matrix_conflicts_before_class_predicates(self):
+        reserved_messages = (
+            "swiftstream-federation-head:v0\n",
+            "swiftstream-federation-head:v1\n",
+            "swiftstream-federation-head:v3\n",
+            "swiftstream-federation-head:v999\n",
+            "swiftstream-federation-head:future\n",
+            "swiftstream-federation-head:\n",
+            "swiftstream-federation-head:v2x\n",
+            "swiftstream-federation-head:v2\nrole=ISSUE_ACTIVE\nrole=ISSUE_CANCEL\n",
+            "swiftstream-federation-head:v2\nclaim-kind=UNKNOWN\n",
+            "swiftstream-federation-head:v2\nclaim-kind=ISSUE_HEAD_CLAIM\nrole=UNKNOWN\n",
+            ClaimedHeadMarker(
+                "ISSUE_BRANCH_LEASE", "ISSUE_ACTIVE", "ISSUE", "R_central:700:I_kwDOIssue:7",
+                "1" * 64, "2" * 64, "INITIAL",
+            ).render(),
+        )
+        for message in reserved_messages:
+            with self.subTest(message=message):
+                client = self.Client(message)
+                result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+                self.assertIs(result.outcome, LegacyClassificationOutcome.CONFLICTING)
+                self.assertIsNone(result.evidence)
+                self.assertEqual(result.reason, "RESERVED_CLAIM_FAMILY_PRESENT")
+                self.assertEqual(client.class_reads, [])
+
+    def test_empty_current_evidence_is_absent_and_adapter_preserves_wave08_semantics(self):
+        result = self.controller().classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertEqual(result.outcome, LegacyClassificationOutcome.ABSENT)
+        self.assertEqual(result.reason, "EXACT_LEGACY_EVIDENCE_ABSENT")
+        self.assertEqual(legacy_classification_disposition(result), LegacyEvidenceDisposition.ABSENT)
+        for outcome, disposition, activation in (
+            (LegacyClassificationOutcome.ABSENT, LegacyEvidenceDisposition.ABSENT, CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION),
+            (LegacyClassificationOutcome.QUARANTINE, LegacyEvidenceDisposition.QUARANTINE, CarrierActivation.LEGACY_CUTOVER_QUARANTINE),
+            (LegacyClassificationOutcome.CONFLICTING, LegacyEvidenceDisposition.CONFLICTING, CarrierActivation.CONFLICTING),
+        ):
+            fake = self.Client()
+            mapped = legacy_classification_disposition(LegacyClassificationResult(outcome, None, "EXACT_LEGACY_EVIDENCE_ABSENT") if outcome is not LegacyClassificationOutcome.QUARANTINE else LegacyClassificationResult(outcome, LegacyQuarantineEvidence(1, LegacyQuarantineClass.MACHINE, 22, "R_central", self.CENTRAL, self.HEAD, "f" * 64), "EXACT_LEGACY_MACHINE"))
+            self.assertIs(mapped, disposition)
+            resolution = resolve_sha_carrier_role(fake, self.CENTRAL, self.HEAD, self.APP.slug, mapped)
+            self.assertIs(resolution.activation, activation)
+
+    def test_manual_evidence_fixed_vector_uses_exact_anchor_scope_and_full_payload(self):
+        client, app, pr, anchor, comment = self.manual_fixture()
+        result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(result.outcome, LegacyClassificationOutcome.QUARANTINE)
+        self.assertIs(result.evidence.evidence_class, LegacyQuarantineClass.MANUAL)
+        self.assertEqual(result.reason, "EXACT_LEGACY_MANUAL")
+        anchor_literal = anchor.render()
+        self.assertEqual(anchor_literal,
+            "<!-- swiftstream-federation-request-anchor:v1 -->\n"
+            "{\"initialBodySha256\":\"419caaad53050bd924b100a38f83ed00c77aad68313a85d6bb16551411b837e4\","
+            "\"initialRequest\":{\"Branch\":\"refs/heads/main\",\"Description\":\"Source\","
+            "\"Dropped publication lines\":null,\"Publication lines\":[{\"ref\":\"refs/heads/main\","
+            "\"skillPrefixes\":[\"owner\"]}],\"Reason\":null,\"Repository URL\":\"https://github.com/Owner/Repo\","
+            "\"Skill prefixes\":[\"owner\"],\"Skills root\":\"skills\"},\"originalAuthorId\":\"U_human\","
+            "\"originalAuthorLogin\":\"alice\",\"prNumber\":81,\"requestClass\":\"update\",\"schemaVersion\":2}\n")
+        anchor_digest = hashlib.sha256(anchor_literal.encode("utf-8")).hexdigest()
+        scope_value = {"changedPaths": ["federation.json"], "requestClass": "update"}
+        scope_json = json.dumps(scope_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        scope_digest = hashlib.sha256(("swiftstream-federation-legacy-manual-proposal-scope:v1\n" + scope_json).encode("utf-8")).hexdigest()
+        payload = {
+            "schemaVersion": 1,
+            "pullRequestNumber": 81,
+            "originalRequestAuthorNodeId": "U_human",
+            "originalRequestAuthorLogin": "alice",
+            "headOid": self.HEAD,
+            "baseOid": self.BASE,
+            "headRef": "legacy/topic",
+            "baseRef": "main",
+            "headRepositoryNodeId": "R_central",
+            "baseRepositoryNodeId": "R_central",
+            "headRepositoryFullName": self.CENTRAL,
+            "baseRepositoryFullName": self.CENTRAL,
+            "requestAnchorCommentDatabaseId": 700,
+            "requestAnchorCommentNodeId": "IC_anchor",
+            "requestAnchorCanonicalSha256": anchor_digest,
+            "requestClass": "update",
+            "initialBodySha256": anchor.initial_body_sha256,
+            "appBotDatabaseId": app.bot_id,
+            "appBotNodeId": app.bot_node_id,
+            "appBotLogin": app.bot_login,
+            "anchorCommentAuthorNodeId": comment.author_id,
+            "anchorCommentAuthorLogin": comment.author_login,
+            "anchorCommentAuthorType": comment.author_type,
+            "anchorCommentEditorNodeId": comment.editor_id,
+            "anchorCommentEditorLogin": comment.editor_login,
+            "anchorCommentEditorType": comment.editor_type,
+            "anchorCommentLastEditedAt": comment.last_edited_at,
+            "anchorCommentIncludesCreatedEdit": comment.includes_created_edit,
+            "proposalScopeDigest": scope_digest,
+        }
+        expected_payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        expected_digest = hashlib.sha256(("swiftstream-federation-legacy-manual-evidence:v1\n" + expected_payload_json).encode("utf-8")).hexdigest()
+        self.assertEqual(result.evidence.evidence_payload_digest, expected_digest)
+
+    def test_manual_evidence_sensitivity_binds_human_app_anchor_and_scope_fields(self):
+        base_client, _app, _pr, _anchor, _comment = self.manual_fixture()
+        baseline = self.controller(base_client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        baseline_digest = baseline.evidence.evidence_payload_digest
+        variants = (
+            {"author_id": "U_other"},
+            {"author_login": "bob"},
+            {"comment_id": 701},
+            {"comment_node": "IC_other"},
+            {"description": "Changed request"},
+            {"request_class": RequestClass.ADD},
+            {"app": replace(self.APP, bot_id=12)},
+            {"app": replace(self.APP, bot_node_id="B_other"), "comment_author_id": "B_other"},
+            {
+                "app": replace(self.APP, slug="swift-stream-federation-next", bot_login="swift-stream-federation-next[bot]"),
+                "comment_author_login": "swift-stream-federation-next[bot]",
+            },
+            {"comment_author_type": None},
+            {"changed_paths": ("federation.lock.json",)},
+        )
+        for values in variants:
+            with self.subTest(values=values):
+                client, app, _pr, _anchor, _comment = self.manual_fixture(**values)
+                result = R02Controller(client, self.CENTRAL, app).classify_legacy_head(
+                    self.HEAD, implementation_reviewed_head_sha="e" * 40,
+                )
+                self.assertIs(result.outcome, LegacyClassificationOutcome.QUARANTINE)
+                self.assertIs(result.evidence.evidence_class, LegacyQuarantineClass.MANUAL)
+                self.assertNotEqual(result.evidence.evidence_payload_digest, baseline_digest)
+
+    def test_manual_payload_digest_changes_for_exactly_one_frozen_field(self):
+        baseline = {
+            "schemaVersion": 1,
+            "pullRequestNumber": 81,
+            "originalRequestAuthorNodeId": "U_human",
+            "originalRequestAuthorLogin": "alice",
+            "headOid": self.HEAD,
+            "baseOid": self.BASE,
+            "headRef": "legacy/topic",
+            "baseRef": "main",
+            "headRepositoryNodeId": "R_central",
+            "baseRepositoryNodeId": "R_central",
+            "headRepositoryFullName": self.CENTRAL,
+            "baseRepositoryFullName": self.CENTRAL,
+            "requestAnchorCommentDatabaseId": 700,
+            "requestAnchorCommentNodeId": "IC_anchor",
+            "requestAnchorCanonicalSha256": "264f587ac8dbfb5f3d8b0342891b1b0881bb190f947e7366503a2fa0b831d8b0",
+            "requestClass": "update",
+            "initialBodySha256": "419caaad53050bd924b100a38f83ed00c77aad68313a85d6bb16551411b837e4",
+            "appBotDatabaseId": 10,
+            "appBotNodeId": "B_bot",
+            "appBotLogin": "swift-stream-federation[bot]",
+            "anchorCommentAuthorNodeId": "B_bot",
+            "anchorCommentAuthorLogin": "swift-stream-federation[bot]",
+            "anchorCommentAuthorType": "Bot",
+            "anchorCommentEditorNodeId": None,
+            "anchorCommentEditorLogin": None,
+            "anchorCommentEditorType": None,
+            "anchorCommentLastEditedAt": None,
+            "anchorCommentIncludesCreatedEdit": False,
+            "proposalScopeDigest": "a367ea6ccee3586aeb018c2d45aa796a49f165d5d23e6a9288b7983f0e892da4",
+        }
+        prefix = "swiftstream-federation-legacy-manual-evidence:v1\n"
+        baseline_digest = _legacy_payload_digest(prefix, baseline)
+        mutations = {
+            "originalRequestAuthorNodeId": "U_other",
+            "originalRequestAuthorLogin": "bob",
+            "requestAnchorCommentDatabaseId": 701,
+            "requestAnchorCommentNodeId": "IC_other",
+            "requestAnchorCanonicalSha256": "4" * 64,
+            "requestClass": "add",
+            "initialBodySha256": "5" * 64,
+            "appBotDatabaseId": 12,
+            "appBotNodeId": "B_other",
+            "appBotLogin": "other[bot]",
+            "anchorCommentAuthorNodeId": "B_comment_other",
+            "anchorCommentAuthorLogin": "comment-other[bot]",
+            "anchorCommentAuthorType": "User",
+            "proposalScopeDigest": "6" * 64,
+        }
+        self.assertEqual(set(mutations), {
+            "originalRequestAuthorNodeId", "originalRequestAuthorLogin",
+            "requestAnchorCommentDatabaseId", "requestAnchorCommentNodeId",
+            "requestAnchorCanonicalSha256", "requestClass", "initialBodySha256",
+            "appBotDatabaseId", "appBotNodeId", "appBotLogin",
+            "anchorCommentAuthorNodeId", "anchorCommentAuthorLogin",
+            "anchorCommentAuthorType", "proposalScopeDigest",
+        })
+        for key, value in mutations.items():
+            changed = dict(baseline)
+            changed[key] = value
+            different_keys = {name for name in baseline if changed[name] != baseline[name]}
+            with self.subTest(field=key):
+                self.assertEqual(different_keys, {key})
+                self.assertNotEqual(_legacy_payload_digest(prefix, changed), baseline_digest)
+
+    def test_machine_exact_ref_source_scope_and_pr_evidence(self):
+        client = self.Client("Swift Stream federation machine publication\n")
+        client.machine_refs = ({
+            "ref": "refs/heads/bot/federation/accepted-source",
+            "source_id": "accepted-source",
+            "sha": self.HEAD,
+        },)
+        source = ControllerCoreTests.accepted_manifest("accepted-source", "Owner/Repo", 41).sources[0]
+        with (
+            patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+            patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+            patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+        ):
+            result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(result.outcome, LegacyClassificationOutcome.QUARANTINE)
+        self.assertIs(result.evidence.evidence_class, LegacyQuarantineClass.MACHINE)
+        no_pr_digest = result.evidence.evidence_payload_digest
+
+        client.prs[91] = PullRequestMetadata(
+            91, "", self.APP.bot_node_id, self.APP.bot_login, self.HEAD, self.BASE,
+            "bot/federation/accepted-source", "main", "R_central", self.CENTRAL,
+            "R_central", self.CENTRAL, None, False, False,
+        )
+        with (
+            patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+            patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+            patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+        ):
+            with_pr = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(with_pr.outcome, LegacyClassificationOutcome.QUARANTINE)
+        self.assertIs(with_pr.evidence.evidence_class, LegacyQuarantineClass.MACHINE)
+        self.assertNotEqual(with_pr.evidence.evidence_payload_digest, no_pr_digest)
+
+        # A stale PR inventory hint is freshly re-read and cannot enter evidence.
+        stale_client = self.Client("Swift Stream federation machine publication\n")
+        stale_client.machine_refs = client.machine_refs
+        stale_client.prs[91] = replace(client.prs[91], head_oid=self.BASE, head_ref="some-other-branch")
+        with (
+            patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+            patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+            patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+        ):
+            stale = self.controller(stale_client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(stale.outcome, LegacyClassificationOutcome.QUARANTINE)
+        self.assertEqual(stale.evidence.evidence_payload_digest, no_pr_digest)
+
+        duplicate_client = self.Client("Swift Stream federation machine publication\n")
+        duplicate_client.machine_refs = client.machine_refs
+        duplicate_client.prs[91] = client.prs[91]
+        duplicate_client.prs[92] = replace(client.prs[91], number=92)
+        with (
+            patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+            patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+            patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+        ):
+            duplicate = self.controller(duplicate_client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(duplicate.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+    def test_machine_relevant_app_pr_contradictions_fail_closed_individually(self):
+        source = ControllerCoreTests.accepted_manifest("accepted-source", "Owner/Repo", 41).sources[0]
+        client = self.Client("Swift Stream federation machine publication\n")
+        client.machine_refs = ({
+            "ref": "refs/heads/bot/federation/accepted-source",
+            "source_id": "accepted-source",
+            "sha": self.HEAD,
+        },)
+        exact_pr = PullRequestMetadata(
+            91, "", self.APP.bot_node_id, self.APP.bot_login, self.HEAD, self.BASE,
+            "bot/federation/accepted-source", "main", "R_central", self.CENTRAL,
+            "R_central", self.CENTRAL, None, False, False,
+        )
+        contradictions = (
+            ("wrong head repository ID", {"head_repository_id": "R_other"}),
+            ("wrong head repository name", {"head_repository": "other/skills"}),
+            ("wrong base repository ID", {"base_repository_id": "R_other"}),
+            ("wrong base repository name", {"base_repository": "other/skills"}),
+            ("wrong base ref", {"base_ref": "develop"}),
+            ("wrong head ref while H is exact", {"head_ref": "bot/federation/other-source"}),
+            ("wrong H while canonical branch is exact", {"head_oid": self.BASE}),
+            ("exact node with wrong login", {"author_login": "other[bot]"}),
+            ("exact login with wrong node", {"author_id": "B_other"}),
+        )
+        for label, changes in contradictions:
+            with self.subTest(contradiction=label):
+                case_client = self.Client("Swift Stream federation machine publication\n")
+                case_client.machine_refs = client.machine_refs
+                case_client.prs[91] = replace(exact_pr, **changes)
+                with (
+                    patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+                    patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+                    patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+                ):
+                    result = self.controller(case_client).classify_legacy_head(
+                        self.HEAD, implementation_reviewed_head_sha="e" * 40,
+                    )
+                self.assertIs(result.outcome, LegacyClassificationOutcome.CONFLICTING)
+                self.assertIsNone(result.evidence)
+
+    def test_machine_relevant_foreign_pr_is_non_authority(self):
+        source = ControllerCoreTests.accepted_manifest("accepted-source", "Owner/Repo", 41).sources[0]
+        client = self.Client("Swift Stream federation machine publication\n")
+        client.machine_refs = ({
+            "ref": "refs/heads/bot/federation/accepted-source",
+            "source_id": "accepted-source",
+            "sha": self.HEAD,
+        },)
+        client.prs[91] = PullRequestMetadata(
+            91, "", "U_foreign", "foreign-user", self.HEAD, self.BASE,
+            "bot/federation/accepted-source", "main", "R_central", self.CENTRAL,
+            "R_central", self.CENTRAL, None, False, False,
+        )
+        with (
+            patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+            patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+            patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+        ):
+            result = self.controller(client).classify_legacy_head(
+                self.HEAD, implementation_reviewed_head_sha="e" * 40,
+            )
+        self.assertIs(result.outcome, LegacyClassificationOutcome.QUARANTINE)
+        self.assertIs(result.evidence.evidence_class, LegacyQuarantineClass.MACHINE)
+        self.assertEqual(result.evidence.evidence_payload_digest, _legacy_payload_digest(
+            "swiftstream-federation-legacy-machine-evidence:v1\n",
+            {
+                "schemaVersion": 1,
+                "sourceId": "accepted-source",
+                "sourceRepositoryId": 41,
+                "machineRef": "refs/heads/bot/federation/accepted-source",
+                "currentMachineRefOid": self.HEAD,
+                "candidateParentSha": self.BASE,
+                "candidateTreeSha": "c" * 40,
+                "candidateScopeDigest": hashlib.sha256(b'["skills/example/SKILL.md"]').hexdigest(),
+                "machinePr": None,
+            },
+        ))
+
+    def test_publish_legacy_failure_conflicting_app_pr_performs_zero_post(self):
+        source = ControllerCoreTests.accepted_manifest("accepted-source", "Owner/Repo", 41).sources[0]
+        client = self.Client("Swift Stream federation machine publication\n")
+        client.machine_refs = ({
+            "ref": "refs/heads/bot/federation/accepted-source",
+            "source_id": "accepted-source",
+            "sha": self.HEAD,
+        },)
+        client.prs[91] = PullRequestMetadata(
+            91, "", self.APP.bot_node_id, self.APP.bot_login, self.HEAD, self.BASE,
+            "bot/federation/accepted-source", "main", "R_wrong", self.CENTRAL,
+            "R_central", self.CENTRAL, None, False, False,
+        )
+        with (
+            patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+            patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+            patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+        ):
+            with self.assertRaises(R02Error):
+                self.controller(client).publish_legacy_failure(
+                    self.HEAD, "d" * 64, implementation_reviewed_head_sha="e" * 40,
+                )
+        self.assertEqual(client.status_calls, [])
+        self.assertEqual(client.mutations, [])
+
+    def test_machine_ambiguous_ref_source_parent_and_scope_fail_closed(self):
+        source = ControllerCoreTests.accepted_manifest("accepted-source", "Owner/Repo", 41).sources[0]
+        for refs, sources, scope_error in (
+            ((), (source,), None),
+            (({"ref": "refs/heads/bot/federation/accepted-source", "source_id": "accepted-source", "sha": self.BASE},), (source,), None),
+            ((
+                {"ref": "refs/heads/bot/federation/accepted-source", "source_id": "accepted-source", "sha": self.HEAD},
+                {"ref": "refs/heads/bot/federation/other-source", "source_id": "other-source", "sha": self.HEAD},
+            ), (source,), None),
+            (({"ref": "refs/heads/bot/federation/accepted-source", "source_id": "accepted-source", "sha": self.HEAD},), (), None),
+            (({"ref": "refs/heads/bot/federation/accepted-source", "source_id": "accepted-source", "sha": self.HEAD},), (source,), controller_module.CandidateScopeError("scope rejected")),
+        ):
+            client = self.Client("Swift Stream federation machine publication\n")
+            client.machine_refs = refs
+            with (
+                patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+                patch.object(R02Controller, "_accepted_sources", return_value=sources),
+                patch.object(controller_module, "validate_machine_generated_scope", side_effect=scope_error or ("skills/example/SKILL.md",)),
+            ):
+                result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+            self.assertIs(result.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+    def test_machine_parent_cardinality_fails_closed(self):
+        source = ControllerCoreTests.accepted_manifest("accepted-source", "Owner/Repo", 41).sources[0]
+        for parents in ((), (self.BASE, "f" * 40)):
+            client = self.Client("Swift Stream federation machine publication\n")
+            client.machine_refs = ({
+                "ref": "refs/heads/bot/federation/accepted-source",
+                "source_id": "accepted-source",
+                "sha": self.HEAD,
+            },)
+            client.parents = parents
+            with (
+                patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+                patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+                patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+            ):
+                result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+            with self.subTest(parents=parents):
+                self.assertIs(result.outcome, LegacyClassificationOutcome.CONFLICTING)
+                self.assertIsNone(result.evidence)
+
+    def test_machine_current_source_identity_is_fresh_and_exact(self):
+        source = ControllerCoreTests.accepted_manifest("accepted-source", "Owner/Repo", 41).sources[0]
+        cases = (
+            (PublicSourceMetadata(41, "Owner/Repo", "main", "fresh description"), LegacyClassificationOutcome.QUARANTINE),
+            (PublicSourceMetadata(42, "Owner/Repo", "main", None), LegacyClassificationOutcome.CONFLICTING),
+            (PublicSourceMetadata(41, "Other/Repo", "main", None), LegacyClassificationOutcome.CONFLICTING),
+            (RuntimeError("source metadata unavailable"), LegacyClassificationOutcome.CONFLICTING),
+        )
+        for metadata, expected in cases:
+            client = self.Client("Swift Stream federation machine publication\n")
+            client.machine_refs = ({
+                "ref": "refs/heads/bot/federation/accepted-source",
+                "source_id": "accepted-source",
+                "sha": self.HEAD,
+            },)
+            metadata_patch = patch.object(
+                controller_module,
+                "read_public_source_metadata",
+                side_effect=metadata if isinstance(metadata, BaseException) else None,
+                return_value=None if isinstance(metadata, BaseException) else metadata,
+            )
+            with (
+                patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+                patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+                metadata_patch,
+                patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+            ):
+                result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+            with self.subTest(metadata=metadata):
+                self.assertIs(result.outcome, expected)
+                if expected is LegacyClassificationOutcome.QUARANTINE:
+                    self.assertIs(result.evidence.evidence_class, LegacyQuarantineClass.MACHINE)
+                    self.assertEqual(result.evidence.evidence_payload_digest, _legacy_payload_digest(
+                        "swiftstream-federation-legacy-machine-evidence:v1\n",
+                        {
+                            "schemaVersion": 1,
+                            "sourceId": "accepted-source",
+                            "sourceRepositoryId": 41,
+                            "machineRef": "refs/heads/bot/federation/accepted-source",
+                            "currentMachineRefOid": self.HEAD,
+                            "candidateParentSha": self.BASE,
+                            "candidateTreeSha": "c" * 40,
+                            "candidateScopeDigest": hashlib.sha256(b'["skills/example/SKILL.md"]').hexdigest(),
+                            "machinePr": None,
+                        },
+                    ))
+                else:
+                    self.assertIsNone(result.evidence)
+
+    def test_machine_repository_id_drift_blocks_legacy_failure_post(self):
+        source = ControllerCoreTests.accepted_manifest("accepted-source", "Owner/Repo", 41).sources[0]
+        client = self.Client("Swift Stream federation machine publication\n")
+        client.machine_refs = ({
+            "ref": "refs/heads/bot/federation/accepted-source",
+            "source_id": "accepted-source",
+            "sha": self.HEAD,
+        },)
+        with (
+            patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+            patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+            patch.object(controller_module, "read_public_source_metadata", return_value=PublicSourceMetadata(42, "Owner/Repo", "main", None)),
+            patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+        ):
+            with self.assertRaises(R02Error):
+                self.controller(client).publish_legacy_failure(
+                    self.HEAD, "d" * 64, implementation_reviewed_head_sha="e" * 40,
+                )
+        self.assertEqual(client.status_calls, [])
+        self.assertEqual(client.mutations, [])
+
+    def test_two_exact_manual_prs_on_same_head_are_ambiguous(self):
+        client, _app, _pr, anchor, comment = self.manual_fixture()
+        second_client, _app, second_pr, second_anchor, second_comment = self.manual_fixture(
+            author_id="U_second", author_login="bob", comment_id=702, comment_node="IC_second",
+        )
+        second_anchor = RequestAnchor(
+            82, second_anchor.request_class, second_anchor.original_author_id,
+            second_anchor.original_author_login, second_anchor.initial_body_sha256,
+            second_anchor.initial_request,
+        )
+        second_pr = replace(second_pr, number=82)
+        second_comment = replace(second_comment, body=second_anchor.render())
+        client.prs[82] = second_pr
+        client.comments[82] = (second_comment,)
+        client.files[82] = second_client.files[81]
+        result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(result.outcome, LegacyClassificationOutcome.CONFLICTING)
+        self.assertEqual(result.reason, "AMBIGUOUS_LEGACY_EVIDENCE")
+        self.assertIsNone(result.evidence)
+
+    def test_trusted_classifier_read_failures_are_conflicting(self):
+        machine = self.Client("Swift Stream federation machine publication\n")
+        machine.fail_reads.add("machine_refs")
+        machine_result = self.controller(machine).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(machine_result.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+        manual, _app, _pr, _anchor, _comment = self.manual_fixture()
+        manual.fail_reads.add("all_prs")
+        manual_result = self.controller(manual).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(manual_result.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+        comments, _app, _pr, _anchor, _comment = self.manual_fixture()
+        comments.fail_reads.add("comments")
+        comments_result = self.controller(comments).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(comments_result.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+        check_client = self.Client()
+        check_client.fail_reads.add("checks")
+        check_result = self.controller(check_client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(check_result.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+    def test_manual_duplicate_anchor_invalid_scope_and_foreign_topology_fail_closed(self):
+        client, _app, _pr, _anchor, comment = self.manual_fixture()
+        client.comments[81] = (comment, replace(comment, database_id=701))
+        duplicate = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(duplicate.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+        client, _app, _pr, _anchor, comment = self.manual_fixture()
+        malformed = replace(comment, body=controller_module.ANCHOR_MARKER + "\n{invalid-json}\n")
+        client.comments[81] = (malformed,)
+        malformed_result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(malformed_result.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+        client, _app, pr, _anchor, _comment = self.manual_fixture()
+        client.prs[81] = replace(pr, body=pr.body + "drift")
+        body_drift = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(body_drift.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+        client, _app, _pr, _anchor, _comment = self.manual_fixture(changed_paths=(".github/workflows/bad.yml",))
+        invalid_scope = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(invalid_scope.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+        client, _app, pr, _anchor, _comment = self.manual_fixture()
+        client.prs[81] = replace(pr, head_repository="fork/Repo", head_repository_id="R_fork")
+        foreign = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(foreign.outcome, LegacyClassificationOutcome.ABSENT)
+
+    def test_manual_human_requester_and_app_comment_author_are_distinct(self):
+        client, app, _pr, _anchor, _comment = self.manual_fixture()
+        result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertEqual(result.outcome, LegacyClassificationOutcome.QUARANTINE)
+        self.assertEqual(client.prs[81].author_id, "U_human")
+        self.assertEqual(client.comments[81][0].author_id, app.bot_node_id)
+        for author_id, author_login in ((app.bot_node_id, app.bot_login), ("U_human", "alice")):
+            swapped, swapped_app, _pr, _anchor, _comment = self.manual_fixture(
+                author_id=author_id, author_login=author_login,
+                comment_author_id=app.bot_node_id, comment_author_login=app.bot_login,
+            )
+            if author_id == app.bot_node_id:
+                classification = self.controller(swapped).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+                self.assertIs(classification.outcome, LegacyClassificationOutcome.CONFLICTING)
+            else:
+                self.assertEqual(swapped_app, app)
+
+    def test_manual_anchor_app_author_and_edit_integrity_are_fail_closed(self):
+        for changes in (
+            {"comment_author_id": "U_other"},
+            {"comment_author_login": "other[bot]"},
+        ):
+            client, app, _pr, _anchor, comment = self.manual_fixture(**changes)
+            # Replace the malformed/mismatched anchor author while retaining the
+            # exact current PR and encoded RequestAnchor payload.
+            result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+            self.assertIs(result.outcome, LegacyClassificationOutcome.CONFLICTING)
+            self.assertIsNone(result.evidence)
+        for field in ("editor_login", "editor_type"):
+            client, _app, _pr, _anchor, comment = self.manual_fixture()
+            changed = dict(comment.__dict__)
+            changed[field] = "editor-value"
+            client.comments[81] = (IssueComment(**changed),)
+            result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+            self.assertIs(result.outcome, LegacyClassificationOutcome.CONFLICTING)
+
+    def test_collision_output_fixed_vector_and_output_digest_sensitivity(self):
+        output = "class=machine-publication; head=" + "a" * 40 + "; result=failure"
+        digests = {}
+        for name, value in (("alpha", "alpha"), ("beta", "beta"), ("none", None), ("empty", ""), ("known", output)):
+            client = self.Client()
+            client.checks = (CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", 10, value),)
+            result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+            self.assertIs(result.outcome, LegacyClassificationOutcome.QUARANTINE)
+            self.assertIs(result.evidence.evidence_class, LegacyQuarantineClass.CHECK_COLLISION)
+            digests[name] = result.evidence.evidence_payload_digest
+            if name == "known":
+                payload = {
+                    "schemaVersion": 1,
+                    "checkRunId": 501,
+                    "name": "federation/trusted-validation",
+                    "headSha": self.HEAD,
+                    "status": "completed",
+                    "conclusion": "failure",
+                    "appId": 10,
+                    "outputDigest": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+                    "implementationReviewedHeadSha": "e" * 40,
+                }
+                expected = hashlib.sha256((
+                    "swiftstream-federation-legacy-check-collision-evidence:v1\n"
+                    + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                ).encode("utf-8")).hexdigest()
+                self.assertEqual(digests[name], expected)
+        self.assertNotEqual(digests["alpha"], digests["beta"])
+        self.assertNotEqual(digests["none"], digests["empty"])
+        self.assertNotEqual(digests["none"], digests["known"])
+
+    def test_collision_requires_reviewed_head_exclusion_and_unique_exact_app_row(self):
+        client = self.Client()
+        client.checks = (CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", 10, "out"),)
+        missing = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha=None)
+        self.assertIs(missing.outcome, LegacyClassificationOutcome.CONFLICTING)
+        reviewed = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha=self.HEAD)
+        self.assertIs(reviewed.outcome, LegacyClassificationOutcome.ABSENT)
+        client.checks = client.checks * 2
+        duplicate = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(duplicate.outcome, LegacyClassificationOutcome.CONFLICTING)
+        client.checks = (CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", 999, "foreign"),)
+        foreign = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(foreign.outcome, LegacyClassificationOutcome.ABSENT)
+
+    def test_manual_and_collision_exact_evidence_aggregates_as_conflicting(self):
+        client, app, _pr, _anchor, _comment = self.manual_fixture()
+        client.checks = (CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", app.app_id, None),)
+        result = self.controller(client).classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+        self.assertIs(result.outcome, LegacyClassificationOutcome.CONFLICTING)
+        self.assertEqual(result.reason, "AMBIGUOUS_LEGACY_EVIDENCE")
+
+    def test_publish_legacy_failure_writes_exact_failure_for_each_quarantine_class(self):
+        boundary = "d" * 64
+        # Manual class uses the full current RequestAnchor and proposal evidence.
+        manual, app, _pr, _anchor, _comment = self.manual_fixture()
+        cases = [(manual, app, None)]
+
+        # Collision class binds the exact current App Check Run.
+        collision = self.Client()
+        collision.checks = (CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", 10, "failure output"),)
+        cases.append((collision, self.APP, None))
+
+        # Machine class binds current accepted source, machine ref, parent/tree/scope.
+        machine = self.Client("Swift Stream federation machine publication\n")
+        machine.machine_refs = ({
+            "ref": "refs/heads/bot/federation/accepted-source",
+            "source_id": "accepted-source",
+            "sha": self.HEAD,
+        },)
+        source = ControllerCoreTests.accepted_manifest("accepted-source", "Owner/Repo", 41).sources[0]
+        with (
+            patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+            patch.object(R02Controller, "_accepted_sources", return_value=(source,)),
+            patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+        ):
+            cases.append((machine, self.APP, (source,)))
+
+        for client, configured_app, machine_sources in cases:
+            scoped = (
+                patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+                patch.object(R02Controller, "_accepted_sources", return_value=machine_sources or ()),
+                patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+            )
+            with scoped[0], scoped[1], scoped[2]:
+                before_reads = client.repository_reads
+                controller = R02Controller(client, self.CENTRAL, configured_app)
+                current = controller.classify_legacy_head(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+                self.assertIs(current.outcome, LegacyClassificationOutcome.QUARANTINE)
+                expected_description = controller_module.render_status_description(
+                    StatusClass.LEGACY,
+                    legacy_status_evidence_digest(current.evidence, boundary),
+                )
+                receipt = controller.publish_legacy_failure(
+                    self.HEAD, boundary, implementation_reviewed_head_sha="e" * 40,
+                )
+            self.assertIs(type(receipt), StatusWriteReceipt)
+            self.assertEqual(client.status_calls[-1], (
+                self.CENTRAL, self.HEAD, "failure", "federation/trusted-validation", expected_description, None,
+            ))
+            self.assertEqual(client.status_calls[-1][2], "failure")
+            self.assertEqual(len(client.status_calls), 1)
+            self.assertEqual(receipt.returned_status.creator_type, "Bot")
+            self.assertEqual(receipt.returned_status.creator_database_id, configured_app.bot_id)
+            self.assertEqual(receipt.returned_status.creator_node_id, configured_app.bot_node_id)
+            self.assertEqual(receipt.returned_status.creator_login, configured_app.bot_login)
+            self.assertGreater(client.repository_reads, before_reads)
+            self.assertEqual(client.mutations, ["create_commit_status"])
+
+    def test_publish_legacy_failure_reserved_family_performs_zero_post(self):
+        client = self.Client("swiftstream-federation-head:v999\n")
+        with self.assertRaises(R02Error):
+            self.controller(client).publish_legacy_failure(
+                self.HEAD, "d" * 64, implementation_reviewed_head_sha="e" * 40,
+            )
+        self.assertEqual(client.status_calls, [])
+        self.assertEqual(client.mutations, [])
+        self.assertEqual(client.class_reads, [])
+
+    def test_publish_legacy_failure_rejects_invalid_inputs_before_authority_reads(self):
+        invalid_calls = (
+            ("A" * 40, "d" * 64, "e" * 40),
+            (self.HEAD, None, "e" * 40),
+            (self.HEAD, "D" * 64, "e" * 40),
+            (self.HEAD, "d" * 63, "e" * 40),
+            (self.HEAD, "d" * 65, "e" * 40),
+            (self.HEAD, "d" * 64, "E" * 40),
+            (self.HEAD, "d" * 64, "e" * 39),
+        )
+        for head, boundary, reviewed in invalid_calls:
+            client = self.Client()
+            with self.subTest(head=head, boundary=boundary, reviewed=reviewed), self.assertRaises(R02Error):
+                self.controller(client).publish_legacy_failure(
+                    head, boundary, implementation_reviewed_head_sha=reviewed,
+                )
+            self.assertEqual(client.status_calls, [])
+            self.assertEqual(client.repository_reads, 0)
+        self.assertEqual(
+            tuple(inspect.signature(R02Controller.publish_legacy_failure).parameters),
+            ("self", "head_sha", "trusted_activation_boundary_id", "implementation_reviewed_head_sha"),
+        )
+        with self.assertRaises(TypeError):
+            self.controller().publish_legacy_failure(
+                self.HEAD, "d" * 64, implementation_reviewed_head_sha="e" * 40, cutoverId="x",
+            )
+
+    def test_publish_legacy_failure_absent_or_conflicting_never_falls_back(self):
+        for message, checks in (
+            ("ordinary commit\n", ()),
+            ("swiftstream-federation-head:future\n", ()),
+        ):
+            client = self.Client(message)
+            client.checks = checks
+            with self.subTest(message=message), self.assertRaises(R02Error):
+                self.controller(client).publish_legacy_failure(
+                    self.HEAD, "d" * 64, implementation_reviewed_head_sha="e" * 40,
+                )
+            self.assertEqual(client.status_calls, [])
+            self.assertEqual(client.mutations, [])
+
+        client = self.Client()
+        client.checks = (
+            CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", 10, "a"),
+            CheckRun(502, "federation/trusted-validation", self.HEAD, "completed", "failure", 10, "b"),
+        )
+        with self.assertRaises(R02Error):
+            self.controller(client).publish_legacy_failure(
+                self.HEAD, "d" * 64, implementation_reviewed_head_sha="e" * 40,
+            )
+        self.assertEqual(client.status_calls, [])
+
+    def test_publish_legacy_failure_same_tuple_retry_reclassifies_and_changed_evidence_changes_digest(self):
+        client = self.Client()
+        client.checks = (CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", 10, "alpha"),)
+        controller = self.controller(client)
+        boundary = "d" * 64
+        first = controller.publish_legacy_failure(self.HEAD, boundary, implementation_reviewed_head_sha="e" * 40)
+        second = controller.publish_legacy_failure(self.HEAD, boundary, implementation_reviewed_head_sha="e" * 40)
+        self.assertEqual(client.status_calls[0], client.status_calls[1])
+        self.assertEqual(first.requested_description, second.requested_description)
+        self.assertEqual(client.repository_reads, 4)  # each invocation classifies, then re-reads write identity
+        client.checks = (CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", 10, "beta"),)
+        third = controller.publish_legacy_failure(self.HEAD, boundary, implementation_reviewed_head_sha="e" * 40)
+        self.assertNotEqual(third.requested_description, first.requested_description)
+        self.assertEqual(len(client.status_calls), 3)
+        client.checks = (CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", 999, "foreign"),)
+        with self.assertRaises(R02Error):
+            controller.publish_legacy_failure(self.HEAD, boundary, implementation_reviewed_head_sha="e" * 40)
+        self.assertEqual(len(client.status_calls), 3)
+
+    def test_publish_legacy_failure_rejects_adversarial_receipts(self):
+        expected_context = "federation/trusted-validation"
+        expected_description = "ssf:v1 legacy ev=" + "f" * 64
+
+        def raw_receipt(repository, sha, state, context, description, target_url, **changes):
+            requested = {
+                "repository": repository,
+                "requested_sha": sha,
+                "method": "POST",
+                "route": f"/repos/{repository}/statuses/{sha}",
+                "requested_state": state,
+                "requested_context": context,
+                "requested_description": description,
+                "requested_target_url": target_url,
+            }
+            status_values = dict(
+                id=901, node_id="ST_status", state=state, context=context,
+                description=description, target_url=target_url,
+                creator_database_id=11, creator_node_id="B_bot",
+                creator_login="swift-stream-federation[bot]", creator_type="Bot",
+                created_at="2026-10-07T00:00:00Z", updated_at="2026-10-07T00:00:00Z",
+            )
+            requested_changes = changes.pop("requested", {})
+            status_changes = changes.pop("status", {})
+            requested.update(requested_changes)
+            status_values.update(status_changes)
+            status = CommitStatus(**status_values)
+            receipt = object.__new__(StatusWriteReceipt)
+            for key, value in {**requested, "returned_status": status}.items():
+                object.__setattr__(receipt, key, value)
+            return receipt
+
+        for variant in (
+            {"requested": {"route": "/wrong"}},
+            {"requested": {"requested_sha": "f" * 40}},
+            {"requested": {"requested_state": "success"}, "status": {"state": "success"}},
+            {"requested": {"requested_context": "other"}, "status": {"context": "other"}},
+            {"requested": {"requested_description": "other"}, "status": {"description": "other"}},
+            {"requested": {"requested_target_url": "https://example.invalid"}, "status": {"target_url": "https://example.invalid"}},
+            {"status": {"creator_database_id": 99, "creator_node_id": "B_foreign"}},
+            {"requested": {"requested_state": "success"}, "status": {"state": "success"}},
+            {"status": {"description": "other"}},
+        ):
+            client = self.Client()
+            client.checks = (CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", 10, "out"),)
+            client.receipt_builder = lambda repository, sha, state, context, description, target_url, variant=variant: raw_receipt(
+                repository, sha, state, context, description, target_url, **variant,
+            )
+            with self.subTest(variant=variant), self.assertRaises(R02Error):
+                self.controller(client).publish_legacy_failure(
+                    self.HEAD, "d" * 64, implementation_reviewed_head_sha="e" * 40,
+                )
+            self.assertEqual(len(client.status_calls), 1)
+
+    def test_plan_legacy_recovery_maps_all_classes_without_mutation(self):
+        expected = {
+            LegacyQuarantineClass.MACHINE: LegacyRecoveryAction.MACHINE_MIGRATION_REQUIRED,
+            LegacyQuarantineClass.MANUAL: LegacyRecoveryAction.MANUAL_BLOCK_REQUIRES_ISSUE_FIRST,
+            LegacyQuarantineClass.CHECK_COLLISION: LegacyRecoveryAction.CHECK_COLLISION_REQUIRES_CLEAN_HEAD,
+        }
+        manual, _app, _pr, _anchor, _comment = self.manual_fixture()
+        collision = self.Client()
+        collision.checks = (CheckRun(501, "federation/trusted-validation", self.HEAD, "completed", "failure", 10, None),)
+        machine = self.Client("Swift Stream federation machine publication\n")
+        machine.machine_refs = ({"ref": "refs/heads/bot/federation/accepted-source", "source_id": "accepted-source", "sha": self.HEAD},)
+        source = ControllerCoreTests.accepted_manifest("accepted-source", "Owner/Repo", 41).sources[0]
+        cases = ((manual, self.APP, None), (collision, self.APP, None), (machine, self.APP, (source,)))
+        for client, app, sources in cases:
+            with (
+                patch.object(R02Controller, "current_accepted_main", return_value=(self.REPOSITORY, self.BASE)),
+                patch.object(R02Controller, "_accepted_sources", return_value=sources or ()),
+                patch.object(controller_module, "validate_machine_generated_scope", return_value=("skills/example/SKILL.md",)),
+            ):
+                decision = R02Controller(client, self.CENTRAL, app).plan_legacy_recovery(
+                    self.HEAD, implementation_reviewed_head_sha="e" * 40,
+                )
+            self.assertIs(decision.action, expected[decision.evidence.evidence_class])
+            self.assertEqual(client.status_calls, [])
+            self.assertEqual(client.mutations, [])
+
+        for message in ("ordinary commit\n", "swiftstream-federation-head:future\n"):
+            client = self.Client(message)
+            with self.assertRaises(R02Error):
+                self.controller(client).plan_legacy_recovery(self.HEAD, implementation_reviewed_head_sha="e" * 40)
+            self.assertEqual(client.mutations, [])
+
+    def test_wave09_writer_and_recovery_methods_have_no_deferred_migration_calls(self):
+        source = Path(controller_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        cls = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "R02Controller")
+        methods = {item.name: item for item in cls.body if isinstance(item, ast.FunctionDef)}
+        forbidden = {
+            "new_carrier_nonce", "claim_generation_id", "create_commit", "create_blob", "create_tree",
+            "update_refs", "create_machine_pull_request", "create_check_run", "update_check_run",
+            "update_pull_request_state", "dispatch_workflow",
+        }
+        for name in ("publish_legacy_failure", "plan_legacy_recovery"):
+            called = {
+                item.func.attr if isinstance(item.func, ast.Attribute) else item.func.id
+                for item in ast.walk(methods[name])
+                if isinstance(item, ast.Call) and (isinstance(item.func, ast.Attribute) or isinstance(item.func, ast.Name))
+            }
+            self.assertFalse(called & forbidden)
 
 
 if __name__ == "__main__":

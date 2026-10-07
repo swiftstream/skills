@@ -80,6 +80,10 @@ from .request_model import (
     CarrierActivation,
     CarrierRole,
     LegacyEvidenceDisposition,
+    LegacyQuarantineClass,
+    LegacyClassificationOutcome,
+    LegacyQuarantineEvidence,
+    LegacyClassificationResult,
     ShaCarrierResolution,
     StatusClass,
     PatchFoldResult,
@@ -102,6 +106,8 @@ from .request_model import (
     issue_owner_key,
     parse_issue_owner_key,
     external_status_evidence_digest,
+    legacy_status_evidence_digest,
+    legacy_recovery_decision,
     cancel_status_evidence_digest,
     claim_generation_id,
     new_carrier_nonce,
@@ -823,6 +829,24 @@ def wave08_legacy_disposition(
     except Exception:
         return LegacyEvidenceDisposition.CONFLICTING
     return disposition if type(disposition) is LegacyEvidenceDisposition else LegacyEvidenceDisposition.CONFLICTING
+
+
+def legacy_classification_disposition(result: LegacyClassificationResult) -> LegacyEvidenceDisposition:
+    if type(result) is not LegacyClassificationResult:
+        raise R02Error("legacy classification result has an invalid type")
+    return {
+        LegacyClassificationOutcome.ABSENT: LegacyEvidenceDisposition.ABSENT,
+        LegacyClassificationOutcome.QUARANTINE: LegacyEvidenceDisposition.QUARANTINE,
+        LegacyClassificationOutcome.CONFLICTING: LegacyEvidenceDisposition.CONFLICTING,
+    }[result.outcome]
+
+
+def _legacy_payload_digest(prefix: str, value: Mapping[str, Any]) -> str:
+    try:
+        canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256((prefix + canonical).encode("utf-8")).hexdigest()
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise R02Error("legacy evidence payload cannot be encoded canonically") from None
 
 
 def wave08_decision_for_resolution(
@@ -6113,6 +6137,455 @@ class R02Controller:
         except Exception as error:
             raise R02Error(f"accepted federation manifest is unavailable: {_bounded_reason(error)}") from None
         return tuple(manifest.sources)
+
+    def classify_legacy_head(
+        self,
+        head_sha: str,
+        *,
+        implementation_reviewed_head_sha: str | None,
+    ) -> LegacyClassificationResult:
+        """Classify exact current legacy evidence without performing any mutation."""
+        absent = lambda reason: LegacyClassificationResult(LegacyClassificationOutcome.ABSENT, None, reason)
+        conflicting = lambda reason: LegacyClassificationResult(LegacyClassificationOutcome.CONFLICTING, None, reason)
+        if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+            return conflicting("INVALID_HEAD_SHA")
+        if implementation_reviewed_head_sha is not None and (
+            type(implementation_reviewed_head_sha) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", implementation_reviewed_head_sha) is None
+        ):
+            return conflicting("INVALID_IMPLEMENTATION_REVIEWED_HEAD_SHA")
+
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            if (
+                type(repository) is not RepositoryMetadata
+                or repository.full_name != self.central_repository
+                or repository.default_branch != "main"
+                or type(repository.id) is not int
+                or repository.id <= 0
+                or type(repository.node_id) is not str
+                or not repository.node_id
+                or len(repository.node_id) > 256
+                or c02.contains_control(repository.node_id)
+            ):
+                return conflicting("CURRENT_LEGACY_EVIDENCE_UNAVAILABLE")
+            commit = self.client.get_git_commit_object(self.central_repository, head_sha)
+            if (
+                type(commit) is not GitCommitObject
+                or commit.sha != head_sha
+                or type(commit.message) is not str
+                or type(commit.tree_sha) is not str
+                or re.fullmatch(r"[0-9a-f]{40}", commit.tree_sha) is None
+                or type(commit.parents) is not tuple
+                or any(type(parent) is not str or re.fullmatch(r"[0-9a-f]{40}", parent) is None for parent in commit.parents)
+            ):
+                return conflicting("CURRENT_LEGACY_EVIDENCE_UNAVAILABLE")
+        except Exception:
+            return conflicting("CURRENT_LEGACY_EVIDENCE_UNAVAILABLE")
+
+        # The entire marker family is reserved. This check must precede every
+        # machine/manual/collision read and predicate, including valid v2.
+        if "swiftstream-federation-head:" in commit.message:
+            return conflicting("RESERVED_CLAIM_FAMILY_PRESENT")
+
+        try:
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            if current_app != self.app:
+                return conflicting("CURRENT_LEGACY_EVIDENCE_UNAVAILABLE")
+        except Exception:
+            return conflicting("CURRENT_LEGACY_EVIDENCE_UNAVAILABLE")
+
+        matches: list[LegacyQuarantineEvidence] = []
+        class_conflict = False
+
+        # LEGACY_MACHINE: exact old message plus current accepted source/ref and
+        # old generated candidate semantics. No PR is required when ref-backed.
+        if commit.message == "Swift Stream federation machine publication\n":
+            try:
+                refs = self.client.list_machine_refs(self.central_repository)
+                if type(refs) not in (tuple, list):
+                    raise R02Error("machine-ref inventory is malformed")
+                normalized_refs: list[tuple[str, str, str]] = []
+                for row in refs:
+                    if type(row) is not dict or set(row) != {"ref", "source_id", "sha"}:
+                        raise R02Error("machine-ref row is malformed")
+                    ref, source_id, oid = row["ref"], row["source_id"], row["sha"]
+                    if (
+                        type(ref) is not str or type(source_id) is not str or not _is_canonical_wave08_source_id(source_id)
+                        or ref != _machine_branch(source_id) and ref != f"refs/heads/{_machine_branch(source_id)}"
+                        or type(oid) is not str or re.fullmatch(r"[0-9a-f]{40}", oid) is None
+                    ):
+                        raise R02Error("machine-ref row identity is malformed")
+                    normalized_refs.append((ref, source_id, oid))
+                refs_for_head = [item for item in normalized_refs if item[2] == head_sha]
+                if len(refs_for_head) != 1:
+                    raise R02Error("old machine head has no unique exact current ref")
+                machine_ref, source_id, _oid = refs_for_head[0]
+                if machine_ref != f"refs/heads/{_machine_branch(source_id)}":
+                    raise R02Error("machine ref name is not canonical")
+                trusted_repository, current_main = self.current_accepted_main()
+                if trusted_repository != repository or trusted_repository.default_branch != "main":
+                    raise R02Error("trusted central main identity changed")
+                sources = tuple(source for source in self._accepted_sources(current_main) if source.source_id == source_id)
+                if len(sources) != 1 or type(sources[0].repository_id) is not int or sources[0].repository_id <= 0:
+                    raise R02Error("exact machine source is not uniquely accepted")
+                accepted_source = sources[0]
+                public_source = read_public_source_metadata(accepted_source.repository)
+                if (
+                    type(public_source) is not PublicSourceMetadata
+                    or type(public_source.repository_id) is not int
+                    or public_source.repository_id <= 0
+                    or public_source.repository_id != accepted_source.repository_id
+                    or type(public_source.full_name) is not str
+                    or public_source.full_name.lower() != accepted_source.repository.lower()
+                ):
+                    raise R02Error("current public source identity does not match accepted source")
+                if len(commit.parents) != 1:
+                    raise R02Error("old machine candidate must have exactly one parent")
+                candidate_parent = commit.parents[0]
+                changed_paths = validate_machine_generated_scope(
+                    self.client, self.central_repository, candidate_parent, head_sha,
+                )
+                if type(changed_paths) is not tuple or any(type(path) is not str for path in changed_paths):
+                    raise R02Error("machine candidate scope result is malformed")
+                scope_digest = hashlib.sha256(json.dumps(
+                    list(changed_paths), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                ).encode("utf-8")).hexdigest()
+
+                machine_pr: dict[str, Any] | None = None
+                summaries = self.client.list_open_pull_requests(self.central_repository)
+                if type(summaries) not in (tuple, list):
+                    raise R02Error("open PR inventory is malformed")
+                exact_candidates: list[PullRequestMetadata] = []
+                for summary in summaries:
+                    if type(summary) is not dict or type(summary.get("number")) is not int or summary["number"] <= 0:
+                        raise R02Error("open PR summary is malformed")
+                    pr = self.client.get_pull_request_metadata(self.central_repository, summary["number"])
+                    if type(pr) is not PullRequestMetadata or pr.number != summary["number"]:
+                        raise R02Error("fresh machine PR metadata is malformed")
+                    appears_relevant = pr.head_oid == head_sha or pr.head_ref == _machine_branch(source_id)
+                    if not appears_relevant:
+                        continue
+                    exact = (
+                        pr.author_id == current_app.bot_node_id
+                        and pr.author_login == current_app.bot_login
+                        and pr.head_repository == repository.full_name
+                        and pr.base_repository == repository.full_name
+                        and pr.head_repository_id == repository.node_id
+                        and pr.base_repository_id == repository.node_id
+                        and pr.head_ref == _machine_branch(source_id)
+                        and pr.base_ref == "main"
+                        and pr.head_oid == head_sha
+                    )
+                    if exact:
+                        exact_candidates.append(pr)
+                    elif pr.author_id == current_app.bot_node_id or pr.author_login == current_app.bot_login:
+                        raise R02Error("current App machine PR evidence conflicts with exact ref authority")
+                if len(exact_candidates) > 1:
+                    raise R02Error("multiple exact current machine PRs claim the legacy head")
+                if exact_candidates:
+                    pr = exact_candidates[0]
+                    machine_pr = {
+                        "number": pr.number,
+                        "authorId": pr.author_id,
+                        "authorLogin": pr.author_login,
+                        "headOid": pr.head_oid,
+                        "baseOid": pr.base_oid,
+                        "headRef": pr.head_ref,
+                        "baseRef": pr.base_ref,
+                        "headRepositoryId": pr.head_repository_id,
+                        "baseRepositoryId": pr.base_repository_id,
+                        "headRepository": pr.head_repository,
+                        "baseRepository": pr.base_repository,
+                        "draft": pr.draft,
+                    }
+                payload = {
+                    "schemaVersion": 1,
+                    "sourceId": source_id,
+                    "sourceRepositoryId": accepted_source.repository_id,
+                    "machineRef": machine_ref,
+                    "currentMachineRefOid": head_sha,
+                    "candidateParentSha": candidate_parent,
+                    "candidateTreeSha": commit.tree_sha,
+                    "candidateScopeDigest": scope_digest,
+                    "machinePr": machine_pr,
+                }
+                digest = _legacy_payload_digest("swiftstream-federation-legacy-machine-evidence:v1\n", payload)
+                matches.append(LegacyQuarantineEvidence(
+                    1, LegacyQuarantineClass.MACHINE, repository.id, repository.node_id,
+                    repository.full_name, head_sha, digest,
+                ))
+            except Exception:
+                class_conflict = True
+
+        # Read the full current PR inventory once for legacy manual anchors.
+        try:
+            summaries = self.client.list_pull_requests(self.central_repository, state="all")
+            if type(summaries) not in (tuple, list):
+                raise R02Error("PR inventory is malformed")
+            manual_evidence: list[LegacyQuarantineEvidence] = []
+            for summary in summaries:
+                if type(summary) is not dict or type(summary.get("number")) is not int or summary["number"] <= 0:
+                    raise R02Error("PR summary is malformed")
+                pr = self.client.get_pull_request_metadata(self.central_repository, summary["number"])
+                if type(pr) is not PullRequestMetadata or pr.number != summary["number"]:
+                    raise R02Error("fresh PR metadata is malformed")
+                if (
+                    pr.head_oid != head_sha
+                    or pr.head_repository != repository.full_name
+                    or pr.base_repository != repository.full_name
+                    or pr.head_repository_id != repository.node_id
+                    or pr.base_repository_id != repository.node_id
+                    or pr.base_ref != "main"
+                    or pr.head_ref.startswith("bot/federation/")
+                ):
+                    continue
+                comments = self.client.list_issue_comments(self.central_repository, pr.number)
+                if type(comments) not in (tuple, list) or any(type(comment) is not IssueComment for comment in comments):
+                    raise R02Error("current PR comment inventory is malformed")
+                anchors_present = [comment for comment in comments if comment.body.startswith(ANCHOR_MARKER)]
+                if not anchors_present:
+                    continue
+                if any(comment.editor_login is not None or comment.editor_type is not None for comment in anchors_present):
+                    raise R02Error("legacy RequestAnchor editor identity is not immutable")
+                anchored = validate_unique_anchor(comments, pr, None, current_app)
+                anchor = anchored.anchor
+                if pr.author_id == current_app.bot_node_id or pr.author_login == current_app.bot_login:
+                    raise R02Error("human RequestAnchor requester identity cannot be the App Bot")
+                files = self.client.list_pull_request_files(self.central_repository, pr.number)
+                if type(files) not in (tuple, list) or any(type(item) is not dict or type(item.get("filename")) is not str for item in files):
+                    raise R02Error("current PR file inventory is malformed")
+                diff = validate_proposal_scope(anchor.request_class, (item["filename"] for item in files))
+                scope_value = {
+                    "changedPaths": list(diff.paths),
+                    "requestClass": anchor.request_class.name.lower(),
+                }
+                scope_json = json.dumps(scope_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                proposal_scope_digest = hashlib.sha256(
+                    ("swiftstream-federation-legacy-manual-proposal-scope:v1\n" + scope_json).encode("utf-8")
+                ).hexdigest()
+                request_anchor_digest = hashlib.sha256(anchor.render().encode("utf-8")).hexdigest()
+                comment = anchored.comment
+                payload = {
+                    "schemaVersion": 1,
+                    "pullRequestNumber": pr.number,
+                    "originalRequestAuthorNodeId": pr.author_id,
+                    "originalRequestAuthorLogin": pr.author_login,
+                    "headOid": pr.head_oid,
+                    "baseOid": pr.base_oid,
+                    "headRef": pr.head_ref,
+                    "baseRef": pr.base_ref,
+                    "headRepositoryNodeId": pr.head_repository_id,
+                    "baseRepositoryNodeId": pr.base_repository_id,
+                    "headRepositoryFullName": pr.head_repository,
+                    "baseRepositoryFullName": pr.base_repository,
+                    "requestAnchorCommentDatabaseId": comment.database_id,
+                    "requestAnchorCommentNodeId": comment.node_id,
+                    "requestAnchorCanonicalSha256": request_anchor_digest,
+                    "requestClass": anchor.request_class.name.lower(),
+                    "initialBodySha256": anchor.initial_body_sha256,
+                    "appBotDatabaseId": current_app.bot_id,
+                    "appBotNodeId": current_app.bot_node_id,
+                    "appBotLogin": current_app.bot_login,
+                    "anchorCommentAuthorNodeId": comment.author_id,
+                    "anchorCommentAuthorLogin": comment.author_login,
+                    "anchorCommentAuthorType": comment.author_type,
+                    "anchorCommentEditorNodeId": comment.editor_id,
+                    "anchorCommentEditorLogin": comment.editor_login,
+                    "anchorCommentEditorType": comment.editor_type,
+                    "anchorCommentLastEditedAt": comment.last_edited_at,
+                    "anchorCommentIncludesCreatedEdit": comment.includes_created_edit,
+                    "proposalScopeDigest": proposal_scope_digest,
+                }
+                manual_evidence.append(LegacyQuarantineEvidence(
+                    1, LegacyQuarantineClass.MANUAL, repository.id, repository.node_id,
+                    repository.full_name, head_sha,
+                    _legacy_payload_digest("swiftstream-federation-legacy-manual-evidence:v1\n", payload),
+                ))
+            if len(manual_evidence) > 1:
+                class_conflict = True
+            elif manual_evidence:
+                matches.extend(manual_evidence)
+        except Exception:
+            class_conflict = True
+
+        # Same-name exact-App Check Runs are collision evidence only when the
+        # caller supplies the trusted implementation-reviewed-head exclusion.
+        try:
+            checks = self.client.list_check_runs(self.central_repository, head_sha)
+            if type(checks) not in (tuple, list) or any(type(check) is not CheckRun for check in checks):
+                raise R02Error("current Check Run inventory is malformed")
+            exact_checks = [
+                check for check in checks
+                if check.name == TRUSTED_VALIDATION_NAME and check.head_sha == head_sha and check.app_id == current_app.app_id
+            ]
+            if exact_checks:
+                if implementation_reviewed_head_sha is None:
+                    class_conflict = True
+                elif implementation_reviewed_head_sha != head_sha:
+                    if len(exact_checks) != 1:
+                        class_conflict = True
+                    else:
+                        check = exact_checks[0]
+                        if type(check.output) is not str and check.output is not None:
+                            raise R02Error("Check Run output is malformed")
+                        if check.output is not None:
+                            encoded_output = check.output.encode("utf-8")
+                            if len(check.output) > 4096:
+                                raise R02Error("Check Run output exceeds the transport bound")
+                            output_digest: str | None = hashlib.sha256(encoded_output).hexdigest()
+                        else:
+                            output_digest = None
+                        payload = {
+                            "schemaVersion": 1,
+                            "checkRunId": check.id,
+                            "name": check.name,
+                            "headSha": check.head_sha,
+                            "status": check.status,
+                            "conclusion": check.conclusion,
+                            "appId": check.app_id,
+                            "outputDigest": output_digest,
+                            "implementationReviewedHeadSha": implementation_reviewed_head_sha,
+                        }
+                        matches.append(LegacyQuarantineEvidence(
+                            1, LegacyQuarantineClass.CHECK_COLLISION, repository.id, repository.node_id,
+                            repository.full_name, head_sha,
+                            _legacy_payload_digest("swiftstream-federation-legacy-check-collision-evidence:v1\n", payload),
+                        ))
+        except Exception:
+            class_conflict = True
+
+        if class_conflict:
+            return conflicting("AMBIGUOUS_LEGACY_EVIDENCE")
+        if len(matches) > 1:
+            return conflicting("AMBIGUOUS_LEGACY_EVIDENCE")
+        if len(matches) == 1:
+            evidence = matches[0]
+            reason = {
+                LegacyQuarantineClass.MACHINE: "EXACT_LEGACY_MACHINE",
+                LegacyQuarantineClass.MANUAL: "EXACT_LEGACY_MANUAL",
+                LegacyQuarantineClass.CHECK_COLLISION: "EXACT_LEGACY_CHECK_COLLISION",
+            }[evidence.evidence_class]
+            return LegacyClassificationResult(LegacyClassificationOutcome.QUARANTINE, evidence, reason)
+        return absent("EXACT_LEGACY_EVIDENCE_ABSENT")
+
+    def publish_legacy_failure(
+        self,
+        head_sha: str,
+        trusted_activation_boundary_id: str,
+        *,
+        implementation_reviewed_head_sha: str | None,
+    ) -> StatusWriteReceipt:
+        """Reclassify current evidence and append only its exact legacy failure tuple."""
+        if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+            raise R02Error("legacy failure head SHA must be exact lowercase 40-hex")
+        if type(trusted_activation_boundary_id) is not str or re.fullmatch(r"[0-9a-f]{64}", trusted_activation_boundary_id) is None:
+            raise R02Error("trusted activation boundary ID must be exact lowercase 64-hex")
+        if implementation_reviewed_head_sha is not None and (
+            type(implementation_reviewed_head_sha) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", implementation_reviewed_head_sha) is None
+        ):
+            raise R02Error("implementation reviewed head SHA must be exact lowercase 40-hex")
+
+        classification = self.classify_legacy_head(
+            head_sha,
+            implementation_reviewed_head_sha=implementation_reviewed_head_sha,
+        )
+        if (
+            type(classification) is not LegacyClassificationResult
+            or classification.outcome is not LegacyClassificationOutcome.QUARANTINE
+            or type(classification.evidence) is not LegacyQuarantineEvidence
+            or classification.evidence.head_sha != head_sha
+            or classification.evidence.central_repository_full_name != self.central_repository
+        ):
+            raise R02Error("exact current legacy quarantine evidence is required before failure publication")
+
+        try:
+            fresh_repository = self.client.get_repository_metadata(self.central_repository)
+            if (
+                type(fresh_repository) is not RepositoryMetadata
+                or fresh_repository.full_name != self.central_repository
+                or fresh_repository.default_branch != "main"
+                or fresh_repository.id != classification.evidence.central_repository_database_id
+                or fresh_repository.node_id != classification.evidence.central_repository_node_id
+                or type(fresh_repository.id) is not int
+                or fresh_repository.id <= 0
+                or type(fresh_repository.node_id) is not str
+                or not fresh_repository.node_id
+                or len(fresh_repository.node_id) > 256
+                or c02.contains_control(fresh_repository.node_id)
+            ):
+                raise R02Error("fresh central repository identity does not match legacy evidence")
+            fresh_app = resolve_app_identity(self.client, self.app.slug)
+            if fresh_app != self.app:
+                raise R02Error("fresh App/Bot identity does not match configured exact App")
+            digest = legacy_status_evidence_digest(classification.evidence, trusted_activation_boundary_id)
+            description = render_status_description(StatusClass.LEGACY, digest)
+            if len(description.encode("ascii")) != 81:
+                raise R02Error("canonical legacy status description must be exactly 81 ASCII bytes")
+        except R02Error:
+            raise
+        except Exception as error:
+            raise R02Error(f"fresh legacy failure authority is unavailable: {_bounded_reason(error)}") from None
+
+        receipt = self.client.create_commit_status(
+            fresh_repository.full_name,
+            head_sha,
+            "failure",
+            _EXTERNAL_STATUS_CONTEXT,
+            description,
+            None,
+        )
+        expected_route = f"/repos/{fresh_repository.full_name}/statuses/{head_sha}"
+        if type(receipt) is not StatusWriteReceipt or (
+            receipt.repository != fresh_repository.full_name
+            or receipt.requested_sha != head_sha
+            or receipt.method != "POST"
+            or receipt.route != expected_route
+            or receipt.requested_state != "failure"
+            or receipt.requested_context != _EXTERNAL_STATUS_CONTEXT
+            or receipt.requested_description != description
+            or receipt.requested_target_url is not None
+        ):
+            raise R02Error("legacy failure receipt does not match the exact requested tuple")
+        status = receipt.returned_status
+        if type(status) is not CommitStatus or (
+            status.state != "failure"
+            or status.context != _EXTERNAL_STATUS_CONTEXT
+            or status.description != description
+            or status.target_url is not None
+            or status.creator_database_id != fresh_app.bot_id
+            or status.creator_node_id != fresh_app.bot_node_id
+            or status.creator_login != fresh_app.bot_login
+            or status.creator_type != "Bot"
+        ):
+            raise R02Error("legacy failure response does not match the exact App Bot tuple")
+        return receipt
+
+    def plan_legacy_recovery(
+        self,
+        head_sha: str,
+        *,
+        implementation_reviewed_head_sha: str | None,
+    ) -> LegacyRecoveryDecision:
+        """Return a nonmutating current-evidence recovery decision for exact H."""
+        if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+            raise R02Error("legacy recovery head SHA must be exact lowercase 40-hex")
+        if implementation_reviewed_head_sha is not None and (
+            type(implementation_reviewed_head_sha) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", implementation_reviewed_head_sha) is None
+        ):
+            raise R02Error("implementation reviewed head SHA must be exact lowercase 40-hex")
+        classification = self.classify_legacy_head(
+            head_sha,
+            implementation_reviewed_head_sha=implementation_reviewed_head_sha,
+        )
+        if type(classification) is not LegacyClassificationResult or classification.outcome is not LegacyClassificationOutcome.QUARANTINE:
+            raise R02Error("exact current legacy quarantine evidence is required for recovery planning")
+        try:
+            return legacy_recovery_decision(classification)
+        except RequestModelError as error:
+            raise R02Error(f"legacy recovery planning failed closed: {_bounded_reason(error)}") from None
 
     def _machine_authority(self, summary: Mapping[str, Any], source: c02.SourceDeclaration, current_main: str, repository: RepositoryMetadata) -> MachinePRAuthority | None:
         number = summary.get("number")

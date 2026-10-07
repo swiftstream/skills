@@ -34,6 +34,7 @@ ISSUE_PATCH_PROJECTION_EVIDENCE_PREFIX = "swiftstream-federation-issue-patch-pro
 NORMALIZE_TARGET_EVIDENCE_PREFIX = "swiftstream-federation-issue-head-normalize-target:v1\n"
 PROPOSAL_TARGET_EVIDENCE_PREFIX = "swiftstream-federation-issue-head-proposal-target:v1\n"
 EXTERNAL_STATUS_EVIDENCE_PREFIX = "swiftstream-federation-external-status-evidence:v1\n"
+LEGACY_STATUS_EVIDENCE_PREFIX = "swiftstream-federation-legacy-status-evidence:v1\n"
 REQUIRED_STATUS_EPOCH_MARKER = "<!-- swiftstream-federation-required-status-epoch:v2 -->"
 ISSUE_FINALIZATION_EPOCH_MARKER = "<!-- swiftstream-federation-issue-finalization-epoch:v1 -->"
 REQUIRED_STATUS_EPOCH_AUTHORITY_PREFIX = "swiftstream-federation-required-status-epoch-authority:v1\n"
@@ -1672,6 +1673,101 @@ class LegacyEvidenceDisposition(Enum):
     CONFLICTING = "CONFLICTING"
 
 
+class LegacyQuarantineClass(Enum):
+    MACHINE = "LEGACY_MACHINE"
+    MANUAL = "LEGACY_MANUAL"
+    CHECK_COLLISION = "LEGACY_CHECK_COLLISION"
+
+
+class LegacyClassificationOutcome(Enum):
+    ABSENT = "ABSENT"
+    QUARANTINE = "QUARANTINE"
+    CONFLICTING = "CONFLICTING"
+
+
+@dataclass(frozen=True)
+class LegacyQuarantineEvidence:
+    schema_version: int
+    evidence_class: LegacyQuarantineClass
+    central_repository_database_id: int
+    central_repository_node_id: str
+    central_repository_full_name: str
+    head_sha: str
+    evidence_payload_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("legacy evidence schemaVersion must be exact integer 1")
+        if type(self.evidence_class) is not LegacyQuarantineClass:
+            _fail("legacy evidence class must be a closed LegacyQuarantineClass value")
+        _issue_positive_int(self.central_repository_database_id, "centralRepositoryDatabaseId")
+        _lease_node_id(self.central_repository_node_id, "centralRepositoryNodeId")
+        full_name = _issue_bounded_text(self.central_repository_full_name, "centralRepositoryFullName", 256)
+        try:
+            c02.validate_repository(full_name)
+        except c02.FederationError as error:
+            _fail(str(error))
+        _lease_sha(self.head_sha, "headSha", git=True)
+        _lease_sha(self.evidence_payload_digest, "evidencePayloadDigest")
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": 1,
+            "evidenceClass": self.evidence_class.value,
+            "centralRepositoryDatabaseId": self.central_repository_database_id,
+            "centralRepositoryNodeId": self.central_repository_node_id,
+            "centralRepositoryFullName": self.central_repository_full_name,
+            "headSha": self.head_sha,
+            "evidencePayloadDigest": self.evidence_payload_digest,
+        }
+
+    def render(self) -> str:
+        return _canonical_json(self.as_value())
+
+
+@dataclass(frozen=True)
+class LegacyClassificationResult:
+    outcome: LegacyClassificationOutcome
+    evidence: LegacyQuarantineEvidence | None
+    reason: str
+
+    def __post_init__(self) -> None:
+        if type(self.outcome) is not LegacyClassificationOutcome:
+            _fail("legacy classification outcome must be a closed enum value")
+        if type(self.reason) is not str or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", self.reason):
+            _fail("legacy classification reason must be a bounded uppercase token")
+        if self.outcome is LegacyClassificationOutcome.QUARANTINE:
+            if type(self.evidence) is not LegacyQuarantineEvidence:
+                _fail("quarantine classification requires exact legacy evidence")
+        elif self.evidence is not None:
+            _fail("absent/conflicting classification cannot carry evidence")
+
+
+class LegacyRecoveryAction(Enum):
+    MACHINE_MIGRATION_REQUIRED = "MACHINE_MIGRATION_REQUIRED"
+    MANUAL_BLOCK_REQUIRES_ISSUE_FIRST = "MANUAL_BLOCK_REQUIRES_ISSUE_FIRST"
+    CHECK_COLLISION_REQUIRES_CLEAN_HEAD = "CHECK_COLLISION_REQUIRES_CLEAN_HEAD"
+
+
+@dataclass(frozen=True)
+class LegacyRecoveryDecision:
+    evidence: LegacyQuarantineEvidence
+    action: LegacyRecoveryAction
+
+    def __post_init__(self) -> None:
+        if type(self.evidence) is not LegacyQuarantineEvidence:
+            _fail("legacy recovery decision requires exact quarantine evidence")
+        if type(self.action) is not LegacyRecoveryAction:
+            _fail("legacy recovery action must be a closed enum value")
+        expected = {
+            LegacyQuarantineClass.MACHINE: LegacyRecoveryAction.MACHINE_MIGRATION_REQUIRED,
+            LegacyQuarantineClass.MANUAL: LegacyRecoveryAction.MANUAL_BLOCK_REQUIRES_ISSUE_FIRST,
+            LegacyQuarantineClass.CHECK_COLLISION: LegacyRecoveryAction.CHECK_COLLISION_REQUIRES_CLEAN_HEAD,
+        }[self.evidence.evidence_class]
+        if self.action is not expected:
+            _fail("legacy recovery action does not match evidence class")
+
+
 @dataclass(frozen=True)
 class ShaCarrierResolution:
     """A PR-independent carrier classification for one exact commit SHA."""
@@ -1852,6 +1948,45 @@ def parse_status_description(text: str) -> StatusEvidenceDescription:
 
 def render_status_description(status_class: StatusClass, evidence_digest: str) -> str:
     return StatusEvidenceDescription(status_class, evidence_digest).render()
+
+
+def legacy_status_evidence_digest(
+    evidence: LegacyQuarantineEvidence,
+    activation_boundary_id: str,
+) -> str:
+    if type(evidence) is not LegacyQuarantineEvidence:
+        _fail("legacy status digest requires exact quarantine evidence")
+    boundary = _lease_sha(activation_boundary_id, "activationBoundaryId")
+    value = {
+        "schemaVersion": 1,
+        "activationBoundaryId": boundary,
+        "centralRepositoryDatabaseId": evidence.central_repository_database_id,
+        "centralRepositoryNodeId": evidence.central_repository_node_id,
+        "centralRepositoryFullName": evidence.central_repository_full_name,
+        "headSha": evidence.head_sha,
+        "evidenceClass": evidence.evidence_class.value,
+        "evidencePayloadDigest": evidence.evidence_payload_digest,
+    }
+    return hashlib.sha256(
+        LEGACY_STATUS_EVIDENCE_PREFIX.encode("utf-8")
+        + _canonical_json(value).encode("utf-8")
+    ).hexdigest()
+
+
+def legacy_recovery_decision(
+    classification: LegacyClassificationResult,
+) -> LegacyRecoveryDecision:
+    if type(classification) is not LegacyClassificationResult:
+        _fail("legacy recovery requires an exact classification result")
+    if classification.outcome is not LegacyClassificationOutcome.QUARANTINE:
+        _fail("legacy recovery requires exact quarantine classification")
+    assert classification.evidence is not None
+    action = {
+        LegacyQuarantineClass.MACHINE: LegacyRecoveryAction.MACHINE_MIGRATION_REQUIRED,
+        LegacyQuarantineClass.MANUAL: LegacyRecoveryAction.MANUAL_BLOCK_REQUIRES_ISSUE_FIRST,
+        LegacyQuarantineClass.CHECK_COLLISION: LegacyRecoveryAction.CHECK_COLLISION_REQUIRES_CLEAN_HEAD,
+    }[classification.evidence.evidence_class]
+    return LegacyRecoveryDecision(classification.evidence, action)
 
 
 def external_status_evidence_digest(
