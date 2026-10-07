@@ -2232,6 +2232,78 @@ class GitHubClient:
     def list_open_pull_requests(self, repository: str, *, max_pages: int = 100) -> tuple[dict[str, Any], ...]:
         return self.list_pull_requests(repository, state="open", max_pages=max_pages)
 
+    def list_repository_issues(
+        self, repository: str, *, state: str = "open", max_pages: int = 100,
+    ) -> tuple[dict[str, int], ...]:
+        """Enumerate bounded Issue-number discovery hints, excluding PR rows."""
+        if type(state) is not str or state not in {"open", "closed", "all"}:
+            raise GitHubAPIError("Issue state must be open, closed, or all")
+        if type(max_pages) is not int or not 1 <= max_pages <= 100:
+            raise GitHubAPIError("Issue max_pages must be an exact integer from 1 to 100")
+        owner, name = self._owner_repo(repository)
+        numbers: set[int] = set()
+        for page in range(1, max_pages + 1):
+            value = self._request(
+                "GET",
+                f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/issues?state={state}&per_page=100&page={page}",
+            )
+            if type(value) is not list or len(value) > 100 or any(type(item) is not dict for item in value):
+                raise InvalidResponseError("Issue enumeration is malformed")
+            for item in value:
+                # GitHub's Issues endpoint deliberately includes pull requests.
+                # Their number must not enter the Issue authority inventory.
+                if "pull_request" in item:
+                    continue
+                number = _positive_id(item.get("number"), "Issue.number")
+                if number in numbers:
+                    raise InvalidResponseError("Issue enumeration contains duplicate Issue numbers")
+                numbers.add(number)
+            if len(value) < 100:
+                return tuple({"number": number} for number in sorted(numbers))
+        raise InvalidResponseError("Issue enumeration reached bounded pagination exhaustion")
+
+    def list_machine_refs(self, repository: str, *, max_pages: int = 100) -> tuple[dict[str, str], ...]:
+        """Enumerate canonical machine publication refs; namespace is discovery only."""
+        if type(max_pages) is not int or not 1 <= max_pages <= 100:
+            raise GitHubAPIError("machine-ref max_pages must be an exact integer from 1 to 100")
+        owner, name = self._owner_repo(repository)
+        prefix = "refs/heads/bot/federation/"
+        refs: dict[str, dict[str, str]] = {}
+        source_ids: set[str] = set()
+        for page in range(1, max_pages + 1):
+            value = self._request(
+                "GET",
+                f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/git/matching-refs/heads/bot/federation?per_page=100&page={page}",
+            )
+            if type(value) is not list or len(value) > 100 or any(type(item) is not dict for item in value):
+                raise InvalidResponseError("machine-ref enumeration is malformed")
+            for item in value:
+                ref = item.get("ref")
+                if type(ref) is not str or not ref.startswith(prefix):
+                    raise InvalidResponseError("machine-ref row has a malformed ref name")
+                suffix = ref[len(prefix):]
+                target = item.get("object")
+                if type(target) is not dict:
+                    raise InvalidResponseError("machine-ref target object is malformed")
+                if "type" in target and target["type"] != "commit":
+                    raise InvalidResponseError("machine-ref target is not a commit")
+                sha = self._sha(target.get("sha"), "machine-ref object.sha")
+                # Matching refs also returns nested Issue/request refs. Validate
+                # their endpoint shape, then keep them outside this inventory.
+                if not suffix or "/" in suffix:
+                    continue
+                try:
+                    source_id = c02.validate_source_id(suffix)
+                except c02.FederationError:
+                    raise InvalidResponseError("machine-ref sourceId is not canonical") from None
+                if ref in refs or source_id in source_ids:
+                    raise InvalidResponseError("machine-ref enumeration contains duplicate ref/sourceId")
+                refs[ref] = {"ref": ref, "source_id": source_id, "sha": sha}
+                source_ids.add(source_id)
+            if len(value) < 100:
+                return tuple(refs[key] for key in sorted(refs, key=lambda ref: (refs[ref]["source_id"], ref)))
+        raise InvalidResponseError("machine-ref enumeration reached bounded pagination exhaustion")
+
     def create_machine_pull_request(self, repository: str, *, head: str, base: str, title: str, body: str) -> int:
         """Create a bounded machine PR; branch and base are data, never URL/query syntax."""
         owner, name = self._owner_repo(repository)

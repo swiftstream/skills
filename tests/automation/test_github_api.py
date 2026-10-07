@@ -1579,6 +1579,193 @@ class GitHubAPITests(unittest.TestCase):
             with self.subTest(malformed=malformed), self.assertRaises(GitHubAPIError):
                 GitHubClient(None, transport).list_pull_requests("swiftstream/skills", max_pages=1)
 
+    def test_bounded_repository_issue_inventory_filters_pull_requests_and_uses_fixed_pages(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, body))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        for state in ("open", "closed", "all"):
+            transport = PageTransport({1: [
+                {"number": 9, "pull_request": {"url": "ignored"}},
+                {"number": 8, "title": "discovery only"},
+                {"number": 2, "body": "not returned"},
+            ]})
+            result = GitHubClient(None, transport).list_repository_issues(
+                "swiftstream/skills", state=state,
+            )
+            self.assertEqual(result, ({"number": 2}, {"number": 8}))
+            self.assertEqual(transport.calls, [(
+                "GET",
+                f"{REST_BASE_URL}/repos/swiftstream/skills/issues?state={state}&per_page=100&page=1",
+                None,
+            )])
+
+        first = [{"number": number} for number in range(100, 0, -1)]
+        transport = PageTransport({1: first, 2: [{"number": 102}, {"number": 101}]})
+        result = GitHubClient(None, transport).list_repository_issues(
+            "swiftstream/skills", state="closed", max_pages=2,
+        )
+        self.assertEqual([item["number"] for item in result], list(range(1, 103)))
+        self.assertEqual(len(transport.calls), 2)
+        self.assertIn("state=closed&per_page=100&page=2", transport.calls[1][1])
+        self.assertTrue(all(call[0] == "GET" and call[2] is None for call in transport.calls))
+
+    def test_bounded_repository_issue_inventory_rejects_invalid_pages_duplicates_and_exhaustion(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, body))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        for state, max_pages, repository in (
+            ("unknown", 1, "swiftstream/skills"),
+            ("open", 0, "swiftstream/skills"),
+            ("open", True, "swiftstream/skills"),
+            ("open", 101, "swiftstream/skills"),
+        ):
+            transport = PageTransport({1: []})
+            with self.subTest(state=state, max_pages=max_pages, repository=repository), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).list_repository_issues(repository, state=state, max_pages=max_pages)
+            self.assertEqual(transport.calls, [])
+
+        transport = PageTransport({1: []})
+        GitHubClient(None, transport).list_repository_issues("swiftstream/skills?state=all", state="open")
+        self.assertEqual(
+            transport.calls[0][1].split("/issues?", 1)[1],
+            "state=open&per_page=100&page=1",
+        )
+        self.assertIn("/repos/swiftstream/skills%253Fstate%253Dall/issues?", transport.calls[0][1])
+        self.assertEqual((transport.calls[0][0], transport.calls[0][2]), ("GET", None))
+
+        for malformed in (None, {}, [None], [{"number": True}], [{"number": 0}], [{"number": "7"}], [{}], [{"number": 2}, {"number": 2}], [
+            {"number": number} for number in range(101)
+        ]):
+            transport = PageTransport({1: malformed})
+            with self.subTest(malformed=malformed), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, transport).list_repository_issues(
+                    "swiftstream/skills", max_pages=1,
+                )
+
+        transport = PageTransport({1: [{"number": number} for number in range(1, 101)]})
+        with self.assertRaisesRegex(InvalidResponseError, "bounded pagination exhaustion"):
+            GitHubClient(None, transport).list_repository_issues("swiftstream/skills", max_pages=1)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_bounded_machine_ref_inventory_is_exact_paginated_and_keeps_orphans(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, body))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        prefix = "refs/heads/bot/federation/"
+        def row(source_id, sha, *, ref=None, target_type="commit"):
+            return {
+                "ref": ref or prefix + source_id,
+                "object": {"sha": sha, "type": target_type},
+            }
+
+        transport = PageTransport({
+            1: [
+                row("zeta", "b" * 40),
+                row("request", "c" * 40, ref=prefix + "request/issue-7"),
+                row("alpha-one", "a" * 40),
+            ],
+        })
+        result = GitHubClient(None, transport).list_machine_refs("swiftstream/skills")
+        self.assertEqual(result, (
+            {"ref": prefix + "alpha-one", "source_id": "alpha-one", "sha": "a" * 40},
+            {"ref": prefix + "zeta", "source_id": "zeta", "sha": "b" * 40},
+        ))
+        self.assertEqual(transport.calls, [(
+            "GET",
+            f"{REST_BASE_URL}/repos/swiftstream/skills/git/matching-refs/heads/bot/federation?per_page=100&page=1",
+            None,
+        )])
+        # An orphaned ref remains visible even when there is no registry input.
+        self.assertEqual(result[1]["source_id"], "zeta")
+
+        full = [row(f"source-{number:03d}", f"{number:040x}") for number in range(100)]
+        transport = PageTransport({1: full, 2: [row("orphan", "f" * 40)]})
+        paged = GitHubClient(None, transport).list_machine_refs("swiftstream/skills", max_pages=2)
+        self.assertEqual(len(paged), 101)
+        self.assertIn("orphan", {item["source_id"] for item in paged})
+        self.assertEqual(len(transport.calls), 2)
+        self.assertIn("page=2", transport.calls[1][1])
+        self.assertTrue(all(call[0] == "GET" and call[2] is None for call in transport.calls))
+
+    def test_bounded_machine_ref_inventory_rejects_malformed_rows_duplicates_and_exhaustion(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, body))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        prefix = "refs/heads/bot/federation/"
+        good = {"ref": prefix + "source", "object": {"sha": "a" * 40, "type": "commit"}}
+        for max_pages, repository in (
+            (0, "swiftstream/skills"), (True, "swiftstream/skills"),
+            (101, "swiftstream/skills"),
+        ):
+            transport = PageTransport({1: []})
+            with self.subTest(max_pages=max_pages, repository=repository), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).list_machine_refs(repository, max_pages=max_pages)
+            self.assertEqual(transport.calls, [])
+
+        transport = PageTransport({1: []})
+        GitHubClient(None, transport).list_machine_refs("swiftstream/skills?x=y")
+        self.assertEqual(
+            transport.calls[0][1].split("/git/matching-refs/", 1)[1],
+            "heads/bot/federation?per_page=100&page=1",
+        )
+        self.assertIn("/repos/swiftstream/skills%253Fx%253Dy/git/", transport.calls[0][1])
+        self.assertEqual((transport.calls[0][0], transport.calls[0][2]), ("GET", None))
+
+        malformed_pages = (
+            None, {}, [None], [{"ref": "refs/heads/bot/other/source", "object": {"sha": "a" * 40}}],
+            [{"ref": prefix + "request/issue-7", "object": None}],
+            [{"ref": 4, "object": {"sha": "a" * 40}}],
+            [{"ref": prefix + "Bad", "object": {"sha": "a" * 40}}],
+            [{"ref": prefix + "source", "object": None}],
+            [{"ref": prefix + "source", "object": {"type": "commit"}}],
+            [{"ref": prefix + "source", "object": {"sha": "A" * 40}}],
+            [{"ref": prefix + "source", "object": {"sha": "a" * 40, "type": "tree"}}],
+            [good, good],
+            [{"ref": prefix + "source", "object": {"sha": "a" * 40}},
+             {"ref": prefix + "source", "object": {"sha": "b" * 40}}],
+            [{"ref": prefix + f"source-{number:03d}", "object": {"sha": f"{number:040x}"}} for number in range(101)],
+        )
+        for malformed in malformed_pages:
+            transport = PageTransport({1: malformed})
+            with self.subTest(malformed=malformed), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, transport).list_machine_refs("swiftstream/skills", max_pages=1)
+
+        transport = PageTransport({1: [
+            {"ref": prefix + f"source-{number:03d}", "object": {"sha": f"{number:040x}"}}
+            for number in range(100)
+        ]})
+        with self.assertRaisesRegex(InvalidResponseError, "bounded pagination exhaustion"):
+            GitHubClient(None, transport).list_machine_refs("swiftstream/skills", max_pages=1)
+        self.assertEqual(len(transport.calls), 1)
+
     def test_issue_pull_request_creation_preserves_canonical_multiline_body_and_draft_false(self):
         request = parse_request_body(
             RequestClass.ADD,

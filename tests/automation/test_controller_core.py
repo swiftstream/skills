@@ -22,6 +22,7 @@ from automation.federation.controller import (
     IssueSourceIdentityKind,
     PhaseNotImplementedError,
     PublicSourceMetadata,
+    R02Controller,
     R01Controller,
     R02Error,
     StaleAuthorityError,
@@ -3714,8 +3715,8 @@ class Wave05ShaCarrierResolverTests(unittest.TestCase):
 
         collector = FalseLifecycleCallCollector()
         collector.visit(module_ast)
-        self.assertEqual(len(collector.call_owners), 2)
-        self.assertEqual(set(collector.call_owners), {"resolve_sha_carrier_role"})
+        self.assertEqual(len(collector.call_owners), 3)
+        self.assertEqual(set(collector.call_owners), {"resolve_sha_carrier_role", "derive_issue_owner_pr"})
 
     def test_reserved_namespace_versions_and_malformed_markers_never_consult_legacy(self):
         valid = self.marker().render()
@@ -6546,6 +6547,1407 @@ class Wave07CancellationControllerTests(unittest.TestCase):
                 state = controller._read_issue_cancellation_state(issue.number)
                 if state.issue.state == "closed":
                     controller.cancel_issue_without_pr(issue.number)
+
+
+class Wave08RoleDecisionContractTests(unittest.TestCase):
+    HEAD = "a" * 40
+
+    @staticmethod
+    def marker(role, claim_kind, *, owner_kind="ISSUE", owner_key="R_central:700:I_issue:7"):
+        return ClaimedHeadMarker(
+            claim_kind=claim_kind, role=role.value, owner_kind=owner_kind, owner_key=owner_key,
+            claim_generation_id="1" * 64, carrier_nonce="2" * 64, transition_kind="INITIAL",
+        )
+
+    def test_closed_decision_mapping_covers_issue_machine_external_and_fail_closed_roles(self):
+        decide = controller_module.wave08_decision_for_resolution
+        kind = controller_module.Wave08DecisionKind
+        target = controller_module.Wave08DispatchTarget
+        issue_active = ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE,
+            self.marker(CarrierRole.ISSUE_ACTIVE, "ISSUE_HEAD_CLAIM"),
+        )
+        finalizing = ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_FINALIZING,
+            self.marker(CarrierRole.ISSUE_FINALIZING, "ISSUE_FINALIZATION_EPOCH"),
+        )
+        cancelling = ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL,
+            self.marker(CarrierRole.ISSUE_CANCEL, "ISSUE_CANCELLATION_FENCE"),
+        )
+        machine = ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION,
+            self.marker(CarrierRole.MACHINE_PUBLICATION, "MACHINE_REF_CLAIM", owner_kind="MACHINE_SOURCE", owner_key="orphan-source"),
+        )
+        for resolution in (issue_active, finalizing):
+            with self.subTest(role=resolution.role):
+                action = decide(self.HEAD, resolution, (12, 7), owner_pr_number=7)
+                self.assertEqual(action.kind, kind.ISSUE_OWNER_FINALIZER_RECOVERY)
+                self.assertEqual(action.dispatch_target, target.ISSUE_FINALIZER)
+                self.assertEqual(action.pull_request_numbers, (7, 12))
+                self.assertEqual(action.owning_pr_number, 7)
+        action = decide(self.HEAD, cancelling, (7,), owner_pr_number=7)
+        self.assertEqual(action.kind, kind.ISSUE_OWNER_CANCELLATION_RECOVERY)
+        self.assertEqual(action.dispatch_target, target.ISSUE_CANCELLATION_RECOVERY)
+        for lane, expected in (
+            (target.MACHINE_VALIDATION, kind.MACHINE_VALIDATION_DISPATCH),
+            (target.MACHINE_FINALIZER, kind.MACHINE_FINALIZER_DISPATCH),
+        ):
+            action = decide(self.HEAD, machine, (7, 12), owner_pr_number=7, machine_target=lane)
+            self.assertEqual((action.kind, action.dispatch_target), (expected, lane))
+
+        reserved_issue = ShaCarrierResolution(CarrierActivation.RESERVED_INACTIVE, CarrierRole.ISSUE_ACTIVE, issue_active.marker)
+        self.assertEqual(decide(self.HEAD, reserved_issue, (7,), owner_pr_number=7).kind, kind.RESERVED_OWNER_RECOVERY)
+        reserved_machine = ShaCarrierResolution(CarrierActivation.RESERVED_INACTIVE, CarrierRole.MACHINE_PUBLICATION, machine.marker)
+        self.assertEqual(decide(self.HEAD, reserved_machine, (7,), owner_pr_number=7).kind, kind.MACHINE_RECOVERY_DEFERRED)
+        self.assertEqual(decide(self.HEAD, ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION), (12, 7)).kind, kind.EXTERNAL_STATUS)
+        self.assertEqual(decide(self.HEAD, ShaCarrierResolution(CarrierActivation.LEGACY_CUTOVER_QUARANTINE), (7,)).kind, kind.LEGACY_QUARANTINE_DEFERRED)
+        self.assertEqual(decide(self.HEAD, ShaCarrierResolution(CarrierActivation.CONFLICTING), (7,)).kind, kind.CONFLICTING_BLOCKED)
+        self.assertEqual(decide(self.HEAD, issue_active, (7,)).kind, kind.NO_MUTATION)
+
+    def test_decision_record_rejects_open_vocabulary_bad_groups_and_role_action_mismatch(self):
+        kind = controller_module.Wave08DecisionKind
+        target = controller_module.Wave08DispatchTarget
+        decide = controller_module.wave08_decision_for_resolution
+        unclaimed = ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+        issue = ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE,
+            self.marker(CarrierRole.ISSUE_ACTIVE, "ISSUE_HEAD_CLAIM"),
+        )
+        machine = ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION,
+            self.marker(CarrierRole.MACHINE_PUBLICATION, "MACHINE_REF_CLAIM", owner_kind="MACHINE_SOURCE", owner_key="source"),
+        )
+        for numbers in ((7, 7), (True,), (0,), (-1,)):
+            with self.subTest(numbers=numbers), self.assertRaises(ValueError):
+                decide(self.HEAD, unclaimed, numbers)
+        for args in (
+            ("A" * 40, unclaimed, ()),
+            (self.HEAD, unclaimed, (7,), 8),
+        ):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                if len(args) == 3:
+                    decide(*args)
+                else:
+                    decide(args[0], args[1], args[2], owner_pr_number=args[3])
+        with self.assertRaises(ValueError):
+            decide(self.HEAD, issue, (7,), owner_pr_number=7, machine_target=target.MACHINE_FINALIZER)
+        with self.assertRaises(ValueError):
+            controller_module.Wave08Decision(
+                self.HEAD, unclaimed, (), None, kind.ISSUE_OWNER_FINALIZER_RECOVERY,
+                controller_module.Wave08DecisionReason.ISSUE_FINALIZER_REQUIRED, target.ISSUE_FINALIZER,
+            )
+        with self.assertRaises(ValueError):
+            controller_module.Wave08Decision(
+                self.HEAD, machine, (7,), 7, kind.ISSUE_OWNER_FINALIZER_RECOVERY,
+                controller_module.Wave08DecisionReason.ISSUE_FINALIZER_REQUIRED, target.ISSUE_FINALIZER,
+            )
+        with self.assertRaises(ValueError):
+            decide(self.HEAD, machine, (7,), owner_pr_number=7, machine_target="workflow.yml")
+        with self.assertRaises(ValueError):
+            controller_module.Wave08Decision(
+                self.HEAD, unclaimed, (7,), None, "UNKNOWN_ACTION",
+                controller_module.Wave08DecisionReason.ROLE_REQUIRES_NO_ACTION,
+            )
+        action = decide(self.HEAD, unclaimed, (7,))
+        with self.assertRaises((AttributeError, TypeError)):
+            action.kind = kind.NO_MUTATION
+
+    def test_permission_profiles_are_closed_immutable_and_exact(self):
+        level = controller_module.Wave08PermissionLevel
+        lane = controller_module.Wave08PermissionLane
+        expected = {
+            lane.WG3_MANUAL_STATUS: {"actions": "write", "statuses": "write", "contents": "read", "pull_requests": "read", "issues": "read", "checks": "none"},
+            lane.WG3_MACHINE_VALIDATION: {"actions": "write", "statuses": "none", "contents": "read", "pull_requests": "read", "issues": "read", "checks": "write"},
+            lane.WG4_ISSUE_MANUAL_FINALIZER: {"actions": "write", "statuses": "write", "contents": "write", "pull_requests": "write", "issues": "read", "checks": "none"},
+            lane.WG4_MACHINE_FINALIZER: {"actions": "write", "statuses": "none", "contents": "write", "pull_requests": "write", "issues": "read", "checks": "write"},
+            lane.WG6_ORDINARY_RECOVERY: {"actions": "write", "statuses": "write", "contents": "write", "pull_requests": "write", "issues": "read", "checks": "none"},
+        }
+        profiles = {item.lane: dict(item.as_pairs()) for item in controller_module.WAVE08_PERMISSION_PROFILES}
+        self.assertEqual(profiles, expected)
+        self.assertEqual(set(profiles), set(lane))
+        self.assertTrue(all(set(value) == set(next(iter(expected.values()))) for value in profiles.values()))
+        self.assertEqual((level.NONE.value, level.READ.value, level.WRITE.value), ("none", "read", "write"))
+        for profile in controller_module.WAVE08_PERMISSION_PROFILES:
+            with self.subTest(lane=profile.lane), self.assertRaises((AttributeError, TypeError)):
+                profile.checks = level.WRITE
+        with self.assertRaises(TypeError):
+            controller_module.Wave08PermissionProfile(
+                lane.WG3_MANUAL_STATUS, actions=level.WRITE, statuses=level.WRITE,
+                contents=level.READ, pull_requests=level.READ, issues=level.READ,
+                checks=level.NONE, admin=level.WRITE,
+            )
+        with self.assertRaises(ValueError):
+            controller_module.Wave08PermissionProfile(
+                lane.WG3_MANUAL_STATUS, actions=level.WRITE, statuses=level.WRITE,
+                contents=level.READ, pull_requests=level.READ, issues=level.READ,
+                checks="none",
+            )
+
+    def test_legacy_disposition_adapter_receives_exact_sha_and_fails_closed(self):
+        adapter = controller_module.wave08_legacy_disposition
+        reads = []
+        self.assertEqual(adapter(self.HEAD, lambda head: reads.append(head) or LegacyEvidenceDisposition.ABSENT), LegacyEvidenceDisposition.ABSENT)
+        self.assertEqual(reads, [self.HEAD])
+        self.assertEqual(adapter(self.HEAD, None), LegacyEvidenceDisposition.CONFLICTING)
+        self.assertEqual(adapter(self.HEAD, lambda _head: "ABSENT"), LegacyEvidenceDisposition.CONFLICTING)
+        self.assertEqual(adapter(self.HEAD, lambda _head: (_ for _ in ()).throw(RuntimeError("offline"))), LegacyEvidenceDisposition.CONFLICTING)
+        self.assertEqual(adapter("A" * 40, lambda _head: LegacyEvidenceDisposition.ABSENT), LegacyEvidenceDisposition.CONFLICTING)
+
+    def test_issue_owner_derivation_uses_exact_full_binding_and_prebinding_fence_pr(self):
+        client, _issue, _anchor, _lease, state, claim = Wave05ShaCarrierResolverTests().make_claim_client()
+        initial_comment_writes = tuple(client.comment_writes)
+        resolution = Wave05ShaCarrierResolverTests.resolve(client, claim.to_head_sha)
+        owner = controller_module.derive_issue_owner_pr(
+            client, Wave05ShaCarrierResolverTests.CENTRAL, claim.to_head_sha,
+            resolution, Wave05ShaCarrierResolverTests.APP.slug,
+        )
+        self.assertEqual(owner.issue_number, state.binding.issue_number)
+        self.assertEqual(owner.pull_request_number, state.binding.pull_request_number)
+        self.assertEqual(owner.owner_key, resolution.marker.owner_key)
+        self.assertEqual(owner.binding_authority, "FULL_BINDING")
+        self.assertEqual(tuple(client.comment_writes), initial_comment_writes)
+        self.assertEqual(client.forbidden_calls, [])
+        self.assertEqual(client.pr_inventory_reads, 0)
+
+        pre_client, pre_issue, _anchor, _lease, _state, _controller, fence = Wave07CancellationControllerTests()._prepare(binding="PRE_BINDING")
+        initial_prebinding_comment_writes = tuple(pre_client.comment_writes)
+        cancel_resolution = Wave05ShaCarrierResolverTests.resolve(pre_client, fence.cancellation_head_sha)
+        pre_owner = controller_module.derive_issue_owner_pr(
+            pre_client, Wave05ShaCarrierResolverTests.CENTRAL, fence.cancellation_head_sha,
+            cancel_resolution, Wave05ShaCarrierResolverTests.APP.slug,
+        )
+        self.assertEqual((pre_owner.issue_number, pre_owner.pull_request_number), (pre_issue.number, fence.pull_request_number))
+        self.assertEqual(pre_owner.binding_authority, "PRE_BINDING")
+        self.assertEqual(tuple(pre_client.comment_writes), initial_prebinding_comment_writes)
+        self.assertEqual(pre_client.forbidden_calls, [])
+
+        full_client, full_issue, _anchor, _lease, full_state, _controller, full_fence = (
+            Wave07CancellationControllerTests()._prepare(binding="FULL_BINDING")
+        )
+        full_resolution = Wave05ShaCarrierResolverTests.resolve(full_client, full_fence.cancellation_head_sha)
+        full_owner = controller_module.derive_issue_owner_pr(
+            full_client, Wave05ShaCarrierResolverTests.CENTRAL, full_fence.cancellation_head_sha,
+            full_resolution, Wave05ShaCarrierResolverTests.APP.slug,
+        )
+        self.assertEqual((full_owner.issue_number, full_owner.pull_request_number), (full_issue.number, full_state.binding.pull_request_number))
+        self.assertEqual(full_owner.binding_authority, "FULL_BINDING")
+
+    def test_issue_owner_derivation_fails_closed_on_repository_issue_and_binding_drift(self):
+        for corruption in ("owner", "repository", "issue", "binding"):
+            with self.subTest(corruption=corruption):
+                client, issue, _anchor, _lease, state, claim = Wave05ShaCarrierResolverTests().make_claim_client()
+                resolution = Wave05ShaCarrierResolverTests.resolve(client, claim.to_head_sha)
+                if corruption == "owner":
+                    resolution = replace(
+                        resolution,
+                        marker=replace(resolution.marker, owner_key="R_central:701:I_other:8"),
+                    )
+                elif corruption == "repository":
+                    client.repository = replace(client.repository, node_id="R_wrong")
+                elif corruption == "issue":
+                    client.issue = replace(issue, database_id=issue.database_id + 1)
+                else:
+                    comments = client.pr_comments[state.binding.pull_request_number]
+                    comments[0] = replace(comments[0], body="edited binding")
+                with self.assertRaises((R02Error, StaleAuthorityError)):
+                    controller_module.derive_issue_owner_pr(
+                        client, Wave05ShaCarrierResolverTests.CENTRAL, claim.to_head_sha,
+                        resolution, Wave05ShaCarrierResolverTests.APP.slug,
+                    )
+
+    def test_real_machine_marker_resolver_remains_fail_closed_without_legacy_fallback(self):
+        marker = self.marker(
+            CarrierRole.MACHINE_PUBLICATION, "MACHINE_REF_CLAIM",
+            owner_kind="MACHINE_SOURCE", owner_key="orphan-source",
+        )
+        legacy_reads = []
+        client = Wave05ShaCarrierResolverTests.commit_message_client(self.HEAD, marker.render())
+        resolution = resolve_sha_carrier_role(
+            client, Wave05ShaCarrierResolverTests.CENTRAL, self.HEAD,
+            Wave05ShaCarrierResolverTests.APP.slug,
+            lambda: legacy_reads.append(self.HEAD) or LegacyEvidenceDisposition.ABSENT,
+        )
+        self.assertEqual(resolution.activation, CarrierActivation.CONFLICTING)
+        self.assertEqual(legacy_reads, [])
+        decision = controller_module.wave08_decision_for_resolution(self.HEAD, resolution, (7,))
+        self.assertEqual(decision.kind, controller_module.Wave08DecisionKind.CONFLICTING_BLOCKED)
+        self.assertEqual(client.reads, [(Wave05ShaCarrierResolverTests.CENTRAL, self.HEAD)])
+
+
+class Wave08RoleFirstRouteTests(unittest.TestCase):
+    CENTRAL = Wave05ShaCarrierResolverTests.CENTRAL
+    APP = Wave05ShaCarrierResolverTests.APP
+    HEAD = "a" * 40
+
+    @staticmethod
+    def controller(client):
+        return R02Controller(client, Wave08RoleFirstRouteTests.CENTRAL, Wave08RoleFirstRouteTests.APP)
+
+    @staticmethod
+    def active_issue_fixture():
+        client, _issue, _anchor, _lease, state, claim = Wave05ShaCarrierResolverTests().make_claim_client()
+        return client, state, claim, Wave08RoleFirstRouteTests.controller(client)
+
+    @staticmethod
+    def install_forbidden_mutation_spies(client):
+        calls = []
+        for name in (
+            "create_check_run", "update_check_run", "update_refs", "update_pull_request_state",
+            "create_issue_comment", "create_machine_pull_request", "create_pull_request",
+            "merge_machine_pull_request", "close_pull_request",
+        ):
+            if hasattr(client, name):
+                def forbidden(*args, _name=name, **kwargs):
+                    calls.append((_name, args, kwargs))
+                    raise AssertionError(f"role-first route unexpectedly called {_name}")
+                setattr(client, name, forbidden)
+        return calls
+
+    def test_issue_active_owner_routes_after_sha_resolution_without_status_or_checks(self):
+        client, state, claim, route = self.active_issue_fixture()
+        initial_writes = tuple(client.comment_writes)
+        mutation_calls = self.install_forbidden_mutation_spies(client)
+        events = []
+        file_reads = []
+        original_pr = client.get_pull_request_metadata
+        original_comments = client.list_issue_comments
+        original_resolver = controller_module.resolve_sha_carrier_role
+
+        def get_pr(repository, number):
+            events.append(("pr", number))
+            return original_pr(repository, number)
+
+        def comments(repository, number):
+            events.append(("comments", number))
+            return original_comments(repository, number)
+
+        def resolve(*args, **kwargs):
+            events.append(("role", args[2]))
+            return original_resolver(*args, **kwargs)
+
+        dispatches = []
+
+        def dispatch(decision, owner, fence):
+            events.append(("dispatch", decision.dispatch_target))
+            dispatches.append((decision, owner, fence))
+
+        client.get_pull_request_metadata = get_pr
+        client.list_issue_comments = comments
+        client.list_pull_request_files = lambda *_args, **_kwargs: file_reads.append("unexpected")
+        with patch.object(controller_module, "resolve_sha_carrier_role", side_effect=resolve):
+            result = route.trusted_validation_role_first(
+                state.binding.pull_request_number,
+                lambda head: LegacyEvidenceDisposition.ABSENT,
+                central_recovery_dispatcher=dispatch,
+            )
+
+        self.assertEqual(result.kind, controller_module.Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY)
+        self.assertEqual(result.dispatch_target, controller_module.Wave08DispatchTarget.ISSUE_FINALIZER)
+        self.assertEqual(result.owning_pr_number, state.binding.pull_request_number)
+        self.assertEqual(len(dispatches), 1)
+        self.assertEqual(dispatches[0][1].pull_request_number, state.binding.pull_request_number)
+        self.assertIsNone(dispatches[0][2])
+        self.assertLess(events.index(("pr", state.binding.pull_request_number)), events.index(("role", claim.to_head_sha)))
+        self.assertLess(events.index(("role", claim.to_head_sha)), next(i for i, item in enumerate(events) if item[0] == "comments"))
+        self.assertEqual(tuple(client.comment_writes), initial_writes)
+        self.assertEqual(mutation_calls, [])
+        self.assertEqual(file_reads, [])
+        self.assertEqual(client.status_calls if hasattr(client, "status_calls") else [], [])
+        self.assertEqual(client.check_calls if hasattr(client, "check_calls") else [], [])
+
+    def test_issue_active_shared_head_nonowner_is_no_mutation_even_when_woken(self):
+        client, state, claim, route = self.active_issue_fixture()
+        owner_number = state.binding.pull_request_number
+        nonowner_number = owner_number + 100
+        client.pull_requests[nonowner_number] = replace(client.pull_requests[owner_number], number=nonowner_number)
+        initial_writes = tuple(client.comment_writes)
+        mutation_calls = self.install_forbidden_mutation_spies(client)
+        dispatches = []
+        result = route.trusted_validation_role_first(
+            nonowner_number,
+            lambda head: LegacyEvidenceDisposition.ABSENT,
+            central_recovery_dispatcher=lambda *args: dispatches.append(args),
+        )
+        self.assertEqual(result.kind, controller_module.Wave08DecisionKind.NO_MUTATION)
+        self.assertIsNone(result.owning_pr_number)
+        self.assertEqual(result.pull_request_numbers, (nonowner_number,))
+        self.assertEqual(dispatches, [])
+        self.assertEqual(tuple(client.comment_writes), initial_writes)
+        self.assertEqual(mutation_calls, [])
+        self.assertEqual(client.status_calls if hasattr(client, "status_calls") else [], [])
+        self.assertEqual(client.check_calls if hasattr(client, "check_calls") else [], [])
+        self.assertEqual(
+            client.pull_requests[nonowner_number].head_oid,
+            client.pull_requests[owner_number].head_oid,
+        )
+
+    def test_finalizing_role_uses_only_issue_finalizer_dispatch_and_never_direct_green(self):
+        client, issue, _anchor, _lease, state, _claim, _immediate, epoch = (
+            Wave05ShaCarrierResolverTests().make_finalization_epoch_client()
+        )
+        route = self.controller(client)
+        initial_statuses = tuple(getattr(client, "status_calls", ()))
+        dispatches = []
+        result = route.trusted_validation_role_first(
+            state.binding.pull_request_number,
+            None,
+            central_recovery_dispatcher=lambda *args: dispatches.append(args),
+        )
+        self.assertEqual(result.resolution.role, CarrierRole.ISSUE_FINALIZING)
+        self.assertEqual(result.kind, controller_module.Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY)
+        self.assertEqual(result.dispatch_target, controller_module.Wave08DispatchTarget.ISSUE_FINALIZER)
+        self.assertEqual(len(dispatches), 1)
+        self.assertEqual(dispatches[0][1].issue_number, issue.number)
+        self.assertEqual(tuple(getattr(client, "status_calls", ())), initial_statuses)
+        self.assertEqual(getattr(client, "check_calls", []), [])
+        self.assertNotEqual(epoch.final_head_sha, "0" * 40)
+
+    def test_cancellation_owner_writes_exact_failure_then_dispatches_terminal_recovery(self):
+        client, issue, _anchor, _lease, state, _controller, fence = (
+            Wave07CancellationControllerTests()._prepare(binding="FULL_BINDING")
+        )
+        route = self.controller(client)
+        prior_stages = tuple(client.stage_calls)
+        prior_ref = client.current_ref
+        order = []
+
+        def dispatch(decision, owner, exact_fence):
+            order.append(("dispatch", len(client.status_posts)))
+            self.assertEqual(decision.dispatch_target, controller_module.Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY)
+            self.assertEqual(owner.pull_request_number, fence.pull_request_number)
+            self.assertEqual(exact_fence, fence)
+
+        result = route.trusted_validation_role_first(
+            fence.pull_request_number,
+            None,
+            central_recovery_dispatcher=dispatch,
+        )
+        self.assertEqual(result.kind, controller_module.Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY)
+        self.assertEqual(result.dispatch_target, controller_module.Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY)
+        self.assertEqual(len(client.status_posts), 1)
+        expected_cancel_description = render_status_description(
+            StatusClass.CANCEL,
+            cancel_status_evidence_digest(
+                central_repository_node_id=fence.central_repository_node_id,
+                issue_number=fence.issue_number,
+                issue_database_id=fence.issue_database_id,
+                issue_node_id=fence.issue_node_id,
+                fence_id=fence.fence_id,
+                cancellation_head_sha=fence.cancellation_head_sha,
+                binding_authority=fence.binding_authority,
+                pull_request_number=fence.pull_request_number,
+                pull_request_database_id=fence.pull_request_database_id,
+                pull_request_node_id=fence.pull_request_node_id,
+            ),
+        )
+        self.assertEqual(client.status_posts[0], (
+            self.CENTRAL, fence.cancellation_head_sha, "failure",
+            "federation/trusted-validation", expected_cancel_description, None,
+        ))
+        self.assertEqual(order, [("dispatch", 1)])
+        self.assertEqual(tuple(client.stage_calls), prior_stages)
+        self.assertEqual(client.current_ref, prior_ref)
+        self.assertEqual(issue.number, state.binding.issue_number)
+
+    def test_cancellation_nonowner_never_writes_status_or_dispatches(self):
+        client, _issue, _anchor, _lease, _state, _controller, fence = (
+            Wave07CancellationControllerTests()._prepare(binding="FULL_BINDING")
+        )
+        owner = fence.pull_request_number
+        nonowner = owner + 100
+        client.pull_requests[nonowner] = replace(
+            client.pull_requests[owner], number=nonowner,
+            author_id="U_external", author_login="external-user",
+            head_ref="external-copy", head_repository="fork/skills",
+            head_repository_id="R_fork",
+        )
+        route = self.controller(client)
+        dispatches = []
+        result = route.trusted_validation_role_first(
+            nonowner, None, central_recovery_dispatcher=lambda *args: dispatches.append(args),
+        )
+        self.assertEqual(result.kind, controller_module.Wave08DecisionKind.NO_MUTATION)
+        self.assertEqual(client.status_posts, [])
+        self.assertEqual(dispatches, [])
+        self.assertEqual(client.stage_calls, [])
+
+    def test_reserved_issue_role_returns_owner_recovery_without_a_carrier(self):
+        client, state, claim, route = self.active_issue_fixture()
+        client.current_ref = "f" * 40
+        dispatches = []
+        result = route.trusted_validation_role_first(
+            state.binding.pull_request_number, None,
+            central_recovery_dispatcher=lambda *args: dispatches.append(args),
+        )
+        self.assertEqual(result.resolution.activation, CarrierActivation.RESERVED_INACTIVE)
+        self.assertEqual(result.kind, controller_module.Wave08DecisionKind.RESERVED_OWNER_RECOVERY)
+        self.assertEqual(len(dispatches), 1)
+        self.assertEqual(client.status_calls if hasattr(client, "status_calls") else [], [])
+        self.assertEqual(client.check_calls if hasattr(client, "check_calls") else [], [])
+        self.assertEqual(client.pull_requests[state.binding.pull_request_number].head_oid, claim.to_head_sha)
+
+    def test_all_reserved_issue_roles_recover_only_for_exact_owner_and_reserved_machine_defers(self):
+        client, state, _claim, route = self.active_issue_fixture()
+        owner_number = state.binding.pull_request_number
+        owner_key = "R_central:700:I_issue:7"
+        role_markers = (
+            (CarrierRole.ISSUE_ACTIVE, "ISSUE_HEAD_CLAIM"),
+            (CarrierRole.ISSUE_FINALIZING, "ISSUE_FINALIZATION_EPOCH"),
+            (CarrierRole.ISSUE_CANCEL, "ISSUE_CANCELLATION_FENCE"),
+        )
+        dispatches = []
+        for role, claim_kind in role_markers:
+            marker = ClaimedHeadMarker(
+                claim_kind=claim_kind, role=role.value, owner_kind="ISSUE", owner_key=owner_key,
+                claim_generation_id="5" * 64, carrier_nonce="6" * 64,
+                transition_kind="INITIAL",
+            )
+            resolution = ShaCarrierResolution(CarrierActivation.RESERVED_INACTIVE, role, marker)
+            owner = controller_module.IssueOwnerPR(7, owner_number, owner_key, "FULL_BINDING")
+            with patch.object(controller_module, "resolve_sha_carrier_role", return_value=resolution), \
+                 patch.object(controller_module, "derive_issue_owner_pr", return_value=owner):
+                result = route.trusted_validation_role_first(
+                    owner_number, None,
+                    central_recovery_dispatcher=lambda decision, _owner, fence: dispatches.append((decision, fence)),
+                )
+            self.assertEqual(result.kind, controller_module.Wave08DecisionKind.RESERVED_OWNER_RECOVERY)
+            self.assertIsNone(dispatches[-1][1])
+        self.assertEqual(len(dispatches), len(role_markers))
+        self.assertEqual(client.status_calls if hasattr(client, "status_calls") else [], [])
+        self.assertEqual(client.check_calls if hasattr(client, "check_calls") else [], [])
+
+        machine_marker = ClaimedHeadMarker(
+            claim_kind="MACHINE_REF_CLAIM", role=CarrierRole.MACHINE_PUBLICATION.value,
+            owner_kind="MACHINE_SOURCE", owner_key="R_central:accepted-source",
+            claim_generation_id="7" * 64, carrier_nonce="8" * 64,
+            transition_kind="MACHINE_PUBLICATION",
+        )
+        machine = ShaCarrierResolution(CarrierActivation.RESERVED_INACTIVE, CarrierRole.MACHINE_PUBLICATION, machine_marker)
+        machine_dispatches = []
+        with patch.object(controller_module, "resolve_sha_carrier_role", return_value=machine):
+            deferred = route.trusted_validation_role_first(
+                owner_number, None,
+                machine_validation_dispatcher=lambda *args: machine_dispatches.append(args),
+            )
+        self.assertEqual(deferred.kind, controller_module.Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED)
+        self.assertEqual(machine_dispatches, [])
+        self.assertEqual(client.status_calls if hasattr(client, "status_calls") else [], [])
+
+    def test_machine_active_requires_exact_accepted_source_pr_and_ref_then_dispatches_machine_only(self):
+        client, state, _claim, route = self.active_issue_fixture()
+        pr_number = state.binding.pull_request_number
+        source = ControllerCoreTests.accepted_manifest().sources[0]
+        repository = client.repository
+        old_pr = client.pull_requests[pr_number]
+        head_sha = old_pr.head_oid
+        client.pull_requests[pr_number] = replace(
+            old_pr,
+            head_ref=controller_module._machine_branch(source.source_id),
+            head_repository=repository.full_name,
+            head_repository_id=repository.node_id,
+            base_oid=IssueBranchLeaseControllerTests.BASE_SHA,
+            base_ref="main",
+            base_repository=repository.full_name,
+            base_repository_id=repository.node_id,
+        )
+        marker = ClaimedHeadMarker(
+            claim_kind="MACHINE_REF_CLAIM", role=CarrierRole.MACHINE_PUBLICATION.value,
+            owner_kind="MACHINE_SOURCE", owner_key=f"{repository.node_id}:{source.source_id}",
+            claim_generation_id="3" * 64, carrier_nonce="4" * 64,
+            transition_kind="MACHINE_PUBLICATION",
+        )
+        machine_resolution = ShaCarrierResolution(CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION, marker)
+        events = []
+        route._accepted_sources = lambda _main: events.append("accepted-sources") or (source,)
+        route._machine_authority = lambda _summary, accepted, _main, _repo: controller_module.MachinePRAuthority(
+            pr_number, accepted.source_id, accepted.repository_id, head_sha,
+        )
+        original_ref = client.get_ref_oid
+        client.get_ref_oid = lambda repository_name, ref: head_sha if ref == f"bot/federation/{source.source_id}" else original_ref(repository_name, ref)
+        machine_calls, issue_calls = [], []
+        with patch.object(
+            controller_module, "resolve_sha_carrier_role",
+            side_effect=lambda *_args, **_kwargs: events.append("role") or machine_resolution,
+        ):
+            result = route.trusted_validation_role_first(
+                pr_number, None,
+                central_recovery_dispatcher=lambda *args: issue_calls.append(args),
+                machine_validation_dispatcher=lambda *args: machine_calls.append(args),
+            )
+        self.assertEqual(result.kind, controller_module.Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH)
+        self.assertEqual(result.dispatch_target, controller_module.Wave08DispatchTarget.MACHINE_VALIDATION)
+        self.assertEqual(len(machine_calls), 1)
+        self.assertEqual(machine_calls[0][1], controller_module.MachinePRAuthority(pr_number, source.source_id, source.repository_id, head_sha))
+        self.assertEqual(issue_calls, [])
+        self.assertLess(events.index("role"), events.index("accepted-sources"))
+
+    def test_machine_owner_mismatch_is_blocked_without_status_check_or_dispatch(self):
+        client, state, _claim, route = self.active_issue_fixture()
+        source = ControllerCoreTests.accepted_manifest().sources[0]
+        marker = ClaimedHeadMarker(
+            claim_kind="MACHINE_REF_CLAIM", role=CarrierRole.MACHINE_PUBLICATION.value,
+            owner_kind="MACHINE_SOURCE", owner_key=f"{client.repository.node_id}:wrong-source",
+            claim_generation_id="3" * 64, carrier_nonce="4" * 64,
+            transition_kind="MACHINE_PUBLICATION",
+        )
+        resolution = ShaCarrierResolution(CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION, marker)
+        route._accepted_sources = lambda _main: (source,)
+        calls = []
+        with patch.object(controller_module, "resolve_sha_carrier_role", return_value=resolution):
+            result = route.trusted_validation_role_first(
+                state.binding.pull_request_number, None,
+                machine_validation_dispatcher=lambda *args: calls.append(args),
+            )
+        self.assertEqual(result.kind, controller_module.Wave08DecisionKind.CONFLICTING_BLOCKED)
+        self.assertIsNone(result.owning_pr_number)
+        self.assertEqual(calls, [])
+        self.assertEqual(client.status_calls if hasattr(client, "status_calls") else [], [])
+        self.assertEqual(client.check_calls if hasattr(client, "check_calls") else [], [])
+
+    def test_legacy_quarantine_defers_and_unclaimed_absent_writes_one_external_tuple(self):
+        identity = GitCommitIdentity("Author", "author@example.test", "2026-10-05T00:00:00Z")
+        pr = PullRequestMetadata(
+            7, "", "B_bot", "bot", self.HEAD, "b" * 40, "feature", "main",
+            "R_central", self.CENTRAL, "R_central", self.CENTRAL, None, False, False,
+        )
+
+        class ReadOnlyClient:
+            def __init__(inner_self):
+                inner_self.events = []
+
+            def get_pull_request_metadata(inner_self, repository, number):
+                inner_self.events.append(("pr", number))
+                return pr
+
+            def get_git_commit_object(inner_self, repository, sha):
+                inner_self.events.append(("commit", sha))
+                return GitCommitObject(sha, "plain commit", "c" * 40, (), identity, identity)
+
+            def get_repository_metadata(inner_self, repository):
+                inner_self.events.append(("repository", repository))
+                return RepositoryMetadata(22, "R_central", repository, "main")
+
+            def get_app_metadata(inner_self, slug):
+                inner_self.events.append(("app", slug))
+                return AppMetadata(self.APP.app_id, slug, self.APP.app_node_id)
+
+            def get_bot_metadata(inner_self, slug):
+                inner_self.events.append(("bot", slug))
+                return BotMetadata(self.APP.bot_id, self.APP.bot_login, self.APP.bot_node_id, "Bot")
+
+            def create_commit_status(inner_self, *args):
+                inner_self.events.append(("status", args))
+                raise AssertionError("external writer is replaced by its exact tuple spy")
+
+            def list_issue_comments(inner_self, *args):
+                raise AssertionError("legacy/quarantine routes cannot inspect Issue comments")
+
+            def list_pull_request_files(inner_self, *args):
+                raise AssertionError("role must resolve before PR file reads")
+
+        client = ReadOnlyClient()
+        route = self.controller(client)
+        with patch.object(controller_module, "resolve_sha_carrier_role", wraps=resolve_sha_carrier_role) as resolver, \
+             patch.object(controller_module, "publish_unclaimed_external_success") as writer:
+            quarantined = route.trusted_validation_role_first(
+                7, lambda head: client.events.append(("legacy", head)) or LegacyEvidenceDisposition.QUARANTINE,
+            )
+            self.assertEqual(quarantined.kind, controller_module.Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED)
+            self.assertEqual(writer.call_count, 0)
+            client.events.clear()
+            unclaimed = route.trusted_validation_role_first(
+                7, lambda head: client.events.append(("legacy", head)) or LegacyEvidenceDisposition.ABSENT,
+            )
+            self.assertEqual(unclaimed.kind, controller_module.Wave08DecisionKind.EXTERNAL_STATUS)
+            self.assertEqual(writer.call_count, 1)
+            self.assertEqual(writer.call_args.args[2:4], (self.HEAD, unclaimed.resolution))
+        self.assertEqual(resolver.call_count, 2)
+        events = client.events
+        self.assertLess(events.index(("pr", 7)), events.index(("commit", self.HEAD)))
+        self.assertLess(events.index(("commit", self.HEAD)), events.index(("legacy", self.HEAD)))
+        self.assertLess(events.index(("legacy", self.HEAD)), events.index(("repository", self.CENTRAL)))
+
+    def test_legacy_dependency_failures_never_publish_external_success(self):
+        identity = GitCommitIdentity("Author", "author@example.test", "2026-10-05T00:00:00Z")
+        pr = PullRequestMetadata(
+            7, "", "B_bot", "bot", self.HEAD, "b" * 40, "feature", "main",
+            "R_central", self.CENTRAL, "R_central", self.CENTRAL, None, False, False,
+        )
+
+        class MarkerlessClient:
+            def get_pull_request_metadata(inner_self, _repository, _number):
+                return pr
+
+            def get_git_commit_object(inner_self, _repository, sha):
+                return GitCommitObject(sha, "plain commit", "c" * 40, (), identity, identity)
+
+        for resolver in (
+            None,
+            lambda _head: "ABSENT",
+            lambda _head: (_ for _ in ()).throw(RuntimeError("legacy unavailable")),
+        ):
+            with self.subTest(resolver=resolver), patch.object(controller_module, "publish_unclaimed_external_success") as writer:
+                result = self.controller(MarkerlessClient()).trusted_validation_role_first(7, resolver)
+                self.assertEqual(result.kind, controller_module.Wave08DecisionKind.CONFLICTING_BLOCKED)
+                self.assertEqual(writer.call_count, 0)
+
+    def test_callback_failure_fails_closed_without_fallback_status_or_current_main_wiring(self):
+        client, state, _claim, route = self.active_issue_fixture()
+        result = route.trusted_validation_role_first(
+            state.binding.pull_request_number, None,
+            central_recovery_dispatcher=lambda *_args: (_ for _ in ()).throw(RuntimeError("dispatch failed")),
+        )
+        self.assertEqual(result.kind, controller_module.Wave08DecisionKind.CONFLICTING_BLOCKED)
+        self.assertEqual(result.reason, controller_module.Wave08DecisionReason.DISPATCH_FAILED)
+        self.assertEqual(client.status_calls if hasattr(client, "status_calls") else [], [])
+        self.assertEqual(client.check_calls if hasattr(client, "check_calls") else [], [])
+        source = Path(controller_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main = next(item for item in tree.body if isinstance(item, ast.FunctionDef) and item.name == "main")
+        called = {item.id for item in ast.walk(main) if isinstance(item, ast.Name)}
+        self.assertNotIn("trusted_validation_role_first", called)
+
+
+class Wave08UniversalRecoveryTests(unittest.TestCase):
+    CENTRAL = Wave05ShaCarrierResolverTests.CENTRAL
+    APP = Wave05ShaCarrierResolverTests.APP
+
+    @staticmethod
+    def install_inventories(client, pull_numbers=(), issue_numbers=(), machine_refs=(), events=None):
+        events = events if events is not None else []
+
+        def prs(_repository, *, max_pages=100):
+            events.append("open_pr_inventory")
+            return tuple({"number": number, "head_oid": "f" * 40} for number in pull_numbers)
+
+        def issues(_repository, *, state="all", max_pages=100):
+            events.append(("issue_inventory", state))
+            return tuple({"number": number} for number in issue_numbers)
+
+        def refs(_repository, *, max_pages=100):
+            events.append("machine_ref_inventory")
+            return tuple(machine_refs)
+
+        client.list_open_pull_requests = prs
+        client.list_repository_issues = issues
+        client.list_machine_refs = refs
+        return events
+
+    @staticmethod
+    def finalization_fixture():
+        client, issue, _anchor, _lease, state, _claim, _immediate, epoch = (
+            Wave05ShaCarrierResolverTests().make_finalization_epoch_client()
+        )
+        return client, issue, state, epoch, R02Controller(
+            client, Wave08UniversalRecoveryTests.CENTRAL, Wave08UniversalRecoveryTests.APP,
+        )
+
+    def test_universal_failed_owner_fresh_read_shared_h_active_issue_active_revalidates_and_readmits_owner(self):
+        client, issue, _anchor, _lease, state, claim = (
+            Wave05ShaCarrierResolverTests().make_claim_client()
+        )
+        controller = R02Controller(client, self.CENTRAL, self.APP)
+        owner_number = state.binding.pull_request_number
+        peer_number = owner_number + 20
+        head_sha = claim.to_head_sha
+        stale_inventory_head = "c" * 40
+        peer = replace(client.pull_requests[owner_number], number=peer_number, head_oid=head_sha)
+        client.pull_requests[peer_number] = peer
+        client.pull_request_metadata_sequences[owner_number] = [
+            RuntimeError("first owner fresh read timed out"),
+        ]
+        self.install_inventories(
+            client, (owner_number, peer_number), issue_numbers=(issue.number,),
+        )
+        client.check_calls = []
+        initial_issue_comments = tuple(client.comments)
+        initial_pr_comments = {number: tuple(comments) for number, comments in client.pr_comments.items()}
+        initial_comment_writes = tuple(client.comment_writes)
+        initial_commit_calls = tuple(client.commit_calls)
+        initial_ref_writes = tuple(client.ref_writes)
+        initial_status_calls = tuple(client.status_calls)
+        initial_check_calls = tuple(client.check_calls)
+
+        resolutions, owner_proofs, explicit_owner_revalidations = [], [], []
+        finalizer_calls, wg1_calls = [], []
+        original_resolver = controller_module.resolve_sha_carrier_role
+        original_derive_owner = controller_module.derive_issue_owner_pr
+        original_get_pr = client.get_pull_request_metadata
+
+        def resolve(*args, **kwargs):
+            resolutions.append(args[2])
+            return original_resolver(*args, **kwargs)
+
+        def derive_owner(*args, **kwargs):
+            result = original_derive_owner(*args, **kwargs)
+            owner_proofs.append(result)
+            return result
+
+        def get_pr(repository, number):
+            if owner_proofs and number == owner_number:
+                explicit_owner_revalidations.append(number)
+            return original_get_pr(repository, number)
+
+        client.get_pull_request_metadata = get_pr
+        with (
+            patch.object(controller_module, "resolve_sha_carrier_role", side_effect=resolve),
+            patch.object(controller_module, "derive_issue_owner_pr", side_effect=derive_owner),
+        ):
+            result = controller.recover_universal_role_first(
+                None,
+                issue_finalizer_dispatcher=lambda decision, owner: finalizer_calls.append((decision, owner)),
+                issue_intake_terminal_dispatcher=wg1_calls.append,
+            )
+
+        self.assertTrue(result.complete)
+        self.assertTrue(any(
+            reason.startswith(f"PR_{owner_number}_FRESH_METADATA_UNAVAILABLE:")
+            for reason in result.blocked_reasons
+        ))
+        self.assertEqual(resolutions, [head_sha])
+        self.assertNotIn(stale_inventory_head, resolutions)
+        self.assertEqual(len(owner_proofs), 1)
+        self.assertEqual(owner_proofs[0].pull_request_number, owner_number)
+        self.assertEqual(explicit_owner_revalidations, [owner_number])
+        self.assertEqual(len(result.decisions), 1)
+        decision = result.decisions[0]
+        self.assertEqual(decision.resolution.activation, CarrierActivation.ACTIVE)
+        self.assertEqual(decision.resolution.role, CarrierRole.ISSUE_ACTIVE)
+        self.assertEqual(decision.owning_pr_number, owner_number)
+        self.assertEqual(decision.pull_request_numbers, (owner_number, peer_number))
+        self.assertEqual(decision.dispatch_target, controller_module.Wave08DispatchTarget.ISSUE_FINALIZER)
+        self.assertEqual(len(finalizer_calls), 1)
+        self.assertEqual(finalizer_calls[0][0], decision)
+        self.assertEqual(finalizer_calls[0][1].pull_request_number, owner_number)
+        self.assertEqual(wg1_calls, [])
+        self.assertEqual(result.dispatch_intents, ())
+        self.assertEqual(result.status_actions, ())
+        self.assertEqual(tuple(client.comments), initial_issue_comments)
+        self.assertEqual(
+            {number: tuple(comments) for number, comments in client.pr_comments.items()},
+            initial_pr_comments,
+        )
+        self.assertEqual(tuple(client.comment_writes), initial_comment_writes)
+        self.assertEqual(tuple(client.commit_calls), initial_commit_calls)
+        self.assertEqual(tuple(client.ref_writes), initial_ref_writes)
+        self.assertEqual(tuple(client.status_calls), initial_status_calls)
+        self.assertEqual(tuple(client.check_calls), initial_check_calls)
+
+    def test_universal_failed_owner_fresh_read_shared_h_active_issue_finalizing_revalidates_and_readmits_owner(self):
+        client, issue, state, epoch, controller = self.finalization_fixture()
+        owner_number = state.binding.pull_request_number
+        peer_number = owner_number + 20
+        head_sha = epoch.final_head_sha
+        stale_inventory_head = "c" * 40
+        client.pull_requests[peer_number] = replace(
+            client.pull_requests[owner_number], number=peer_number, head_oid=head_sha,
+        )
+        client.pull_request_metadata_sequences[owner_number] = [
+            RuntimeError("first finalizing owner fresh read timed out"),
+        ]
+        self.install_inventories(
+            client, (owner_number, peer_number), issue_numbers=(issue.number,),
+        )
+        client.check_calls = []
+        initial_issue_comments = tuple(client.comments)
+        initial_pr_comments = {number: tuple(comments) for number, comments in client.pr_comments.items()}
+        initial_comment_writes = tuple(client.comment_writes)
+        initial_commit_calls = tuple(client.commit_calls)
+        initial_ref_writes = tuple(client.ref_writes)
+        initial_status_calls = tuple(client.status_calls)
+        initial_check_calls = tuple(client.check_calls)
+
+        resolutions, owner_proofs, explicit_owner_revalidations = [], [], []
+        finalizer_calls, wg1_calls = [], []
+        original_resolver = controller_module.resolve_sha_carrier_role
+        original_derive_owner = controller_module.derive_issue_owner_pr
+        original_get_pr = client.get_pull_request_metadata
+
+        def resolve(*args, **kwargs):
+            resolutions.append(args[2])
+            return original_resolver(*args, **kwargs)
+
+        def derive_owner(*args, **kwargs):
+            result = original_derive_owner(*args, **kwargs)
+            owner_proofs.append(result)
+            return result
+
+        def get_pr(repository, number):
+            if owner_proofs and number == owner_number:
+                explicit_owner_revalidations.append(number)
+            return original_get_pr(repository, number)
+
+        client.get_pull_request_metadata = get_pr
+        with (
+            patch.object(controller_module, "resolve_sha_carrier_role", side_effect=resolve),
+            patch.object(controller_module, "derive_issue_owner_pr", side_effect=derive_owner),
+        ):
+            result = controller.recover_universal_role_first(
+                None,
+                issue_finalizer_dispatcher=lambda decision, owner: finalizer_calls.append((decision, owner)),
+                issue_intake_terminal_dispatcher=wg1_calls.append,
+            )
+
+        self.assertTrue(result.complete)
+        self.assertTrue(any(
+            reason.startswith(f"PR_{owner_number}_FRESH_METADATA_UNAVAILABLE:")
+            for reason in result.blocked_reasons
+        ))
+        self.assertEqual(resolutions, [head_sha])
+        self.assertNotIn(stale_inventory_head, resolutions)
+        self.assertEqual(len(owner_proofs), 1)
+        self.assertEqual(owner_proofs[0].pull_request_number, owner_number)
+        self.assertEqual(explicit_owner_revalidations, [owner_number])
+        self.assertEqual(len(result.decisions), 1)
+        decision = result.decisions[0]
+        self.assertEqual(decision.resolution.activation, CarrierActivation.ACTIVE)
+        self.assertEqual(decision.resolution.role, CarrierRole.ISSUE_FINALIZING)
+        self.assertEqual(decision.owning_pr_number, owner_number)
+        self.assertEqual(decision.pull_request_numbers, (owner_number, peer_number))
+        self.assertEqual(decision.dispatch_target, controller_module.Wave08DispatchTarget.ISSUE_FINALIZER)
+        self.assertEqual(len(finalizer_calls), 1)
+        self.assertEqual(finalizer_calls[0][0], decision)
+        self.assertEqual(finalizer_calls[0][1].pull_request_number, owner_number)
+        self.assertEqual(wg1_calls, [])
+        self.assertEqual(result.dispatch_intents, ())
+        self.assertEqual(result.status_actions, ())
+        self.assertEqual(tuple(client.comments), initial_issue_comments)
+        self.assertEqual(
+            {number: tuple(comments) for number, comments in client.pr_comments.items()},
+            initial_pr_comments,
+        )
+        self.assertEqual(tuple(client.comment_writes), initial_comment_writes)
+        self.assertEqual(tuple(client.commit_calls), initial_commit_calls)
+        self.assertEqual(tuple(client.ref_writes), initial_ref_writes)
+        self.assertEqual(tuple(client.status_calls), initial_status_calls)
+        self.assertEqual(tuple(client.check_calls), initial_check_calls)
+
+    def test_universal_owner_revalidation_head_change_suppresses_same_issue_wg1_and_preserves_unrelated_safe_h(self):
+        client, issue, _anchor, _lease, state, claim = (
+            Wave05ShaCarrierResolverTests().make_claim_client()
+        )
+        controller = R02Controller(client, self.CENTRAL, self.APP)
+        owner_number = state.binding.pull_request_number
+        peer_number = owner_number + 20
+        unrelated_number = owner_number + 30
+        head_sha = claim.to_head_sha
+        unrelated_head = "9" * 40
+        changed_owner_head = "8" * 40
+        stale_owner_head = "f" * 40
+        stale_peer_head = "e" * 40
+        stale_unrelated_head = "d" * 40
+        owner_pr = client.pull_requests[owner_number]
+        client.pull_requests[peer_number] = replace(owner_pr, number=peer_number, head_oid=head_sha)
+        client.pull_requests[unrelated_number] = replace(
+            owner_pr, number=unrelated_number, head_oid=unrelated_head,
+        )
+        client.pull_request_metadata_sequences[owner_number] = [
+            RuntimeError("first owner fresh read timed out"),
+        ]
+        self.install_inventories(
+            client, (owner_number, peer_number, unrelated_number), issue_numbers=(issue.number,),
+        )
+
+        def stale_inventory(_repository, *, max_pages=100):
+            return (
+                {"number": owner_number, "head_oid": stale_owner_head},
+                {"number": peer_number, "head_oid": stale_peer_head},
+                {"number": unrelated_number, "head_oid": stale_unrelated_head},
+            )
+
+        client.list_open_pull_requests = stale_inventory
+        client.check_calls = []
+        initial_issue_comments = tuple(client.comments)
+        initial_pr_comments = {number: tuple(comments) for number, comments in client.pr_comments.items()}
+        initial_comment_writes = tuple(client.comment_writes)
+        initial_commit_calls = tuple(client.commit_calls)
+        initial_ref_writes = tuple(client.ref_writes)
+        initial_status_calls = tuple(client.status_calls)
+        initial_check_calls = tuple(client.check_calls)
+
+        resolutions, owner_proofs = [], []
+        explicit_owner_revalidations, revalidation_results = [], []
+        finalizer_calls, wg1_calls, external_writes = [], [], []
+        original_resolver = controller_module.resolve_sha_carrier_role
+        original_derive_owner = controller_module.derive_issue_owner_pr
+        original_get_pr = client.get_pull_request_metadata
+
+        def resolve(*args, **kwargs):
+            sha = args[2]
+            resolutions.append(sha)
+            if sha == unrelated_head:
+                self.assertIs(args[4](), LegacyEvidenceDisposition.ABSENT)
+                return ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+            return original_resolver(*args, **kwargs)
+
+        def derive_owner(*args, **kwargs):
+            result = original_derive_owner(*args, **kwargs)
+            owner_proofs.append(result)
+            client.pull_request_metadata_sequences[owner_number] = [
+                replace(owner_pr, head_oid=changed_owner_head),
+            ]
+            return result
+
+        def get_pr(repository, number):
+            value = original_get_pr(repository, number)
+            if owner_proofs and number == owner_number:
+                explicit_owner_revalidations.append(number)
+                revalidation_results.append(value)
+            return value
+
+        def publish_external(_client, _repository, sha, _resolution, _app):
+            external_writes.append(sha)
+
+        client.get_pull_request_metadata = get_pr
+        with (
+            patch.object(controller_module, "resolve_sha_carrier_role", side_effect=resolve),
+            patch.object(controller_module, "derive_issue_owner_pr", side_effect=derive_owner),
+            patch.object(controller_module, "publish_unclaimed_external_success", side_effect=publish_external),
+        ):
+            result = controller.recover_universal_role_first(
+                lambda _sha: LegacyEvidenceDisposition.ABSENT,
+                issue_finalizer_dispatcher=lambda decision, owner: finalizer_calls.append((decision, owner)),
+                issue_intake_terminal_dispatcher=wg1_calls.append,
+            )
+
+        self.assertTrue(result.complete)
+        self.assertEqual(len(owner_proofs), 1)
+        self.assertEqual(owner_proofs[0].pull_request_number, owner_number)
+        self.assertEqual(explicit_owner_revalidations, [owner_number])
+        self.assertEqual(len(revalidation_results), 1)
+        self.assertEqual(revalidation_results[0].head_oid, changed_owner_head)
+        self.assertEqual(resolutions, sorted((head_sha, unrelated_head)))
+        self.assertNotIn(stale_owner_head, resolutions)
+        self.assertNotIn(stale_peer_head, resolutions)
+        self.assertNotIn(stale_unrelated_head, resolutions)
+
+        owner_decision = next(item for item in result.decisions if item.head_sha == head_sha)
+        self.assertEqual(owner_decision.resolution.activation, CarrierActivation.ACTIVE)
+        self.assertEqual(owner_decision.resolution.role, CarrierRole.ISSUE_ACTIVE)
+        self.assertIsNone(owner_decision.owning_pr_number)
+        self.assertEqual(owner_decision.pull_request_numbers, (peer_number,))
+        self.assertTrue(any(
+            reason == f"{head_sha}:ISSUE_OWNER_PR_HEAD_CHANGED"
+            for reason in result.blocked_reasons
+        ))
+        self.assertEqual(finalizer_calls, [])
+        self.assertEqual(wg1_calls, [])
+        self.assertFalse(any(intent.issue_number == issue.number for intent in result.dispatch_intents))
+
+        self.assertEqual(external_writes, [unrelated_head])
+        self.assertEqual(result.status_actions, ((unrelated_head, "EXTERNAL_SUCCESS"),))
+        self.assertEqual(tuple(client.comments), initial_issue_comments)
+        self.assertEqual(
+            {number: tuple(comments) for number, comments in client.pr_comments.items()},
+            initial_pr_comments,
+        )
+        self.assertEqual(tuple(client.comment_writes), initial_comment_writes)
+        self.assertEqual(tuple(client.commit_calls), initial_commit_calls)
+        self.assertEqual(tuple(client.ref_writes), initial_ref_writes)
+        self.assertEqual(tuple(client.status_calls), initial_status_calls)
+        self.assertEqual(tuple(client.check_calls), initial_check_calls)
+
+    def test_universal_finalizing_head_dispatches_once_to_wg4_even_without_visible_status(self):
+        client, issue, state, epoch, controller = self.finalization_fixture()
+        owner_number = state.binding.pull_request_number
+        owner_pr = client.pull_requests[owner_number]
+        for number in (owner_number + 20, owner_number + 10):
+            client.pull_requests[number] = replace(owner_pr, number=number)
+        events = self.install_inventories(
+            client, (owner_number + 20, owner_number, owner_number + 10),
+            issue_numbers=(issue.number,), events=[],
+        )
+        client.check_calls = []
+        initial_comment_writes = tuple(client.comment_writes)
+        initial_issue_comments = tuple(client.comments)
+        initial_pr_comments = {number: tuple(comments) for number, comments in client.pr_comments.items()}
+        initial_ref_writes = tuple(client.ref_writes)
+        initial_commit_calls = tuple(client.commit_calls)
+        initial_status_calls = tuple(client.status_calls)
+        initial_check_calls = tuple(client.check_calls)
+        finalizer_calls, wg1_calls, resolutions = [], [], []
+        original_resolver = controller_module.resolve_sha_carrier_role
+
+        def resolve(*args, **kwargs):
+            events.append(("resolve", args[2]))
+            resolutions.append(args[2])
+            return original_resolver(*args, **kwargs)
+
+        with patch.object(controller_module, "resolve_sha_carrier_role", side_effect=resolve):
+            result = controller.recover_universal_role_first(
+                None,
+                issue_intake_terminal_dispatcher=wg1_calls.append,
+                issue_finalizer_dispatcher=lambda decision, owner: finalizer_calls.append((decision, owner)),
+            )
+
+        self.assertTrue(result.complete)
+        self.assertEqual(result.distinct_pr_head_count, 1)
+        self.assertEqual(resolutions, [epoch.final_head_sha])
+        self.assertEqual(result.decisions[0].resolution.role, CarrierRole.ISSUE_FINALIZING)
+        self.assertEqual(result.decisions[0].dispatch_target, controller_module.Wave08DispatchTarget.ISSUE_FINALIZER)
+        self.assertEqual(result.decisions[0].pull_request_numbers, tuple(sorted(client.pull_requests)))
+        self.assertEqual(result.decisions[0].owning_pr_number, owner_number)
+        self.assertEqual(len(finalizer_calls), 1)
+        self.assertEqual(finalizer_calls[0][1].issue_number, issue.number)
+        self.assertEqual(wg1_calls, [])
+        self.assertEqual(result.dispatch_intents, ())
+        self.assertEqual(result.relevant_issue_count, 1)
+        self.assertEqual(len(result.issue_recoveries), 1)
+        self.assertEqual(result.issue_recoveries[0].issue_number, issue.number)
+        self.assertEqual(result.issue_recoveries[0].outcome, "DEFERRED")
+        self.assertEqual(
+            result.issue_recoveries[0].reason,
+            "EXACT_ACTIVE_ISSUE_FINALIZER_OWNS_WG4_DISPATCH",
+        )
+        self.assertEqual(result.status_actions, ())
+        self.assertEqual(getattr(client, "status_calls", []), [])
+        self.assertEqual(getattr(client, "check_calls", []), [])
+        self.assertEqual(tuple(client.comment_writes), initial_comment_writes)
+        self.assertEqual(tuple(client.comments), initial_issue_comments)
+        self.assertEqual(
+            {number: tuple(comments) for number, comments in client.pr_comments.items()},
+            initial_pr_comments,
+        )
+        self.assertEqual(tuple(client.ref_writes), initial_ref_writes)
+        self.assertEqual(tuple(client.commit_calls), initial_commit_calls)
+        self.assertEqual(tuple(client.status_calls), initial_status_calls)
+        self.assertEqual(tuple(client.check_calls), initial_check_calls)
+        inventory_events = ("open_pr_inventory", ("issue_inventory", "all"), "machine_ref_inventory")
+        self.assertLess(max(events.index(item) for item in inventory_events), events.index(("resolve", epoch.final_head_sha)))
+
+    def test_wg1_direct_recovery_defers_exact_active_issue_finalizing_head_before_source_resolution(self):
+        client, issue, state, epoch, controller = self.finalization_fixture()
+        owner_number = state.binding.pull_request_number
+        client.check_calls = []
+        initial_issue_comments = tuple(client.comments)
+        initial_pr_comments = tuple(client.pr_comments[owner_number])
+        initial_comment_writes = tuple(client.comment_writes)
+        initial_commit_calls = tuple(client.commit_calls)
+        initial_ref_writes = tuple(client.ref_writes)
+        initial_status_calls = tuple(client.status_calls)
+        initial_check_calls = tuple(client.check_calls)
+        source_resolver_calls = []
+        final_green_calls, required_epoch_calls = [], []
+
+        def source_resolver(*args):
+            source_resolver_calls.append(args)
+            raise AssertionError("Wg1 must hand finalizing authority to Wg4 before source resolution")
+
+        controller.publish_issue_final_success = lambda *args, **kwargs: final_green_calls.append((args, kwargs))
+        controller.revoke_required_status_epoch = lambda *args, **kwargs: required_epoch_calls.append((args, kwargs))
+        result = controller.recover_issue_first_authority(issue.number, source_resolver)
+
+        self.assertEqual(result.outcome, "DEFERRED")
+        self.assertEqual(result.reason, "ISSUE_FINALIZER_OWNED_BY_WG4")
+        self.assertEqual(source_resolver_calls, [])
+        self.assertEqual(final_green_calls, [])
+        self.assertEqual(required_epoch_calls, [])
+        self.assertEqual(tuple(client.comments), initial_issue_comments)
+        self.assertEqual(tuple(client.pr_comments[owner_number]), initial_pr_comments)
+        self.assertEqual(tuple(client.comment_writes), initial_comment_writes)
+        self.assertEqual(tuple(client.commit_calls), initial_commit_calls)
+        self.assertEqual(tuple(client.ref_writes), initial_ref_writes)
+        self.assertEqual(tuple(client.status_calls), initial_status_calls)
+        self.assertEqual(tuple(client.check_calls), initial_check_calls)
+        resolution = controller_module.resolve_sha_carrier_role(
+            client, self.CENTRAL, epoch.final_head_sha, self.APP.slug,
+            LegacyEvidenceDisposition.CONFLICTING,
+        )
+        self.assertEqual(resolution.activation, CarrierActivation.ACTIVE)
+        self.assertEqual(resolution.role, CarrierRole.ISSUE_FINALIZING)
+        self.assertEqual(
+            tuple(client.pr_comments[owner_number]),
+            initial_pr_comments,
+            "Wg1 must not persist an IssueHeadClaim that poisons authority history",
+        )
+
+    def test_universal_isolates_one_fresh_pr_metadata_failure_from_safe_sha_work(self):
+        client, _issue, state, _epoch, controller = self.finalization_fixture()
+        first = client.pull_requests[state.binding.pull_request_number]
+        failed_pr_number = first.number + 10
+        safe_pr_number = first.number + 20
+        stale_failed_head = "c" * 40
+        stale_safe_head = "d" * 40
+        safe_head = "e" * 40
+        client.pull_requests[failed_pr_number] = replace(
+            first, number=failed_pr_number, head_oid=stale_failed_head,
+        )
+        client.pull_requests[safe_pr_number] = replace(
+            first, number=safe_pr_number, head_oid=safe_head,
+        )
+        client.pull_request_metadata_sequences[failed_pr_number] = [RuntimeError("fresh PR read timed out")]
+        events = self.install_inventories(client, (failed_pr_number, safe_pr_number), events=[])
+
+        def inventory_with_distinct_stale_heads(_repository, *, max_pages=100):
+            events.append("open_pr_inventory")
+            return (
+                {"number": failed_pr_number, "head_oid": stale_failed_head},
+                {"number": safe_pr_number, "head_oid": stale_safe_head},
+            )
+
+        client.list_open_pull_requests = inventory_with_distinct_stale_heads
+        resolution_calls, external_writes = [], []
+
+        def explicit_unclaimed(_client, _repository, sha, _slug, legacy):
+            events.append(("resolve", sha))
+            resolution_calls.append(sha)
+            self.assertIs(legacy(), LegacyEvidenceDisposition.ABSENT)
+            return ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+
+        def publish_external(_client, _repository, sha, _resolution, _app):
+            events.append(("publish", sha))
+            external_writes.append(sha)
+
+        with (
+            patch.object(controller_module, "resolve_sha_carrier_role", side_effect=explicit_unclaimed),
+            patch.object(controller_module, "publish_unclaimed_external_success", side_effect=publish_external),
+        ):
+            result = controller.recover_universal_role_first(
+                lambda _sha: LegacyEvidenceDisposition.ABSENT,
+            )
+
+        self.assertTrue(result.complete)
+        self.assertEqual(result.open_pr_inventory_count, 2)
+        self.assertEqual(result.fresh_pr_count, 1)
+        self.assertEqual(result.distinct_pr_head_count, 1)
+        self.assertEqual(resolution_calls, [safe_head])
+        self.assertNotIn(stale_failed_head, resolution_calls)
+        self.assertNotIn(stale_safe_head, resolution_calls)
+        self.assertEqual(external_writes, [safe_head])
+        self.assertEqual(result.status_actions, ((safe_head, "EXTERNAL_SUCCESS"),))
+        self.assertEqual(tuple(item.head_sha for item in result.decisions), (safe_head,))
+        self.assertTrue(any(
+            reason.startswith(f"PR_{failed_pr_number}_FRESH_METADATA_UNAVAILABLE:")
+            for reason in result.blocked_reasons
+        ))
+        self.assertFalse(any(
+            "FRESH_PR_HEAD_UNAVAILABLE_OR_GROUPING_AMBIGUOUS; SHA ACTIONS SUPPRESSED" in reason
+            for reason in result.blocked_reasons
+        ))
+        inventory_events = ("open_pr_inventory", ("issue_inventory", "all"), "machine_ref_inventory")
+        self.assertLess(
+            max(events.index(item) for item in inventory_events),
+            events.index(("publish", safe_head)),
+        )
+
+    def test_universal_uses_fresh_heads_and_one_external_status_per_distinct_shared_sha(self):
+        client, _issue, state, _epoch, controller = self.finalization_fixture()
+        first_owner = state.binding.pull_request_number
+        first = client.pull_requests[first_owner]
+        second_sha, third_sha = "a" * 40, "b" * 40
+        client.pull_requests[first_owner + 1] = replace(first, number=first_owner + 1)
+        client.pull_requests[first_owner + 2] = replace(first, number=first_owner + 2, head_oid=second_sha)
+        client.pull_requests[first_owner + 3] = replace(first, number=first_owner + 3, head_oid=second_sha)
+        client.pull_requests[first_owner + 4] = replace(first, number=first_owner + 4, head_oid=third_sha)
+        all_numbers = tuple(sorted(client.pull_requests))
+        events = self.install_inventories(client, all_numbers, events=[])
+        resolution_calls, status_calls = [], []
+
+        def explicit_legacy(_client, _repository, sha, _slug, legacy):
+            events.append(("resolve", sha))
+            resolution_calls.append(sha)
+            self.assertIs(legacy(), LegacyEvidenceDisposition.ABSENT)
+            return ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+
+        with (
+            patch.object(controller_module, "resolve_sha_carrier_role", side_effect=explicit_legacy),
+            patch.object(controller_module, "publish_unclaimed_external_success", side_effect=lambda _client, _repo, sha, _resolution, _app: status_calls.append(sha)),
+        ):
+            result = controller.recover_universal_role_first(
+                lambda _sha: LegacyEvidenceDisposition.ABSENT,
+            )
+
+        self.assertEqual(resolution_calls, sorted((first.head_oid, second_sha, third_sha)))
+        self.assertEqual(result.distinct_pr_head_count, 3)
+        self.assertEqual(status_calls, sorted((first.head_oid, second_sha, third_sha)), result)
+        self.assertEqual(len(result.status_actions), 3)
+        self.assertEqual(tuple(item.head_sha for item in result.decisions), tuple(sorted(resolution_calls)))
+        self.assertTrue(all(item.kind is controller_module.Wave08DecisionKind.EXTERNAL_STATUS for item in result.decisions))
+        self.assertEqual(events.count(("issue_inventory", "all")), 1)
+        self.assertEqual(events.count("machine_ref_inventory"), 1)
+
+    def test_machine_ref_without_open_pr_is_retained_as_orphan_deferred_evidence(self):
+        client, _issue, _anchor, _lease = Wave05ShaCarrierResolverTests.make_client()
+        controller = R02Controller(client, self.CENTRAL, self.APP)
+        sha = "9" * 40
+        self.install_inventories(client, machine_refs=(
+            {"ref": "refs/heads/bot/federation/retired-source", "source_id": "retired-source", "sha": sha},
+        ))
+        controller._accepted_sources = lambda _main=None: ()
+        result = controller.recover_universal_role_first(None)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.machine_ref_inventory_count, 1)
+        self.assertEqual(len(result.machine_refs), 1)
+        self.assertEqual(result.machine_refs[0].head_sha, sha)
+        self.assertEqual(result.machine_refs[0].outcome, "DEFERRED_ORPHANED_SOURCE")
+        self.assertEqual(result.decisions, ())
+        self.assertEqual(getattr(client, "status_calls", []), [])
+        self.assertEqual(getattr(client, "check_calls", []), [])
+
+    def test_machine_namespace_suppresses_unclaimed_success_and_reserved_machine_never_passes(self):
+        client, _issue, _anchor, _lease, _state, claim = Wave05ShaCarrierResolverTests().make_claim_client()
+        controller = R02Controller(client, self.CENTRAL, self.APP)
+        owner_number = next(iter(client.pull_requests))
+        row = {"ref": "refs/heads/bot/federation/owner-repo", "source_id": "owner-repo", "sha": claim.to_head_sha}
+        self.install_inventories(client, (owner_number,), machine_refs=(row,))
+        controller._accepted_sources = lambda _main=None: ()
+        unclaimed_writes = []
+        with (
+            patch.object(controller_module, "resolve_sha_carrier_role", return_value=ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)),
+            patch.object(controller_module, "publish_unclaimed_external_success", side_effect=lambda *args: unclaimed_writes.append(args)),
+        ):
+            result = controller.recover_universal_role_first(lambda _sha: LegacyEvidenceDisposition.ABSENT)
+        self.assertEqual(unclaimed_writes, [])
+        self.assertEqual(result.decisions[0].kind, controller_module.Wave08DecisionKind.CONFLICTING_BLOCKED)
+        self.assertEqual(getattr(client, "check_calls", []), [])
+
+        marker = Wave08RoleDecisionContractTests.marker(
+            CarrierRole.MACHINE_PUBLICATION, "MACHINE_REF_CLAIM",
+            owner_kind="MACHINE_SOURCE", owner_key=f"{client.get_repository_metadata(self.CENTRAL).node_id}:owner-repo",
+        )
+        reserved = ShaCarrierResolution(CarrierActivation.RESERVED_INACTIVE, CarrierRole.MACHINE_PUBLICATION, marker)
+        with patch.object(controller_module, "resolve_sha_carrier_role", return_value=reserved):
+            result = controller.recover_universal_role_first(lambda _sha: LegacyEvidenceDisposition.ABSENT)
+        self.assertEqual(result.decisions[0].kind, controller_module.Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED)
+        self.assertEqual(result.status_actions, ())
+        self.assertEqual(getattr(client, "check_calls", []), [])
+
+    def test_exact_active_machine_role_dispatches_machine_validation_without_manual_status(self):
+        client, _issue, _anchor, _lease, state, claim = Wave05ShaCarrierResolverTests().make_claim_client()
+        controller = R02Controller(client, self.CENTRAL, self.APP)
+        number = state.binding.pull_request_number
+        head = claim.to_head_sha
+        source = c02.SourceDeclaration(
+            "owner-repo", "Owner/Repo", 41, "skills", "Source",
+            (c02.LineDeclaration("refs/heads/main", ("owner-repo",)),),
+        )
+        central_node_id = client.get_repository_metadata(self.CENTRAL).node_id
+        marker = Wave08RoleDecisionContractTests.marker(
+            CarrierRole.MACHINE_PUBLICATION, "MACHINE_REF_CLAIM",
+            owner_kind="MACHINE_SOURCE", owner_key=f"{central_node_id}:owner-repo",
+        )
+        active = ShaCarrierResolution(CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION, marker)
+        original = client.pull_requests[number]
+        client.pull_requests[number] = replace(
+            original, head_ref="bot/federation/owner-repo", head_oid=head,
+            head_repository=self.CENTRAL, head_repository_id=central_node_id,
+            base_ref="main", base_repository=self.CENTRAL, base_repository_id=central_node_id,
+        )
+        self.install_inventories(client, (number,), machine_refs=(
+            {"ref": "refs/heads/bot/federation/owner-repo", "source_id": "owner-repo", "sha": head},
+        ))
+        controller._accepted_sources = lambda _main=None: (source,)
+        controller._machine_authority = lambda summary, declaration, _main, _repository: (
+            controller_module.MachinePRAuthority(
+                summary["number"], declaration.source_id, declaration.repository_id, head,
+            )
+        )
+        machine_calls, manual_calls, wg1_calls = [], [], []
+        with patch.object(controller_module, "resolve_sha_carrier_role", return_value=active):
+            result = controller.recover_universal_role_first(
+                None,
+                issue_intake_terminal_dispatcher=wg1_calls.append,
+                issue_finalizer_dispatcher=lambda *args: manual_calls.append(args),
+                machine_validation_dispatcher=lambda decision, authority: machine_calls.append((decision, authority)),
+            )
+        self.assertEqual(len(machine_calls), 1)
+        self.assertEqual(machine_calls[0][0].dispatch_target, controller_module.Wave08DispatchTarget.MACHINE_VALIDATION)
+        self.assertEqual(machine_calls[0][1].head_sha, head)
+        self.assertEqual(manual_calls, [])
+        self.assertEqual(wg1_calls, [])
+        self.assertEqual(result.status_actions, ())
+        self.assertEqual(getattr(client, "status_calls", []), [])
+        self.assertEqual(getattr(client, "check_calls", []), [])
+        self.assertEqual(result.machine_refs[0].outcome, "DISPATCHED")
+
+    def test_issue_inventory_dispatches_strict_unanchored_form_and_ignores_ordinary_issue(self):
+        client, issue, _anchor, _lease = Wave05ShaCarrierResolverTests.make_client()
+        controller = R02Controller(client, self.CENTRAL, self.APP)
+        client.comments = []
+        self.install_inventories(client, issue_numbers=(issue.number,))
+        intents = []
+        result = controller.recover_universal_role_first(
+            None, issue_intake_terminal_dispatcher=intents.append,
+        )
+        self.assertEqual(result.relevant_issue_count, 1)
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0].target, controller_module.Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY)
+        self.assertEqual(intents[0].issue_number, issue.number)
+
+        client.issue = replace(issue, body="An ordinary unrelated Issue")
+        intents.clear()
+        result = controller.recover_universal_role_first(
+            None, issue_intake_terminal_dispatcher=intents.append,
+        )
+        self.assertEqual(result.relevant_issue_count, 0)
+        self.assertEqual(intents, [])
+
+        client.issue = replace(issue, body="### Federation request type\n\nnot a valid form")
+        result = controller.recover_universal_role_first(
+            None, issue_intake_terminal_dispatcher=intents.append,
+        )
+        self.assertEqual(result.relevant_issue_count, 1)
+        self.assertEqual(result.issue_recoveries[0].outcome, "BLOCKED")
+        self.assertEqual(intents, [])
+
+    def test_wg6_active_cancel_publishes_exact_failure_before_wg1_dispatch(self):
+        client, issue, _anchor, _lease, _state, controller, fence = (
+            Wave07CancellationControllerTests()._prepare(binding="FULL_BINDING")
+        )
+        number = fence.pull_request_number
+        self.install_inventories(client, (number,))
+        initial_comment_writes = tuple(client.comment_writes)
+        dispatch_observations = []
+        result = controller.recover_universal_role_first(
+            None,
+            issue_intake_terminal_dispatcher=lambda intent: dispatch_observations.append(
+                (intent, len(client.status_posts)),
+            ),
+        )
+        self.assertEqual(len(client.status_posts), 1)
+        self.assertEqual(result.status_actions, ((fence.cancellation_head_sha, "ISSUE_CANCEL_FAILURE"),))
+        self.assertEqual(len(dispatch_observations), 1)
+        intent, visible_status_posts = dispatch_observations[0]
+        self.assertEqual(intent.target, controller_module.Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY)
+        self.assertEqual(intent.issue_number, issue.number)
+        self.assertEqual(visible_status_posts, 1)
+        self.assertEqual(tuple(client.comment_writes), initial_comment_writes)
+        self.assertEqual(getattr(client, "check_calls", []), [])
+
+    def test_wg1_closed_anchor_only_recovery_never_uses_source_registry_or_finalizer_apis(self):
+        client, issue, _anchor, _lease, controller = Wave07CancellationControllerTests()._no_pr_fixture(
+            with_lease=False,
+        )
+        forbidden = []
+        controller.publish_issue_final_success = lambda *_args, **_kwargs: forbidden.append("final-green")
+        controller.revoke_required_status_epoch = lambda *_args, **_kwargs: forbidden.append("required-status-epoch")
+        calls = []
+
+        def source_resolver(*_args):
+            calls.append("source")
+            raise AssertionError("closed cancellation must not consult current source registry")
+
+        result = controller.recover_issue_first_authority(issue.number, source_resolver)
+        self.assertEqual(result.outcome, "CANCELLED_NO_PR")
+        self.assertEqual(calls, [])
+        self.assertEqual(forbidden, [])
+
+    def test_recovery_layers_never_call_issue_final_green_rse_or_machine_check_writers(self):
+        source = Path(controller_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        cls = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "R02Controller")
+        methods = {item.name: item for item in cls.body if isinstance(item, ast.FunctionDef)}
+        for name in ("recover_universal_role_first", "recover_issue_first_authority"):
+            called = {
+                item.func.attr if isinstance(item.func, ast.Attribute) else item.func.id
+                for item in ast.walk(methods[name])
+                if isinstance(item, ast.Call) and (isinstance(item.func, ast.Attribute) or isinstance(item.func, ast.Name))
+            }
+            self.assertFalse(called & {
+                "publish_issue_final_success", "revoke_required_status_epoch",
+                "create_check_run", "update_check_run", "upsert_trusted_validation_check",
+            })
 
 
 if __name__ == "__main__":

@@ -262,6 +262,276 @@ def _raise_if_reserved_issue_pr(pr: PullRequestMetadata) -> None:
         raise ReservedIssuePRPendingManagedAuthority("reserved Issue PR is quarantined pending Wave 04 managed authority")
 
 
+class Wave08DecisionKind(Enum):
+    NO_MUTATION = "NO_MUTATION"
+    RESERVED_OWNER_RECOVERY = "RESERVED_OWNER_RECOVERY"
+    MACHINE_RECOVERY_DEFERRED = "MACHINE_RECOVERY_DEFERRED"
+    ISSUE_OWNER_FINALIZER_RECOVERY = "ISSUE_OWNER_FINALIZER_RECOVERY"
+    ISSUE_OWNER_CANCELLATION_RECOVERY = "ISSUE_OWNER_CANCELLATION_RECOVERY"
+    MACHINE_VALIDATION_DISPATCH = "MACHINE_VALIDATION_DISPATCH"
+    MACHINE_FINALIZER_DISPATCH = "MACHINE_FINALIZER_DISPATCH"
+    EXTERNAL_STATUS = "EXTERNAL_STATUS"
+    LEGACY_QUARANTINE_DEFERRED = "LEGACY_QUARANTINE_DEFERRED"
+    CONFLICTING_BLOCKED = "CONFLICTING_BLOCKED"
+
+
+class Wave08DispatchTarget(Enum):
+    ISSUE_FINALIZER = "ISSUE_FINALIZER"
+    ISSUE_CANCELLATION_RECOVERY = "ISSUE_CANCELLATION_RECOVERY"
+    ISSUE_INTAKE_TERMINAL_RECOVERY = "ISSUE_INTAKE_TERMINAL_RECOVERY"
+    MACHINE_VALIDATION = "MACHINE_VALIDATION"
+    MACHINE_FINALIZER = "MACHINE_FINALIZER"
+
+
+class Wave08DecisionReason(Enum):
+    OWNER_NOT_PRESENT = "OWNER_NOT_PRESENT"
+    ROLE_REQUIRES_NO_ACTION = "ROLE_REQUIRES_NO_ACTION"
+    RESERVED_ROLE = "RESERVED_ROLE"
+    ISSUE_FINALIZER_REQUIRED = "ISSUE_FINALIZER_REQUIRED"
+    ISSUE_CANCELLATION_REQUIRED = "ISSUE_CANCELLATION_REQUIRED"
+    MACHINE_VALIDATION_REQUIRED = "MACHINE_VALIDATION_REQUIRED"
+    MACHINE_FINALIZER_REQUIRED = "MACHINE_FINALIZER_REQUIRED"
+    EXPLICITLY_UNCLAIMED = "EXPLICITLY_UNCLAIMED"
+    LEGACY_CLASSIFIER_DEFERRED = "LEGACY_CLASSIFIER_DEFERRED"
+    CONFLICTING_EVIDENCE = "CONFLICTING_EVIDENCE"
+    MACHINE_AUTHORITY_PENDING = "MACHINE_AUTHORITY_PENDING"
+    FRESH_AUTHORITY_FAILED = "FRESH_AUTHORITY_FAILED"
+    DISPATCH_FAILED = "DISPATCH_FAILED"
+
+
+class Wave08PermissionLevel(Enum):
+    NONE = "none"
+    READ = "read"
+    WRITE = "write"
+
+
+class Wave08PermissionLane(Enum):
+    WG3_MANUAL_STATUS = "WG3_MANUAL_STATUS"
+    WG3_MACHINE_VALIDATION = "WG3_MACHINE_VALIDATION"
+    WG4_ISSUE_MANUAL_FINALIZER = "WG4_ISSUE_MANUAL_FINALIZER"
+    WG4_MACHINE_FINALIZER = "WG4_MACHINE_FINALIZER"
+    WG6_ORDINARY_RECOVERY = "WG6_ORDINARY_RECOVERY"
+
+
+_WAVE08_PERMISSION_KEYS = ("actions", "statuses", "contents", "pull_requests", "issues", "checks")
+_WAVE08_PERMISSION_VALUES = {
+    Wave08PermissionLane.WG3_MANUAL_STATUS: ("write", "write", "read", "read", "read", "none"),
+    Wave08PermissionLane.WG3_MACHINE_VALIDATION: ("write", "none", "read", "read", "read", "write"),
+    Wave08PermissionLane.WG4_ISSUE_MANUAL_FINALIZER: ("write", "write", "write", "write", "read", "none"),
+    Wave08PermissionLane.WG4_MACHINE_FINALIZER: ("write", "none", "write", "write", "read", "write"),
+    Wave08PermissionLane.WG6_ORDINARY_RECOVERY: ("write", "write", "write", "write", "read", "none"),
+}
+
+
+@dataclass(frozen=True)
+class Wave08PermissionProfile:
+    lane: Wave08PermissionLane
+    actions: Wave08PermissionLevel
+    statuses: Wave08PermissionLevel
+    contents: Wave08PermissionLevel
+    pull_requests: Wave08PermissionLevel
+    issues: Wave08PermissionLevel
+    checks: Wave08PermissionLevel
+
+    def __post_init__(self) -> None:
+        if type(self.lane) is not Wave08PermissionLane:
+            raise ValueError("Wave 08 permission lane must be closed")
+        values = tuple(getattr(self, key) for key in _WAVE08_PERMISSION_KEYS)
+        if any(type(value) is not Wave08PermissionLevel for value in values):
+            raise ValueError("Wave 08 permission values must use the closed permission enum")
+        expected = _WAVE08_PERMISSION_VALUES[self.lane]
+        if tuple(value.value for value in values) != expected:
+            raise ValueError("Wave 08 permission profile differs from its exact lane contract")
+
+    def as_pairs(self) -> tuple[tuple[str, str], ...]:
+        return tuple((key, getattr(self, key).value) for key in _WAVE08_PERMISSION_KEYS)
+
+
+WAVE08_PERMISSION_PROFILES = tuple(
+    Wave08PermissionProfile(lane, *(Wave08PermissionLevel(value) for value in values))
+    for lane, values in _WAVE08_PERMISSION_VALUES.items()
+)
+
+
+@dataclass(frozen=True)
+class Wave08Decision:
+    head_sha: str
+    resolution: ShaCarrierResolution
+    pull_request_numbers: tuple[int, ...]
+    owning_pr_number: int | None
+    kind: Wave08DecisionKind
+    reason: Wave08DecisionReason
+    dispatch_target: Wave08DispatchTarget | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", self.head_sha) is None:
+            raise ValueError("Wave 08 decision head must be exact lowercase 40-hex")
+        if type(self.resolution) is not ShaCarrierResolution:
+            raise ValueError("Wave 08 decision requires an exact SHA carrier resolution")
+        if type(self.pull_request_numbers) is not tuple:
+            raise ValueError("Wave 08 PR numbers must be a canonical tuple")
+        if any(type(number) is not int or not 1 <= number <= 9_223_372_036_854_775_807 for number in self.pull_request_numbers):
+            raise ValueError("Wave 08 PR numbers must be positive exact integers")
+        if tuple(sorted(set(self.pull_request_numbers))) != self.pull_request_numbers:
+            raise ValueError("Wave 08 PR numbers must be unique and deterministically sorted")
+        if self.owning_pr_number is not None:
+            if type(self.owning_pr_number) is not int or not 1 <= self.owning_pr_number <= 9_223_372_036_854_775_807:
+                raise ValueError("Wave 08 owner PR number must be a positive exact integer")
+            if self.owning_pr_number not in self.pull_request_numbers:
+                raise ValueError("Wave 08 owner PR must belong to the shared-head group")
+        if type(self.kind) is not Wave08DecisionKind or type(self.reason) is not Wave08DecisionReason:
+            raise ValueError("Wave 08 decision kind/reason must use closed enums")
+        if self.dispatch_target is not None and type(self.dispatch_target) is not Wave08DispatchTarget:
+            raise ValueError("Wave 08 dispatch target must use a closed semantic enum")
+
+        activation, role = self.resolution.activation, self.resolution.role
+        marker = self.resolution.marker
+        expected: dict[Wave08DecisionKind, tuple[set[tuple[CarrierActivation, CarrierRole | None]], Wave08DispatchTarget | None]] = {
+            Wave08DecisionKind.NO_MUTATION: ({(item, role_value) for item in CarrierActivation for role_value in (None, *tuple(CarrierRole))}, None),
+            Wave08DecisionKind.RESERVED_OWNER_RECOVERY: ({(CarrierActivation.RESERVED_INACTIVE, item) for item in CarrierRole if item is not CarrierRole.MACHINE_PUBLICATION}, None),
+            Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY: ({(CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE), (CarrierActivation.ACTIVE, CarrierRole.ISSUE_FINALIZING)}, Wave08DispatchTarget.ISSUE_FINALIZER),
+            Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY: ({(CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL)}, Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY),
+            Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH: ({(CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION)}, Wave08DispatchTarget.MACHINE_VALIDATION),
+            Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH: ({(CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION)}, Wave08DispatchTarget.MACHINE_FINALIZER),
+            Wave08DecisionKind.EXTERNAL_STATUS: ({(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION, None)}, None),
+            Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED: ({(CarrierActivation.LEGACY_CUTOVER_QUARANTINE, None)}, None),
+            Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED: ({(CarrierActivation.RESERVED_INACTIVE, CarrierRole.MACHINE_PUBLICATION)}, None),
+            Wave08DecisionKind.CONFLICTING_BLOCKED: (
+                {(item, role_value) for item in CarrierActivation for role_value in (None, *tuple(CarrierRole))}, None,
+            ),
+        }
+        allowed_pairs, target = expected[self.kind]
+        if (activation, role) not in allowed_pairs or self.dispatch_target is not target:
+            raise ValueError("Wave 08 decision kind/target is incompatible with its SHA role")
+        owner_actions = {
+            Wave08DecisionKind.RESERVED_OWNER_RECOVERY,
+            Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY,
+            Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY,
+            Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH,
+            Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH,
+        }
+        if self.kind in owner_actions and self.owning_pr_number is None:
+            raise ValueError("owner action requires the exact owner PR in the shared-head group")
+        if self.kind not in owner_actions and self.owning_pr_number is not None:
+            raise ValueError("non-owner action cannot claim an owning PR")
+        if self.kind is Wave08DecisionKind.RESERVED_OWNER_RECOVERY and (
+            marker is None or marker.owner_kind != "ISSUE"
+        ):
+            raise ValueError("reserved owner recovery requires an exact Issue claim marker")
+        if self.kind is Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED and (
+            marker is None or marker.owner_kind != "MACHINE_SOURCE" or marker.claim_kind != "MACHINE_REF_CLAIM"
+        ):
+            raise ValueError("machine recovery deferral requires the exact reserved machine claim marker")
+        if self.kind in {
+            Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY,
+            Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY,
+        } and (marker is None or marker.owner_kind != "ISSUE"):
+            raise ValueError("Issue action requires an exact Issue claim marker")
+        if self.kind is Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY and (
+            (role is CarrierRole.ISSUE_ACTIVE and marker.claim_kind not in {
+                "ISSUE_BRANCH_LEASE", "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH",
+            })
+            or (role is CarrierRole.ISSUE_FINALIZING and marker.claim_kind != "ISSUE_FINALIZATION_EPOCH")
+        ):
+            raise ValueError("Issue finalizer action requires the exact role-specific marker kind")
+        if self.kind is Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY and (
+            role is not CarrierRole.ISSUE_CANCEL or marker.claim_kind != "ISSUE_CANCELLATION_FENCE"
+        ):
+            raise ValueError("Issue cancellation action requires an exact cancellation-fence marker")
+        if self.kind in {
+            Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH,
+            Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH,
+        } and (
+            marker is None or marker.owner_kind != "MACHINE_SOURCE" or marker.claim_kind != "MACHINE_REF_CLAIM"
+        ):
+            raise ValueError("machine action requires an exact supplied machine-claim marker")
+        if self.kind is Wave08DecisionKind.EXTERNAL_STATUS and not self.pull_request_numbers:
+            raise ValueError("external status action requires an OPEN-PR head group")
+
+
+@dataclass(frozen=True)
+class IssueOwnerPR:
+    issue_number: int
+    pull_request_number: int
+    owner_key: str
+    binding_authority: str
+
+    def __post_init__(self) -> None:
+        if type(self.issue_number) is not int or not 1 <= self.issue_number <= 9_223_372_036_854_775_807:
+            raise ValueError("Issue owner number must be a positive exact integer")
+        if type(self.pull_request_number) is not int or not 1 <= self.pull_request_number <= 9_223_372_036_854_775_807:
+            raise ValueError("owner PR number must be a positive exact integer")
+        if type(self.owner_key) is not str or not self.owner_key:
+            raise ValueError("Issue owner key is required")
+        if type(self.binding_authority) is not str or self.binding_authority not in {"FULL_BINDING", "PRE_BINDING"}:
+            raise ValueError("Issue owner binding authority is unknown")
+
+
+@dataclass(frozen=True)
+class Wave08IssueRecoveryIntent:
+    """Bounded Wg6-to-Wg1 semantic dispatch; it carries no mutation authority."""
+
+    target: Wave08DispatchTarget
+    central_repository_node_id: str
+    issue_number: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.target not in {
+            Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY,
+            Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY,
+        }:
+            raise ValueError("Issue recovery intent requires a closed Wg1 semantic target")
+        if type(self.central_repository_node_id) is not str or not self.central_repository_node_id:
+            raise ValueError("Issue recovery intent requires the exact central repository identity")
+        if type(self.issue_number) is not int or not 1 <= self.issue_number <= 9_223_372_036_854_775_807:
+            raise ValueError("Issue recovery intent requires a positive exact Issue number")
+        if type(self.reason) is not str or not self.reason or len(self.reason.encode("utf-8")) > 256:
+            raise ValueError("Issue recovery intent reason must be bounded text")
+
+
+@dataclass(frozen=True)
+class Wave08IssueRecoveryRecord:
+    issue_number: int
+    issue_database_id: int | None
+    issue_node_id: str | None
+    outcome: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class Wave08MachineRefRecord:
+    ref: str
+    source_id: str
+    head_sha: str
+    outcome: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class Wave08UniversalRecoveryResult:
+    """Immutable bounded evidence from one complete or fail-closed recovery sweep."""
+
+    complete: bool
+    open_pr_inventory_count: int
+    fresh_pr_count: int
+    distinct_pr_head_count: int
+    issue_inventory_count: int
+    relevant_issue_count: int
+    machine_ref_inventory_count: int
+    decisions: tuple[Wave08Decision, ...]
+    issue_recoveries: tuple[Wave08IssueRecoveryRecord, ...]
+    machine_refs: tuple[Wave08MachineRefRecord, ...]
+    dispatch_intents: tuple[Wave08IssueRecoveryIntent, ...]
+    status_actions: tuple[tuple[str, str], ...]
+    blocked_reasons: tuple[str, ...]
+    deferred_count: int
+
+    @property
+    def blocked_count(self) -> int:
+        return len(self.blocked_reasons)
+
+
 @dataclass(frozen=True)
 class AppIdentity:
     slug: str
@@ -528,8 +798,141 @@ _CLAIMED_HEAD_FAMILY = "swiftstream-federation-head:"
 _EXTERNAL_STATUS_CONTEXT = "federation/trusted-validation"
 
 
+def _is_canonical_wave08_source_id(value: Any) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        return c02.validate_source_id(value) == value
+    except c02.FederationError:
+        return False
+
+
 def _conflicting_sha_carrier(marker: ClaimedHeadMarker | None = None) -> ShaCarrierResolution:
     return ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=marker)
+
+
+def wave08_legacy_disposition(
+    head_sha: str,
+    resolver: Callable[[str], LegacyEvidenceDisposition] | None,
+) -> LegacyEvidenceDisposition:
+    """Call the explicit trusted legacy classifier for exactly H; never infer ABSENT."""
+    if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None or not callable(resolver):
+        return LegacyEvidenceDisposition.CONFLICTING
+    try:
+        disposition = resolver(head_sha)
+    except Exception:
+        return LegacyEvidenceDisposition.CONFLICTING
+    return disposition if type(disposition) is LegacyEvidenceDisposition else LegacyEvidenceDisposition.CONFLICTING
+
+
+def wave08_decision_for_resolution(
+    head_sha: str,
+    resolution: ShaCarrierResolution,
+    pull_request_numbers: Iterable[int],
+    *,
+    owner_pr_number: int | None = None,
+    machine_target: Wave08DispatchTarget = Wave08DispatchTarget.MACHINE_VALIDATION,
+) -> Wave08Decision:
+    """Pure closed SHA-role-to-action mapping for one deterministic shared-head group."""
+    if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+        raise ValueError("Wave 08 decision head must be exact lowercase 40-hex")
+    if type(resolution) is not ShaCarrierResolution:
+        raise ValueError("Wave 08 decision requires an exact SHA carrier resolution")
+    if type(machine_target) is not Wave08DispatchTarget or machine_target not in {
+        Wave08DispatchTarget.MACHINE_VALIDATION, Wave08DispatchTarget.MACHINE_FINALIZER,
+    }:
+        raise ValueError("machine action requires a closed machine semantic target")
+    if isinstance(pull_request_numbers, (str, bytes)):
+        raise ValueError("Wave 08 PR group must be an integer sequence")
+    try:
+        raw_numbers = tuple(pull_request_numbers)
+    except TypeError:
+        raise ValueError("Wave 08 PR group must be an integer sequence") from None
+    if any(type(number) is not int or not 1 <= number <= 9_223_372_036_854_775_807 for number in raw_numbers):
+        raise ValueError("Wave 08 PR group numbers must be positive exact integers")
+    if len(set(raw_numbers)) != len(raw_numbers):
+        raise ValueError("Wave 08 PR group contains duplicate PR numbers")
+    numbers = tuple(sorted(raw_numbers))
+    if owner_pr_number is not None and (
+        type(owner_pr_number) is not int
+        or not 1 <= owner_pr_number <= 9_223_372_036_854_775_807
+    ):
+        raise ValueError("Wave 08 owner PR number must be a positive exact integer")
+    owner = owner_pr_number
+    if owner is not None and owner not in numbers:
+        raise ValueError("Wave 08 owner PR must belong to the shared-head group")
+    owner_is_member = owner is not None and owner in numbers
+    activation, role, marker = resolution.activation, resolution.role, resolution.marker
+    if role is not CarrierRole.MACHINE_PUBLICATION and machine_target is not Wave08DispatchTarget.MACHINE_VALIDATION:
+        raise ValueError("Issue and non-machine roles cannot select a machine dispatch lane")
+    if activation in {
+        CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION,
+        CarrierActivation.LEGACY_CUTOVER_QUARANTINE,
+        CarrierActivation.CONFLICTING,
+    } and owner is not None:
+        raise ValueError("unclaimed, quarantined, and conflicting heads cannot have an owner PR")
+
+    def make(kind: Wave08DecisionKind, reason: Wave08DecisionReason, target: Wave08DispatchTarget | None = None, *, chosen_owner: int | None = None) -> Wave08Decision:
+        return Wave08Decision(head_sha, resolution, numbers, chosen_owner, kind, reason, target)
+
+    if activation is CarrierActivation.CONFLICTING:
+        return make(Wave08DecisionKind.CONFLICTING_BLOCKED, Wave08DecisionReason.CONFLICTING_EVIDENCE)
+    if activation is CarrierActivation.LEGACY_CUTOVER_QUARANTINE:
+        return make(Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED, Wave08DecisionReason.LEGACY_CLASSIFIER_DEFERRED)
+    if activation is CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION:
+        if numbers:
+            return make(Wave08DecisionKind.EXTERNAL_STATUS, Wave08DecisionReason.EXPLICITLY_UNCLAIMED)
+        return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.ROLE_REQUIRES_NO_ACTION)
+    if activation is CarrierActivation.RESERVED_INACTIVE:
+        if role is CarrierRole.MACHINE_PUBLICATION:
+            if marker is not None and marker.owner_kind == "MACHINE_SOURCE" and marker.claim_kind == "MACHINE_REF_CLAIM":
+                return make(Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED, Wave08DecisionReason.MACHINE_AUTHORITY_PENDING)
+            return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.OWNER_NOT_PRESENT)
+        if owner_is_member and marker is not None and marker.owner_kind == "ISSUE":
+            return make(
+                Wave08DecisionKind.RESERVED_OWNER_RECOVERY,
+                Wave08DecisionReason.RESERVED_ROLE,
+                chosen_owner=owner,
+            )
+        return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.OWNER_NOT_PRESENT)
+
+    if activation is not CarrierActivation.ACTIVE or type(role) is not CarrierRole:
+        return make(Wave08DecisionKind.CONFLICTING_BLOCKED, Wave08DecisionReason.CONFLICTING_EVIDENCE)
+    if role in {CarrierRole.ISSUE_ACTIVE, CarrierRole.ISSUE_FINALIZING}:
+        if not owner_is_member or marker is None or marker.owner_kind != "ISSUE":
+            return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.OWNER_NOT_PRESENT)
+        return make(
+            Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY,
+            Wave08DecisionReason.ISSUE_FINALIZER_REQUIRED,
+            Wave08DispatchTarget.ISSUE_FINALIZER,
+            chosen_owner=owner,
+        )
+    if role is CarrierRole.ISSUE_CANCEL:
+        if not owner_is_member or marker is None or marker.owner_kind != "ISSUE":
+            return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.OWNER_NOT_PRESENT)
+        return make(
+            Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY,
+            Wave08DecisionReason.ISSUE_CANCELLATION_REQUIRED,
+            Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY,
+            chosen_owner=owner,
+        )
+    if role is CarrierRole.MACHINE_PUBLICATION:
+        if not owner_is_member or marker is None or marker.owner_kind != "MACHINE_SOURCE" or marker.claim_kind != "MACHINE_REF_CLAIM":
+            return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.OWNER_NOT_PRESENT)
+        if machine_target is Wave08DispatchTarget.MACHINE_VALIDATION:
+            return make(
+                Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH,
+                Wave08DecisionReason.MACHINE_VALIDATION_REQUIRED,
+                machine_target,
+                chosen_owner=owner,
+            )
+        return make(
+            Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH,
+            Wave08DecisionReason.MACHINE_FINALIZER_REQUIRED,
+            machine_target,
+            chosen_owner=owner,
+        )
+    return make(Wave08DecisionKind.CONFLICTING_BLOCKED, Wave08DecisionReason.CONFLICTING_EVIDENCE)
 
 
 def _issue_pr_binding_matches_cancellation_identity(
@@ -973,6 +1376,132 @@ def _resolve_issue_cancellation_carrier(
         return ShaCarrierResolution(activation, CarrierRole.ISSUE_CANCEL, marker)
     except Exception:
         return _conflicting_sha_carrier(marker)
+
+
+def derive_issue_owner_pr(
+    client: GitHubClient,
+    repository: str,
+    head_sha: str,
+    resolution: ShaCarrierResolution,
+    app_slug: str,
+    *,
+    role_already_resolved: bool = False,
+) -> IssueOwnerPR:
+    """Derive an Issue owner from validated claim history and exact current binding."""
+    if (
+        type(head_sha) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        or type(resolution) is not ShaCarrierResolution
+        or resolution.activation not in {CarrierActivation.ACTIVE, CarrierActivation.RESERVED_INACTIVE}
+        or type(resolution.marker) is not ClaimedHeadMarker
+        or resolution.marker.owner_kind != "ISSUE"
+    ):
+        raise R02Error("exact Issue claimed-head resolution is required to derive its owner")
+    if type(role_already_resolved) is not bool:
+        raise R02Error("role_already_resolved must be an exact bool")
+    if not role_already_resolved:
+        fresh_resolution = resolve_sha_carrier_role(
+            client, repository, head_sha, app_slug, LegacyEvidenceDisposition.CONFLICTING,
+        )
+        if fresh_resolution != resolution:
+            raise StaleAuthorityError("Issue SHA role changed during owner derivation")
+    try:
+        central = client.get_repository_metadata(repository)
+        central_node_id, issue_database_id, issue_node_id, issue_number = parse_issue_owner_key(
+            resolution.marker.owner_key,
+        )
+        if (
+            type(central) is not RepositoryMetadata
+            or central.full_name != repository
+            or central.default_branch != "main"
+            or central.node_id != central_node_id
+        ):
+            raise R02Error("Issue owner key does not bind the exact central repository")
+        app = resolve_app_identity(client, app_slug)
+        issue = client.get_issue_metadata(repository, issue_number)
+        comments = tuple(client.list_issue_comments(repository, issue_number))
+        if (
+            type(issue) is not IssueMetadata
+            or issue.number != issue_number
+            or issue.database_id != issue_database_id
+            or issue.node_id != issue_node_id
+            or issue.is_pull_request
+        ):
+            raise R02Error("claimed Issue owner does not match fresh Issue identity")
+        anchor = validate_unique_issue_anchor(comments, issue, app)
+        if issue_owner_key(
+            central.node_id, anchor.anchor.issue_database_id,
+            anchor.anchor.issue_node_id, anchor.anchor.issue_number,
+        ) != resolution.marker.owner_key:
+            raise R02Error("IssueRequestAnchor does not match the claimed owner key")
+        lease = _resolve_issue_branch_lease_class(
+            client, repository, comments, app, anchor.anchor,
+            anchor.comment.database_id, central.node_id,
+        )
+        if lease is None:
+            raise R02Error("exact IssueBranchLease is required to derive an Issue owner")
+        if resolution.marker.claim_kind == "ISSUE_BRANCH_LEASE" and (
+            lease.lease.initial_head_sha != head_sha or _lease_marker_for(lease.lease) != resolution.marker
+        ):
+            raise R02Error("Issue lease does not bind the exact claimed head")
+        if resolution.marker.claim_kind == "ISSUE_CANCELLATION_FENCE":
+            authority = _fresh_issue_cancellation_authority(
+                client, repository, issue_number, app, allow_pr_stage_state=True,
+            )
+            current_ref = _read_issue_branch_ref(
+                client, repository, authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+            )
+            fences = _issue_cancellation_fence_comments(
+                client, repository, authority.pr_comments, app, authority, current_ref or ZERO_OID,
+            )
+            exact = tuple(
+                item for item in fences
+                if item.fence.cancellation_head_sha == head_sha
+                and _issue_cancellation_fence_marker(item.fence) == resolution.marker
+            )
+            if len(exact) != 1 or (
+                resolution.activation is CarrierActivation.ACTIVE
+                and (current_ref != head_sha or authority.pr.head_oid != head_sha)
+            ):
+                raise R02Error("cancellation owner does not match the exact active fence/PR head")
+            return IssueOwnerPR(
+                issue_number, authority.pull_request_number, resolution.marker.owner_key,
+                "PRE_BINDING" if authority.binding_authority == "PRE_BINDING" else "FULL_BINDING",
+            )
+        state = _read_managed_issue_pr_binding_state(
+            client, repository, issue_number, app, central.node_id,
+            lambda _request, _request_class: None,
+            validate_fresh_source_authority=False,
+            require_open_lifecycle=False,
+        )
+        current_ref = _read_issue_branch_ref(
+            client, repository, state.binding.branch_ref.removeprefix("refs/heads/"),
+        )
+        pr_comments = tuple(client.list_issue_comments(repository, state.binding.pull_request_number))
+        history = _issue_authority_history(
+            client, repository, pr_comments, app, state, current_ref or ZERO_OID,
+        )
+        if not any(
+            item.target_head_sha == head_sha
+            and item.claim_kind == resolution.marker.claim_kind
+            and (
+                (_issue_head_claim_marker(item.artifact) if item.claim_kind == "ISSUE_HEAD_CLAIM"
+                 else _required_status_epoch_marker(item.artifact) if item.claim_kind == "REQUIRED_STATUS_EPOCH"
+                 else _issue_finalization_epoch_marker(item.artifact) if item.claim_kind == "ISSUE_FINALIZATION_EPOCH"
+                 else _lease_marker_for(item.artifact)) == resolution.marker
+            )
+            for item in history
+        ):
+            raise R02Error("Issue authority history does not bind the claimed owner PR")
+        if resolution.activation is CarrierActivation.ACTIVE and (
+            current_ref != head_sha or state.pr.head_oid != head_sha
+        ):
+            raise R02Error("active Issue owner PR/ref no longer points at the exact resolved head")
+        return IssueOwnerPR(issue_number, state.binding.pull_request_number, resolution.marker.owner_key, "FULL_BINDING")
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"exact Issue owner derivation failed: {_bounded_reason(error)}") from None
 
 
 def publish_unclaimed_external_success(
@@ -8544,6 +9073,1133 @@ class R02Controller:
         ):
             raise StaleAuthorityError("revocation CAS is not the exact ACTIVE(ISSUE_ACTIVE) HV")
         return epoch
+
+    def trusted_validation_role_first(
+        self,
+        pr_number: int,
+        legacy_disposition_resolver: Callable[[str], LegacyEvidenceDisposition] | None,
+        *,
+        central_recovery_dispatcher: Callable[[Wave08Decision, IssueOwnerPR, IssueCancellationFence | None], Any] | None = None,
+        machine_validation_dispatcher: Callable[[Wave08Decision, MachinePRAuthority], Any] | None = None,
+    ) -> Wave08Decision:
+        """Resolve the fresh PR head's SHA role before reading PR-specific authority."""
+        if type(pr_number) is not int or not 1 <= pr_number <= 9_223_372_036_854_775_807:
+            raise R02Error("role-first validation requires a positive exact PR number")
+        if central_recovery_dispatcher is not None and not callable(central_recovery_dispatcher):
+            raise R02Error("central recovery dispatcher must be a semantic callable")
+        if machine_validation_dispatcher is not None and not callable(machine_validation_dispatcher):
+            raise R02Error("machine validation dispatcher must be a semantic callable")
+
+        pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+        if type(pr) is not PullRequestMetadata or pr.number != pr_number:
+            raise StaleAuthorityError("fresh role-first PR identity is malformed")
+        head_sha = pr.head_oid
+        if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+            raise StaleAuthorityError("fresh role-first PR head is not exact lowercase 40-hex")
+
+        def exact_legacy_disposition() -> LegacyEvidenceDisposition:
+            return wave08_legacy_disposition(head_sha, legacy_disposition_resolver)
+
+        resolution = resolve_sha_carrier_role(
+            self.client, self.central_repository, head_sha, self.app.slug,
+            exact_legacy_disposition,
+        )
+        pull_request_numbers = (pr_number,)
+
+        def blocked(reason: Wave08DecisionReason) -> Wave08Decision:
+            return Wave08Decision(
+                head_sha, resolution, pull_request_numbers, None,
+                Wave08DecisionKind.CONFLICTING_BLOCKED, reason,
+            )
+
+        if resolution.activation in {
+            CarrierActivation.CONFLICTING,
+            CarrierActivation.LEGACY_CUTOVER_QUARANTINE,
+            CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION,
+        }:
+            decision = wave08_decision_for_resolution(head_sha, resolution, pull_request_numbers)
+            if decision.kind is Wave08DecisionKind.EXTERNAL_STATUS:
+                central = self.client.get_repository_metadata(self.central_repository)
+                fresh_app = resolve_app_identity(self.client, self.app.slug)
+                if (
+                    type(central) is not RepositoryMetadata
+                    or central.full_name != self.central_repository
+                    or central.default_branch != "main"
+                    or fresh_app != self.app
+                ):
+                    return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+                publish_unclaimed_external_success(
+                    self.client, central, head_sha, resolution, fresh_app,
+                )
+            return decision
+
+        if resolution.role is CarrierRole.MACHINE_PUBLICATION:
+            if resolution.activation is CarrierActivation.RESERVED_INACTIVE:
+                return wave08_decision_for_resolution(head_sha, resolution, pull_request_numbers)
+            marker = resolution.marker
+            if (
+                resolution.activation is not CarrierActivation.ACTIVE
+                or marker is None
+                or marker.owner_kind != "MACHINE_SOURCE"
+                or marker.claim_kind != "MACHINE_REF_CLAIM"
+            ):
+                return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+            try:
+                repository, accepted_main = self.current_accepted_main()
+                if repository.default_branch != "main":
+                    raise StaleAuthorityError("machine role requires central main")
+                accepted_sources = self._accepted_sources(accepted_main)
+                owner_key_matches = tuple(
+                    source for source in accepted_sources
+                    if marker.owner_key == f"{repository.node_id}:{source.source_id}"
+                )
+                if len(owner_key_matches) != 1:
+                    raise StaleAuthorityError("machine claim owner is not one exact accepted source")
+                source = owner_key_matches[0]
+                authority = self._machine_authority(
+                    {"number": pr_number}, source, accepted_main, repository,
+                )
+                current_machine_ref = self.client.get_ref_oid(
+                    self.central_repository, f"bot/federation/{source.source_id}",
+                )
+                if (
+                    authority is None
+                    or not authority.valid
+                    or authority.number != pr_number
+                    or authority.source_id != source.source_id
+                    or authority.repository_id != source.repository_id
+                    or authority.head_sha != head_sha
+                    or current_machine_ref != head_sha
+                    or pr.head_ref != _machine_branch(source.source_id)
+                    or pr.head_repository != repository.full_name
+                    or pr.head_repository_id != repository.node_id
+                    or pr.base_repository != repository.full_name
+                    or pr.base_repository_id != repository.node_id
+                    or pr.base_oid != accepted_main
+                ):
+                    raise StaleAuthorityError("machine PR/ref/source owner does not bind the exact role head")
+                decision = wave08_decision_for_resolution(
+                    head_sha, resolution, pull_request_numbers, owner_pr_number=pr_number,
+                    machine_target=Wave08DispatchTarget.MACHINE_VALIDATION,
+                )
+            except Exception:
+                return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+            if machine_validation_dispatcher is not None:
+                try:
+                    machine_validation_dispatcher(decision, authority)
+                except Exception:
+                    return blocked(Wave08DecisionReason.DISPATCH_FAILED)
+            return decision
+
+        if resolution.role not in {
+            CarrierRole.ISSUE_ACTIVE,
+            CarrierRole.ISSUE_FINALIZING,
+            CarrierRole.ISSUE_CANCEL,
+        }:
+            return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+        try:
+            owner = derive_issue_owner_pr(
+                self.client, self.central_repository, head_sha, resolution, self.app.slug,
+            )
+        except Exception:
+            return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+        if owner.pull_request_number != pr_number:
+            return wave08_decision_for_resolution(head_sha, resolution, pull_request_numbers)
+
+        fence: IssueCancellationFence | None = None
+        if (
+            resolution.role is CarrierRole.ISSUE_CANCEL
+            and resolution.activation is CarrierActivation.ACTIVE
+        ):
+            try:
+                cancellation = _fresh_issue_cancellation_authority(
+                    self.client, self.central_repository, owner.issue_number, self.app,
+                    allow_pr_stage_state=True,
+                )
+                current_ref = _read_issue_branch_ref(
+                    self.client, self.central_repository,
+                    cancellation.lease.lease.branch_ref.removeprefix("refs/heads/"),
+                )
+                fences, _comments = self._read_issue_cancellation_fences(
+                    cancellation, current_ref or ZERO_OID,
+                )
+                exact_fences = tuple(
+                    item.fence for item in fences
+                    if item.fence.cancellation_head_sha == head_sha
+                    and _issue_cancellation_fence_marker(item.fence) == resolution.marker
+                )
+                if (
+                    len(exact_fences) != 1
+                    or cancellation.pull_request_number != pr_number
+                    or current_ref != head_sha
+                    or cancellation.pr.head_oid != head_sha
+                    or cancellation.raw_pr_state != "OPEN"
+                    or cancellation.raw_pr_merged
+                ):
+                    raise StaleAuthorityError("current cancellation fence/owner PR is not exact")
+                fence = exact_fences[0]
+                self.publish_issue_cancel_failure(owner.issue_number, fence)
+            except Exception:
+                return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+
+        decision = wave08_decision_for_resolution(
+            head_sha, resolution, pull_request_numbers, owner_pr_number=pr_number,
+        )
+        if central_recovery_dispatcher is not None:
+            try:
+                central_recovery_dispatcher(decision, owner, fence)
+            except Exception:
+                return blocked(Wave08DecisionReason.DISPATCH_FAILED)
+        return decision
+
+    def recover_issue_first_authority(
+        self,
+        issue_number: int,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> Wave08IssueRecoveryRecord:
+        """Wg1-like explicit Issue intake/terminal recovery using Wave 02-07 authorities."""
+        if type(issue_number) is not int or not 1 <= issue_number <= 9_223_372_036_854_775_807:
+            raise R02Error("Issue recovery requires a positive exact Issue number")
+        if not callable(source_authority_resolver):
+            raise R02Error("Issue recovery requires a fresh source-authority resolver")
+
+        # The cancellation classifier is deliberately the first authority path.
+        # A missing anchor is the sole expected reason to fall through to open intake.
+        terminal_state: IssueCancellationState | None = None
+        try:
+            terminal_state = self._read_issue_cancellation_state(issue_number)
+        except DuplicateAnchorError as error:
+            try:
+                snapshot = self.client.get_issue_metadata(self.central_repository, issue_number)
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"Issue identity is unavailable after anchor classification: {_bounded_reason(read_error)}"
+                ) from None
+            if (
+                type(snapshot) is not IssueMetadata
+                or snapshot.number != issue_number
+                or snapshot.is_pull_request
+            ):
+                raise StaleAuthorityError("fresh Issue identity is malformed after anchor classification") from None
+            if snapshot.state != "open":
+                return Wave08IssueRecoveryRecord(
+                    issue_number, snapshot.database_id, snapshot.node_id,
+                    "BLOCKED", f"CLOSED_ISSUE_REQUIRES_UNIQUE_ANCHOR:{_bounded_reason(error)}",
+                )
+            terminal_state = None
+        except Exception as error:
+            # A closed Issue with malformed/ambiguous cancellation authority must
+            # not be reinterpreted through live source-registry eligibility.
+            try:
+                snapshot = self.client.get_issue_metadata(self.central_repository, issue_number)
+            except Exception:
+                raise StaleAuthorityError(
+                    f"Issue cancellation authority is unavailable: {_bounded_reason(error)}"
+                ) from None
+            if type(snapshot) is not IssueMetadata or snapshot.number != issue_number or snapshot.is_pull_request:
+                raise StaleAuthorityError("fresh Issue identity is malformed during cancellation recovery") from None
+            if snapshot.state != "open":
+                raise StaleAuthorityError(
+                    f"closed Issue cancellation classification is blocked: {_bounded_reason(error)}"
+                ) from None
+            # Open unanchored Issues do not yet have cancellation provenance.
+            terminal_state = None
+
+        if terminal_state is not None and terminal_state.issue.state == "closed":
+            state = terminal_state
+            if state.classification in {
+                IssueCancellationClass.A_ANCHOR_ONLY,
+                IssueCancellationClass.B_LEASE_REF_ABSENT,
+                IssueCancellationClass.C_LEASE_ZERO_PR,
+            }:
+                result = self.cancel_issue_without_pr(issue_number)
+                return Wave08IssueRecoveryRecord(
+                    issue_number, state.issue.database_id, state.issue.node_id,
+                    "CANCELLED_NO_PR", result.proof_kind.value,
+                )
+            if state.classification is IssueCancellationClass.F_CONFLICTING:
+                return Wave08IssueRecoveryRecord(
+                    issue_number, state.issue.database_id, state.issue.node_id,
+                    "BLOCKED", "CANCELLATION_CLASS_F_CONFLICTING",
+                )
+            if state.classification not in {
+                IssueCancellationClass.D_PRE_BINDING_ONE_PR,
+                IssueCancellationClass.E_FULL_BINDING,
+            }:
+                return Wave08IssueRecoveryRecord(
+                    issue_number, state.issue.database_id, state.issue.node_id,
+                    "BLOCKED", "UNKNOWN_CANCELLATION_CLASS",
+                )
+            if state.merge_observed:
+                if state.classification is IssueCancellationClass.E_FULL_BINDING:
+                    return Wave08IssueRecoveryRecord(
+                        issue_number, state.issue.database_id, state.issue.node_id,
+                        "MERGE_WINS", "POST_MERGE_RECOVERY_REQUIRED",
+                    )
+                return Wave08IssueRecoveryRecord(
+                    issue_number, state.issue.database_id, state.issue.node_id,
+                    "PRESERVED", "MERGED_PRE_BINDING_HAS_NO_CANCELLATION_DELETE_AUTHORITY",
+                )
+
+            fence = self.prepare_issue_cancellation_fence(
+                issue_number,
+                classification="D" if state.classification is IssueCancellationClass.D_PRE_BINDING_ONE_PR else "E",
+                nonce_factory=nonce_factory,
+            )
+            try:
+                self._require_current_cancel_failure(fence)
+            except Exception as error:
+                return Wave08IssueRecoveryRecord(
+                    issue_number, state.issue.database_id, state.issue.node_id,
+                    "DEFERRED", f"WAITING_FOR_WG6_CANCEL_FAILURE:{_bounded_reason(error)}",
+                )
+            self.establish_issue_cancellation_draft_witness(issue_number)
+            self.establish_issue_terminal_cancelled_result(issue_number)
+            terminal = self.cleanup_issue_cancelled_branch(issue_number)
+            return Wave08IssueRecoveryRecord(
+                issue_number, state.issue.database_id, state.issue.node_id,
+                "CANCELLED_PR_BACKED", "EXACT_TERMINAL_RESULT_AND_REF_CAS_VERIFIED",
+            )
+
+        if terminal_state is not None:
+            if terminal_state.classification is IssueCancellationClass.F_CONFLICTING:
+                return Wave08IssueRecoveryRecord(
+                    issue_number, terminal_state.issue.database_id, terminal_state.issue.node_id,
+                    "BLOCKED", "OPEN_ISSUE_CANCELLATION_PROVENANCE_CONFLICT",
+                )
+            if (
+                terminal_state.issue.state == "open"
+                and terminal_state.classification in {
+                    IssueCancellationClass.D_PRE_BINDING_ONE_PR,
+                    IssueCancellationClass.E_FULL_BINDING,
+                }
+            ):
+                authority = terminal_state.cancellation_authority
+                head_sha = authority.pr.head_oid if authority is not None else None
+                if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+                    return Wave08IssueRecoveryRecord(
+                        issue_number, terminal_state.issue.database_id, terminal_state.issue.node_id,
+                        "DEFERRED", "CURRENT_ISSUE_CARRIER_ROLE_UNAVAILABLE_FOR_WG1",
+                    )
+                try:
+                    current_resolution = resolve_sha_carrier_role(
+                        self.client, self.central_repository, head_sha, self.app.slug,
+                        LegacyEvidenceDisposition.CONFLICTING,
+                    )
+                except Exception:
+                    current_resolution = _conflicting_sha_carrier()
+                if current_resolution.role is CarrierRole.ISSUE_FINALIZING and current_resolution.activation in {
+                    CarrierActivation.ACTIVE,
+                    CarrierActivation.RESERVED_INACTIVE,
+                }:
+                    return Wave08IssueRecoveryRecord(
+                        issue_number, terminal_state.issue.database_id, terminal_state.issue.node_id,
+                        "DEFERRED", "ISSUE_FINALIZER_OWNED_BY_WG4",
+                    )
+                if current_resolution.activation not in {
+                    CarrierActivation.ACTIVE,
+                    CarrierActivation.RESERVED_INACTIVE,
+                }:
+                    return Wave08IssueRecoveryRecord(
+                        issue_number, terminal_state.issue.database_id, terminal_state.issue.node_id,
+                        "DEFERRED", "CURRENT_ISSUE_CARRIER_ROLE_UNRESOLVED_FOR_WG1",
+                    )
+            issue = terminal_state.issue
+            comments = terminal_state.issue_comments
+        else:
+            try:
+                issue = self.client.get_issue_metadata(self.central_repository, issue_number)
+                comments = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+            except Exception as error:
+                raise StaleAuthorityError(f"fresh open Issue intake authority is unavailable: {_bounded_reason(error)}") from None
+        if (
+            type(issue) is not IssueMetadata
+            or issue.number != issue_number
+            or issue.is_pull_request
+            or issue.state != "open"
+        ):
+            return Wave08IssueRecoveryRecord(
+                issue_number,
+                issue.database_id if type(issue) is IssueMetadata else None,
+                issue.node_id if type(issue) is IssueMetadata else None,
+                "NOOP", "ISSUE_NOT_OPEN",
+            )
+
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            if (
+                type(repository) is not RepositoryMetadata
+                or repository.full_name != self.central_repository
+                or repository.default_branch != "main"
+                or not repository.node_id
+                or current_app != self.app
+            ):
+                raise StaleAuthorityError("central repository/App identity is not the exact current main")
+        except Exception as error:
+            raise StaleAuthorityError(f"Issue intake central authority is unavailable: {_bounded_reason(error)}") from None
+
+        try:
+            anchors = _issue_anchor_candidates(comments)
+            if len(anchors) > 1:
+                raise R02Error("duplicate IssueRequestAnchor comments block intake")
+            if anchors:
+                anchor = validate_unique_issue_anchor(comments, issue, current_app)
+                fresh_source = source_authority_resolver(
+                    anchor.anchor.initial_request, anchor.anchor.request_class,
+                )
+                _validate_issue_source_authority(anchor.anchor, fresh_source)
+                anchor = create_or_validate_issue_anchor(
+                    self.client, self.central_repository, issue, comments,
+                    current_app, fresh_source, source_authority_resolver,
+                )
+            else:
+                try:
+                    request = parse_issue_request_body(issue.body)
+                except RequestModelError as error:
+                    if type(issue.body) is str and issue.body.lstrip().startswith("### Federation request type"):
+                        return Wave08IssueRecoveryRecord(
+                            issue_number, issue.database_id, issue.node_id,
+                            "BLOCKED", f"MALFORMED_RECOGNIZED_ISSUE_REQUEST:{_bounded_reason(error)}",
+                        )
+                    return Wave08IssueRecoveryRecord(
+                        issue_number, issue.database_id, issue.node_id,
+                        "NOOP", "UNRELATED_OPEN_ISSUE",
+                    )
+                source_authority = source_authority_resolver(request, request.request_class)
+                anchor = create_or_validate_issue_anchor(
+                    self.client, self.central_repository, issue, comments,
+                    current_app, source_authority, source_authority_resolver,
+                )
+            lease = create_or_validate_issue_branch_lease(
+                self.client, self.central_repository, anchor, current_app,
+                repository.node_id, source_authority_resolver,
+                nonce_factory=nonce_factory,
+            )
+            binding_state = create_or_recover_issue_pr_binding(
+                self.client, self.central_repository, issue_number, current_app,
+                repository.node_id, source_authority_resolver,
+            )
+            if binding_state.lease != lease.lease or binding_state.issue_anchor != anchor:
+                raise StaleAuthorityError("recovered Issue lease/binding differs from the exact anchor authority")
+            if self.candidate_builder is None:
+                return Wave08IssueRecoveryRecord(
+                    issue_number, issue.database_id, issue.node_id,
+                    "BINDING_READY", "EXACT_ANCHOR_LEASE_AND_PR_BINDING_RECOVERED",
+                )
+            route = self.interactive_issue_managed_route(
+                issue_number, source_authority_resolver,
+                semantic_validator=semantic_validator,
+                nonce_factory=nonce_factory,
+            )
+            return Wave08IssueRecoveryRecord(
+                issue_number, issue.database_id, issue.node_id,
+                route.outcome, route.reason,
+            )
+        except Exception as error:
+            return Wave08IssueRecoveryRecord(
+                issue_number, issue.database_id, issue.node_id,
+                "BLOCKED", _bounded_reason(error),
+            )
+
+    def recover_universal_role_first(
+        self,
+        legacy_disposition_resolver: Callable[[str], LegacyEvidenceDisposition] | None,
+        *,
+        issue_intake_terminal_dispatcher: Callable[[Wave08IssueRecoveryIntent], Any] | None = None,
+        issue_finalizer_dispatcher: Callable[[Wave08Decision, IssueOwnerPR], Any] | None = None,
+        machine_validation_dispatcher: Callable[[Wave08Decision, MachinePRAuthority], Any] | None = None,
+        machine_finalizer_dispatcher: Callable[[Wave08Decision, MachinePRAuthority], Any] | None = None,
+        max_pages: int = 100,
+    ) -> Wave08UniversalRecoveryResult:
+        """Wg6-like bounded inventory, SHA-role-first dispatch and status recovery."""
+        if type(max_pages) is not int or not 1 <= max_pages <= 100:
+            raise R02Error("universal recovery max_pages must be an exact integer from 1 to 100")
+        callbacks = (
+            issue_intake_terminal_dispatcher,
+            issue_finalizer_dispatcher,
+            machine_validation_dispatcher,
+            machine_finalizer_dispatcher,
+        )
+        if any(callback is not None and not callable(callback) for callback in callbacks):
+            raise R02Error("universal recovery callbacks must be semantic callables")
+
+        # Complete every required bounded inventory before any write or dispatch.
+        inventories: dict[str, tuple[Any, ...]] = {}
+        inventory_errors: list[str] = []
+        for key, reader in (
+            ("open_prs", lambda: self.client.list_open_pull_requests(self.central_repository, max_pages=max_pages)),
+            ("issues", lambda: self.client.list_repository_issues(self.central_repository, state="all", max_pages=max_pages)),
+            ("machine_refs", lambda: self.client.list_machine_refs(self.central_repository, max_pages=max_pages)),
+        ):
+            try:
+                value = reader()
+                if type(value) not in {tuple, list}:
+                    raise R02Error(f"{key} bounded inventory did not return a sequence")
+                inventories[key] = tuple(value)
+            except Exception as error:
+                inventory_errors.append(f"{key}:{_bounded_reason(error)}")
+        if inventory_errors:
+            return Wave08UniversalRecoveryResult(
+                False, len(inventories.get("open_prs", ())), 0, 0,
+                len(inventories.get("issues", ())), 0,
+                len(inventories.get("machine_refs", ())), (), (), (), (), (),
+                tuple(inventory_errors), 0,
+            )
+
+        raw_prs = inventories["open_prs"]
+        raw_issues = inventories["issues"]
+        raw_machine_refs = inventories["machine_refs"]
+        blocked: list[str] = []
+        deferred_count = 0
+        machine_inventory_ambiguous = False
+        seen_pr_numbers: set[int] = set()
+        seen_issue_numbers: set[int] = set()
+        seen_machine_refs: set[str] = set()
+        pr_inventory_valid = True
+        for row in raw_prs:
+            if (
+                type(row) is not dict
+                or type(row.get("number")) is not int
+                or not 1 <= row["number"] <= 9_223_372_036_854_775_807
+                or row["number"] in seen_pr_numbers
+            ):
+                pr_inventory_valid = False
+                break
+            seen_pr_numbers.add(row["number"])
+        if not pr_inventory_valid:
+            blocked.append("OPEN_PR_INVENTORY_ROWS_MALFORMED_OR_DUPLICATE")
+        issue_inventory_valid = True
+        for row in raw_issues:
+            if (
+                type(row) is not dict
+                or type(row.get("number")) is not int
+                or not 1 <= row["number"] <= 9_223_372_036_854_775_807
+                or row["number"] in seen_issue_numbers
+            ):
+                issue_inventory_valid = False
+                break
+            seen_issue_numbers.add(row["number"])
+        if not issue_inventory_valid:
+            blocked.append("ISSUE_INVENTORY_ROWS_MALFORMED_OR_DUPLICATE")
+
+        machine_rows: list[dict[str, str]] = []
+        for row in raw_machine_refs:
+            if (
+                type(row) is not dict
+                or type(row.get("ref")) is not str
+                or type(row.get("source_id")) is not str
+                or type(row.get("sha")) is not str
+                or re.fullmatch(r"refs/heads/bot/federation/[a-z0-9]+(?:-[a-z0-9]+)*", row["ref"]) is None
+                or row["ref"] != f"refs/heads/bot/federation/{row['source_id']}"
+                or not _is_canonical_wave08_source_id(row["source_id"])
+                or re.fullmatch(r"[0-9a-f]{40}", row["sha"]) is None
+                or row["ref"] in seen_machine_refs
+            ):
+                blocked.append("MACHINE_REF_ROW_MALFORMED_OR_DUPLICATE")
+                machine_inventory_ambiguous = True
+                continue
+            seen_machine_refs.add(row["ref"])
+            machine_rows.append({"ref": row["ref"], "source_id": row["source_id"], "sha": row["sha"]})
+
+        try:
+            central = self.client.get_repository_metadata(self.central_repository)
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            if (
+                type(central) is not RepositoryMetadata
+                or central.full_name != self.central_repository
+                or central.default_branch != "main"
+                or not central.node_id
+                or current_app != self.app
+            ):
+                raise StaleAuthorityError("central repository/App identity is not the exact current main")
+        except Exception as error:
+            blocked.append(f"CENTRAL_APP_AUTHORITY_UNAVAILABLE:{_bounded_reason(error)}")
+            central = None
+            current_app = None
+
+        fresh_prs: dict[int, PullRequestMetadata] = {}
+        head_groups: dict[str, list[PullRequestMetadata]] = {}
+        failed_fresh_pr_numbers: set[int] = set()
+        global_head_ambiguous = not pr_inventory_valid
+        for row in sorted((item for item in raw_prs if type(item) is dict), key=lambda item: item.get("number", 0) if type(item.get("number")) is int else 0):
+            number = row.get("number")
+            if type(number) is not int:
+                continue
+            try:
+                pr = self.client.get_pull_request_metadata(self.central_repository, number)
+                if (
+                    type(pr) is not PullRequestMetadata
+                    or pr.number != number
+                    or type(pr.head_oid) is not str
+                    or re.fullmatch(r"[0-9a-f]{40}", pr.head_oid) is None
+                ):
+                    raise R02Error("fresh PR metadata/head is malformed")
+            except Exception as error:
+                failed_fresh_pr_numbers.add(number)
+                blocked.append(f"PR_{number}_FRESH_METADATA_UNAVAILABLE:{_bounded_reason(error)}")
+                continue
+            fresh_prs[number] = pr
+            head_groups.setdefault(pr.head_oid, []).append(pr)
+        for group in head_groups.values():
+            group.sort(key=lambda item: item.number)
+
+        fresh_issues: dict[int, tuple[IssueMetadata, tuple[IssueComment, ...], str | None]] = {}
+        issue_inventory_records: dict[int, Wave08IssueRecoveryRecord] = {}
+        relevant_issue_numbers: set[int] = set()
+        if current_app is None:
+            issue_app = None
+        else:
+            issue_app = current_app
+        recognized_markers = (
+            ISSUE_REQUEST_ANCHOR_MARKER,
+            ISSUE_BRANCH_LEASE_MARKER,
+            ISSUE_INTERNAL_PR_BINDING_MARKER,
+            ISSUE_CANCELLATION_FENCE_MARKER,
+            ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+            ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
+            ISSUE_NO_PR_CANCELLED_RESULT_MARKER,
+            ISSUE_PATCH_PROJECTION_MARKER,
+            ISSUE_HEAD_CLAIM_MARKER,
+            REQUIRED_STATUS_EPOCH_MARKER,
+            ISSUE_FINALIZATION_EPOCH_MARKER,
+        )
+        for row in sorted((item for item in raw_issues if type(item) is dict), key=lambda item: item.get("number", 0) if type(item.get("number")) is int else 0):
+            number = row.get("number")
+            if type(number) is not int:
+                continue
+            try:
+                issue = self.client.get_issue_metadata(self.central_repository, number)
+                if (
+                    type(issue) is not IssueMetadata
+                    or issue.number != number
+                    or issue.is_pull_request
+                ):
+                    raise R02Error("fresh Issue metadata differs from exact Issue inventory identity")
+                comments = tuple(self.client.list_issue_comments(self.central_repository, number))
+                if any(type(comment) is not IssueComment for comment in comments):
+                    raise R02Error("Issue comment inventory contains a malformed record")
+            except Exception as error:
+                reason = f"FRESH_AUTHORITY_UNAVAILABLE:{_bounded_reason(error)}"
+                blocked.append(f"ISSUE_{number}_{reason}")
+                issue_inventory_records[number] = Wave08IssueRecoveryRecord(
+                    number, None, None, "BLOCKED", reason,
+                )
+                continue
+
+            relevant = False
+            issue_reason: str | None = None
+            recognized = [comment for comment in comments if any(
+                type(comment.body) is str and comment.body.startswith(marker)
+                for marker in recognized_markers
+            )]
+            if recognized:
+                relevant = True
+                if issue_app is None:
+                    issue_reason = "APP_IDENTITY_UNAVAILABLE_FOR_RECOGNIZED_ARTIFACT"
+                else:
+                    try:
+                        anchors = _issue_anchor_candidates(comments)
+                        if anchors:
+                            validate_unique_issue_anchor(comments, issue, issue_app)
+                        elif any(comment.body.startswith(ISSUE_REQUEST_ANCHOR_MARKER) for comment in recognized):
+                            raise R02Error("IssueRequestAnchor was recognized but not parsed")
+                        # Parse every recognized marker and validate its immutable
+                        # App-authored comment envelope before retaining relevance.
+                        for comment in recognized:
+                            body = comment.body
+                            if body.startswith(ISSUE_REQUEST_ANCHOR_MARKER):
+                                parse_issue_request_anchor(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueRequestAnchor")
+                            elif body.startswith(ISSUE_BRANCH_LEASE_MARKER):
+                                parse_issue_branch_lease(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueBranchLease")
+                            elif body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER):
+                                parse_issue_internal_pr_binding(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueInternalPRBinding")
+                            elif body.startswith(ISSUE_CANCELLATION_FENCE_MARKER):
+                                parse_issue_cancellation_fence(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueCancellationFence")
+                            elif body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER):
+                                parse_issue_cancellation_draft_witness(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueCancellationDraftWitness")
+                            elif body.startswith(ISSUE_TERMINAL_CANCELLED_RESULT_MARKER):
+                                parse_issue_terminal_cancelled_result(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueTerminalCancelledResult")
+                            elif body.startswith(ISSUE_NO_PR_CANCELLED_RESULT_MARKER):
+                                parse_issue_no_pr_cancelled_result(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueNoPRCancelledResult")
+                            elif body.startswith(ISSUE_PATCH_PROJECTION_MARKER):
+                                parse_issue_patch_projection(body)
+                                _epoch_comment_authority(comment, issue_app, "IssuePatchProjection")
+                                raise R02Error("IssuePatchProjection is not valid on the owning Issue")
+                            else:
+                                # Claimed-head artifacts belong on the generated
+                                # PR, so their appearance on an Issue blocks it.
+                                parser = (
+                                    parse_issue_head_claim if body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+                                    else parse_required_status_epoch if body.startswith(REQUIRED_STATUS_EPOCH_MARKER)
+                                    else parse_issue_finalization_epoch
+                                )
+                                parser(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueHeadAuthority")
+                                raise R02Error("claimed-head epoch artifact is misplaced on the owning Issue")
+                        if anchors and central is not None:
+                            _resolve_issue_branch_lease_class(
+                                self.client, self.central_repository, comments, issue_app,
+                                anchors[0].anchor, anchors[0].comment.database_id, central.node_id,
+                            )
+                    except Exception as error:
+                        issue_reason = f"RECOGNIZED_ARTIFACT_BLOCKED:{_bounded_reason(error)}"
+            if issue.state == "open" and not recognized:
+                try:
+                    parse_issue_request_body(issue.body)
+                    relevant = True
+                except RequestModelError as error:
+                    if type(issue.body) is str and issue.body.lstrip().startswith("### Federation request type"):
+                        relevant = True
+                        issue_reason = f"MALFORMED_RECOGNIZED_ISSUE_REQUEST:{_bounded_reason(error)}"
+            if relevant:
+                relevant_issue_numbers.add(number)
+            fresh_issues[number] = (issue, comments, issue_reason)
+
+        # Load accepted-source authority once, after the complete inventories and
+        # fresh central identity are known. Failure defers machine routing only.
+        machine_sources: tuple[c02.SourceDeclaration, ...] | None = None
+        machine_main: str | None = None
+        if machine_rows and central is not None:
+            try:
+                machine_main = self.client.get_ref_oid(self.central_repository, "main")
+                machine_sources = self._accepted_sources(machine_main)
+            except Exception as error:
+                blocked.append(f"ACCEPTED_MACHINE_SOURCE_AUTHORITY_UNAVAILABLE:{_bounded_reason(error)}")
+
+        machine_refs_by_sha: dict[str, list[dict[str, str]]] = {}
+        for row in machine_rows:
+            machine_refs_by_sha.setdefault(row["sha"], []).append(row)
+
+        decisions: list[Wave08Decision] = []
+        issue_intents_by_key: dict[tuple[str, int], Wave08IssueRecoveryIntent] = {}
+        finalizer_owned_issue_keys: set[tuple[str, int]] = set()
+        finalizer_work: list[tuple[Wave08Decision, IssueOwnerPR]] = []
+        machine_work: list[tuple[Wave08Decision, MachinePRAuthority, Wave08DispatchTarget]] = []
+        status_actions: list[tuple[str, str]] = []
+        issue_records_by_number: dict[int, Wave08IssueRecoveryRecord] = dict(issue_inventory_records)
+
+        for number in sorted(relevant_issue_numbers):
+            issue, _comments, reason = fresh_issues[number]
+            if reason is not None:
+                issue_records_by_number[number] = Wave08IssueRecoveryRecord(
+                    number, issue.database_id, issue.node_id, "BLOCKED", reason,
+                )
+                blocked.append(f"ISSUE_{number}:{reason}")
+                continue
+            if central is None:
+                reason = "CENTRAL_REPOSITORY_IDENTITY_UNAVAILABLE"
+                issue_records_by_number[number] = Wave08IssueRecoveryRecord(
+                    number, issue.database_id, issue.node_id, "BLOCKED", reason,
+                )
+                blocked.append(f"ISSUE_{number}:{reason}")
+                continue
+            target = (
+                Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY
+                if issue.state == "closed"
+                else Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY
+            )
+            intent = Wave08IssueRecoveryIntent(
+                target, central.node_id,
+                number, "ALL_ISSUE_RECOVERY_INVENTORY",
+            )
+            issue_intents_by_key[(intent.central_repository_node_id, number)] = intent
+            issue_records_by_number[number] = Wave08IssueRecoveryRecord(
+                number, issue.database_id, issue.node_id, "DISPATCH_INTENT", intent.target.value,
+            )
+
+        if global_head_ambiguous:
+            blocked.append("FRESH_PR_HEAD_UNAVAILABLE_OR_GROUPING_AMBIGUOUS; SHA ACTIONS SUPPRESSED")
+        elif central is not None and current_app is not None:
+            for head_sha in sorted(head_groups):
+                prs = head_groups[head_sha]
+                numbers = tuple(pr.number for pr in prs)
+                resolution = resolve_sha_carrier_role(
+                    self.client, self.central_repository, head_sha, self.app.slug,
+                    lambda exact_sha=head_sha: wave08_legacy_disposition(
+                        exact_sha, legacy_disposition_resolver,
+                    ),
+                )
+                machine_rows_for_head = machine_refs_by_sha.get(head_sha, [])
+                if resolution.activation is CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION and (
+                    machine_rows_for_head or machine_inventory_ambiguous
+                ):
+                    decision = Wave08Decision(
+                        head_sha, resolution, numbers, None,
+                        Wave08DecisionKind.CONFLICTING_BLOCKED,
+                        Wave08DecisionReason.CONFLICTING_EVIDENCE,
+                    )
+                    decisions.append(decision)
+                    blocked.append(f"{head_sha}:UNCLAIMED_SUPPRESSED_BY_MACHINE_REF_NAMESPACE")
+                    continue
+                if (
+                    resolution.role is CarrierRole.MACHINE_PUBLICATION
+                    and resolution.activation in {CarrierActivation.ACTIVE, CarrierActivation.RESERVED_INACTIVE}
+                ):
+                    marker = resolution.marker
+                    if (
+                        marker is None or marker.owner_kind != "MACHINE_SOURCE"
+                        or marker.claim_kind != "MACHINE_REF_CLAIM"
+                    ):
+                        decisions.append(Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=marker),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.CONFLICTING_EVIDENCE,
+                        ))
+                        blocked.append(f"{head_sha}:MACHINE_MARKER_NOT_EXACT")
+                        continue
+                    if resolution.activation is CarrierActivation.RESERVED_INACTIVE:
+                        decisions.append(wave08_decision_for_resolution(head_sha, resolution, numbers))
+                        deferred_count += 1
+                        continue
+                    owner_key_prefix = f"{central.node_id}:"
+                    source_id = marker.owner_key[len(owner_key_prefix):] if marker.owner_key.startswith(owner_key_prefix) else ""
+                    sources = tuple(
+                        source for source in (machine_sources or ())
+                        if source.source_id == source_id and marker.owner_key == f"{central.node_id}:{source.source_id}"
+                    )
+                    matching_refs = tuple(
+                        row for row in machine_rows_for_head
+                        if row["source_id"] == source_id
+                        and row["ref"] == f"refs/heads/bot/federation/{source_id}"
+                    )
+                    matching_prs = tuple(
+                        pr for pr in prs
+                        if source_id and pr.head_ref == _machine_branch(source_id)
+                        and pr.head_repository_id == central.node_id
+                        and pr.head_repository == central.full_name
+                        and pr.base_repository_id == central.node_id
+                        and pr.base_repository == central.full_name
+                        and pr.base_ref == "main"
+                    )
+                    if len(sources) != 1 or len(matching_refs) != 1 or len(matching_prs) != 1:
+                        decisions.append(Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=marker),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.FRESH_AUTHORITY_FAILED,
+                        ))
+                        blocked.append(f"{head_sha}:MACHINE_OWNER_SOURCE_REF_OR_PR_NOT_EXACT")
+                        continue
+                    try:
+                        authority = self._machine_authority(
+                            {"number": matching_prs[0].number}, sources[0],
+                            machine_main or "", central,
+                        )
+                        if (
+                            authority is None or not authority.valid
+                            or authority.head_sha != head_sha
+                            or matching_refs[0]["sha"] != head_sha
+                        ):
+                            raise StaleAuthorityError("machine PR/ref/source does not bind exact active H")
+                        decision = wave08_decision_for_resolution(
+                            head_sha, resolution, numbers,
+                            owner_pr_number=authority.number,
+                            machine_target=Wave08DispatchTarget.MACHINE_VALIDATION,
+                        )
+                        decisions.append(decision)
+                        machine_work.append((decision, authority, Wave08DispatchTarget.MACHINE_VALIDATION))
+                    except Exception as error:
+                        decisions.append(Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=marker),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.FRESH_AUTHORITY_FAILED,
+                        ))
+                        blocked.append(f"{head_sha}:MACHINE_AUTHORITY_FAILED:{_bounded_reason(error)}")
+                    continue
+
+                owner: IssueOwnerPR | None = None
+                if resolution.role in {
+                    CarrierRole.ISSUE_ACTIVE,
+                    CarrierRole.ISSUE_FINALIZING,
+                    CarrierRole.ISSUE_CANCEL,
+                } and resolution.activation in {
+                    CarrierActivation.ACTIVE,
+                    CarrierActivation.RESERVED_INACTIVE,
+                }:
+                    try:
+                        owner = derive_issue_owner_pr(
+                            self.client, self.central_repository, head_sha, resolution,
+                            self.app.slug, role_already_resolved=True,
+                        )
+                    except Exception as error:
+                        decisions.append(Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=resolution.marker),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.FRESH_AUTHORITY_FAILED,
+                        ))
+                        blocked.append(f"{head_sha}:ISSUE_OWNER_AUTHORITY_FAILED:{_bounded_reason(error)}")
+                        continue
+
+                active_issue_finalizer = (
+                    owner is not None
+                    and resolution.activation is CarrierActivation.ACTIVE
+                    and resolution.role in {
+                        CarrierRole.ISSUE_ACTIVE,
+                        CarrierRole.ISSUE_FINALIZING,
+                    }
+                )
+                if active_issue_finalizer:
+                    # Exact active role plus exact derived owner proves finalizer
+                    # ownership independently of first-pass group membership.
+                    finalizer_owned_issue_keys.add((central.node_id, owner.issue_number))
+
+                    owner_number = owner.pull_request_number
+                    if owner_number not in numbers:
+                        if owner_number not in seen_pr_numbers:
+                            blocked.append(
+                                f"{head_sha}:ISSUE_OWNER_PR_NOT_IN_OPEN_PR_INVENTORY"
+                            )
+                        elif owner_number not in failed_fresh_pr_numbers:
+                            blocked.append(
+                                f"{head_sha}:ISSUE_OWNER_PR_NOT_IN_CURRENT_H_GROUP"
+                            )
+                        else:
+                            try:
+                                revalidated_owner_pr = self.client.get_pull_request_metadata(
+                                    self.central_repository, owner_number,
+                                )
+                                if (
+                                    type(revalidated_owner_pr) is not PullRequestMetadata
+                                    or revalidated_owner_pr.number != owner_number
+                                    or type(revalidated_owner_pr.head_oid) is not str
+                                    or re.fullmatch(r"[0-9a-f]{40}", revalidated_owner_pr.head_oid) is None
+                                ):
+                                    raise R02Error("owner PR revalidation metadata is malformed")
+                                if revalidated_owner_pr.head_oid != head_sha:
+                                    blocked.append(
+                                        f"{head_sha}:ISSUE_OWNER_PR_HEAD_CHANGED"
+                                    )
+                                else:
+                                    # Re-admit only the explicit fresh current-H
+                                    # read. The failed inventory row remains a hint.
+                                    group = head_groups.get(head_sha)
+                                    if group is None:
+                                        raise R02Error("current H group disappeared before owner re-admission")
+                                    if all(item.number != owner_number for item in group):
+                                        group.append(revalidated_owner_pr)
+                                        group.sort(key=lambda item: item.number)
+                                    fresh_prs[owner_number] = revalidated_owner_pr
+                                    prs = group
+                                    numbers = tuple(item.number for item in group)
+                            except Exception as error:
+                                blocked.append(
+                                    f"{head_sha}:ISSUE_OWNER_PR_REVALIDATION_UNAVAILABLE:{_bounded_reason(error)}"
+                                )
+
+                owner_number = owner.pull_request_number if owner is not None and owner.pull_request_number in numbers else None
+                decision = wave08_decision_for_resolution(
+                    head_sha, resolution, numbers, owner_pr_number=owner_number,
+                )
+                decisions.append(decision)
+                if decision.kind is Wave08DecisionKind.EXTERNAL_STATUS:
+                    try:
+                        latest_central = self.client.get_repository_metadata(self.central_repository)
+                        latest_app = resolve_app_identity(self.client, self.app.slug)
+                        if (
+                            type(latest_central) is not RepositoryMetadata
+                            or latest_central.full_name != self.central_repository
+                            or latest_central.default_branch != "main"
+                            or latest_central.node_id != central.node_id
+                            or latest_app != current_app
+                        ):
+                            raise StaleAuthorityError("external status central/App identity changed before write")
+                        publish_unclaimed_external_success(
+                            self.client, latest_central, head_sha, resolution, latest_app,
+                        )
+                        status_actions.append((head_sha, "EXTERNAL_SUCCESS"))
+                    except Exception as error:
+                        decisions[-1] = Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.FRESH_AUTHORITY_FAILED,
+                        )
+                        blocked.append(f"{head_sha}:UNCLAIMED_EXTERNAL_STATUS_FAILED:{_bounded_reason(error)}")
+                    continue
+                if decision.kind is Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED:
+                    deferred_count += 1
+                    continue
+                if decision.kind in {
+                    Wave08DecisionKind.CONFLICTING_BLOCKED,
+                    Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED,
+                }:
+                    if decision.kind is Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED:
+                        deferred_count += 1
+                    else:
+                        blocked.append(f"{head_sha}:CONFLICTING_SHA_ROLE")
+                    continue
+                if owner_number is None or owner is None:
+                    continue
+                if decision.kind is Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY:
+                    finalizer_work.append((decision, owner))
+                elif decision.kind is Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY:
+                    try:
+                        cancellation = _fresh_issue_cancellation_authority(
+                            self.client, self.central_repository, owner.issue_number,
+                            current_app, allow_pr_stage_state=True,
+                        )
+                        current_ref = _read_issue_branch_ref(
+                            self.client, self.central_repository,
+                            cancellation.lease.lease.branch_ref.removeprefix("refs/heads/"),
+                        )
+                        fences, _ = self._read_issue_cancellation_fences(
+                            cancellation, current_ref or ZERO_OID,
+                        )
+                        exact_fences = tuple(
+                            item.fence for item in fences
+                            if item.fence.cancellation_head_sha == head_sha
+                            and _issue_cancellation_fence_marker(item.fence) == resolution.marker
+                        )
+                        if (
+                            len(exact_fences) != 1
+                            or cancellation.pull_request_number != owner.pull_request_number
+                            or current_ref != head_sha
+                            or cancellation.pr.head_oid != head_sha
+                            or cancellation.raw_pr_state != "OPEN"
+                            or cancellation.raw_pr_merged
+                        ):
+                            raise StaleAuthorityError("exact active cancellation owner/ref/PR/H changed")
+                        self.publish_issue_cancel_failure(owner.issue_number, exact_fences[0])
+                        status_actions.append((head_sha, "ISSUE_CANCEL_FAILURE"))
+                        intent = Wave08IssueRecoveryIntent(
+                            Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY,
+                            central.node_id, owner.issue_number, "ACTIVE_ISSUE_CANCEL_EXACT_HC",
+                        )
+                        issue_intents_by_key[(central.node_id, owner.issue_number)] = intent
+                        issue_records_by_number[owner.issue_number] = Wave08IssueRecoveryRecord(
+                            owner.issue_number, None, None, "DISPATCH_INTENT", "ACTIVE_ISSUE_CANCEL_EXACT_HC",
+                        )
+                    except Exception as error:
+                        decisions[-1] = Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=resolution.marker),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.FRESH_AUTHORITY_FAILED,
+                        )
+                        blocked.append(f"{head_sha}:WG6_CANCEL_FAILURE_RECOVERY_FAILED:{_bounded_reason(error)}")
+                elif decision.kind is Wave08DecisionKind.RESERVED_OWNER_RECOVERY:
+                    intent = Wave08IssueRecoveryIntent(
+                        Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY,
+                        central.node_id, owner.issue_number, "RESERVED_ISSUE_OWNER_RECOVERY",
+                    )
+                    issue_intents_by_key[(central.node_id, owner.issue_number)] = intent
+
+        # Exact active finalizer ownership supersedes only the provisional generic
+        # all-Issue Wg1 intake intent for that same central repository and Issue.
+        # Explicit cancellation and RESERVED owner-recovery intents remain intact.
+        for key in sorted(finalizer_owned_issue_keys):
+            intent = issue_intents_by_key.get(key)
+            if (
+                intent is None
+                or intent.target is not Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY
+                or intent.reason != "ALL_ISSUE_RECOVERY_INVENTORY"
+            ):
+                continue
+            del issue_intents_by_key[key]
+            issue = fresh_issues[key[1]][0]
+            issue_records_by_number[key[1]] = Wave08IssueRecoveryRecord(
+                key[1], issue.database_id, issue.node_id,
+                "DEFERRED", "EXACT_ACTIVE_ISSUE_FINALIZER_OWNS_WG4_DISPATCH",
+            )
+
+        # Correction 01: active Issue role recovery dispatches only the closed
+        # ISSUE_FINALIZER semantic to Wg4. Wg1 gets a separate intake/terminal intent.
+        for decision, owner in finalizer_work:
+            if decision.dispatch_target is not Wave08DispatchTarget.ISSUE_FINALIZER:
+                blocked.append(f"{decision.head_sha}:ISSUE_FINALIZER_TARGET_DRIFT")
+                continue
+            if issue_finalizer_dispatcher is not None:
+                try:
+                    issue_finalizer_dispatcher(decision, owner)
+                except Exception as error:
+                    blocked.append(f"{decision.head_sha}:ISSUE_FINALIZER_DISPATCH_FAILED:{_bounded_reason(error)}")
+
+        for intent in sorted(
+            issue_intents_by_key.values(),
+            key=lambda item: (item.central_repository_node_id, item.issue_number, item.target.value),
+        ):
+            if issue_intake_terminal_dispatcher is not None:
+                try:
+                    issue_intake_terminal_dispatcher(intent)
+                except Exception as error:
+                    blocked.append(f"ISSUE_{intent.issue_number}:WG1_DISPATCH_FAILED:{_bounded_reason(error)}")
+
+        for decision, authority, target in machine_work:
+            callback = (
+                machine_finalizer_dispatcher
+                if target is Wave08DispatchTarget.MACHINE_FINALIZER
+                else machine_validation_dispatcher
+            )
+            if callback is not None:
+                try:
+                    callback(decision, authority)
+                except Exception as error:
+                    blocked.append(f"{decision.head_sha}:MACHINE_DISPATCH_FAILED:{_bounded_reason(error)}")
+
+        machine_records: list[Wave08MachineRefRecord] = []
+        accepted_source_ids = {source.source_id for source in (machine_sources or ())}
+        for row in sorted(machine_rows, key=lambda item: (item["source_id"], item["ref"])):
+            head = row["sha"]
+            if row["source_id"] not in accepted_source_ids:
+                outcome, reason = "DEFERRED_ORPHANED_SOURCE", "SOURCE_ID_NOT_CURRENTLY_ACCEPTED"
+                deferred_count += 1
+            elif not head_groups.get(head):
+                outcome, reason = "DEFERRED_NO_OPEN_PR", "MACHINE_REF_IS_DISCOVERY_ONLY"
+                deferred_count += 1
+            elif any(
+                decision.head_sha == head and decision.resolution.role is CarrierRole.MACHINE_PUBLICATION
+                and decision.kind in {
+                    Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH,
+                    Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH,
+                }
+                for decision in decisions
+            ):
+                outcome, reason = "DISPATCHED", "EXACT_MACHINE_ROLE_AND_OWNER_PR_VALIDATED"
+            elif any(decision.head_sha == head for decision in decisions):
+                outcome, reason = "BLOCKED", "SHA_ROLE_DOES_NOT_AUTHORIZE_MACHINE_RECOVERY"
+                blocked.append(f"{row['ref']}:SHA_ROLE_DOES_NOT_AUTHORIZE_MACHINE_RECOVERY")
+            else:
+                outcome, reason = "DEFERRED", "SHA_ROLE_NOT_RESOLVED"
+                deferred_count += 1
+            machine_records.append(Wave08MachineRefRecord(row["ref"], row["source_id"], head, outcome, reason))
+        for row in raw_machine_refs:
+            if type(row) is not dict or not all(type(row.get(key)) is str for key in ("ref", "source_id", "sha")):
+                machine_records.append(Wave08MachineRefRecord(
+                    "INVALID", "INVALID", "0" * 40, "BLOCKED", "MALFORMED_MACHINE_REF_INVENTORY_ROW",
+                ))
+
+        issue_records = tuple(
+            issue_records_by_number[number]
+            for number in sorted(issue_records_by_number)
+        )
+        decisions.sort(key=lambda item: item.head_sha)
+        return Wave08UniversalRecoveryResult(
+            True,
+            len(raw_prs),
+            len(fresh_prs),
+            len(head_groups),
+            len(raw_issues),
+            len(relevant_issue_numbers),
+            len(raw_machine_refs),
+            tuple(decisions),
+            issue_records,
+            tuple(machine_records),
+            tuple(sorted(
+                issue_intents_by_key.values(),
+                key=lambda item: (item.central_repository_node_id, item.issue_number, item.target.value),
+            )),
+            tuple(status_actions),
+            tuple(blocked),
+            deferred_count,
+        )
 
     def trusted_machine_validation(self, pr_number: int, accepted_base_sha: str, *, expected_head_sha: str | None = None) -> TrustedValidationResult:
         repository, current_main = self.current_accepted_main()
