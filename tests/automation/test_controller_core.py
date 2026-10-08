@@ -2,8 +2,10 @@ import ast
 import base64
 import hashlib
 import inspect
+from io import StringIO
 import json
 from contextlib import nullcontext
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 import unittest
@@ -8957,6 +8959,146 @@ class Wave09LegacyClassifierTests(unittest.TestCase):
                 if isinstance(item, ast.Call) and (isinstance(item.func, ast.Attribute) or isinstance(item.func, ast.Name))
             }
             self.assertFalse(called & forbidden)
+
+
+class Wave10InertActivationGuardTests(unittest.TestCase):
+    EXPECTED_STDOUT = (
+        '{"activationWriteAllowed":false,"ordinaryWriteAllowed":false,'
+        '"reason":"WAVE10_INERT_GUARD","runtimeState":"MERGED_UNPROVEN"}\n'
+    )
+
+    @staticmethod
+    def invoke_cli(environ):
+        stdout = StringIO()
+        stderr = StringIO()
+        with patch.dict(controller_module.os.environ, environ, clear=True):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = controller_module.main(["activation-guard"])
+        return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def test_wave10_inert_activation_guard_is_canonical(self):
+        result = controller_module.wave10_inert_activation_guard()
+
+        self.assertEqual(
+            tuple(state.value for state in controller_module.G8RuntimeState),
+            ("ACTIVE_G8", "MERGED_UNPROVEN", "BLOCKED_POST_MERGE", "PRE_G8_NOT_APPLICABLE"),
+        )
+        self.assertIs(type(result.runtime_state), controller_module.G8RuntimeState)
+        self.assertIs(result.runtime_state, controller_module.G8RuntimeState.MERGED_UNPROVEN)
+        self.assertIs(result.ordinary_write_allowed, False)
+        self.assertIs(result.activation_write_allowed, False)
+        self.assertEqual(result.reason, "WAVE10_INERT_GUARD")
+
+    def test_wave10_inert_activation_guard_cannot_be_active(self):
+        result = controller_module.wave10_inert_activation_guard()
+
+        self.assertIsNot(result.runtime_state, controller_module.G8RuntimeState.ACTIVE_G8)
+        self.assertFalse(result.ordinary_write_allowed)
+        self.assertFalse(result.activation_write_allowed)
+        with self.assertRaisesRegex(ValueError, "ordinary writes require ACTIVE_G8"):
+            controller_module.G8ActivationGuardResult(
+                runtime_state=controller_module.G8RuntimeState.MERGED_UNPROVEN,
+                ordinary_write_allowed=True,
+                activation_write_allowed=False,
+                reason="WAVE10_INERT_GUARD",
+            )
+
+    def test_activation_guard_cli_succeeds_without_runtime_credentials(self):
+        exit_code, stdout, stderr = self.invoke_cli({})
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout, self.EXPECTED_STDOUT)
+        self.assertEqual(stderr, "")
+
+    def test_activation_guard_cli_ignores_authority_like_environment_overrides(self):
+        overrides = {
+            "FEDERATION_GITHUB_TOKEN": "ghs_plausible_authority_token",
+            "FEDERATION_APP_SLUG": "swift-stream-federation[bot]",
+            "GITHUB_REPOSITORY": "SwiftStream/skills",
+            "FEDERATION_G8_RUNTIME_STATE": "ACTIVE_G8",
+            "FEDERATION_G8_ACTIVE": "true",
+            "FEDERATION_ACTIVATION_BOUNDARY_ID": "boundary-123",
+            "FEDERATION_ACTIVATION_REF": "refs/heads/main",
+            "FEDERATION_EVENT_PATH": "/tmp/nonexistent-g8-event.json",
+        }
+        exit_code, stdout, stderr = self.invoke_cli(overrides)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout, self.EXPECTED_STDOUT)
+        self.assertEqual(stderr, "")
+
+    def test_activation_guard_cli_does_not_construct_github_client(self):
+        with patch.object(controller_module, "GitHubClient", side_effect=AssertionError("GitHubClient constructed")):
+            exit_code, stdout, stderr = self.invoke_cli({})
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout, self.EXPECTED_STDOUT)
+        self.assertEqual(stderr, "")
+
+    def test_activation_guard_cli_does_not_resolve_app_identity(self):
+        with patch.object(controller_module, "resolve_app_identity", side_effect=AssertionError("App identity resolved")):
+            exit_code, stdout, stderr = self.invoke_cli({})
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout, self.EXPECTED_STDOUT)
+        self.assertEqual(stderr, "")
+
+    def test_activation_guard_ast_has_no_mutation_surface(self):
+        source_path = Path(inspect.getsourcefile(controller_module))
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        guard = functions["wave10_inert_activation_guard"]
+        self.assertEqual(guard.args.args, [])
+
+        main = functions["main"]
+        branches = [
+            node for node in main.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Attribute)
+            and node.test.left.attr == "command"
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == "activation-guard"
+        ]
+        self.assertEqual(len(branches), 1)
+        activation_branch = branches[0]
+        branch_index = main.body.index(activation_branch)
+        self.assertGreater(branch_index, 0)
+        previous = main.body[branch_index - 1]
+        self.assertIsInstance(previous, ast.Assign)
+        self.assertIsInstance(previous.value, ast.Call)
+        self.assertIsInstance(previous.value.func, ast.Attribute)
+        self.assertEqual(previous.value.func.attr, "parse_args")
+
+        forbidden = {
+            "create_commit_status",
+            "create_check_run",
+            "update_check_run",
+            "update_refs",
+            "create_issue_comment",
+            "dispatch_workflow",
+            "create_pull_request",
+            "reopen_pull_request",
+            "mark_pull_request_ready_for_review",
+            "convert_pull_request_to_draft",
+            "close_pull_request",
+            "create_git_blob",
+            "create_git_tree",
+            "create_git_commit",
+        }
+        isolated = ast.Module(body=[guard, activation_branch], type_ignores=[])
+        called = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+            for node in ast.walk(isolated)
+            if isinstance(node, ast.Call)
+            and (isinstance(node.func, ast.Attribute) or isinstance(node.func, ast.Name))
+        }
+        self.assertFalse(called & forbidden)
 
 
 if __name__ == "__main__":

@@ -179,6 +179,42 @@ class PhaseNotImplementedError(ControllerError):
     """The requested operation belongs to a later frozen phase."""
 
 
+class G8RuntimeState(Enum):
+    ACTIVE_G8 = "ACTIVE_G8"
+    MERGED_UNPROVEN = "MERGED_UNPROVEN"
+    BLOCKED_POST_MERGE = "BLOCKED_POST_MERGE"
+    PRE_G8_NOT_APPLICABLE = "PRE_G8_NOT_APPLICABLE"
+
+
+@dataclass(frozen=True)
+class G8ActivationGuardResult:
+    runtime_state: G8RuntimeState
+    ordinary_write_allowed: bool
+    activation_write_allowed: bool
+    reason: str
+
+    def __post_init__(self) -> None:
+        if type(self.runtime_state) is not G8RuntimeState:
+            raise ValueError("G8 runtime state must be an exact G8RuntimeState")
+        if type(self.ordinary_write_allowed) is not bool or type(self.activation_write_allowed) is not bool:
+            raise ValueError("G8 write permissions must be exact booleans")
+        if self.ordinary_write_allowed and self.runtime_state is not G8RuntimeState.ACTIVE_G8:
+            raise ValueError("ordinary writes require ACTIVE_G8")
+        if self.activation_write_allowed:
+            raise ValueError("Wave10 activation writes are always disabled")
+        if self.reason != "WAVE10_INERT_GUARD":
+            raise ValueError("Wave10 guard reason is fixed")
+
+
+def wave10_inert_activation_guard() -> G8ActivationGuardResult:
+    return G8ActivationGuardResult(
+        runtime_state=G8RuntimeState.MERGED_UNPROVEN,
+        ordinary_write_allowed=False,
+        activation_write_allowed=False,
+        reason="WAVE10_INERT_GUARD",
+    )
+
+
 @dataclass(frozen=True)
 class CandidateDiff:
     paths: tuple[str, ...]
@@ -11189,8 +11225,18 @@ def main(argv: list[str] | None = None) -> int:
     import sys
 
     parser = argparse.ArgumentParser(description="Swift Stream trusted federation controller")
-    parser.add_argument("command", choices=("interactive", "trusted-validation", "state-finalize", "reconcile", "main-advance"))
+    parser.add_argument("command", choices=("interactive", "trusted-validation", "state-finalize", "reconcile", "main-advance", "activation-guard"))
     args = parser.parse_args(argv)
+    if args.command == "activation-guard":
+        result = wave10_inert_activation_guard()
+        payload = {
+            "activationWriteAllowed": result.activation_write_allowed,
+            "ordinaryWriteAllowed": result.ordinary_write_allowed,
+            "reason": result.reason,
+            "runtimeState": result.runtime_state.value,
+        }
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
+        return 0
     client: GitHubClient | None = None
     number: int | None = None
     result_kind = "proposal"
