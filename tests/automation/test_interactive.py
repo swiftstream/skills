@@ -538,7 +538,7 @@ class InteractiveTests(unittest.TestCase):
         created_manifest = json.loads(__import__("base64").b64decode(fake.created_blob))
         self.assertEqual(created_manifest["sources"][0]["description"], "A source")
         self.assertEqual(len(fake.created), 2)
-        self.assertEqual(fake.dispatches, [("swiftstream/skills", "federation-state-finalize.yml", "refs/heads/main", {"pull_number": "7"})])
+        self.assertEqual(fake.dispatches, [("swiftstream/skills", "federation-g8-state-finalize.yml", "refs/heads/main", {"pull_number": "7"})])
         self.assertNotIn("FEDERATION_REQUEST_CLASS", environment)
 
     def test_unrelated_pr_without_marker_is_clean_noop_for_federation_entrypoints(self):
@@ -1077,7 +1077,7 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(_bounded_error_reason(short_error), "R02Error:why")
 
     def test_workflows_have_exact_triggers_pins_and_no_pr_head_execution(self):
-        for name in ("federation-interactive.yml", "federation-trusted-validation.yml", "federation-state-finalize.yml"):
+        for name in ("federation-g8-interactive.yml", "federation-g8-trusted-validation.yml", "federation-g8-state-finalize.yml"):
             text = (ROOT / ".github/workflows" / name).read_text()
             self.assertIn("FEDERATION_EVENT_PATH: ${{ github.event_path }}", text)
             self.assertNotIn("FEDERATION_EVENT_PATH: $GITHUB_EVENT_PATH", text)

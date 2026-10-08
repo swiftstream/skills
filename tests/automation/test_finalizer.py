@@ -285,15 +285,15 @@ class FinalizerTests(unittest.TestCase):
             )
 
     def test_finalizer_workflow_preserves_global_serialization_without_readiness_ceremony(self):
-        finalizer = (ROOT / ".github/workflows/federation-state-finalize.yml").read_text()
-        self.assertIn("swiftstream-skills-federation-state-finalizer", finalizer)
+        finalizer = (ROOT / ".github/workflows/federation-g8-state-finalize.yml").read_text()
+        self.assertIn("swiftstream-skills-federation-manual-authority", finalizer)
         self.assertIn("cancel-in-progress: false", finalizer)
         self.assertNotIn("FEDERATION_NO_BYPASS_PROOF_V2", finalizer)
         self.assertNotIn("FEDERATION_RULESET_ID", finalizer)
 
     def test_state_finalize_workflow_queues_pending_runs_and_never_cancels_in_progress(self):
-        finalizer = (ROOT / ".github/workflows/federation-state-finalize.yml").read_text()
-        self.assertIn("group: swiftstream-skills-federation-state-finalizer", finalizer)
+        finalizer = (ROOT / ".github/workflows/federation-g8-state-finalize.yml").read_text()
+        self.assertIn("group: swiftstream-skills-federation-manual-authority", finalizer)
         self.assertIn("cancel-in-progress: false", finalizer)
         self.assertIn("queue: max", finalizer)
         self.assertNotIn("cancel-in-progress: true", finalizer)
@@ -410,7 +410,7 @@ class FinalizerTests(unittest.TestCase):
         client.checks = []
         self.assertEqual(controller.finalize_one_machine_pr(authority), "check-recovery-dispatched")
         self.assertEqual(client.merge_calls, [])
-        self.assertEqual(client.dispatches, [("federation-trusted-validation.yml", {"pull_number": "41"})])
+        self.assertEqual(client.dispatches, [("federation-g8-trusted-validation.yml", {"pull_number": "41"})])
 
     def test_production_finalizer_wrong_app_same_name_is_recovery_only(self):
         client, controller, _source, authority = self._production_finalizer_fixture()

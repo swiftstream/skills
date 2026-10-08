@@ -234,7 +234,7 @@ class ValidationTests(unittest.TestCase):
         payload = fake.checks[-1][3]["output"]
         self.assertEqual(set(payload), {"title", "summary", "text"})
         self.assertEqual(fake.checks[-1][3]["conclusion"], "failure")
-        self.assertEqual(fake.dispatches[-1][1], "federation-state-finalize.yml")
+        self.assertEqual(fake.dispatches[-1][1], "federation-g8-state-finalize.yml")
 
     def test_c05_central_transport_has_explicit_empty_proxy_handler(self):
         transport = UrllibTransport()
@@ -383,7 +383,7 @@ class ValidationTests(unittest.TestCase):
             fake.ref_reads = 0
             self.assertEqual(main(["state-finalize"]), 1)
         self.assertFalse(any(item[3].get("conclusion") == "success" for item in fake.checks))
-        self.assertEqual(fake.dispatches[-1][1], "federation-state-finalize.yml")
+        self.assertEqual(fake.dispatches[-1][1], "federation-g8-state-finalize.yml")
 
     def test_state_finalize_stale_checkout_self_wakes_without_cas_or_green(self):
         from tests.automation.test_interactive import ProductionAddClient

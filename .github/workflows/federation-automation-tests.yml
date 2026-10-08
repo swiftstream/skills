@@ -13,6 +13,8 @@ on:
       - "docs/MECHANICS.md"
       - "README.md"
       - "AGENTS.md"
+      - ".github/federation/g8-activation-contract.json"
+      - ".github/federation/g8-authority-surface.json"
 
 permissions:
   contents: read

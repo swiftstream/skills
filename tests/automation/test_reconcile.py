@@ -115,7 +115,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(result.outcome, "CHANGED")
         self.assertEqual(client.refs[0].before_oid, "0" * 40)
         self.assertFalse(client.refs[0].force)
-        self.assertEqual(client.dispatches[-1][0], "federation-state-finalize.yml")
+        self.assertEqual(client.dispatches[-1][0], "federation-g8-state-finalize.yml")
 
     def test_machine_scope_rejects_non_generated_paths(self):
         class Trees:
@@ -596,8 +596,8 @@ class ReconcileTests(unittest.TestCase):
         result = controller.main_advance()
         self.assertEqual(result, "MAIN_ADVANCE_DISPATCHED:1")
         self.assertEqual(client.dispatches, [
-            ("federation-reconcile.yml", "refs/heads/main", {"repository_id": "123"}),
-            ("federation-state-finalize.yml", "refs/heads/main", {}),
+            ("federation-g8-reconcile.yml", "refs/heads/main", {"repository_id": "123"}),
+            ("federation-g8-state-finalize.yml", "refs/heads/main", {}),
         ])
 
     def test_main_advance_multiple_sources_is_deterministic_and_finalizer_is_coalesced(self):
@@ -607,7 +607,7 @@ class ReconcileTests(unittest.TestCase):
         client, controller = self._main_advance_controller((source_b, source_a), machine)
         controller.main_advance()
         self.assertEqual([item[2]["repository_id"] for item in client.dispatches[:2]], ["1", "2"])
-        self.assertEqual(sum(item[0] == "federation-state-finalize.yml" for item in client.dispatches), 1)
+        self.assertEqual(sum(item[0] == "federation-g8-state-finalize.yml" for item in client.dispatches), 1)
 
     def test_main_advance_owned_manual_pr_wakes_only_shared_finalizer(self):
         body = "Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\nDemo\nBranch:\nmain\nSkills root:\nskills\nSkill prefixes:\ndemo\n"
@@ -636,7 +636,7 @@ class ReconcileTests(unittest.TestCase):
         controller._accepted_sources = lambda _main=None: (source,)
         controller._machine_prs = lambda _main, _repository, _sources: {"demo": []}
         self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
-        self.assertEqual(client.dispatches, [("federation-state-finalize.yml", "refs/heads/main", {})])
+        self.assertEqual(client.dispatches, [("federation-g8-state-finalize.yml", "refs/heads/main", {})])
 
     def test_main_advance_valid_central_manual_add_update_remove_each_wakes_one_shared_finalizer(self):
         for request_class in (RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE):
@@ -644,7 +644,7 @@ class ReconcileTests(unittest.TestCase):
                 pr, comment = self._manual_main_advance_pr(request_class)
                 client, controller = self._main_advance_with_prs({pr.number: pr}, {pr.number: (comment,)})
                 self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
-                self.assertEqual(client.dispatches, [("federation-state-finalize.yml", "refs/heads/main", {})])
+                self.assertEqual(client.dispatches, [("federation-g8-state-finalize.yml", "refs/heads/main", {})])
 
     def test_main_advance_manual_requires_central_trusted_head_and_exact_head_identity(self):
         cases = (
@@ -681,8 +681,8 @@ class ReconcileTests(unittest.TestCase):
         )
         self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:1")
         self.assertEqual(client.dispatches, [
-            ("federation-reconcile.yml", "refs/heads/main", {"repository_id": "99"}),
-            ("federation-state-finalize.yml", "refs/heads/main", {}),
+            ("federation-g8-reconcile.yml", "refs/heads/main", {"repository_id": "99"}),
+            ("federation-g8-state-finalize.yml", "refs/heads/main", {}),
         ])
 
     def test_main_advance_valid_machine_and_manual_work_coalesce_to_one_shared_finalizer_wake(self):
@@ -694,7 +694,7 @@ class ReconcileTests(unittest.TestCase):
             {"demo": [MachinePRAuthority(41, "demo", 99, machine_pr.head_oid)]},
         )
         self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:1")
-        self.assertEqual(sum(item[0] == "federation-state-finalize.yml" for item in client.dispatches), 1)
+        self.assertEqual(sum(item[0] == "federation-g8-state-finalize.yml" for item in client.dispatches), 1)
         self.assertEqual(len(client.dispatches), 2)
 
     def test_main_advance_stale_base_and_unrelated_prs_remain_no_wake(self):
@@ -867,7 +867,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(client.dispatches, [])
 
     def test_main_advance_workflow_has_push_main_static_boundaries(self):
-        workflow = (controller_module.Path(__file__).resolve().parents[2] / ".github/workflows/federation-main-advance.yml").read_text()
+        workflow = (controller_module.Path(__file__).resolve().parents[2] / ".github/workflows/federation-g8-main-advance.yml").read_text()
         self.assertIn("branches: [main]", workflow)
         self.assertIn("contents: read", workflow)
         self.assertIn("permission-contents: write", workflow)
@@ -880,8 +880,8 @@ class ReconcileTests(unittest.TestCase):
 
     def test_main_advance_and_interactive_share_request_anchor_authority_concurrency(self):
         workflows = controller_module.Path(__file__).resolve().parents[2] / ".github/workflows"
-        main_advance = (workflows / "federation-main-advance.yml").read_text()
-        interactive = (workflows / "federation-interactive.yml").read_text()
+        main_advance = (workflows / "federation-g8-main-advance.yml").read_text()
+        interactive = (workflows / "federation-g8-interactive.yml").read_text()
         group = "group: swiftstream-skills-federation-manual-authority"
         self.assertEqual(main_advance.count(group), 1)
         self.assertEqual(interactive.count(group), 1)

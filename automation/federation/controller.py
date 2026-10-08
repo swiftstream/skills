@@ -6772,7 +6772,7 @@ class R02Controller:
             if pre_mutation_guard is not None:
                 pre_mutation_guard()
             if dispatch_finalizer:
-                self.client.dispatch_workflow(self.central_repository, "federation-state-finalize.yml", "refs/heads/main", {"expected_source_id": source.source_id})
+                self.client.dispatch_workflow(self.central_repository, "federation-g8-state-finalize.yml", "refs/heads/main", {"expected_source_id": source.source_id})
             return MachineReconcileResult("CHANGED", source.source_id, hinted_id, f"MACHINE_PR_{number}")
         raise AssertionError("bounded reconcile loop did not return")
 
@@ -6786,7 +6786,7 @@ class R02Controller:
             # removed or moved during the sweep is therefore a bounded NOOP.
             results.append(self.reconcile(source.repository_id, dispatch_finalizer=False))
         if any(result.outcome == "CHANGED" for result in results):
-            self.client.dispatch_workflow(self.central_repository, "federation-state-finalize.yml", "refs/heads/main", {})
+            self.client.dispatch_workflow(self.central_repository, "federation-g8-state-finalize.yml", "refs/heads/main", {})
         return tuple(results)
 
     def _manual_reconcile_guard(
@@ -10823,7 +10823,7 @@ class R02Controller:
             raise R02Error("trusted-validation recovery PR number is invalid")
         self.client.dispatch_workflow(
             self.central_repository,
-            "federation-trusted-validation.yml",
+            "federation-g8-trusted-validation.yml",
             "refs/heads/main",
             {"pull_number": str(pr_number)},
         )
@@ -11025,7 +11025,7 @@ class R02Controller:
         for source_id in sorted(machine):
             if machine[source_id]:
                 source = next(source for source in sources if source.source_id == source_id)
-                self.client.dispatch_workflow(self.central_repository, "federation-reconcile.yml", "refs/heads/main", {"repository_id": str(source.repository_id)})
+                self.client.dispatch_workflow(self.central_repository, "federation-g8-reconcile.yml", "refs/heads/main", {"repository_id": str(source.repository_id)})
                 dispatched.add(source_id)
                 wake_finalizer = True
         for summary in self.client.list_open_pull_requests(self.central_repository):
@@ -11084,7 +11084,7 @@ class R02Controller:
             except (GitHubAPIError, R02Error, RequestModelError):
                 continue
         if wake_finalizer:
-            self.client.dispatch_workflow(self.central_repository, "federation-state-finalize.yml", "refs/heads/main", {})
+            self.client.dispatch_workflow(self.central_repository, "federation-g8-state-finalize.yml", "refs/heads/main", {})
         if not (dispatched or wake_finalizer or updated_manual) and managed_issue_noop is not None:
             return managed_issue_noop
         return f"MAIN_ADVANCE_DISPATCHED:{len(dispatched)}" if (dispatched or wake_finalizer or updated_manual) else "MAIN_ADVANCE_NOOP"
@@ -11248,7 +11248,7 @@ def main(argv: list[str] | None = None) -> int:
         nonlocal fresh_wake_dispatched
         if fresh_wake_dispatched or client is None:
             return
-        client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {})
+        client.dispatch_workflow(repository, "federation-g8-state-finalize.yml", "refs/heads/main", {})
         fresh_wake_dispatched = True
 
     try:
@@ -11330,7 +11330,7 @@ def main(argv: list[str] | None = None) -> int:
                 if result_identity is None:
                     result_identity = anchor.comment.database_id
                 _post_bounded_result(client, repository, number, updated_comments, kind=result_kind, identity=result_identity, result="PROPOSAL_UPDATED", reason=f"{request_class.value}:{len(candidate.changed_paths)}")
-                client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
+                client.dispatch_workflow(repository, "federation-g8-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
             else:
                 initial_pr = client.get_pull_request_metadata(repository, number)
                 if _is_reserved_issue_pr_head(initial_pr.head_ref):
@@ -11347,7 +11347,7 @@ def main(argv: list[str] | None = None) -> int:
                 if not _anchor_candidates(comments) and _MACHINE_BRANCH_RE.fullmatch(initial_pr.head_ref):
                     result = controller.trusted_machine_validation(number, accepted_main, expected_head_sha=initial_pr.head_oid)
                     controller.publish_validation_result(result)
-                    client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
+                    client.dispatch_workflow(repository, "federation-g8-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
                 else:
                     if not _anchor_candidates(comments) and read_optional_request_marker(client, repository, initial_pr.head_oid) is None:
                         try:
@@ -11376,7 +11376,7 @@ def main(argv: list[str] | None = None) -> int:
                         return 0
                     result = controller.trusted_validation(number, accepted_main, controller.production_candidate_check(number, accepted_main, expected_head_sha=initial_pr.head_oid), expected_head_sha=initial_pr.head_oid)
                     controller.publish_validation_result(result)
-                    client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
+                    client.dispatch_workflow(repository, "federation-g8-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
         elif args.command == "state-finalize":
             work_limit_text = env.get("FEDERATION_WORK_LIMIT", "3")
             if not re.fullmatch(r"[1-9][0-9]?", work_limit_text):
