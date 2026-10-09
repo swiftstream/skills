@@ -48,6 +48,7 @@ EXACT_APP_REQUIRED_STATUS_EVIDENCE_PREFIX = "swiftstream-federation-prior-requir
 CLAIMED_HEAD_MARKER_HEADER = "swiftstream-federation-head:v2"
 ISSUE_BRANCH_LEASE_MARKER = "<!-- swiftstream-federation-issue-branch-lease:v1 -->"
 CLAIM_GENERATION_PREFIX = "swiftstream-federation-claim-generation:v1\n"
+MACHINE_REF_CLAIM_AUTHORITY_PREFIX = "swiftstream-federation-machine-ref-claim-authority:v2\n"
 ISSUE_BRANCH_LEASE_AUTHORITY_PREFIX = "swiftstream-federation-issue-branch-lease-authority:v1\n"
 _CLAIM_KINDS = frozenset({
     "ISSUE_BRANCH_LEASE", "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH",
@@ -1249,6 +1250,102 @@ def _canonical_json(value: Any) -> str:
         _fail("authority JSON value cannot be encoded canonically")
 
 
+def authority_surface_digest(contract_blob_oid: str, manifest_blob_oid: str, entries: Iterable[Mapping[str, Any]]) -> str:
+    """Hash the exact reviewed contract, manifest and ordered regular-blob identities."""
+    normalized: list[dict[str, str]] = []
+    for entry in entries:
+        if type(entry) is not dict or set(entry) != {"path", "blobOid", "sha256"}:
+            _fail("authority surface entry has invalid exact keys")
+        path = entry["path"]
+        if type(path) is not str or not path or path.startswith("/") or "\\" in path or any(part in {"", ".", ".."} for part in path.split("/")):
+            _fail("authority surface entry path is invalid")
+        blob_oid = entry["blobOid"]
+        digest = entry["sha256"]
+        if type(blob_oid) is not str or not _SHA40_RE.fullmatch(blob_oid) or type(digest) is not str or not _SHA256_RE.fullmatch(digest):
+            _fail("authority surface entry digest is invalid")
+        normalized.append({"path": path, "blobOid": blob_oid, "sha256": digest})
+    paths = [item["path"] for item in normalized]
+    if paths != sorted(set(paths), key=lambda item: item.encode("utf-8")):
+        _fail("authority surface entries must be sorted and unique")
+    for value, label in ((contract_blob_oid, "contractBlobOid"), (manifest_blob_oid, "manifestBlobOid")):
+        if type(value) is not str or not _SHA40_RE.fullmatch(value):
+            _fail(f"{label} must be lowercase 40-hex")
+    material = {"schemaVersion": 1, "contractBlobOid": contract_blob_oid, "manifestBlobOid": manifest_blob_oid, "entries": normalized}
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def new_writer_topology_digest(writers: Iterable[Mapping[str, Any]]) -> str:
+    normalized: list[dict[str, str]] = []
+    for writer in writers:
+        if type(writer) is not dict or set(writer) != {"path", "blobOid", "sha256"}:
+            _fail("new writer topology entry has invalid exact keys")
+        path, blob_oid, digest = writer["path"], writer["blobOid"], writer["sha256"]
+        if type(path) is not str or not path or path.startswith("/") or "\\" in path or any(part in {"", ".", ".."} for part in path.split("/")):
+            _fail("new writer topology path is invalid")
+        if type(blob_oid) is not str or not _SHA40_RE.fullmatch(blob_oid) or type(digest) is not str or not _SHA256_RE.fullmatch(digest):
+            _fail("new writer topology digest is invalid")
+        normalized.append({"path": path, "blobOid": blob_oid, "sha256": digest})
+    if len({item["path"] for item in normalized}) != len(normalized):
+        _fail("new writer topology paths must be unique")
+    material = {"schemaVersion": 1, "writers": normalized}
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def activation_boundary_id_digest(
+    central_repository_node_id: str,
+    implementation_pr_number: int,
+    implementation_pr_database_id: int,
+    implementation_pr_node_id: str,
+    merged_result_oid: str,
+    authority_digest: str,
+    topology_digest: str,
+) -> str:
+    material = {
+        "schemaVersion": 1,
+        "centralRepositoryNodeId": central_repository_node_id,
+        "implementationPrNumber": implementation_pr_number,
+        "implementationPrDatabaseId": implementation_pr_database_id,
+        "implementationPrNodeId": implementation_pr_node_id,
+        "mergedResultOid": merged_result_oid,
+        "authoritySurfaceDigest": authority_digest,
+        "newWriterTopologyDigest": topology_digest,
+    }
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ActivationBoundaryEvidence:
+    schema_version: int
+    central_repository_node_id: str
+    implementation_pr_number: int
+    implementation_pr_database_id: int
+    implementation_pr_node_id: str
+    implementation_reviewed_head_sha: str
+    merged_result_oid: str
+    authority_surface_digest: str
+    new_writer_topology_digest: str
+    activation_boundary_id: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("activation boundary schemaVersion must be exact integer 1")
+        _lease_node_id(self.central_repository_node_id, "centralRepositoryNodeId")
+        _issue_positive_int(self.implementation_pr_number, "implementationPrNumber")
+        _issue_positive_int(self.implementation_pr_database_id, "implementationPrDatabaseId")
+        _lease_node_id(self.implementation_pr_node_id, "implementationPrNodeId")
+        for value, label in ((self.implementation_reviewed_head_sha, "implementationReviewedHeadSha"), (self.merged_result_oid, "mergedResultOid")):
+            _lease_sha(value, label, git=True)
+        for value, label in ((self.authority_surface_digest, "authoritySurfaceDigest"), (self.new_writer_topology_digest, "newWriterTopologyDigest"), (self.activation_boundary_id, "activationBoundaryId")):
+            _lease_sha(value, label)
+        expected = activation_boundary_id_digest(
+            self.central_repository_node_id, self.implementation_pr_number,
+            self.implementation_pr_database_id, self.implementation_pr_node_id,
+            self.merged_result_oid, self.authority_surface_digest, self.new_writer_topology_digest,
+        )
+        if self.activation_boundary_id != expected:
+            _fail("activationBoundaryId does not match its canonical hash material")
+
+
 def effective_request_digest(request: Request) -> str:
     """Hash only the canonical effective Request body, never raw Issue formatting."""
     return hashlib.sha256(
@@ -2415,6 +2512,50 @@ def claim_generation_id(
         "transitionKind": transition_kind,
     }
     return hashlib.sha256((CLAIM_GENERATION_PREFIX + _canonical_json(value)).encode("utf-8")).hexdigest()
+
+
+def machine_ref_claim_authority_digest(
+    *,
+    central_repository_node_id: str,
+    owner_key: str,
+    source_id: str,
+    source_repository_id: int,
+    machine_ref: str,
+    accepted_base_sha: str,
+    accepted_base_tree_sha: str,
+    candidate_tree_sha: str,
+    candidate_scope_digest: str,
+) -> str:
+    """Hash the durable, restart-reconstructable authority for a machine claim."""
+    central = _lease_node_id(central_repository_node_id, "centralRepositoryNodeId", delimiter_free=True)
+    try:
+        canonical_source_id = c02.validate_source_id(source_id)
+        repository_id = c02.validate_repository_id(source_repository_id)
+    except (c02.FederationError, TypeError):
+        _fail("machine source identity is invalid")
+    expected_owner = f"{central}:{canonical_source_id}"
+    if type(owner_key) is not str or owner_key != expected_owner:
+        _fail("machine ownerKey does not match central repository and sourceId")
+    expected_ref = f"refs/heads/bot/federation/{canonical_source_id}"
+    if type(machine_ref) is not str or machine_ref != expected_ref:
+        _fail("machineRef is not the canonical full ref for sourceId")
+    _lease_sha(accepted_base_sha, "acceptedBaseSha", git=True)
+    _lease_sha(accepted_base_tree_sha, "acceptedBaseTreeSha", git=True)
+    _lease_sha(candidate_tree_sha, "candidateTreeSha", git=True)
+    _lease_sha(candidate_scope_digest, "candidateScopeDigest")
+    value = {
+        "schemaVersion": 2,
+        "centralRepositoryNodeId": central,
+        "ownerKey": expected_owner,
+        "sourceId": canonical_source_id,
+        "sourceRepositoryId": repository_id,
+        "machineRef": expected_ref,
+        "acceptedBaseSha": accepted_base_sha,
+        "acceptedBaseTreeSha": accepted_base_tree_sha,
+        "candidateTreeSha": candidate_tree_sha,
+        "candidateScopeDigest": candidate_scope_digest,
+    }
+    return hashlib.sha256((MACHINE_REF_CLAIM_AUTHORITY_PREFIX + _canonical_json(value)).encode("utf-8")).hexdigest()
 
 
 _ISSUE_HEAD_CLAIM_TRANSITIONS = frozenset({

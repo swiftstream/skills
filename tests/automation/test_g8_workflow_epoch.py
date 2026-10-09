@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -899,10 +900,12 @@ class G8WorkflowEpochTests(unittest.TestCase):
                 "interactive": {"actions": "write", "contents": "write", "pull-requests": "write", "issues": "read"},
             },
             "federation-g8-trusted-validation.yml": {
+                "role-router": {"contents": "read", "pull-requests": "read", "issues": "read", "checks": "read", "statuses": "read"},
                 "manual-status-validation": {"actions": "write", "statuses": "write", "contents": "read", "pull-requests": "read", "issues": "read"},
                 "machine-validation": {"actions": "write", "checks": "write", "contents": "read", "pull-requests": "read", "issues": "read"},
             },
             "federation-g8-state-finalize.yml": {
+                "role-router": {"contents": "read", "pull-requests": "read", "issues": "read", "checks": "read", "statuses": "read"},
                 "issue-manual-finalizer": {"actions": "write", "statuses": "write", "contents": "write", "pull-requests": "write", "issues": "read"},
                 "machine-finalizer": {"actions": "write", "checks": "write", "contents": "write", "pull-requests": "write", "issues": "read"},
             },
@@ -925,8 +928,25 @@ class G8WorkflowEpochTests(unittest.TestCase):
                 token_count = job_text.count(APP_TOKEN_ACTION)
                 if token_count:
                     self.assertEqual(token_count, 1)
-                    self.assertIn("needs: activation-guard\n", job_text)
-                    self.assertIn("if: needs.activation-guard.outputs.runtime_state == 'ACTIVE_G8'", job_text)
+                    if filename == "federation-g8-trusted-validation.yml" and job_name != "role-router":
+                        self.assertIn("needs: [activation-guard, role-router]\n", job_text)
+                        route = "MANUAL_STATUS" if job_name == "manual-status-validation" else "MACHINE_VALIDATION"
+                        self.assertIn(
+                            f"if: needs.activation-guard.outputs.runtime_state == 'ACTIVE_G8' && needs.role-router.outputs.route == '{route}'",
+                            job_text,
+                        )
+                    elif filename == "federation-g8-state-finalize.yml" and job_name == "role-router":
+                        self.assertIn("needs: activation-guard\n", job_text)
+                        self.assertIn("if: needs.activation-guard.outputs.runtime_state == 'ACTIVE_G8'", job_text)
+                    elif filename == "federation-g8-state-finalize.yml":
+                        self.assertIn("needs: [activation-guard, role-router]\n", job_text)
+                        lane = "issue_manual_needed" if job_name == "issue-manual-finalizer" else "machine_needed"
+                        self.assertIn(f"needs.role-router.outputs.{lane} == 'true'", job_text)
+                        self.assertIn("needs.role-router.outputs.blocked == 'false'", job_text)
+                        self.assertIn("needs.activation-guard.outputs.runtime_state == 'ACTIVE_G8'", job_text)
+                    else:
+                        self.assertIn("needs: activation-guard\n", job_text)
+                        self.assertIn("if: needs.activation-guard.outputs.runtime_state == 'ACTIVE_G8'", job_text)
                     workflow_permissions = re.search(r"\n    permissions:\n((?:      [^\n]+\n)+)", job_text)
                     self.assertIsNotNone(workflow_permissions)
                     self.assertEqual(workflow_permissions.group(1), "      contents: read\n")
@@ -966,7 +986,24 @@ class G8WorkflowEpochTests(unittest.TestCase):
                 )
                 self.assertNotIn("federation-trusted-validation-pr-", text)
                 self.assertNotIn(MANUAL_AUTHORITY_GROUP, text)
-            else:
+                jobs = dict(jobs)
+                router = jobs["role-router"]
+                self.assertNotRegex(router, r"^\s*permission-[a-z-]+:\s+write\s*$")
+                self.assertIn("trusted-validation-route", router)
+                self.assertIn("non-canonical Wg3 route bytes", router)
+                self.assertNotIn("&& false", text)
+                self.assertIn("trusted-validation-manual", jobs["manual-status-validation"])
+                self.assertIn("trusted-validation-machine", jobs["machine-validation"])
+                self.assertNotIn("controller trusted-validation\n", text)
+            if filename == "federation-g8-state-finalize.yml":
+                jobs = dict(jobs)
+                self.assertIn("state-finalize-route", jobs["role-router"])
+                self.assertIn("state-finalize-manual", jobs["issue-manual-finalizer"])
+                self.assertIn("state-finalize-machine", jobs["machine-finalizer"])
+                self.assertNotIn("permission-checks:", jobs["issue-manual-finalizer"])
+                self.assertNotIn("permission-statuses:", jobs["machine-finalizer"])
+                self.assertNotIn("controller state-finalize\n", text)
+            elif filename != "federation-g8-trusted-validation.yml":
                 self.assertIn(f"group: {MANUAL_AUTHORITY_GROUP}", text)
             self.assertIn("cancel-in-progress: false", text)
 
@@ -1015,14 +1052,10 @@ class G8WorkflowEpochTests(unittest.TestCase):
         for forbidden in (
             "ActivationRecoveryWitness",
             "class ActivationEpoch",
-            "activationBoundaryId",
-            ".federation-g8-activation",
-            "federation/g8-activation",
         ):
             self.assertNotIn(forbidden, wave10_production)
         controller = (ROOT / "automation" / "federation" / "controller.py").read_text(encoding="utf-8")
         self.assertNotIn("activate-g8", controller)
-        self.assertNotIn("activationRef", controller)
         for path in NEW_WRITER_PATHS:
             text = (ROOT / path).read_text(encoding="utf-8")
             if Path(path).name != "federation-g8-reconcile.yml":
@@ -1031,6 +1064,38 @@ class G8WorkflowEpochTests(unittest.TestCase):
         self.assertIn("activate-g8", reconcile)
         self.assertIn("activate-g8-wave10-blocked", reconcile)
         self.assertNotIn(APP_TOKEN_ACTION, dict(_top_level_job_blocks(reconcile))["activate-g8-wave10-blocked"])
+
+    def test_wg3_route_transport_parser_rejects_noncanonical_outputs(self):
+        workflow = (WORKFLOWS / "federation-g8-trusted-validation.yml").read_text(encoding="utf-8")
+        marker = 'python3 - "${route_stdout}" "${GITHUB_OUTPUT}" <<\'PY\'\n'
+        start = workflow.index(marker) + len(marker)
+        end = workflow.index("\n          PY\n", start)
+        parser = textwrap.dedent(workflow[start:end])
+        cases = (
+            (b'{"route":"MANUAL_STATUS"}\n', True),
+            (b'{"route":"UNKNOWN"}\n', False),
+            (b'{"route":"NOOP","route":"MANUAL_STATUS"}\n', False),
+            (b'{"route":"NOOP"}\nextra\n', False),
+            (b'{ "route": "NOOP" }\n', False),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            route_file = root / "route.out"
+            output_file = root / "github-output"
+            for payload, expected_success in cases:
+                with self.subTest(payload=payload):
+                    route_file.write_bytes(payload)
+                    output_file.write_bytes(b"")
+                    result = subprocess.run(
+                        [sys.executable, "-c", parser, str(route_file), str(output_file)],
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode == 0, expected_success, result.stderr.decode("utf-8", "replace"))
+                    self.assertEqual(
+                        output_file.read_bytes(),
+                        b"route=MANUAL_STATUS\n" if expected_success else b"",
+                    )
 
     def test_wg1_issue_comment_semantic_suppression_remains_in_controller(self):
         controller = (ROOT / "automation" / "federation" / "controller.py").read_text(encoding="utf-8")

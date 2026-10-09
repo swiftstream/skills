@@ -17,12 +17,14 @@ from automation.federation.github_api import (
     ISSUE_ROUTING_BEFORE_QUERY,
     ISSUE_COMMENT_NODES_QUERY,
     PULL_REQUEST_BODY_FALLBACK_QUERY,
+    MERGED_PULL_REQUEST_QUERY,
     PULL_REQUEST_ROUTING_AFTER_QUERY,
     PULL_REQUEST_ROUTING_BEFORE_QUERY,
     UPDATE_REFS_MUTATION,
     ZERO_OID,
     GitHubClient,
     PullRequestStageMutationReceipt,
+    MergedPullRequestMetadata,
     GitHubAPIError,
     IssueMetadata,
     GitTreeEntry,
@@ -2263,6 +2265,75 @@ class Wave07PullRequestStageMutationTests(unittest.TestCase):
         with self.assertRaises(TransportError):
             GitHubClient(None, transport).close_pull_request("PR_kwDOPull", "mutation-123")
         self.assertEqual(len(transport.calls), 1)
+
+
+class Wave11MergedPullRequestReadTests(unittest.TestCase):
+    def payload(self, **pull_overrides):
+        pull = {
+            "id": "PR_kwDOUId1T88AAAABHO6OqA", "databaseId": 4780363432, "number": 27,
+            "state": "CLOSED", "isDraft": False, "merged": True,
+            "mergedAt": "2026-10-08T10:11:12Z", "mergeCommit": {"oid": "a" * 40},
+            "headRefOid": "b" * 40, "baseRefOid": "c" * 40,
+            "headRefName": "g8/issue-first-federation-implementation", "baseRefName": "main",
+            "headRepository": {"id": "R_kgDOUId1Tw", "databaseId": 1351054671, "nameWithOwner": "swiftstream/skills"},
+            "baseRepository": {"id": "R_kgDOUId1Tw", "databaseId": 1351054671, "nameWithOwner": "swiftstream/skills"},
+        }
+        pull.update(pull_overrides)
+        return {"data": {"repository": {"id": "R_kgDOUId1Tw", "databaseId": 1351054671, "nameWithOwner": "swiftstream/skills", "pullRequest": pull}}}
+
+    def read(self, payload):
+        class EchoURLTransport:
+            def __init__(self): self.calls = []
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, headers, body, timeout))
+                return HttpResponse(200, url, json.dumps(payload).encode("utf-8"))
+        transport = EchoURLTransport()
+        client = GitHubClient(None, transport)
+        return client.get_merged_pull_request_metadata("swiftstream/skills", 27), transport
+
+    def test_exact_read_only_merged_pr_model(self):
+        result, transport = self.read(self.payload())
+        self.assertIs(type(result), MergedPullRequestMetadata)
+        self.assertEqual(result.repository_full_name, "swiftstream/skills")
+        self.assertEqual(result.pull_request_database_id, 4780363432)
+        self.assertEqual(result.merge_commit_oid, "a" * 40)
+        self.assertEqual(result.head_repository_node_id, "R_kgDOUId1Tw")
+        self.assertEqual(len(transport.calls), 1)
+        method, url, _headers, body, _timeout = transport.calls[0]
+        self.assertEqual(method, "POST")
+        request = json.loads(body)
+        self.assertEqual(request["query"], MERGED_PULL_REQUEST_QUERY)
+        self.assertEqual(request["variables"], {"owner": "swiftstream", "name": "skills", "number": 27})
+
+    def test_rejects_wrong_shape_types_and_noncanonical_metadata(self):
+        cases = (
+            {"number": True}, {"databaseId": True}, {"isDraft": 0}, {"merged": "true"},
+            {"mergeCommit": {"oid": "A" * 40}}, {"mergedAt": "2026-10-08T10:11:12+00:00"},
+            {"unexpected": "field"},
+        )
+        for override in cases:
+            with self.subTest(override=override), self.assertRaises(InvalidResponseError):
+                self.read(self.payload(**override))
+
+    def test_compare_commits_requires_exact_identity_and_merge_base(self):
+        base, head = "a" * 40, "b" * 40
+        response = {"base_commit": {"sha": base}, "merge_base_commit": {"sha": base}, "status": "ahead", "commits": [{"sha": head}]}
+        class CompareTransport:
+            def __init__(self, value): self.value, self.calls = value, []
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, headers, body, timeout))
+                return HttpResponse(200, url, json.dumps(self.value).encode("utf-8"))
+        transport = CompareTransport(response)
+        self.assertEqual(GitHubClient(None, transport).compare_commits("swiftstream/skills", base, head), ("ahead", base, base))
+        for invalid in (
+            {**response, "base_commit": {"sha": "c" * 40}},
+            {**response, "merge_base_commit": {"sha": "c" * 40}},
+            {**response, "status": "diverged"},
+            {**response, "commits": []},
+        ):
+            transport = CompareTransport(invalid)
+            with self.subTest(invalid=invalid), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, transport).compare_commits("swiftstream/skills", base, head)
 
 
 if __name__ == "__main__":

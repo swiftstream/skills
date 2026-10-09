@@ -174,7 +174,7 @@ jobs:
           FEDERATION_RECONCILE_REPOSITORY_ID: ${{ inputs.repository_id }}
           FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ steps.trusted-checkout.outputs.sha }}
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -B -m automation.federation.controller reconcile
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m automation.federation.controller universal-recovery
   activate-g8-wave10-blocked:
     needs: activation-guard
     if: github.event_name == 'workflow_dispatch' && inputs.mode == 'activate-g8'

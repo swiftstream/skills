@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -41,6 +42,7 @@ from automation.federation.controller import (
     resolve_issue_source_authority,
     validate_unique_issue_anchor,
 )
+from automation.federation.github_api import MergedPullRequestMetadata, RepositoryMetadata, GitTreeEntry
 from automation.federation.request_model import (
     ISSUE_REQUEST_ANCHOR_MARKER,
     ISSUE_BRANCH_LEASE_MARKER,
@@ -67,6 +69,7 @@ from automation.federation.request_model import (
     IssuePRBinding,
     IssueBranchLease,
     ClaimedHeadMarker,
+    ActivationBoundaryEvidence,
     CarrierActivation,
     CarrierRole,
     LegacyEvidenceDisposition,
@@ -102,6 +105,9 @@ from automation.federation.request_model import (
     parse_issue_cancellation_draft_witness,
     parse_issue_terminal_cancelled_result,
     cancel_status_evidence_digest,
+    claim_generation_id,
+    activation_boundary_id_digest,
+    machine_ref_claim_authority_digest,
 )
 from automation.federation.github_api import (
     CheckRun,
@@ -7159,8 +7165,13 @@ class Wave08RoleFirstRouteTests(unittest.TestCase):
 
         client = ReadOnlyClient()
         route = self.controller(client)
-        with patch.object(controller_module, "resolve_sha_carrier_role", wraps=resolve_sha_carrier_role) as resolver, \
-             patch.object(controller_module, "publish_unclaimed_external_success") as writer:
+        canonical_resolutions = iter((
+            ShaCarrierResolution(CarrierActivation.LEGACY_CUTOVER_QUARANTINE),
+            ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION),
+        ))
+        with patch.object(route, "resolve_current_sha_carrier_role", side_effect=lambda sha: (
+            client.events.append(("role", sha)) or next(canonical_resolutions)
+        )), patch.object(controller_module, "publish_unclaimed_external_success") as writer:
             quarantined = route.trusted_validation_role_first(
                 7, lambda head: client.events.append(("legacy", head)) or LegacyEvidenceDisposition.QUARANTINE,
             )
@@ -7173,11 +7184,9 @@ class Wave08RoleFirstRouteTests(unittest.TestCase):
             self.assertEqual(unclaimed.kind, controller_module.Wave08DecisionKind.EXTERNAL_STATUS)
             self.assertEqual(writer.call_count, 1)
             self.assertEqual(writer.call_args.args[2:4], (self.HEAD, unclaimed.resolution))
-        self.assertEqual(resolver.call_count, 2)
         events = client.events
-        self.assertLess(events.index(("pr", 7)), events.index(("commit", self.HEAD)))
-        self.assertLess(events.index(("commit", self.HEAD)), events.index(("legacy", self.HEAD)))
-        self.assertLess(events.index(("legacy", self.HEAD)), events.index(("repository", self.CENTRAL)))
+        self.assertLess(events.index(("pr", 7)), events.index(("role", self.HEAD)))
+        self.assertEqual(events.count(("legacy", self.HEAD)), 0)
 
     def test_legacy_dependency_failures_never_publish_external_success(self):
         identity = GitCommitIdentity("Author", "author@example.test", "2026-10-05T00:00:00Z")
@@ -7253,6 +7262,49 @@ class Wave08UniversalRecoveryTests(unittest.TestCase):
         return client, issue, state, epoch, R02Controller(
             client, Wave08UniversalRecoveryTests.CENTRAL, Wave08UniversalRecoveryTests.APP,
         )
+
+    def test_universal_read_only_rejects_semantic_dispatchers_before_inventory_or_mutation(self):
+        callback_names = (
+            "issue_intake_terminal_dispatcher",
+            "issue_finalizer_dispatcher",
+            "machine_validation_dispatcher",
+            "machine_finalizer_dispatcher",
+        )
+        for callback_name in callback_names:
+            with self.subTest(callback=callback_name):
+                client, _issue, _state, _epoch, controller = self.finalization_fixture()
+                events = self.install_inventories(client, events=[])
+                client.check_calls = list(getattr(client, "check_calls", ()))
+                calls = []
+
+                def mutation_state():
+                    return (
+                        tuple(client.comments),
+                        tuple(sorted(
+                            (number, tuple(comments))
+                            for number, comments in client.pr_comments.items()
+                        )),
+                        tuple(getattr(client, "comment_writes", ())),
+                        tuple(getattr(client, "commit_calls", ())),
+                        tuple(getattr(client, "ref_writes", ())),
+                        tuple(getattr(client, "status_calls", ())),
+                        tuple(getattr(client, "check_calls", ())),
+                    )
+
+                before = mutation_state()
+                with self.assertRaisesRegex(
+                    R02Error,
+                    "universal recovery read_only mode forbids semantic dispatch callbacks",
+                ):
+                    controller.recover_universal_role_first(
+                        None,
+                        read_only=True,
+                        **{callback_name: lambda *args: calls.append(args)},
+                    )
+
+                self.assertEqual(calls, [])
+                self.assertEqual(events, [], "read-only callback rejection must happen before inventory")
+                self.assertEqual(mutation_state(), before)
 
     def test_universal_failed_owner_fresh_read_shared_h_active_issue_active_revalidates_and_readmits_owner(self):
         client, issue, _anchor, _lease, state, claim = (
@@ -7480,17 +7532,15 @@ class Wave08UniversalRecoveryTests(unittest.TestCase):
         resolutions, owner_proofs = [], []
         explicit_owner_revalidations, revalidation_results = [], []
         finalizer_calls, wg1_calls, external_writes = [], [], []
-        original_resolver = controller_module.resolve_sha_carrier_role
+        original_resolver = controller.resolve_current_sha_carrier_role
         original_derive_owner = controller_module.derive_issue_owner_pr
         original_get_pr = client.get_pull_request_metadata
 
-        def resolve(*args, **kwargs):
-            sha = args[2]
+        def resolve(sha):
             resolutions.append(sha)
             if sha == unrelated_head:
-                self.assertIs(args[4](), LegacyEvidenceDisposition.ABSENT)
                 return ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
-            return original_resolver(*args, **kwargs)
+            return original_resolver(sha)
 
         def derive_owner(*args, **kwargs):
             result = original_derive_owner(*args, **kwargs)
@@ -7512,7 +7562,7 @@ class Wave08UniversalRecoveryTests(unittest.TestCase):
 
         client.get_pull_request_metadata = get_pr
         with (
-            patch.object(controller_module, "resolve_sha_carrier_role", side_effect=resolve),
+            patch.object(controller, "resolve_current_sha_carrier_role", side_effect=resolve),
             patch.object(controller_module, "derive_issue_owner_pr", side_effect=derive_owner),
             patch.object(controller_module, "publish_unclaimed_external_success", side_effect=publish_external),
         ):
@@ -7700,10 +7750,9 @@ class Wave08UniversalRecoveryTests(unittest.TestCase):
         client.list_open_pull_requests = inventory_with_distinct_stale_heads
         resolution_calls, external_writes = [], []
 
-        def explicit_unclaimed(_client, _repository, sha, _slug, legacy):
+        def explicit_unclaimed(sha):
             events.append(("resolve", sha))
             resolution_calls.append(sha)
-            self.assertIs(legacy(), LegacyEvidenceDisposition.ABSENT)
             return ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
 
         def publish_external(_client, _repository, sha, _resolution, _app):
@@ -7711,7 +7760,7 @@ class Wave08UniversalRecoveryTests(unittest.TestCase):
             external_writes.append(sha)
 
         with (
-            patch.object(controller_module, "resolve_sha_carrier_role", side_effect=explicit_unclaimed),
+            patch.object(controller, "resolve_current_sha_carrier_role", side_effect=explicit_unclaimed),
             patch.object(controller_module, "publish_unclaimed_external_success", side_effect=publish_external),
         ):
             result = controller.recover_universal_role_first(
@@ -7755,14 +7804,13 @@ class Wave08UniversalRecoveryTests(unittest.TestCase):
         events = self.install_inventories(client, all_numbers, events=[])
         resolution_calls, status_calls = [], []
 
-        def explicit_legacy(_client, _repository, sha, _slug, legacy):
+        def explicit_legacy(sha):
             events.append(("resolve", sha))
             resolution_calls.append(sha)
-            self.assertIs(legacy(), LegacyEvidenceDisposition.ABSENT)
             return ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
 
         with (
-            patch.object(controller_module, "resolve_sha_carrier_role", side_effect=explicit_legacy),
+            patch.object(controller, "resolve_current_sha_carrier_role", side_effect=explicit_legacy),
             patch.object(controller_module, "publish_unclaimed_external_success", side_effect=lambda _client, _repo, sha, _resolution, _app: status_calls.append(sha)),
         ):
             result = controller.recover_universal_role_first(
@@ -9099,6 +9147,407 @@ class Wave10InertActivationGuardTests(unittest.TestCase):
             and (isinstance(node.func, ast.Attribute) or isinstance(node.func, ast.Name))
         }
         self.assertFalse(called & forbidden)
+
+
+class Wave11ActivationBoundaryControllerTests(unittest.TestCase):
+    WRITERS = (
+        ".github/workflows/federation-g8-issue-intake.yml",
+        ".github/workflows/federation-g8-interactive.yml",
+        ".github/workflows/federation-g8-trusted-validation.yml",
+        ".github/workflows/federation-g8-state-finalize.yml",
+        ".github/workflows/federation-g8-main-advance.yml",
+        ".github/workflows/federation-g8-reconcile.yml",
+    )
+    CONTRACT_PATH = ".github/federation/g8-activation-contract.json"
+    MANIFEST_PATH = ".github/federation/g8-authority-surface.json"
+    SURFACE = tuple(sorted({
+        CONTRACT_PATH, MANIFEST_PATH, *WRITERS,
+        "automation/federation/__init__.py", "automation/federation/controller.py",
+        "automation/federation/github_api.py", "automation/federation/request_model.py",
+        "automation/federation/workspace.py", "scripts/federate.py",
+    }))
+
+    def contract(self, **overrides):
+        value = {
+            "schemaVersion": 1, "centralRepositoryNodeId": "R_kgDOUId1Tw",
+            "implementationPrNumber": 27, "implementationPrDatabaseId": 4780363432,
+            "implementationPrNodeId": "PR_kwDOUId1T88AAAABHO6OqA", "baseRef": "main",
+            "activationRef": "refs/heads/bot/federation-g8-activation",
+            "activationStatusContext": "federation/g8-activation",
+            "exactNewWriterPaths": list(self.WRITERS), "authoritySurfaceManifestPath": self.MANIFEST_PATH,
+            "contractVersion": "correction-12",
+        }
+        value.update(overrides)
+        return value
+
+    @staticmethod
+    def canonical(value):
+        return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+
+    class Client:
+        def __init__(self, test, *, discovery_contract=None, merged_contract=None, manifest=None, pr=None, compare=None):
+            self.test = test
+            self.calls = []
+            self.discovery_contract = discovery_contract
+            self.merged_contract = merged_contract
+            self.manifest_value = manifest
+            self.pr = pr or MergedPullRequestMetadata(
+                "swiftstream/skills", "R_kgDOUId1Tw", 1351054671,
+                "PR_kwDOUId1T88AAAABHO6OqA", 4780363432, 27, "CLOSED", False, True,
+                "2026-10-08T10:11:12Z", "e" * 40, "d" * 40, "c" * 40,
+                "g8/issue-first-federation-implementation", "main",
+                "R_kgDOUId1Tw", 1351054671, "swiftstream/skills",
+                "R_kgDOUId1Tw", 1351054671, "swiftstream/skills",
+            )
+            self.compare = compare or ("ahead", "e" * 40, "e" * 40)
+            self.blobs = {}
+            self.trees = {}
+            test._populate_client(self)
+
+        def get_repository_metadata(self, repository):
+            self.calls.append(("repository", repository))
+            return RepositoryMetadata(1351054671, "R_kgDOUId1Tw", "swiftstream/skills", "main")
+
+        def get_ref_oid(self, repository, ref):
+            self.calls.append(("ref", repository, ref))
+            return "f" * 40
+
+        def get_commit_tree(self, repository, sha):
+            self.calls.append(("tree", sha))
+            return sha, self.trees[sha]
+
+        def get_blob(self, repository, sha):
+            self.calls.append(("blob", sha))
+            return self.blobs[sha]
+
+        def get_merged_pull_request_metadata(self, repository, number):
+            self.calls.append(("pr", number))
+            return self.pr
+
+        def compare_commits(self, repository, base, head):
+            self.calls.append(("compare", base, head))
+            return self.compare
+
+    def _populate_client(self, client):
+        valid_contract = self.contract()
+        discovery = client.discovery_contract if client.discovery_contract is not None else self.canonical(valid_contract)
+        merged = client.merged_contract if client.merged_contract is not None else discovery
+        manifest_value = client.manifest_value if client.manifest_value is not None else {"schemaVersion": 2, "paths": list(self.SURFACE)}
+        manifest = self.canonical(manifest_value)
+        rows = {}
+        for index, path in enumerate(self.SURFACE, 1):
+            if path == self.CONTRACT_PATH:
+                content = discovery
+            elif path == self.MANIFEST_PATH:
+                content = manifest
+            else:
+                content = ("trusted:" + path + "\n").encode()
+            oid = f"{index:040x}"
+            rows[path] = GitTreeEntry(path, "100644", "blob", oid)
+            client.blobs[oid] = content
+        merged_contract_oid = f"{len(self.SURFACE) + 20:040x}"
+        rows[self.CONTRACT_PATH] = GitTreeEntry(self.CONTRACT_PATH, "100644", "blob", merged_contract_oid)
+        client.blobs[merged_contract_oid] = merged
+        main_rows = dict(rows)
+        main_contract_oid = f"{len(self.SURFACE) + 21:040x}"
+        main_rows[self.CONTRACT_PATH] = GitTreeEntry(self.CONTRACT_PATH, "100644", "blob", main_contract_oid)
+        client.blobs[main_contract_oid] = discovery
+        client.trees["f" * 40] = tuple(main_rows.values())
+        client.trees["e" * 40] = tuple(rows.values())
+
+    def controller(self, client):
+        return R02Controller(client, "swiftstream/skills", AppIdentity("swift-stream-federation", 1, "A_app", 2, "B_bot", "swift-stream-federation[bot]"), environ={"IMPLEMENTATION_PR_NUMBER": "999"})
+
+    def test_derives_boundary_from_exact_merged_result_and_fixed_pr(self):
+        client = self.Client(self)
+        evidence = self.controller(client).derive_activation_boundary_evidence()
+        self.assertEqual(evidence.merged_result_oid, "e" * 40)
+        self.assertEqual(evidence.implementation_reviewed_head_sha, "d" * 40)
+        self.assertEqual(evidence.implementation_pr_number, 27)
+        self.assertEqual(evidence.activation_boundary_id, controller_module.activation_boundary_id_digest(
+            evidence.central_repository_node_id, evidence.implementation_pr_number,
+            evidence.implementation_pr_database_id, evidence.implementation_pr_node_id,
+            evidence.merged_result_oid, evidence.authority_surface_digest, evidence.new_writer_topology_digest,
+        ))
+        self.assertEqual([call for call in client.calls if call[0] == "pr"], [("pr", 27)])
+        self.assertLess(client.calls.index(("blob", f"{len(self.SURFACE) + 21:040x}")), client.calls.index(("pr", 27)))
+
+    def test_poisoned_discovery_tuple_fails_before_pr_query(self):
+        bad = self.Client(self, discovery_contract=self.canonical(self.contract(implementationPrNumber=28)))
+        with self.assertRaises(R02Error):
+            self.controller(bad).derive_activation_boundary_evidence()
+        self.assertFalse(any(call[0] == "pr" for call in bad.calls))
+
+    def test_discovery_and_merged_contract_must_be_byte_identical(self):
+        bad = self.Client(self, merged_contract=self.canonical(self.contract(contractVersion="correction-13")))
+        with self.assertRaises(R02Error):
+            self.controller(bad).derive_activation_boundary_evidence()
+
+    def test_exact_head_topology_and_main_containment_are_required(self):
+        bad_pr = self.Client(self, pr=replace(self.Client(self).pr, head_ref="other"))
+        with self.assertRaises(R02Error):
+            self.controller(bad_pr).derive_activation_boundary_evidence()
+        bad_compare = self.Client(self, compare=("ahead", "e" * 40, "a" * 40))
+        with self.assertRaises(R02Error):
+            self.controller(bad_compare).derive_activation_boundary_evidence()
+        for state in ("behind", "diverged"):
+            client = self.Client(self, compare=(state, "e" * 40, "a" * 40))
+            with self.subTest(state=state), self.assertRaises(R02Error):
+                self.controller(client).derive_activation_boundary_evidence()
+
+    def test_manifest_and_contract_bytes_must_be_canonical_and_exact(self):
+        invalid = (
+            {"schemaVersion": 1, "paths": list(self.SURFACE)},
+            {"schemaVersion": 2, "paths": list(self.SURFACE[:-1])},
+            {"schemaVersion": 2, "paths": list(self.SURFACE) + ["extra.py"]},
+        )
+        for manifest in invalid:
+            client = self.Client(self, manifest=manifest)
+            with self.subTest(manifest=manifest), self.assertRaises(R02Error):
+                self.controller(client).derive_activation_boundary_evidence()
+
+
+class Wave11CanonicalShaResolverTests(unittest.TestCase):
+    CENTRAL = "swiftstream/skills"
+    BASE = "b" * 40
+    HEAD = "a" * 40
+    TREE = "e" * 40
+    BASE_TREE = "c" * 40
+    APP = AppIdentity("swift-stream-federation", 1, "A_app", 2, "B_bot", "swift-stream-federation[bot]")
+    REPOSITORY = RepositoryMetadata(1351054671, "R_kgDOUId1Tw", CENTRAL, "main")
+    SOURCE = c02.SourceDeclaration(
+        "source-one", "Owner/Repo", 41, "skills", "Source",
+        (c02.LineDeclaration("refs/heads/main", ("source-one",)),),
+    )
+    PATHS = ("skills/source-one/SKILL.md",)
+
+    @staticmethod
+    def _canonical(value):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+    class Client:
+        def __init__(self, current_ref, message, with_pr):
+            self.current_ref = current_ref
+            self.message = message
+            self.with_pr = with_pr
+            self.calls = []
+            self.identity = GitCommitIdentity("Maintainer", "maintainer@example.test", "2026-10-08T00:00:00Z")
+            self.pr = PullRequestMetadata(
+                55, "PR_node", "B_bot", "swift-stream-federation[bot]",
+                Wave11CanonicalShaResolverTests.HEAD, Wave11CanonicalShaResolverTests.BASE,
+                "bot/federation/source-one", "main", "R_kgDOUId1Tw",
+                Wave11CanonicalShaResolverTests.CENTRAL, "R_kgDOUId1Tw", Wave11CanonicalShaResolverTests.CENTRAL,
+                None, False, False,
+            )
+
+        def get_repository_metadata(self, _repository):
+            self.calls.append("repository")
+            return Wave11CanonicalShaResolverTests.REPOSITORY
+
+        def get_ref_oid(self, _repository, ref):
+            self.calls.append(("ref", ref))
+            return Wave11CanonicalShaResolverTests.BASE if ref == "main" else self.current_ref
+
+        def get_app_metadata(self, slug):
+            return AppMetadata(Wave11CanonicalShaResolverTests.APP.app_id, slug, Wave11CanonicalShaResolverTests.APP.app_node_id)
+
+        def get_bot_metadata(self, slug):
+            app = Wave11CanonicalShaResolverTests.APP
+            return BotMetadata(app.bot_id, app.bot_login, app.bot_node_id, "Bot")
+
+        def get_git_commit_object(self, _repository, sha):
+            self.calls.append(("commit", sha))
+            if sha == Wave11CanonicalShaResolverTests.HEAD:
+                return GitCommitObject(sha, self.message, Wave11CanonicalShaResolverTests.TREE, (Wave11CanonicalShaResolverTests.BASE,), self.identity, self.identity)
+            return GitCommitObject(sha, "base\n", Wave11CanonicalShaResolverTests.BASE_TREE, (), self.identity, self.identity)
+
+        def list_open_pull_requests(self, _repository):
+            self.calls.append("open_prs")
+            return ({"number": 55},) if self.with_pr else ()
+
+        def get_pull_request_metadata(self, _repository, number):
+            self.calls.append(("pr", number))
+            return self.pr
+
+    def _machine_claim(self):
+        central = self.REPOSITORY.node_id
+        owner = f"{central}:{self.SOURCE.source_id}"
+        scope = hashlib.sha256(b"swiftstream-federation-machine-ref-claim-scope:v1\n" + self._canonical({
+            "schemaVersion": 1, "candidateTreeSha": self.TREE, "changedPaths": list(self.PATHS),
+        })).hexdigest()
+        authority = machine_ref_claim_authority_digest(
+            central_repository_node_id=central,
+            owner_key=owner,
+            source_id=self.SOURCE.source_id,
+            source_repository_id=self.SOURCE.repository_id,
+            machine_ref="refs/heads/bot/federation/source-one",
+            accepted_base_sha=self.BASE,
+            accepted_base_tree_sha=self.BASE_TREE,
+            candidate_tree_sha=self.TREE,
+            candidate_scope_digest=scope,
+        )
+        generation = claim_generation_id(
+            authority_preimage_digest=authority, carrier_nonce="4" * 64,
+            central_repository_node_id=central, owner_key=owner,
+            from_head_sha=self.BASE, from_tree_sha=self.BASE_TREE,
+            claim_kind="MACHINE_REF_CLAIM", role="MACHINE_PUBLICATION",
+            owner_kind="MACHINE_SOURCE", transition_kind="MACHINE_PUBLICATION",
+        )
+        return ClaimedHeadMarker(
+            "MACHINE_REF_CLAIM", "MACHINE_PUBLICATION", "MACHINE_SOURCE", owner,
+            generation, "4" * 64, "MACHINE_PUBLICATION",
+        )
+
+    def _machine_controller(self, current_ref, *, with_pr=True, marker=None):
+        marker = marker or self._machine_claim()
+        client = self.Client(current_ref, marker.render(), with_pr)
+        controller = R02Controller(client, self.CENTRAL, self.APP)
+        controller._accepted_sources = lambda _main: (self.SOURCE,)
+        return controller, client
+
+    def test_markerless_path_uses_boundary_classification_before_unclaimed(self):
+        controller, client = self._machine_controller(self.BASE, with_pr=False)
+        identity = client.identity
+        client.message = "ordinary commit\n"
+        boundary_id = activation_boundary_id_digest(
+            "R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA",
+            "d" * 40, "1" * 64, "2" * 64,
+        )
+        boundary = ActivationBoundaryEvidence(
+            1, "R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA",
+            "f" * 40, "d" * 40, "1" * 64, "2" * 64, boundary_id,
+        )
+        calls = []
+        classification = LegacyClassificationResult(LegacyClassificationOutcome.ABSENT, None, "ABSENT")
+        with patch.object(controller, "derive_activation_boundary_evidence", side_effect=lambda: calls.append("boundary") or boundary), \
+             patch.object(controller, "classify_legacy_head", side_effect=lambda sha, *, implementation_reviewed_head_sha: (
+                 calls.append(("legacy", sha, implementation_reviewed_head_sha)) or classification
+             )):
+            result = controller.resolve_current_sha_carrier_role(self.HEAD)
+        self.assertEqual(result.activation, CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+        self.assertEqual(calls, ["boundary", ("legacy", self.HEAD, "f" * 40)])
+
+    def test_machine_v2_requires_exact_fresh_ref_and_pr_authority(self):
+        controller, _client = self._machine_controller(self.HEAD)
+        source_read = patch.object(controller_module, "read_public_source_metadata", return_value=PublicSourceMetadata(41, "Owner/Repo", "main", None))
+        with source_read, patch.object(controller_module, "validate_machine_generated_scope", return_value=self.PATHS):
+            result = controller.resolve_current_sha_carrier_role(self.HEAD)
+        self.assertEqual((result.activation, result.role), (CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION))
+
+        moved, _client = self._machine_controller("9" * 40)
+        with patch.object(controller_module, "read_public_source_metadata", return_value=PublicSourceMetadata(41, "Owner/Repo", "main", None)), \
+             patch.object(controller_module, "validate_machine_generated_scope", return_value=self.PATHS):
+            result = moved.resolve_current_sha_carrier_role(self.HEAD)
+        self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+
+    def test_machine_v2_reserved_and_identity_generation_failures(self):
+        reserved, _client = self._machine_controller(self.BASE, with_pr=False)
+        with patch.object(controller_module, "read_public_source_metadata", return_value=PublicSourceMetadata(41, "Owner/Repo", "main", None)), \
+             patch.object(controller_module, "validate_machine_generated_scope", return_value=self.PATHS):
+            result = reserved.resolve_current_sha_carrier_role(self.HEAD)
+        self.assertEqual((result.activation, result.role), (CarrierActivation.RESERVED_INACTIVE, CarrierRole.MACHINE_PUBLICATION))
+
+        wrong_owner, wrong_client = self._machine_controller(self.HEAD)
+        original = self._machine_claim()
+        wrong_client.message = replace(original, owner_key="R_kgDOUId1Tw:another-source").render()
+        with patch.object(wrong_owner, "derive_activation_boundary_evidence", side_effect=AssertionError("reserved marker fallback")):
+            self.assertEqual(wrong_owner.resolve_current_sha_carrier_role(self.HEAD).activation, CarrierActivation.CONFLICTING)
+
+        bad_generation, bad_client = self._machine_controller(self.HEAD)
+        bad_client.message = replace(original, claim_generation_id="f" * 64).render()
+        with patch.object(controller_module, "read_public_source_metadata", return_value=PublicSourceMetadata(41, "Owner/Repo", "main", None)), \
+             patch.object(controller_module, "validate_machine_generated_scope", return_value=self.PATHS):
+            self.assertEqual(bad_generation.resolve_current_sha_carrier_role(self.HEAD).activation, CarrierActivation.CONFLICTING)
+
+    def test_real_b_to_h_lifecycle_survives_full_controller_restart(self):
+        marker = self._machine_claim()
+        marker_bytes = marker.render()
+        before_controller, before_client = self._machine_controller("9" * 40, marker=marker)
+        self.assertEqual(before_client.message, marker_bytes)
+        # The only durable mutation is the exact ref transition B -> H.
+        before_client.current_ref = self.HEAD
+        restarted_client = self.Client(self.HEAD, before_client.message, True)
+        restarted_controller = R02Controller(restarted_client, self.CENTRAL, self.APP)
+        restarted_controller._accepted_sources = lambda _main: (self.SOURCE,)
+        self.assertEqual(restarted_client.message, marker_bytes)
+        with patch.object(controller_module, "read_public_source_metadata", return_value=PublicSourceMetadata(41, "Owner/Repo", "main", None)), \
+             patch.object(controller_module, "validate_machine_generated_scope", return_value=self.PATHS):
+            result = restarted_controller.resolve_current_sha_carrier_role(self.HEAD)
+        self.assertEqual((result.activation, result.role), (CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION))
+        self.assertEqual(result.marker, marker)
+
+    def test_zero_to_h_restart_and_third_value_stay_reserved_or_conflicting(self):
+        marker = self._machine_claim()
+        absent_controller, absent_client = self._machine_controller(None, marker=marker)
+        self.assertIsNone(absent_client.current_ref)
+        absent_client.current_ref = self.HEAD
+        restarted, _client = self._machine_controller(self.HEAD, marker=marker)
+        with patch.object(controller_module, "read_public_source_metadata", return_value=PublicSourceMetadata(41, "Owner/Repo", "main", None)), \
+             patch.object(controller_module, "validate_machine_generated_scope", return_value=self.PATHS):
+            result = restarted.resolve_current_sha_carrier_role(self.HEAD)
+        self.assertEqual(result.activation, CarrierActivation.ACTIVE)
+
+        third, _client = self._machine_controller("8" * 40, marker=marker)
+        with patch.object(controller_module, "read_public_source_metadata", return_value=PublicSourceMetadata(41, "Owner/Repo", "main", None)), \
+             patch.object(controller_module, "validate_machine_generated_scope", return_value=self.PATHS):
+            result = third.resolve_current_sha_carrier_role(self.HEAD)
+        self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+        self.assertIsNot(result.activation, CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+
+    def test_old_v1_generation_is_not_accepted_by_fallback(self):
+        central = self.REPOSITORY.node_id
+        owner = f"{central}:{self.SOURCE.source_id}"
+        scope = hashlib.sha256(b"swiftstream-federation-machine-ref-claim-scope:v1\n" + self._canonical({
+            "schemaVersion": 1, "candidateTreeSha": self.TREE, "changedPaths": list(self.PATHS),
+        })).hexdigest()
+        authority = hashlib.sha256(b"swiftstream-federation-machine-ref-claim-authority:v1\n" + self._canonical({
+            "schemaVersion": 1, "centralRepositoryNodeId": central, "ownerKey": owner,
+            "sourceId": self.SOURCE.source_id, "sourceRepositoryId": self.SOURCE.repository_id,
+            "acceptedBaseSha": self.BASE, "acceptedBaseTreeSha": self.BASE_TREE,
+            "currentMachineRefOid": self.HEAD, "candidateTreeSha": self.TREE,
+            "candidateScopeDigest": scope,
+        })).hexdigest()
+        generation = claim_generation_id(
+            authority_preimage_digest=authority, carrier_nonce="4" * 64,
+            central_repository_node_id=central, owner_key=owner,
+            from_head_sha=self.BASE, from_tree_sha=self.BASE_TREE,
+            claim_kind="MACHINE_REF_CLAIM", role="MACHINE_PUBLICATION",
+            owner_kind="MACHINE_SOURCE", transition_kind="MACHINE_PUBLICATION",
+        )
+        old_marker = ClaimedHeadMarker(
+            "MACHINE_REF_CLAIM", "MACHINE_PUBLICATION", "MACHINE_SOURCE", owner,
+            generation, "4" * 64, "MACHINE_PUBLICATION",
+        )
+        controller, client = self._machine_controller(self.HEAD, marker=old_marker)
+        with patch.object(controller_module, "read_public_source_metadata", return_value=PublicSourceMetadata(41, "Owner/Repo", "main", None)), \
+             patch.object(controller_module, "validate_machine_generated_scope", return_value=self.PATHS):
+            result = controller.resolve_current_sha_carrier_role(self.HEAD)
+        self.assertEqual(result.activation, CarrierActivation.CONFLICTING)
+        self.assertEqual(client.message, old_marker.render())
+
+    def test_canonical_resolver_has_no_external_legacy_authority_or_reserved_fallback(self):
+        controller, _client = self._machine_controller(self.HEAD)
+        source = ast.parse(Path(controller_module.__file__).read_text(encoding="utf-8"))
+        cls = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == "R02Controller")
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "resolve_current_sha_carrier_role")
+        self.assertEqual([arg.arg for arg in method.args.args], ["self", "head_sha"])
+        calls = {
+            item.func.id if isinstance(item.func, ast.Name) else item.func.attr
+            for item in ast.walk(method)
+            if isinstance(item, ast.Call) and (isinstance(item.func, ast.Name) or isinstance(item.func, ast.Attribute))
+        }
+        self.assertNotIn("wave08_legacy_disposition", calls)
+        self.assertNotIn("legacy_disposition_resolver", calls)
+        self.assertNotIn("legacy_evidence_disposition", calls)
+
+    def test_reserved_marker_never_enters_legacy_or_unclaimed_fallback(self):
+        controller, _client = self._machine_controller(self.HEAD)
+        with patch.object(controller, "derive_activation_boundary_evidence", side_effect=AssertionError("legacy fallback")), \
+             patch.object(controller, "classify_legacy_head", side_effect=AssertionError("legacy fallback")), \
+             patch.object(controller_module, "read_public_source_metadata", return_value=PublicSourceMetadata(41, "Owner/Repo", "main", None)), \
+             patch.object(controller_module, "validate_machine_generated_scope", return_value=self.PATHS):
+            result = controller.resolve_current_sha_carrier_role(self.HEAD)
+        self.assertEqual(result.activation, CarrierActivation.ACTIVE)
 
 
 if __name__ == "__main__":

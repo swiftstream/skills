@@ -12,6 +12,7 @@ from automation.federation.controller import (
     MissingTrustedCheckError,
     R02Controller,
     R02Error,
+    MachinePRAuthority,
     AnchorComment,
     StaleAuthorityError,
     authorized_patch_events,
@@ -30,7 +31,10 @@ import automation.federation.controller as controller_module
 from scripts import federate as c02
 from automation.federation.github_api import CheckRun, IssueComment, PullRequestMetadata, RepositoryMetadata
 from automation.federation.github_api import ISSUE_COMMENT_NODES_QUERY, REST_BASE_URL, GitHubClient, HttpResponse, UrllibTransport
-from automation.federation.request_model import RequestAnchor, RequestClass, body_sha256, parse_request_body
+from automation.federation.request_model import (
+    CarrierActivation, CarrierRole, ClaimedHeadMarker, RequestAnchor,
+    RequestClass, ShaCarrierResolution, body_sha256, parse_request_body,
+)
 from tests.automation.test_interactive import ProductionAddClient, trusted_previous_patches
 
 
@@ -39,6 +43,119 @@ APP = AppIdentity("swiftstream-federation", 77, "A_app", 88, "U_bot", "swiftstre
 
 
 class ValidationTests(unittest.TestCase):
+    def test_wave11_router_is_read_only_and_selects_only_exact_machine_lane(self):
+        repository = RepositoryMetadata(7, "R_central", "swiftstream/skills", "main")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        head = "a" * 40
+        pr = PullRequestMetadata(
+            7, "", "U_author", "alice", head, "b" * 40,
+            "bot/federation/demo", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+
+        class Client:
+            def __init__(self):
+                self.writes = []
+            def get_pull_request_metadata(self, _repository, number):
+                self.assert_number = number
+                return pr
+            def get_ref_oid(self, _repository, ref):
+                self.assert_ref = ref
+                return head
+
+        controller = object.__new__(R02Controller)
+        controller.central_repository = "swiftstream/skills"
+        controller.client = Client()
+        controller.current_accepted_main = lambda: (repository, "b" * 40)
+        controller._accepted_sources = lambda _main: (source,)
+        marker = ClaimedHeadMarker(
+            "MACHINE_REF_CLAIM", CarrierRole.MACHINE_PUBLICATION.value,
+            "MACHINE_SOURCE", "R_central:demo", "c" * 64, "d" * 64,
+            "MACHINE_PUBLICATION",
+        )
+        controller.resolve_current_sha_carrier_role = lambda _sha: ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION, marker,
+        )
+        controller._machine_authority = lambda *_args: MachinePRAuthority(7, "demo", 99, head)
+        self.assertEqual(controller.trusted_validation_route(7), "MACHINE_VALIDATION")
+        self.assertEqual(controller.client.assert_ref, "bot/federation/demo")
+        self.assertEqual(controller.client.writes, [])
+
+        controller.resolve_current_sha_carrier_role = lambda _sha: ShaCarrierResolution(
+            CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION,
+        )
+        self.assertEqual(controller.trusted_validation_route(7), "MANUAL_STATUS")
+        self.assertEqual(controller.client.writes, [])
+
+    def test_wave11_manual_writer_rejects_machine_role_before_any_mutation(self):
+        repository = RepositoryMetadata(7, "R_central", "swiftstream/skills", "main")
+        head = "a" * 40
+        pr = PullRequestMetadata(
+            7, "", "U_author", "alice", head, "b" * 40,
+            "bot/federation/demo", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+        marker = ClaimedHeadMarker(
+            "MACHINE_REF_CLAIM", CarrierRole.MACHINE_PUBLICATION.value,
+            "MACHINE_SOURCE", "R_central:demo", "c" * 64, "d" * 64,
+            "MACHINE_PUBLICATION",
+        )
+        class Client:
+            def get_pull_request_metadata(self, _repository, _number):
+                return pr
+        controller = object.__new__(R02Controller)
+        controller.central_repository = "swiftstream/skills"
+        controller.client = Client()
+        controller.current_accepted_main = lambda: (repository, "b" * 40)
+        controller.resolve_current_sha_carrier_role = lambda _sha: ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION, marker,
+        )
+        controller.trusted_validation_role_first = lambda *_args, **_kwargs: self.fail("machine role must be rejected before role-first writer dispatch")
+        self.assertEqual(controller.trusted_validation_manual(7), "NOOP_MACHINE_ROLE")
+
+    def test_wave11_machine_writer_rejects_issue_role_before_check_mutation(self):
+        repository = RepositoryMetadata(7, "R_central", "swiftstream/skills", "main")
+        head = "a" * 40
+        pr = PullRequestMetadata(
+            7, "", "U_author", "alice", head, "b" * 40,
+            "proposal", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+        marker = ClaimedHeadMarker(
+            "ISSUE_HEAD_CLAIM", CarrierRole.ISSUE_ACTIVE.value,
+            "ISSUE", "R_central:7", "c" * 64, "d" * 64,
+            "ISSUE_HEAD_CLAIM",
+        )
+        class Client:
+            def get_pull_request_metadata(self, _repository, _number):
+                return pr
+        controller = object.__new__(R02Controller)
+        controller.central_repository = "swiftstream/skills"
+        controller.client = Client()
+        controller.current_accepted_main = lambda: (repository, "b" * 40)
+        controller.resolve_current_sha_carrier_role = lambda _sha: ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE, marker,
+        )
+        controller.trusted_machine_validation = lambda *_args, **_kwargs: self.fail("Issue role must be rejected before machine validation")
+        controller.publish_validation_result = lambda *_args, **_kwargs: self.fail("Issue role must not write a Check Run")
+        with self.assertRaises(StaleAuthorityError):
+            controller.trusted_validation_machine(7)
+
+    def test_wave11_writer_entrypoints_revalidate_and_keep_capabilities_split(self):
+        source = (ROOT / "automation/federation/controller.py").read_text(encoding="utf-8")
+        route = source.split("    def trusted_validation_route(", 1)[1].split("    def trusted_validation_manual(", 1)[0]
+        manual = source.split("    def trusted_validation_manual(", 1)[1].split("    def trusted_validation_machine(", 1)[0]
+        machine = source.split("    def trusted_validation_machine(", 1)[1].split("    def trusted_validation(", 1)[0]
+        self.assertNotRegex(route, r"(?:create_commit_status|update_check_run|dispatch_workflow|update_pull_request_state|update_refs)\(")
+        self.assertIn("resolve_current_sha_carrier_role", manual)
+        self.assertIn("trusted_validation_role_first", manual)
+        self.assertNotIn("publish_validation_result", manual)
+        self.assertNotIn("update_check_run(", manual)
+        self.assertGreaterEqual(machine.count("resolve_current_sha_carrier_role"), 2)
+        self.assertIn("publish_validation_result", machine)
+        self.assertNotIn("create_commit_status(", machine)
+        self.assertIn('args.command != "trusted-validation-route"', source)
+
     def test_valid_fixture_only_can_pass_and_exact_check_output_is_bounded(self):
         request_class = __import__("automation.federation.request_model", fromlist=["RequestClass"]).RequestClass.ADD
         result = evaluate_trusted_validation(request_class, "a" * 40, "b" * 40, lambda: (True, "candidate-ok"), allow_success=True)

@@ -79,6 +79,7 @@ from automation.federation.request_model import (
     render_status_description,
     classify_issue_head_claim_progression,
     claim_generation_id,
+    machine_ref_claim_authority_digest,
     parse_claimed_head_marker,
     parse_issue_branch_lease,
     parse_issue_patch_projection,
@@ -96,6 +97,10 @@ from automation.federation.request_model import (
     parse_pr_issue_origin_binding,
     proposed_line_refs,
     validate_drop_set,
+    ActivationBoundaryEvidence,
+    authority_surface_digest,
+    new_writer_topology_digest,
+    activation_boundary_id_digest,
 )
 from automation.federation.workspace import validate_trusted_ref
 
@@ -2690,6 +2695,93 @@ class Wave09LegacyRequestModelTests(unittest.TestCase):
         self.assertEqual(parse_status_description(maintenance).status_class, StatusClass.MAINTENANCE)
         with self.assertRaises(RequestModelError):
             render_status_description(StatusClass.MAINTENANCE, "b" * 64)
+
+
+class Wave11ActivationBoundaryModelTests(unittest.TestCase):
+    def test_surface_and_writer_digests_bind_exact_canonical_inputs(self):
+        entries = [
+            {"path": "a.py", "blobOid": "a" * 40, "sha256": "b" * 64},
+            {"path": "b.py", "blobOid": "c" * 40, "sha256": "d" * 64},
+        ]
+        surface = authority_surface_digest("e" * 40, "f" * 40, entries)
+        self.assertEqual(len(surface), 64)
+        self.assertNotEqual(surface, authority_surface_digest("0" * 40, "f" * 40, entries))
+        self.assertNotEqual(surface, authority_surface_digest("e" * 40, "f" * 40, [entries[0], {**entries[1], "sha256": "1" * 64}]))
+        with self.assertRaises(RequestModelError):
+            authority_surface_digest("e" * 40, "f" * 40, list(reversed(entries)))
+        writers = [entries[1], entries[0]]
+        topology = new_writer_topology_digest(writers)
+        self.assertNotEqual(topology, new_writer_topology_digest(list(reversed(writers))))
+
+    def test_boundary_id_hash_has_exact_fields_and_excludes_reviewed_head(self):
+        expected = activation_boundary_id_digest("R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA", "1" * 40, "2" * 64, "3" * 64)
+        evidence = ActivationBoundaryEvidence(1, "R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA", "4" * 40, "1" * 40, "2" * 64, "3" * 64, expected)
+        self.assertEqual(evidence.activation_boundary_id, expected)
+        changed_reviewed_head = ActivationBoundaryEvidence(1, "R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA", "5" * 40, "1" * 40, "2" * 64, "3" * 64, expected)
+        self.assertEqual(changed_reviewed_head.activation_boundary_id, evidence.activation_boundary_id)
+        with self.assertRaises(RequestModelError):
+            ActivationBoundaryEvidence(1, "R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA", "4" * 40, "1" * 40, "2" * 64, "3" * 64, "0" * 64)
+        for bad_number in (True, 0, -1):
+            with self.subTest(bad_number=bad_number), self.assertRaises(RequestModelError):
+                ActivationBoundaryEvidence(1, "R_kgDOUId1Tw", bad_number, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA", "4" * 40, "1" * 40, "2" * 64, "3" * 64, expected)
+
+
+class Wave11MachineAuthorityV2ModelTests(unittest.TestCase):
+    def fields(self):
+        return {
+            "central_repository_node_id": "R_kgDOUId1Tw",
+            "owner_key": "R_kgDOUId1Tw:source-one",
+            "source_id": "source-one",
+            "source_repository_id": 41,
+            "machine_ref": "refs/heads/bot/federation/source-one",
+            "accepted_base_sha": "a" * 40,
+            "accepted_base_tree_sha": "b" * 40,
+            "candidate_tree_sha": "c" * 40,
+            "candidate_scope_digest": "d" * 64,
+        }
+
+    def test_v2_authority_is_canonical_and_binds_exact_machine_ref(self):
+        fields = self.fields()
+        digest = machine_ref_claim_authority_digest(**fields)
+        material = {
+            "schemaVersion": 2,
+            "centralRepositoryNodeId": fields["central_repository_node_id"],
+            "ownerKey": fields["owner_key"],
+            "sourceId": fields["source_id"],
+            "sourceRepositoryId": fields["source_repository_id"],
+            "machineRef": fields["machine_ref"],
+            "acceptedBaseSha": fields["accepted_base_sha"],
+            "acceptedBaseTreeSha": fields["accepted_base_tree_sha"],
+            "candidateTreeSha": fields["candidate_tree_sha"],
+            "candidateScopeDigest": fields["candidate_scope_digest"],
+        }
+        expected = hashlib.sha256(
+            b"swiftstream-federation-machine-ref-claim-authority:v2\n"
+            + json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest()
+        self.assertEqual(digest, expected)
+        with self.assertRaises(RequestModelError):
+            machine_ref_claim_authority_digest(**{**fields, "machine_ref": "refs/heads/bot/federation/another-source"})
+        parameters = inspect.signature(machine_ref_claim_authority_digest).parameters
+        self.assertNotIn("current_machine_ref_oid", parameters)
+        self.assertNotIn("before_oid", parameters)
+        self.assertNotIn("target_head_sha", parameters)
+
+    def test_v2_authority_rejects_malformed_or_mismatched_bindings(self):
+        fields = self.fields()
+        for key, bad_value in (
+            ("central_repository_node_id", "bad:central"),
+            ("owner_key", "R_kgDOUId1Tw:other"),
+            ("source_id", "Source-One"),
+            ("source_repository_id", True),
+            ("machine_ref", "bot/federation/source-one"),
+            ("accepted_base_sha", "A" * 40),
+            ("accepted_base_tree_sha", "b" * 64),
+            ("candidate_tree_sha", "c" * 39),
+            ("candidate_scope_digest", "d" * 63),
+        ):
+            with self.subTest(key=key), self.assertRaises(RequestModelError):
+                machine_ref_claim_authority_digest(**{**fields, key: bad_value})
 
 
 if __name__ == "__main__":

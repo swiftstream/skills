@@ -227,6 +227,30 @@ PULL_REQUEST_BODY_FALLBACK_QUERY = """query FederationPullRequestBodyFallback($o
   }
 }"""
 
+MERGED_PULL_REQUEST_QUERY = """query FederationMergedPullRequest($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    id
+    databaseId
+    nameWithOwner
+    pullRequest(number: $number) {
+      id
+      databaseId
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      mergeCommit { oid }
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      headRepository { id databaseId nameWithOwner }
+      baseRepository { id databaseId nameWithOwner }
+    }
+  }
+}"""
+
 ISSUE_COMMENT_NODES_QUERY = """query FederationIssueCommentNodes($ids: [ID!]!) {
   nodes(ids: $ids) {
     __typename
@@ -478,6 +502,31 @@ class PullRequestMetadata:
     last_edited_at: str | None
     includes_created_edit: bool
     draft: bool
+
+
+@dataclass(frozen=True)
+class MergedPullRequestMetadata:
+    repository_full_name: str
+    repository_node_id: str
+    repository_database_id: int
+    pull_request_node_id: str
+    pull_request_database_id: int
+    pull_request_number: int
+    state: str
+    is_draft: bool
+    merged: bool
+    merged_at: str | None
+    merge_commit_oid: str | None
+    head_oid: str
+    base_oid: str
+    head_ref: str
+    base_ref: str
+    head_repository_node_id: str
+    head_repository_database_id: int
+    head_repository_full_name: str
+    base_repository_node_id: str
+    base_repository_database_id: int
+    base_repository_full_name: str
 
 
 @dataclass(frozen=True)
@@ -1055,6 +1104,7 @@ class GitHubClient:
             ISSUE_ROUTING_BEFORE_QUERY,
             ISSUE_ROUTING_AFTER_QUERY,
             PULL_REQUEST_BODY_FALLBACK_QUERY,
+            MERGED_PULL_REQUEST_QUERY,
             ISSUE_COMMENT_NODES_QUERY,
             APP_QUERY,
             BOT_QUERY,
@@ -1570,6 +1620,108 @@ class GitHubClient:
             before.includes_created_edit,
             before.draft,
         )
+
+    def get_merged_pull_request_metadata(self, repository: str, number: int) -> MergedPullRequestMetadata:
+        """Read one exact PR merge/topology snapshot using a fixed read-only query."""
+        owner, name = self._owner_repo(repository)
+        if type(number) is not int or type(number) is bool or number <= 0:
+            raise GitHubAPIError("pull request number must be positive")
+        data = self._graphql(
+            MERGED_PULL_REQUEST_QUERY,
+            {"owner": owner, "name": name, "number": number},
+            operation="mergedPullRequest",
+        )
+        if type(data) is not dict or set(data) != {"repository"} or type(data.get("repository")) is not dict:
+            raise InvalidResponseError("merged PR response has invalid exact top-level shape")
+        repo = data["repository"]
+        if set(repo) != {"id", "databaseId", "nameWithOwner", "pullRequest"}:
+            raise InvalidResponseError("merged PR repository response has invalid exact shape")
+        repo_full_name = _bounded_text(repo.get("nameWithOwner"), "repository.nameWithOwner", 512)
+        repo_node_id = _bounded_text(repo.get("id"), "repository.id", 256)
+        repo_database_id = _positive_id(repo.get("databaseId"), "repository.databaseId")
+        pull = repo.get("pullRequest")
+        expected_pull_keys = {
+            "id", "databaseId", "number", "state", "isDraft", "merged", "mergedAt", "mergeCommit",
+            "headRefOid", "baseRefOid", "headRefName", "baseRefName", "headRepository", "baseRepository",
+        }
+        if type(pull) is not dict or set(pull) != expected_pull_keys:
+            raise InvalidResponseError("merged PR response has invalid exact pull request shape")
+        returned_number = pull.get("number")
+        if type(returned_number) is not int or type(returned_number) is bool or returned_number != number:
+            raise InvalidResponseError("merged PR number does not match requested number")
+        state = pull.get("state")
+        if type(state) is not str or state not in {"OPEN", "CLOSED"}:
+            raise InvalidResponseError("merged PR state is invalid")
+        is_draft, merged = pull.get("isDraft"), pull.get("merged")
+        if type(is_draft) is not bool or type(merged) is not bool:
+            raise InvalidResponseError("merged PR draft/merged fields must be exact booleans")
+        merged_at = pull.get("mergedAt")
+        if merged_at is not None:
+            merged_at = _canonical_utc_timestamp(merged_at, "pullRequest.mergedAt")
+        merge_commit = pull.get("mergeCommit")
+        if merge_commit is None:
+            merge_commit_oid = None
+        elif type(merge_commit) is dict and set(merge_commit) == {"oid"}:
+            merge_commit_oid = self._sha(merge_commit.get("oid"), "pullRequest.mergeCommit.oid")
+        else:
+            raise InvalidResponseError("merged PR mergeCommit is malformed")
+
+        def repository_identity(raw: Any, label: str) -> tuple[str, int, str]:
+            if type(raw) is not dict or set(raw) != {"id", "databaseId", "nameWithOwner"}:
+                raise InvalidResponseError(f"{label} repository identity is malformed")
+            return (
+                _bounded_text(raw.get("id"), f"{label}.id", 256),
+                _positive_id(raw.get("databaseId"), f"{label}.databaseId"),
+                _bounded_text(raw.get("nameWithOwner"), f"{label}.nameWithOwner", 512),
+            )
+
+        head_repo = repository_identity(pull.get("headRepository"), "headRepository")
+        base_repo = repository_identity(pull.get("baseRepository"), "baseRepository")
+        return MergedPullRequestMetadata(
+            repo_full_name, repo_node_id, repo_database_id,
+            _bounded_text(pull.get("id"), "pullRequest.id", 256),
+            _positive_id(pull.get("databaseId"), "pullRequest.databaseId"),
+            returned_number, state, is_draft, merged, merged_at, merge_commit_oid,
+            self._sha(pull.get("headRefOid"), "pullRequest.headRefOid"),
+            self._sha(pull.get("baseRefOid"), "pullRequest.baseRefOid"),
+            _bounded_text(pull.get("headRefName"), "pullRequest.headRefName", 256),
+            _bounded_text(pull.get("baseRefName"), "pullRequest.baseRefName", 256),
+            *head_repo, *base_repo,
+        )
+
+    def compare_commits(self, repository: str, base_sha: str, head_sha: str) -> tuple[str, str, str]:
+        """Return strict (status, base SHA, merge-base SHA) for bounded ancestry proof."""
+        owner, name = self._owner_repo(repository)
+        base, head = self._sha(base_sha, "compare base SHA"), self._sha(head_sha, "compare head SHA")
+        url = (
+            f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}"
+            f"/compare/{base}...{head}"
+        )
+        value = self._request("GET", url)
+        if type(value) is not dict or type(value.get("base_commit")) is not dict or type(value.get("merge_base_commit")) is not dict:
+            raise InvalidResponseError("commit compare response is malformed")
+        returned_base = self._sha(value["base_commit"].get("sha"), "compare.base_commit.sha")
+        raw_commits = value.get("commits")
+        if type(raw_commits) is not list or any(type(item) is not dict for item in raw_commits):
+            raise InvalidResponseError("commit compare commits list is malformed")
+        merge_base = self._sha(value["merge_base_commit"].get("sha"), "compare.merge_base_commit.sha")
+        status = value.get("status")
+        if type(status) is not str or status not in {"identical", "ahead", "behind", "diverged"}:
+            raise InvalidResponseError("commit compare status is invalid")
+        if returned_base != base:
+            raise InvalidResponseError("commit compare response base identity differs from request")
+        returned_head = base if not raw_commits else self._sha(raw_commits[-1].get("sha"), "compare.head SHA")
+        if status == "identical":
+            coherent = head == base and not raw_commits and merge_base == base
+        elif status == "ahead":
+            coherent = returned_head == head and merge_base == base
+        elif status == "behind":
+            coherent = not raw_commits and merge_base == head
+        else:
+            coherent = returned_head == head and merge_base not in {base, head}
+        if not coherent:
+            raise InvalidResponseError("commit compare response status, head, and merge base are inconsistent")
+        return status, returned_base, merge_base
 
     def reopen_pull_request(self, pull_request_node_id: str, client_mutation_id: str) -> PullRequestStageMutationReceipt:
         return self._pull_request_stage_mutation("REOPEN", pull_request_node_id, client_mutation_id)
