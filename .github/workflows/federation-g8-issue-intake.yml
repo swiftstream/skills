@@ -48,11 +48,24 @@ jobs:
             exit 1
           fi
           echo "sha=$trusted_head" >> "$GITHUB_OUTPUT"
+      - id: guard-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-issues: read
+          permission-pull-requests: read
+          permission-statuses: read
       - id: parse-guard
-        name: Validate frozen activation guard output
+        name: Validate Wave12 activation guard output
+        env:
+          FEDERATION_GITHUB_TOKEN: ${{ steps.guard-token.outputs.token }}
+          FEDERATION_APP_SLUG: ${{ steps.guard-token.outputs.app-slug }}
+          FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ steps.trusted-checkout.outputs.sha }}
         run: |
           set -euo pipefail
-          guard_stdout="${RUNNER_TEMP}/g8-wave10-activation-guard.out"
+          guard_stdout="${RUNNER_TEMP}/g8-wave12-activation-guard.out"
           : > "${guard_stdout}"
           PYTHONDONTWRITEBYTECODE=1 python3 -B -m automation.federation.controller activation-guard > "${guard_stdout}"
           python3 - "${guard_stdout}" "${GITHUB_OUTPUT}" <<'PY'
@@ -108,14 +121,22 @@ jobs:
           if type(value["runtimeState"]) is not str:
               raise SystemExit("invalid runtimeState type")
 
-          if value["activationWriteAllowed"] is not False:
-              raise SystemExit("activation writes unexpectedly allowed")
-          if value["ordinaryWriteAllowed"] is not False:
-              raise SystemExit("ordinary writes unexpectedly allowed")
-          if value["reason"] != "WAVE10_INERT_GUARD":
-              raise SystemExit("unexpected activation guard reason")
-          if value["runtimeState"] != "MERGED_UNPROVEN":
+          allowed = {
+              "ACTIVE_G8": (True, False, "ACTIVE_G8_EPOCH_PROVEN"),
+              "MERGED_UNPROVEN": (False, True, "MERGED_UNPROVEN_NO_VALID_EPOCH"),
+              "BLOCKED_POST_MERGE": (False, False, "BLOCKED_POST_MERGE_CONFLICT"),
+              "PRE_G8_NOT_APPLICABLE": (False, False, "PRE_G8_NOT_APPLICABLE"),
+          }
+          runtime_state = value["runtimeState"]
+          if runtime_state not in allowed:
               raise SystemExit("unexpected activation guard runtime state")
+          ordinary_expected, activation_expected, reason_expected = allowed[runtime_state]
+          if value["ordinaryWriteAllowed"] is not ordinary_expected:
+              raise SystemExit("ordinaryWriteAllowed does not match runtime state")
+          if value["activationWriteAllowed"] is not activation_expected:
+              raise SystemExit("activationWriteAllowed does not match runtime state")
+          if value["reason"] != reason_expected:
+              raise SystemExit("activation guard reason does not match runtime state")
 
           canonical = (
               json.dumps(
@@ -131,9 +152,9 @@ jobs:
               raise SystemExit("non-canonical activation guard bytes")
 
           with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8", newline="\n") as output:
-              output.write("runtime_state=MERGED_UNPROVEN\n")
-              output.write("ordinary_write_allowed=false\n")
-              output.write("activation_write_allowed=false\n")
+              output.write("runtime_state=" + value["runtimeState"] + "\n")
+              output.write("ordinary_write_allowed=" + ("true" if value["ordinaryWriteAllowed"] else "false") + "\n")
+              output.write("activation_write_allowed=" + ("true" if value["activationWriteAllowed"] else "false") + "\n")
           PY
   issue-intake:
     needs: activation-guard

@@ -2784,5 +2784,349 @@ class Wave11MachineAuthorityV2ModelTests(unittest.TestCase):
                 machine_ref_claim_authority_digest(**{**fields, key: bad_value})
 
 
+class Wave12ActivationModelTests(unittest.TestCase):
+    @staticmethod
+    def boundary_material():
+        merged = "1" * 40
+        authority = "2" * 64
+        topology = "3" * 64
+        boundary = rm.activation_boundary_id_digest(
+            rm.G8_CENTRAL_REPOSITORY_NODE_ID,
+            rm.G8_IMPLEMENTATION_PR_NUMBER,
+            rm.G8_IMPLEMENTATION_PR_DATABASE_ID,
+            rm.G8_IMPLEMENTATION_PR_NODE_ID,
+            merged,
+            authority,
+            topology,
+        )
+        return merged, authority, topology, boundary
+
+    @classmethod
+    def witness(cls):
+        _merged, _authority, _topology, boundary = cls.boundary_material()
+        return rm.ActivationRecoveryWitness(
+            1,
+            boundary,
+            7001,
+            2,
+            "4" * 64,
+            rm.ordered_recovery_actions_digest(()),
+            "5" * 64,
+            0,
+            "6" * 64,
+            "7" * 64,
+        )
+
+    @classmethod
+    def evidence(cls, **changes):
+        merged, authority, topology, boundary = cls.boundary_material()
+        witness = cls.witness()
+        values = dict(
+            schema_version=1,
+            evidence_kind="G8_ACTIVATION_RECOVERY",
+            central_repository_node_id=rm.G8_CENTRAL_REPOSITORY_NODE_ID,
+            implementation_pr_number=rm.G8_IMPLEMENTATION_PR_NUMBER,
+            implementation_pr_database_id=rm.G8_IMPLEMENTATION_PR_DATABASE_ID,
+            implementation_pr_node_id=rm.G8_IMPLEMENTATION_PR_NODE_ID,
+            activation_boundary_id=boundary,
+            merged_result_oid=merged,
+            authority_surface_digest=authority,
+            new_writer_topology_digest=topology,
+            activation_run_id=witness.activation_run_id,
+            activation_run_attempt=witness.activation_run_attempt,
+            pre_recovery_inventory_digest=witness.pre_recovery_inventory_digest,
+            ordered_recovery_actions_digest=witness.ordered_recovery_actions_digest,
+            recovery_action_count=0,
+            post_recovery_inventory_digest=witness.post_recovery_inventory_digest,
+            unresolved_authority_count=0,
+            old_run_terminal_digest=witness.old_run_terminal_digest,
+            six_workflow_identity_digest=witness.six_workflow_identity_digest,
+            legacy_inventory_quarantine_migration_digest="8" * 64,
+            activation_recovery_witness_id=witness.witness_id(),
+            recovery_result="SUCCESS",
+        )
+        values.update(changes)
+        return rm.ActivationRecoveryEvidence(**values)
+
+    def test_frozen_writer_constants_are_exact_and_unique(self):
+        self.assertEqual(rm.G8_IMPLEMENTATION_PR_NUMBER, 27)
+        self.assertEqual(rm.G8_IMPLEMENTATION_PR_DATABASE_ID, 4780363432)
+        self.assertEqual(rm.G8_IMPLEMENTATION_PR_NODE_ID, "PR_kwDOUId1T88AAAABHO6OqA")
+        self.assertEqual(len(rm.G8_NEW_WRITER_PATHS), 6)
+        self.assertEqual(len(set(rm.G8_NEW_WRITER_PATHS)), 6)
+        self.assertEqual(
+            rm.G8_OLD_WRITERS,
+            (
+                (".github/workflows/federation-interactive.yml", 350485971),
+                (".github/workflows/federation-trusted-validation.yml", 350485976),
+                (".github/workflows/federation-state-finalize.yml", 350485975),
+                (".github/workflows/federation-main-advance.yml", 350485973),
+                (".github/workflows/federation-reconcile.yml", 350485974),
+            ),
+        )
+        self.assertEqual(len({path for path, _ in rm.G8_OLD_WRITERS}), 5)
+        self.assertEqual(len({workflow_id for _, workflow_id in rm.G8_OLD_WRITERS}), 5)
+
+    def test_action_digest_has_exact_closed_envelope_and_empty_digest(self):
+        empty_expected = hashlib.sha256(
+            rm.G8_ACTIVATION_RECOVERY_ACTIONS_PREFIX.encode()
+            + json.dumps(
+                {"schemaVersion": 1, "actions": []},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ).encode()
+        ).hexdigest()
+        self.assertEqual(rm.ordered_recovery_actions_digest(()), empty_expected)
+        action = rm.ActivationRecoveryAction(
+            1, 0, rm.ActivationRecoveryActionClass.LEGACY_FAILURE_STATUS,
+            "a" * 64, "b" * 64, rm.ActivationRecoveryResultClass.APPLIED,
+        )
+        self.assertEqual(
+            action.as_value(),
+            {
+                "schemaVersion": 1, "sequence": 0,
+                "actionClass": "LEGACY_FAILURE_STATUS",
+                "subjectDigest": "a" * 64, "effectDigest": "b" * 64,
+                "resultClass": "APPLIED",
+            },
+        )
+        self.assertEqual(
+            {item.value for item in rm.ActivationRecoveryActionClass},
+            {
+                "LEGACY_FAILURE_STATUS", "CANCEL_FAILURE_STATUS", "LEGACY_MACHINE_MIGRATION",
+                "ISSUE_TERMINAL_CLEANUP", "ISSUE_REQUEST_RECOVERY", "RESERVED_TRANSITION_RECOVERY",
+            },
+        )
+        with self.assertRaises(RequestModelError):
+            rm.ordered_recovery_actions_digest((
+                rm.ActivationRecoveryAction(
+                    1, 1, rm.ActivationRecoveryActionClass.CANCEL_FAILURE_STATUS,
+                    "a" * 64, "b" * 64, rm.ActivationRecoveryResultClass.ALREADY_CONVERGED,
+                ),
+            ))
+        with self.assertRaises(RequestModelError):
+            rm.ActivationRecoveryAction(1, 0, "LEGACY_FAILURE_STATUS", "a" * 64, "b" * 64, rm.ActivationRecoveryResultClass.APPLIED)
+
+    def test_witness_id_is_exact_canonical_json_without_prefix(self):
+        witness = self.witness()
+        expected = hashlib.sha256(json.dumps(
+            witness.as_value(), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ).encode()).hexdigest()
+        self.assertEqual(witness.witness_id(), expected)
+        self.assertEqual(rm.activation_recovery_witness_id(witness), expected)
+        with self.assertRaises(RequestModelError):
+            rm.ActivationRecoveryWitness(
+                1, witness.activation_boundary_id, 1, 1,
+                "1" * 64, "2" * 64, "3" * 64, 1, "4" * 64, "5" * 64,
+            )
+
+    def test_recovery_evidence_exact_bytes_round_trip_and_result_digest(self):
+        evidence = self.evidence()
+        rendered = evidence.render()
+        expected_json = json.dumps(
+            evidence.as_value(), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        )
+        self.assertEqual(
+            rendered,
+            rm.G8_ACTIVATION_RECOVERY_EVIDENCE_MARKER + "\n" + expected_json + "\n",
+        )
+        self.assertEqual(rendered.count("\n"), 2)
+        self.assertLessEqual(len(rendered.encode()), rm.MAX_G8_ACTIVATION_RECOVERY_EVIDENCE_BYTES)
+        self.assertEqual(rm.parse_activation_recovery_evidence(rendered), evidence)
+        expected_digest = hashlib.sha256(rendered.encode()).hexdigest()
+        self.assertEqual(evidence.result_digest(), expected_digest)
+        self.assertEqual(rm.activation_recovery_result_digest(evidence), expected_digest)
+        self.assertEqual(evidence.to_witness(), self.witness())
+
+    def test_recovery_evidence_rejects_extra_missing_duplicate_and_noncanonical_bytes(self):
+        evidence = self.evidence()
+        value = evidence.as_value()
+        for mutated in (
+            {**value, "unexpected": 1},
+            {key: item for key, item in value.items() if key != "recoveryResult"},
+        ):
+            text = rm.G8_ACTIVATION_RECOVERY_EVIDENCE_MARKER + "\n" + json.dumps(
+                mutated, sort_keys=True, separators=(",", ":"),
+            ) + "\n"
+            with self.subTest(keys=set(mutated)), self.assertRaises(RequestModelError):
+                rm.parse_activation_recovery_evidence(text)
+        duplicate = (
+            rm.G8_ACTIVATION_RECOVERY_EVIDENCE_MARKER + "\n"
+            + '{"schemaVersion":1,"schemaVersion":1}' + "\n"
+        )
+        with self.assertRaises(RequestModelError):
+            rm.parse_activation_recovery_evidence(duplicate)
+        with self.assertRaises(RequestModelError):
+            rm.parse_activation_recovery_evidence(evidence.render().replace(',"recoveryResult"', ', "recoveryResult"', 1))
+        with self.assertRaises(RequestModelError):
+            rm.parse_activation_recovery_evidence(evidence.render().replace("\n", "\r\n"))
+
+    def test_recovery_evidence_rejects_wrong_authority_and_result_fields(self):
+        base = self.evidence()
+        cases = (
+            {"implementation_pr_number": 28},
+            {"implementation_pr_database_id": True},
+            {"implementation_pr_node_id": "PR_other"},
+            {"central_repository_node_id": "R_other"},
+            {"activation_boundary_id": "0" * 64},
+            {"activation_recovery_witness_id": "0" * 64},
+            {"unresolved_authority_count": 1},
+            {"unresolved_authority_count": False},
+            {"recovery_result": "FAILURE"},
+            {"recovery_action_count": True},
+            {"merged_result_oid": "A" * 40},
+        )
+        base_values = dict(
+            schema_version=base.schema_version,
+            evidence_kind=base.evidence_kind,
+            central_repository_node_id=base.central_repository_node_id,
+            implementation_pr_number=base.implementation_pr_number,
+            implementation_pr_database_id=base.implementation_pr_database_id,
+            implementation_pr_node_id=base.implementation_pr_node_id,
+            activation_boundary_id=base.activation_boundary_id,
+            merged_result_oid=base.merged_result_oid,
+            authority_surface_digest=base.authority_surface_digest,
+            new_writer_topology_digest=base.new_writer_topology_digest,
+            activation_run_id=base.activation_run_id,
+            activation_run_attempt=base.activation_run_attempt,
+            pre_recovery_inventory_digest=base.pre_recovery_inventory_digest,
+            ordered_recovery_actions_digest=base.ordered_recovery_actions_digest,
+            recovery_action_count=base.recovery_action_count,
+            post_recovery_inventory_digest=base.post_recovery_inventory_digest,
+            unresolved_authority_count=base.unresolved_authority_count,
+            old_run_terminal_digest=base.old_run_terminal_digest,
+            six_workflow_identity_digest=base.six_workflow_identity_digest,
+            legacy_inventory_quarantine_migration_digest=base.legacy_inventory_quarantine_migration_digest,
+            activation_recovery_witness_id=base.activation_recovery_witness_id,
+            recovery_result=base.recovery_result,
+        )
+        for change in cases:
+            with self.subTest(change=change), self.assertRaises(RequestModelError):
+                rm.ActivationRecoveryEvidence(**{**base_values, **change})
+
+    def test_recovery_evidence_renderer_enforces_8192_byte_ceiling(self):
+        evidence = self.evidence()
+        object.__setattr__(evidence, "evidence_kind", "X" * 8_500)
+        with self.assertRaises(RequestModelError):
+            evidence.render()
+
+    def test_six_workflow_identity_digest_binds_exact_order_state_and_unique_ids(self):
+        writers = [
+            {
+                "path": path,
+                "reviewedBlobOid": f"{index + 1:040x}",
+                "reviewedBlobSha256": f"{index + 1:064x}",
+                "workflowId": 100 + index,
+                "workflowState": "active",
+            }
+            for index, path in enumerate(rm.G8_NEW_WRITER_PATHS)
+        ]
+        digest = rm.six_workflow_identity_digest(writers)
+        self.assertEqual(len(digest), 64)
+        with self.assertRaises(RequestModelError):
+            rm.six_workflow_identity_digest(list(reversed(writers)))
+        with self.assertRaises(RequestModelError):
+            rm.six_workflow_identity_digest([{**item, "workflowState": "disabled_manually"} for item in writers])
+        duplicate = [dict(item) for item in writers]
+        duplicate[1]["workflowId"] = duplicate[0]["workflowId"]
+        with self.assertRaises(RequestModelError):
+            rm.six_workflow_identity_digest(duplicate)
+
+    def test_old_path_and_old_run_digests_are_closed_and_fail_on_nonterminal(self):
+        old_path_rows = [
+            {"path": path, "historicWorkflowId": workflow_id, "pathPresent": False}
+            for path, workflow_id in sorted(rm.G8_OLD_WRITERS)
+        ]
+        digest = rm.old_path_absence_proof_digest("a" * 40, "a" * 40, old_path_rows)
+        self.assertEqual(len(digest), 64)
+        with self.assertRaises(RequestModelError):
+            rm.old_path_absence_proof_digest("a" * 40, "b" * 40, old_path_rows)
+        with self.assertRaises(RequestModelError):
+            rm.old_path_absence_proof_digest("a" * 40, "a" * 40, [{**old_path_rows[0], "pathPresent": True}, *old_path_rows[1:]])
+        run_rows = []
+        for index, (path, workflow_id) in enumerate(rm.G8_OLD_WRITERS):
+            runs = [] if index else [{
+                "runId": 10, "runAttempt": 1, "status": "completed", "conclusion": "failure",
+                "event": "push", "headBranch": "main", "headSha": "c" * 40,
+            }]
+            run_rows.append({
+                "path": path, "historicWorkflowId": workflow_id,
+                "enumerationState": "COMPLETE", "runs": runs,
+            })
+        self.assertEqual(len(rm.old_run_terminal_proof_digest(run_rows)), 64)
+        run_rows[0]["runs"][0]["status"] = "in_progress"
+        with self.assertRaises(RequestModelError):
+            rm.old_run_terminal_proof_digest(run_rows)
+
+    def test_inventory_digest_is_stage_bound_and_canonical(self):
+        inventory = {"machineRefs": [], "openIssues": [2, 1]}
+        self.assertNotEqual(
+            rm.activation_recovery_inventory_digest("PRE", inventory),
+            rm.activation_recovery_inventory_digest("POST", inventory),
+        )
+        self.assertEqual(
+            rm.activation_recovery_inventory_digest("PRE", inventory),
+            rm.activation_recovery_inventory_digest("PRE", {"openIssues": [2, 1], "machineRefs": []}),
+        )
+        with self.assertRaises(RequestModelError):
+            rm.activation_recovery_inventory_digest("pre", inventory)
+
+    @classmethod
+    def epoch_record(cls, *, evidence_cutover_id=None):
+        merged, authority, topology, boundary = cls.boundary_material()
+        evidence = cls.evidence()
+        new_workflows = tuple(
+            rm.ActivationWorkflowIdentity(path, 1000 + index, "active")
+            for index, path in enumerate(rm.G8_NEW_WRITER_PATHS)
+        )
+        old_workflows = tuple(
+            rm.HistoricWorkflowIdentity(path, workflow_id)
+            for path, workflow_id in rm.G8_OLD_WRITERS
+        )
+        return rm.ActivationEpochRecord(
+            1, boundary, rm.G8_CENTRAL_REPOSITORY_NODE_ID,
+            rm.G8_IMPLEMENTATION_PR_NUMBER, rm.G8_IMPLEMENTATION_PR_DATABASE_ID,
+            rm.G8_IMPLEMENTATION_PR_NODE_ID, merged, authority, topology,
+            new_workflows, old_workflows,
+            "9" * 64, "a" * 64, "b" * 64,
+            evidence.activation_recovery_witness_id, evidence.result_digest(),
+            9001, 3, "2026-10-09T12:34:56Z", evidence_cutover_id,
+        )
+
+    def test_activation_epoch_record_round_trip_digest_and_optional_cutover(self):
+        record = self.epoch_record()
+        self.assertNotIn("evidenceCutoverId", record.as_value())
+        self.assertEqual(rm.parse_activation_epoch_record(record.render()), record)
+        self.assertEqual(rm.activation_record_digest(record), hashlib.sha256(record.render().encode()).hexdigest())
+        correlated = self.epoch_record(evidence_cutover_id="cutover-correlation-only")
+        self.assertEqual(correlated.as_value()["evidenceCutoverId"], "cutover-correlation-only")
+        self.assertEqual(rm.parse_activation_epoch_record(correlated.render()), correlated)
+        value = record.as_value()
+        value["unexpected"] = 1
+        with self.assertRaises(RequestModelError):
+            rm.parse_activation_epoch_record(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+        missing = record.as_value()
+        del missing["activationRecoveryResultDigest"]
+        with self.assertRaises(RequestModelError):
+            rm.parse_activation_epoch_record(json.dumps(missing, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def test_activation_status_ev_uses_exact_record_hae_boundary_bytes(self):
+        record = self.epoch_record()
+        hae = "c" * 40
+        expected = hashlib.sha256(
+            record.render().encode()
+            + hae.encode("ascii")
+            + record.activation_boundary_id.encode("ascii")
+        ).hexdigest()
+        self.assertEqual(
+            rm.activation_status_evidence_digest(record, hae, record.activation_boundary_id),
+            expected,
+        )
+        description = rm.activation_status_description(record, hae, record.activation_boundary_id)
+        self.assertEqual(description, "g8a:v1 active ev=" + expected)
+        self.assertEqual(len(description.encode("ascii")), 81)
+        with self.assertRaises(RequestModelError):
+            rm.activation_status_evidence_digest(record, hae, "0" * 64)
+
+
 if __name__ == "__main__":
     unittest.main()

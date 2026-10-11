@@ -485,6 +485,72 @@ class BotMetadata:
     type: str
 
 
+_WORKFLOW_STATES = frozenset({
+    "active", "deleted", "disabled_fork", "disabled_inactivity", "disabled_manually",
+})
+_WORKFLOW_RUN_STATUSES = frozenset({
+    "queued", "in_progress", "completed", "waiting", "requested", "pending",
+})
+_WORKFLOW_RUN_CONCLUSIONS = frozenset({
+    "success", "failure", "neutral", "cancelled", "skipped",
+    "timed_out", "action_required", "stale", "startup_failure",
+})
+
+
+@dataclass(frozen=True)
+class WorkflowMetadata:
+    id: int
+    node_id: str
+    name: str
+    path: str
+    state: str
+
+    def __post_init__(self) -> None:
+        _positive_id(self.id, "workflow.id")
+        _bounded_text(self.node_id, "workflow.node_id", 256)
+        _bounded_text(self.name, "workflow.name", 256)
+        path = _bounded_text(self.path, "workflow.path", 256)
+        prefix = ".github/workflows/"
+        if (
+            not path.startswith(prefix)
+            or path == prefix
+            or "/" in path[len(prefix):]
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+        ):
+            raise InvalidResponseError("workflow.path must be an exact workflow file path")
+        if type(self.state) is not str or self.state not in _WORKFLOW_STATES:
+            raise InvalidResponseError("workflow.state is not a closed known value")
+
+
+@dataclass(frozen=True)
+class WorkflowRunMetadata:
+    id: int
+    run_attempt: int
+    status: str
+    conclusion: str | None
+    workflow_id: int
+    event: str
+    head_branch: str | None
+    head_sha: str
+
+    def __post_init__(self) -> None:
+        _positive_id(self.id, "workflow_run.id")
+        _positive_id(self.run_attempt, "workflow_run.run_attempt")
+        _positive_id(self.workflow_id, "workflow_run.workflow_id")
+        if type(self.status) is not str or self.status not in _WORKFLOW_RUN_STATUSES:
+            raise InvalidResponseError("workflow_run.status is not a closed known value")
+        if self.conclusion is not None and (
+            type(self.conclusion) is not str or self.conclusion not in _WORKFLOW_RUN_CONCLUSIONS
+        ):
+            raise InvalidResponseError("workflow_run.conclusion is not a closed known value")
+        _bounded_text(self.event, "workflow_run.event", 64)
+        if self.head_branch is not None:
+            _bounded_text(self.head_branch, "workflow_run.head_branch", 256)
+        if type(self.head_sha) is not str or not _SHA40_RE.fullmatch(self.head_sha):
+            raise InvalidResponseError("workflow_run.head_sha must be lowercase 40-hex")
+
+
 @dataclass(frozen=True)
 class PullRequestMetadata:
     number: int
@@ -2188,6 +2254,12 @@ class GitHubClient:
             raise InvalidResponseError("Git ref response is malformed")
         return self._sha(value["object"].get("sha"), "ref.object.sha")
 
+    def get_optional_ref_oid(self, repository: str, branch: str) -> str | None:
+        try:
+            return self.get_ref_oid(repository, branch)
+        except NotFoundError:
+            return None
+
     def create_blob(self, repository: str, content: str, *, encoding: str = "base64") -> GitObject:
         owner, name = self._owner_repo(repository)
         if encoding not in {"base64", "utf-8"} or type(content) is not str:
@@ -2341,6 +2413,146 @@ class GitHubClient:
             app_id,
             output_text,
         )
+
+    @staticmethod
+    def _workflow_path(value: Any) -> str:
+        path = _bounded_text(value, "workflow path", 256)
+        prefix = ".github/workflows/"
+        if (
+            not path.startswith(prefix)
+            or path == prefix
+            or "/" in path[len(prefix):]
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+        ):
+            raise GitHubAPIError("workflow path must be an exact .github/workflows file")
+        return path
+
+    @classmethod
+    def _parse_workflow_metadata(
+        cls,
+        value: Any,
+        *,
+        expected_path: str | None = None,
+        expected_id: int | None = None,
+    ) -> WorkflowMetadata:
+        exact_keys = {
+            "id", "node_id", "name", "path", "state",
+            "created_at", "updated_at", "url", "html_url", "badge_url",
+        }
+        if type(value) is not dict or set(value) != exact_keys:
+            raise InvalidResponseError("workflow metadata response has invalid exact shape")
+        metadata = WorkflowMetadata(
+            _positive_id(value["id"], "workflow.id"),
+            _bounded_text(value["node_id"], "workflow.node_id", 256),
+            _bounded_text(value["name"], "workflow.name", 256),
+            _bounded_text(value["path"], "workflow.path", 256),
+            _bounded_text(value["state"], "workflow.state", 64),
+        )
+        _parse_github_timestamp(value["created_at"], "workflow.created_at")
+        _parse_github_timestamp(value["updated_at"], "workflow.updated_at")
+        for key in ("url", "html_url", "badge_url"):
+            _bounded_text(value[key], f"workflow.{key}", 2_048)
+        if expected_path is not None and metadata.path != expected_path:
+            raise InvalidResponseError("workflow metadata path does not match the exact requested path")
+        if expected_id is not None and metadata.id != expected_id:
+            raise InvalidResponseError("workflow metadata ID does not match the exact requested ID")
+        return metadata
+
+    def get_workflow_metadata_by_path(self, repository: str, workflow_path: str) -> WorkflowMetadata:
+        owner, name = self._owner_repo(repository)
+        path = self._workflow_path(workflow_path)
+        filename = path.removeprefix(".github/workflows/")
+        value = self.request_json(
+            "GET",
+            ["repos", owner, name, "actions", "workflows", filename],
+        )
+        return self._parse_workflow_metadata(value, expected_path=path)
+
+    def get_workflow_metadata_by_id(self, repository: str, workflow_id: int) -> WorkflowMetadata:
+        owner, name = self._owner_repo(repository)
+        identifier = _positive_id(workflow_id, "workflow ID")
+        value = self.request_json(
+            "GET",
+            ["repos", owner, name, "actions", "workflows", str(identifier)],
+        )
+        return self._parse_workflow_metadata(value, expected_id=identifier)
+
+    @classmethod
+    def _parse_workflow_run(cls, value: Any, *, expected_workflow_id: int) -> WorkflowRunMetadata:
+        if type(value) is not dict:
+            raise InvalidResponseError("workflow run must be an object")
+        required = {
+            "id", "run_attempt", "status", "conclusion",
+            "workflow_id", "event", "head_branch", "head_sha",
+        }
+        if not required.issubset(value):
+            raise InvalidResponseError("workflow run is missing required exact metadata")
+        head_branch = value["head_branch"]
+        if head_branch is not None:
+            head_branch = _bounded_text(head_branch, "workflow_run.head_branch", 256)
+        run = WorkflowRunMetadata(
+            _positive_id(value["id"], "workflow_run.id"),
+            _positive_id(value["run_attempt"], "workflow_run.run_attempt"),
+            _bounded_text(value["status"], "workflow_run.status", 32),
+            None if value["conclusion"] is None else _bounded_text(value["conclusion"], "workflow_run.conclusion", 64),
+            _positive_id(value["workflow_id"], "workflow_run.workflow_id"),
+            _bounded_text(value["event"], "workflow_run.event", 64),
+            head_branch,
+            cls._sha(value["head_sha"], "workflow_run.head_sha"),
+        )
+        if run.workflow_id != expected_workflow_id:
+            raise InvalidResponseError("workflow run workflow_id does not match requested workflow")
+        return run
+
+    def list_workflow_runs(
+        self,
+        repository: str,
+        workflow_id: int,
+        *,
+        max_pages: int = 100,
+    ) -> tuple[WorkflowRunMetadata, ...]:
+        owner, name = self._owner_repo(repository)
+        identifier = _positive_id(workflow_id, "workflow ID")
+        if type(max_pages) is not int or type(max_pages) is bool or not 1 <= max_pages <= 100:
+            raise GitHubAPIError("workflow run max_pages must be an exact integer from 1 to 100")
+        runs: list[WorkflowRunMetadata] = []
+        seen_run_ids: set[int] = set()
+        expected_total: int | None = None
+        for page in range(1, max_pages + 1):
+            value = self._request(
+                "GET",
+                f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/actions/workflows/{identifier}/runs?per_page=100&page={page}",
+            )
+            if type(value) is not dict or set(value) != {"total_count", "workflow_runs"}:
+                raise InvalidResponseError("workflow run list response has invalid exact shape")
+            total_count = value["total_count"]
+            page_runs = value["workflow_runs"]
+            if (
+                type(total_count) is not int
+                or type(total_count) is bool
+                or not 0 <= total_count <= 9_223_372_036_854_775_807
+                or type(page_runs) is not list
+                or len(page_runs) > 100
+            ):
+                raise InvalidResponseError("workflow run list count/page is invalid")
+            if expected_total is None:
+                expected_total = total_count
+            elif total_count != expected_total:
+                raise InvalidResponseError("workflow run total_count changed during pagination")
+            for raw in page_runs:
+                run = self._parse_workflow_run(raw, expected_workflow_id=identifier)
+                if run.id in seen_run_ids:
+                    raise InvalidResponseError("workflow run ID is duplicated across pagination")
+                seen_run_ids.add(run.id)
+                runs.append(run)
+            if len(runs) > total_count:
+                raise InvalidResponseError("workflow run pages exceed declared total_count")
+            if len(runs) == total_count:
+                return tuple(runs)
+            if len(page_runs) < 100:
+                raise InvalidResponseError("workflow run pagination ended before declared total_count")
+        raise InvalidResponseError("workflow run pagination exceeds configured page bound")
 
     def dispatch_workflow(self, repository: str, workflow: str, ref: str, inputs: Mapping[str, str] | None = None) -> None:
         owner, name = self._owner_repo(repository)

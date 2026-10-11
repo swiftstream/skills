@@ -9009,11 +9009,16 @@ class Wave09LegacyClassifierTests(unittest.TestCase):
             self.assertFalse(called & forbidden)
 
 
-class Wave10InertActivationGuardTests(unittest.TestCase):
-    EXPECTED_STDOUT = (
-        '{"activationWriteAllowed":false,"ordinaryWriteAllowed":false,'
-        '"reason":"WAVE10_INERT_GUARD","runtimeState":"MERGED_UNPROVEN"}\n'
+class Wave12ActivationGuardContractTests(unittest.TestCase):
+    APP = controller_module.AppIdentity(
+        "swift-stream-federation", 101, "A_app", 202, "B_bot", "swift-stream-federation[bot]",
     )
+    ENV = {
+        "GITHUB_REPOSITORY": "swiftstream/skills",
+        "FEDERATION_GITHUB_TOKEN": "read-only-token",
+        "FEDERATION_APP_SLUG": "swift-stream-federation",
+        "FEDERATION_TRUSTED_CHECKOUT_SHA": "f" * 40,
+    }
 
     @staticmethod
     def invoke_cli(environ):
@@ -9024,129 +9029,126 @@ class Wave10InertActivationGuardTests(unittest.TestCase):
                 exit_code = controller_module.main(["activation-guard"])
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
-    def test_wave10_inert_activation_guard_is_canonical(self):
-        result = controller_module.wave10_inert_activation_guard()
-
+    def test_wave12_guard_result_matrix_is_closed(self):
+        expected = {
+            controller_module.G8RuntimeState.ACTIVE_G8:
+                (True, False, "ACTIVE_G8_EPOCH_PROVEN"),
+            controller_module.G8RuntimeState.MERGED_UNPROVEN:
+                (False, True, "MERGED_UNPROVEN_NO_VALID_EPOCH"),
+            controller_module.G8RuntimeState.BLOCKED_POST_MERGE:
+                (False, False, "BLOCKED_POST_MERGE_CONFLICT"),
+            controller_module.G8RuntimeState.PRE_G8_NOT_APPLICABLE:
+                (False, False, "PRE_G8_NOT_APPLICABLE"),
+        }
         self.assertEqual(
             tuple(state.value for state in controller_module.G8RuntimeState),
             ("ACTIVE_G8", "MERGED_UNPROVEN", "BLOCKED_POST_MERGE", "PRE_G8_NOT_APPLICABLE"),
         )
-        self.assertIs(type(result.runtime_state), controller_module.G8RuntimeState)
-        self.assertIs(result.runtime_state, controller_module.G8RuntimeState.MERGED_UNPROVEN)
-        self.assertIs(result.ordinary_write_allowed, False)
-        self.assertIs(result.activation_write_allowed, False)
-        self.assertEqual(result.reason, "WAVE10_INERT_GUARD")
-
-    def test_wave10_inert_activation_guard_cannot_be_active(self):
-        result = controller_module.wave10_inert_activation_guard()
-
-        self.assertIsNot(result.runtime_state, controller_module.G8RuntimeState.ACTIVE_G8)
-        self.assertFalse(result.ordinary_write_allowed)
-        self.assertFalse(result.activation_write_allowed)
-        with self.assertRaisesRegex(ValueError, "ordinary writes require ACTIVE_G8"):
+        for state, values in expected.items():
+            with self.subTest(state=state):
+                result = controller_module._g8_activation_guard_result(state)
+                self.assertEqual(
+                    (result.ordinary_write_allowed, result.activation_write_allowed, result.reason),
+                    values,
+                )
+        with self.assertRaisesRegex(ValueError, "closed runtime-state matrix"):
             controller_module.G8ActivationGuardResult(
-                runtime_state=controller_module.G8RuntimeState.MERGED_UNPROVEN,
-                ordinary_write_allowed=True,
-                activation_write_allowed=False,
-                reason="WAVE10_INERT_GUARD",
+                controller_module.G8RuntimeState.MERGED_UNPROVEN,
+                False,
+                False,
+                "MERGED_UNPROVEN_NO_VALID_EPOCH",
+            )
+        with self.assertRaisesRegex(ValueError, "closed runtime-state matrix"):
+            controller_module.G8ActivationGuardResult(
+                controller_module.G8RuntimeState.ACTIVE_G8,
+                False,
+                False,
+                "ACTIVE_G8_EPOCH_PROVEN",
             )
 
-    def test_activation_guard_cli_succeeds_without_runtime_credentials(self):
+    def test_activation_guard_cli_requires_read_authority_credentials(self):
         exit_code, stdout, stderr = self.invoke_cli({})
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("R02Error", stderr)
 
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(stdout, self.EXPECTED_STDOUT)
-        self.assertEqual(stderr, "")
-
-    def test_activation_guard_cli_ignores_authority_like_environment_overrides(self):
+    def test_activation_guard_cli_uses_real_guard_and_canonical_transport(self):
+        result = controller_module._g8_activation_guard_result(
+            controller_module.G8RuntimeState.MERGED_UNPROVEN,
+        )
         overrides = {
-            "FEDERATION_GITHUB_TOKEN": "ghs_plausible_authority_token",
-            "FEDERATION_APP_SLUG": "swift-stream-federation[bot]",
-            "GITHUB_REPOSITORY": "SwiftStream/skills",
+            **self.ENV,
             "FEDERATION_G8_RUNTIME_STATE": "ACTIVE_G8",
             "FEDERATION_G8_ACTIVE": "true",
-            "FEDERATION_ACTIVATION_BOUNDARY_ID": "boundary-123",
+            "FEDERATION_ACTIVATION_BOUNDARY_ID": "caller-controlled",
             "FEDERATION_ACTIVATION_REF": "refs/heads/main",
             "FEDERATION_EVENT_PATH": "/tmp/nonexistent-g8-event.json",
         }
-        exit_code, stdout, stderr = self.invoke_cli(overrides)
+        with (
+            patch.object(controller_module, "GitHubClient", return_value=object()) as client,
+            patch.object(controller_module, "resolve_app_identity", return_value=self.APP) as resolver,
+            patch.object(
+                controller_module.R02Controller,
+                "derive_g8_activation_guard",
+                return_value=result,
+            ) as derive,
+            patch.object(
+                controller_module,
+                "C02CandidateBuilder",
+                side_effect=AssertionError("activation guard must not build a candidate builder"),
+            ),
+        ):
+            exit_code, stdout, stderr = self.invoke_cli(overrides)
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(stdout, self.EXPECTED_STDOUT)
+        self.assertEqual(
+            stdout,
+            '{"activationWriteAllowed":true,"ordinaryWriteAllowed":false,'
+            '"reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","runtimeState":"MERGED_UNPROVEN"}\n',
+        )
         self.assertEqual(stderr, "")
+        client.assert_called_once_with("read-only-token")
+        resolver.assert_called_once_with(client.return_value, "swift-stream-federation")
+        derive.assert_called_once_with()
 
-    def test_activation_guard_cli_does_not_construct_github_client(self):
-        with patch.object(controller_module, "GitHubClient", side_effect=AssertionError("GitHubClient constructed")):
-            exit_code, stdout, stderr = self.invoke_cli({})
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(stdout, self.EXPECTED_STDOUT)
-        self.assertEqual(stderr, "")
-
-    def test_activation_guard_cli_does_not_resolve_app_identity(self):
-        with patch.object(controller_module, "resolve_app_identity", side_effect=AssertionError("App identity resolved")):
-            exit_code, stdout, stderr = self.invoke_cli({})
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(stdout, self.EXPECTED_STDOUT)
-        self.assertEqual(stderr, "")
-
-    def test_activation_guard_ast_has_no_mutation_surface(self):
+    def test_activation_guard_proof_chain_has_no_mutation_surface(self):
         source_path = Path(inspect.getsourcefile(controller_module))
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
-        functions = {
-            node.name: node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
+        cls = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "R02Controller"
+        )
+        methods = {
+            node.name: node for node in cls.body if isinstance(node, ast.FunctionDef)
         }
-        guard = functions["wave10_inert_activation_guard"]
-        self.assertEqual(guard.args.args, [])
-
-        main = functions["main"]
-        branches = [
-            node for node in main.body
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.left, ast.Attribute)
-            and node.test.left.attr == "command"
-            and len(node.test.comparators) == 1
-            and isinstance(node.test.comparators[0], ast.Constant)
-            and node.test.comparators[0].value == "activation-guard"
-        ]
-        self.assertEqual(len(branches), 1)
-        activation_branch = branches[0]
-        branch_index = main.body.index(activation_branch)
-        self.assertGreater(branch_index, 0)
-        previous = main.body[branch_index - 1]
-        self.assertIsInstance(previous, ast.Assign)
-        self.assertIsInstance(previous.value, ast.Call)
-        self.assertIsInstance(previous.value.func, ast.Attribute)
-        self.assertEqual(previous.value.func.attr, "parse_args")
-
+        proof_names = {
+            "_require_current_g8_guard_surface",
+            "_read_g8_activation_epoch",
+            "_read_selected_g8_recovery_evidence",
+            "_has_exact_g8_activation_status",
+            "derive_g8_activation_guard",
+        }
+        self.assertTrue(proof_names.issubset(methods))
         forbidden = {
-            "create_commit_status",
-            "create_check_run",
-            "update_check_run",
-            "update_refs",
-            "create_issue_comment",
-            "dispatch_workflow",
-            "create_pull_request",
-            "reopen_pull_request",
-            "mark_pull_request_ready_for_review",
-            "convert_pull_request_to_draft",
-            "close_pull_request",
-            "create_git_blob",
-            "create_git_tree",
-            "create_git_commit",
+            "create_blob", "create_tree", "create_commit", "update_refs",
+            "create_commit_status", "create_check_run", "update_check_run",
+            "create_issue_comment", "dispatch_workflow", "create_pull_request",
+            "reopen_pull_request", "mark_pull_request_ready_for_review",
+            "convert_pull_request_to_draft", "close_pull_request",
+            "create_git_blob", "create_git_tree", "create_git_commit",
         }
-        isolated = ast.Module(body=[guard, activation_branch], type_ignores=[])
-        called = {
-            node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
-            for node in ast.walk(isolated)
-            if isinstance(node, ast.Call)
-            and (isinstance(node.func, ast.Attribute) or isinstance(node.func, ast.Name))
+        for name in sorted(proof_names):
+            called = {
+                node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+                for node in ast.walk(methods[name])
+                if isinstance(node, ast.Call)
+                and (isinstance(node.func, ast.Attribute) or isinstance(node.func, ast.Name))
+            }
+            self.assertFalse(called & forbidden, (name, called & forbidden))
+        top_functions = {
+            node.name for node in tree.body if isinstance(node, ast.FunctionDef)
         }
-        self.assertFalse(called & forbidden)
+        self.assertNotIn("wave10_inert_activation_guard", top_functions)
 
 
 class Wave11ActivationBoundaryControllerTests(unittest.TestCase):
@@ -9271,6 +9273,37 @@ class Wave11ActivationBoundaryControllerTests(unittest.TestCase):
         ))
         self.assertEqual([call for call in client.calls if call[0] == "pr"], [("pr", 27)])
         self.assertLess(client.calls.index(("blob", f"{len(self.SURFACE) + 21:040x}")), client.calls.index(("pr", 27)))
+
+    def test_open_fixed_pr_is_pre_g8_not_applicable_but_contradictory_closed_unmerged_blocks(self):
+        base = self.Client(self).pr
+        pre_client = self.Client(
+            self,
+            pr=replace(
+                base,
+                state="OPEN",
+                is_draft=True,
+                merged=False,
+                merged_at=None,
+                merge_commit_oid=None,
+            ),
+        )
+        with self.assertRaises(controller_module.PreG8NotApplicableError):
+            self.controller(pre_client).derive_activation_boundary_evidence()
+
+        contradictory = self.Client(
+            self,
+            pr=replace(
+                base,
+                state="CLOSED",
+                is_draft=False,
+                merged=False,
+                merged_at=None,
+                merge_commit_oid=None,
+            ),
+        )
+        with self.assertRaises(R02Error) as caught:
+            self.controller(contradictory).derive_activation_boundary_evidence()
+        self.assertNotIsInstance(caught.exception, controller_module.PreG8NotApplicableError)
 
     def test_poisoned_discovery_tuple_fails_before_pr_query(self):
         bad = self.Client(self, discovery_contract=self.canonical(self.contract(implementationPrNumber=28)))

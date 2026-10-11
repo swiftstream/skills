@@ -2336,5 +2336,191 @@ class Wave11MergedPullRequestReadTests(unittest.TestCase):
                 GitHubClient(None, transport).compare_commits("swiftstream/skills", base, head)
 
 
+class Wave12WorkflowReadSubstrateTests(unittest.TestCase):
+    repository = "swiftstream/skills"
+    workflow_id = 412345678
+
+    @staticmethod
+    def workflow_payload(**changes):
+        value = {
+            "id": Wave12WorkflowReadSubstrateTests.workflow_id,
+            "node_id": "W_kwDOExactWorkflow",
+            "name": "G8 Issue Intake",
+            "path": ".github/workflows/federation-g8-issue-intake.yml",
+            "state": "active",
+            "created_at": "2026-10-08T10:11:12Z",
+            "updated_at": "2026-10-09T10:11:12Z",
+            "url": "https://api.github.com/repos/swiftstream/skills/actions/workflows/412345678",
+            "html_url": "https://github.com/swiftstream/skills/actions/workflows/federation-g8-issue-intake.yml",
+            "badge_url": "https://github.com/swiftstream/skills/actions/workflows/federation-g8-issue-intake.yml/badge.svg",
+        }
+        value.update(changes)
+        return value
+
+    @staticmethod
+    def run_payload(run_id, *, workflow_id=None, status="completed", conclusion="success", attempt=1):
+        return {
+            "id": run_id,
+            "run_attempt": attempt,
+            "status": status,
+            "conclusion": conclusion,
+            "workflow_id": workflow_id if workflow_id is not None else Wave12WorkflowReadSubstrateTests.workflow_id,
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "head_sha": f"{run_id:040x}"[-40:],
+            "name": "ignored non-authority presentation field",
+        }
+
+    def test_workflow_metadata_exact_path_and_numeric_id_reads(self):
+        payload = self.workflow_payload()
+        response_body = json.dumps(payload).encode()
+        path_transport = FakeTransport(HttpResponse(
+            200,
+            REST_BASE_URL + "/repos/swiftstream/skills/actions/workflows/federation-g8-issue-intake.yml",
+            response_body,
+        ))
+        by_path = GitHubClient(None, path_transport).get_workflow_metadata_by_path(
+            self.repository,
+            ".github/workflows/federation-g8-issue-intake.yml",
+        )
+        self.assertIs(type(by_path), github_api_module.WorkflowMetadata)
+        self.assertEqual(by_path.id, self.workflow_id)
+        self.assertEqual(by_path.path, ".github/workflows/federation-g8-issue-intake.yml")
+        self.assertEqual(by_path.state, "active")
+        self.assertEqual(path_transport.calls[0][0], "GET")
+
+        id_transport = FakeTransport(HttpResponse(
+            200,
+            REST_BASE_URL + f"/repos/swiftstream/skills/actions/workflows/{self.workflow_id}",
+            response_body,
+        ))
+        by_id = GitHubClient(None, id_transport).get_workflow_metadata_by_id(self.repository, self.workflow_id)
+        self.assertEqual(by_id, by_path)
+
+    def test_workflow_metadata_rejects_shape_identity_state_and_path_ambiguity(self):
+        cases = (
+            {**self.workflow_payload(), "unexpected": 1},
+            {key: value for key, value in self.workflow_payload().items() if key != "badge_url"},
+            self.workflow_payload(id=True),
+            self.workflow_payload(state="unknown"),
+            self.workflow_payload(path=".github/workflows/nested/workflow.yml"),
+        )
+        for payload in cases:
+            with self.subTest(payload=payload), self.assertRaises((InvalidResponseError, GitHubAPIError)):
+                transport = FakeTransport(HttpResponse(
+                    200,
+                    REST_BASE_URL + "/repos/swiftstream/skills/actions/workflows/federation-g8-issue-intake.yml",
+                    json.dumps(payload).encode(),
+                ))
+                GitHubClient(None, transport).get_workflow_metadata_by_path(
+                    self.repository,
+                    ".github/workflows/federation-g8-issue-intake.yml",
+                )
+        with self.assertRaises(GitHubAPIError):
+            GitHubClient(None, FakeTransport(None)).get_workflow_metadata_by_path(
+                self.repository,
+                ".github/workflows/nested/workflow.yml",
+            )
+
+    def test_workflow_run_inventory_is_bounded_typed_and_preserves_nonterminal_status(self):
+        payload = {
+            "total_count": 2,
+            "workflow_runs": [
+                self.run_payload(101),
+                self.run_payload(102, status="in_progress", conclusion=None, attempt=2),
+            ],
+        }
+        url = REST_BASE_URL + f"/repos/swiftstream/skills/actions/workflows/{self.workflow_id}/runs?per_page=100&page=1"
+        transport = FakeTransport(HttpResponse(200, url, json.dumps(payload).encode()))
+        runs = GitHubClient(None, transport).list_workflow_runs(self.repository, self.workflow_id)
+        self.assertEqual([run.id for run in runs], [101, 102])
+        self.assertEqual(runs[1].run_attempt, 2)
+        self.assertEqual(runs[1].status, "in_progress")
+        self.assertIsNone(runs[1].conclusion)
+        self.assertTrue(any(run.status != "completed" for run in runs))
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_workflow_run_inventory_paginates_and_requires_declared_total(self):
+        first = [self.run_payload(index + 1) for index in range(100)]
+        second = [self.run_payload(101)]
+        base = REST_BASE_URL + f"/repos/swiftstream/skills/actions/workflows/{self.workflow_id}/runs?per_page=100&page="
+        transport = SequenceTransport([
+            HttpResponse(200, base + "1", json.dumps({"total_count": 101, "workflow_runs": first}).encode()),
+            HttpResponse(200, base + "2", json.dumps({"total_count": 101, "workflow_runs": second}).encode()),
+        ])
+        runs = GitHubClient(None, transport).list_workflow_runs(self.repository, self.workflow_id, max_pages=2)
+        self.assertEqual(len(runs), 101)
+        self.assertEqual(len(transport.calls), 2)
+
+        exhausted = FakeTransport(HttpResponse(
+            200,
+            base + "1",
+            json.dumps({"total_count": 101, "workflow_runs": first}).encode(),
+        ))
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, exhausted).list_workflow_runs(self.repository, self.workflow_id, max_pages=1)
+
+        short = FakeTransport(HttpResponse(
+            200,
+            base + "1",
+            json.dumps({"total_count": 3, "workflow_runs": first[:2]}).encode(),
+        ))
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, short).list_workflow_runs(self.repository, self.workflow_id)
+
+    def test_workflow_run_inventory_rejects_malformed_unknown_and_mismatched_runs(self):
+        url = REST_BASE_URL + f"/repos/swiftstream/skills/actions/workflows/{self.workflow_id}/runs?per_page=100&page=1"
+        cases = (
+            {"total_count": True, "workflow_runs": []},
+            {"total_count": 1, "workflow_runs": [self.run_payload(1, workflow_id=self.workflow_id + 1)]},
+            {"total_count": 1, "workflow_runs": [self.run_payload(1, status="mystery")]},
+            {"total_count": 1, "workflow_runs": [self.run_payload(1, conclusion="mystery")]},
+            {"total_count": 1, "workflow_runs": [{key: value for key, value in self.run_payload(1).items() if key != "run_attempt"}]},
+        )
+        for payload in cases:
+            with self.subTest(payload=payload), self.assertRaises(InvalidResponseError):
+                transport = FakeTransport(HttpResponse(200, url, json.dumps(payload).encode()))
+                GitHubClient(None, transport).list_workflow_runs(self.repository, self.workflow_id)
+        duplicate = {
+            "total_count": 2,
+            "workflow_runs": [self.run_payload(1), self.run_payload(1, attempt=2)],
+        }
+        with self.assertRaises(InvalidResponseError):
+            transport = FakeTransport(HttpResponse(200, url, json.dumps(duplicate).encode()))
+            GitHubClient(None, transport).list_workflow_runs(self.repository, self.workflow_id)
+
+    def test_deleted_workflow_id_not_found_remains_typed_not_found(self):
+        url = REST_BASE_URL + f"/repos/swiftstream/skills/actions/workflows/{self.workflow_id}/runs?per_page=100&page=1"
+        transport = FakeTransport(HttpResponse(404, url, b'{"message":"Not Found"}'))
+        with self.assertRaises(NotFoundError):
+            GitHubClient(None, transport).list_workflow_runs(self.repository, self.workflow_id)
+
+    def test_optional_ref_maps_only_exact_404_to_absence(self):
+        branch = "bot/federation-g8-activation"
+        url = REST_BASE_URL + "/repos/swiftstream/skills/git/ref/heads/bot/federation-g8-activation"
+        missing = FakeTransport(HttpResponse(404, url, b'{"message":"Not Found"}'))
+        self.assertIsNone(GitHubClient(None, missing).get_optional_ref_oid(self.repository, branch))
+
+        forbidden = FakeTransport(HttpResponse(403, url, b'{"message":"Forbidden"}'))
+        with self.assertRaises(ForbiddenError):
+            GitHubClient(None, forbidden).get_optional_ref_oid(self.repository, branch)
+
+        server = FakeTransport(HttpResponse(503, url, b'{"message":"Unavailable"}'))
+        with self.assertRaises(ServerError):
+            GitHubClient(None, server).get_optional_ref_oid(self.repository, branch)
+
+        present = FakeTransport(HttpResponse(
+            200, url, json.dumps({"object": {"sha": "a" * 40}}).encode(),
+        ))
+        self.assertEqual(
+            GitHubClient(None, present).get_optional_ref_oid(self.repository, branch),
+            "a" * 40,
+        )
+
+        malformed = FakeTransport(HttpResponse(200, url, b'{"object":{}}'))
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, malformed).get_optional_ref_oid(self.repository, branch)
+
+
 if __name__ == "__main__":
     unittest.main()

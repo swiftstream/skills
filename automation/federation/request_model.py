@@ -5169,3 +5169,732 @@ def parse_issue_no_pr_cancelled_result(text: str) -> IssueNoPRCancelledResult:
     if text != result.render():
         _fail("IssueNoPRCancelledResult representation is not canonical")
     return result
+
+# G8 Wave12 activation artifacts are pure, transport-independent canonical models.
+G8_ACTIVATION_RECOVERY_EVIDENCE_MARKER = "<!-- swiftstream-federation-g8-activation-recovery-evidence:v1 -->"
+G8_ACTIVATION_RECOVERY_ACTIONS_PREFIX = "swiftstream-federation-g8-activation-recovery-actions:v1\n"
+MAX_G8_ACTIVATION_RECOVERY_EVIDENCE_BYTES = 8_192
+G8_ACTIVATION_RECORD_PATH = ".federation-g8-activation"
+G8_ACTIVATION_REF = "refs/heads/bot/federation-g8-activation"
+G8_ACTIVATION_STATUS_CONTEXT = "federation/g8-activation"
+G8_ACTIVATION_STATUS_DESCRIPTION_PREFIX = "g8a:v1 active ev="
+G8_CENTRAL_REPOSITORY_NODE_ID = "R_kgDOUId1Tw"
+G8_IMPLEMENTATION_PR_NUMBER = 27
+G8_IMPLEMENTATION_PR_DATABASE_ID = 4_780_363_432
+G8_IMPLEMENTATION_PR_NODE_ID = "PR_kwDOUId1T88AAAABHO6OqA"
+
+G8_NEW_WRITER_PATHS = (
+    ".github/workflows/federation-g8-issue-intake.yml",
+    ".github/workflows/federation-g8-interactive.yml",
+    ".github/workflows/federation-g8-trusted-validation.yml",
+    ".github/workflows/federation-g8-state-finalize.yml",
+    ".github/workflows/federation-g8-main-advance.yml",
+    ".github/workflows/federation-g8-reconcile.yml",
+)
+
+G8_OLD_WRITERS = (
+    (".github/workflows/federation-interactive.yml", 350_485_971),
+    (".github/workflows/federation-trusted-validation.yml", 350_485_976),
+    (".github/workflows/federation-state-finalize.yml", 350_485_975),
+    (".github/workflows/federation-main-advance.yml", 350_485_973),
+    (".github/workflows/federation-reconcile.yml", 350_485_974),
+)
+
+
+def _wave12_nonnegative_int(value: Any, label: str) -> int:
+    if type(value) is not int or not 0 <= value <= 9_223_372_036_854_775_807:
+        _fail(f"{label} must be a nonnegative signed-64 integer")
+    return value
+
+
+def _wave12_workflow_path(value: Any, label: str) -> str:
+    text = _issue_bounded_text(value, label, 256)
+    prefix = ".github/workflows/"
+    if (
+        not text.startswith(prefix)
+        or text == prefix
+        or "/" in text[len(prefix):]
+        or "\\" in text
+        or any(part in {"", ".", ".."} for part in text.split("/"))
+    ):
+        _fail(f"{label} must be an exact workflow path")
+    return text
+
+
+class ActivationRecoveryActionClass(Enum):
+    LEGACY_FAILURE_STATUS = "LEGACY_FAILURE_STATUS"
+    CANCEL_FAILURE_STATUS = "CANCEL_FAILURE_STATUS"
+    LEGACY_MACHINE_MIGRATION = "LEGACY_MACHINE_MIGRATION"
+    ISSUE_TERMINAL_CLEANUP = "ISSUE_TERMINAL_CLEANUP"
+    ISSUE_REQUEST_RECOVERY = "ISSUE_REQUEST_RECOVERY"
+    RESERVED_TRANSITION_RECOVERY = "RESERVED_TRANSITION_RECOVERY"
+
+
+class ActivationRecoveryResultClass(Enum):
+    APPLIED = "APPLIED"
+    ALREADY_CONVERGED = "ALREADY_CONVERGED"
+    DEFERRED_POST_ACTIVE = "DEFERRED_POST_ACTIVE"
+
+
+@dataclass(frozen=True)
+class ActivationRecoveryAction:
+    schema_version: int
+    sequence: int
+    action_class: ActivationRecoveryActionClass
+    subject_digest: str
+    effect_digest: str
+    result_class: ActivationRecoveryResultClass
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("ActivationRecoveryAction schemaVersion must be exact integer 1")
+        _wave12_nonnegative_int(self.sequence, "sequence")
+        if type(self.action_class) is not ActivationRecoveryActionClass:
+            _fail("ActivationRecoveryAction actionClass must be a closed value")
+        _lease_sha(self.subject_digest, "subjectDigest")
+        _lease_sha(self.effect_digest, "effectDigest")
+        if type(self.result_class) is not ActivationRecoveryResultClass:
+            _fail("ActivationRecoveryAction resultClass must be a closed value")
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": self.schema_version,
+            "sequence": self.sequence,
+            "actionClass": self.action_class.value,
+            "subjectDigest": self.subject_digest,
+            "effectDigest": self.effect_digest,
+            "resultClass": self.result_class.value,
+        }
+
+
+def ordered_recovery_actions_digest(actions: Iterable[ActivationRecoveryAction]) -> str:
+    normalized = tuple(actions)
+    if any(type(action) is not ActivationRecoveryAction for action in normalized):
+        _fail("ordered recovery actions must contain exact ActivationRecoveryAction values")
+    if tuple(action.sequence for action in normalized) != tuple(range(len(normalized))):
+        _fail("ordered recovery actions must use contiguous zero-based sequence values")
+    material = {"schemaVersion": 1, "actions": [action.as_value() for action in normalized]}
+    return hashlib.sha256(
+        G8_ACTIVATION_RECOVERY_ACTIONS_PREFIX.encode("utf-8")
+        + _canonical_json(material).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True)
+class ActivationRecoveryWitness:
+    schema_version: int
+    activation_boundary_id: str
+    activation_run_id: int
+    activation_run_attempt: int
+    pre_recovery_inventory_digest: str
+    ordered_recovery_actions_digest: str
+    post_recovery_inventory_digest: str
+    unresolved_authority_count: int
+    old_run_terminal_digest: str
+    six_workflow_identity_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("ActivationRecoveryWitness schemaVersion must be exact integer 1")
+        _lease_sha(self.activation_boundary_id, "activationBoundaryId")
+        _issue_positive_int(self.activation_run_id, "activationRunId")
+        _issue_positive_int(self.activation_run_attempt, "activationRunAttempt")
+        for value, label in (
+            (self.pre_recovery_inventory_digest, "preRecoveryInventoryDigest"),
+            (self.ordered_recovery_actions_digest, "orderedRecoveryActionsDigest"),
+            (self.post_recovery_inventory_digest, "postRecoveryInventoryDigest"),
+            (self.old_run_terminal_digest, "oldRunTerminalDigest"),
+            (self.six_workflow_identity_digest, "sixWorkflowIdentityDigest"),
+        ):
+            _lease_sha(value, label)
+        if type(self.unresolved_authority_count) is not int or self.unresolved_authority_count != 0:
+            _fail("unresolvedAuthorityCount must be exact integer 0")
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": self.schema_version,
+            "activationBoundaryId": self.activation_boundary_id,
+            "activationRunId": self.activation_run_id,
+            "activationRunAttempt": self.activation_run_attempt,
+            "preRecoveryInventoryDigest": self.pre_recovery_inventory_digest,
+            "orderedRecoveryActionsDigest": self.ordered_recovery_actions_digest,
+            "postRecoveryInventoryDigest": self.post_recovery_inventory_digest,
+            "unresolvedAuthorityCount": self.unresolved_authority_count,
+            "oldRunTerminalDigest": self.old_run_terminal_digest,
+            "sixWorkflowIdentityDigest": self.six_workflow_identity_digest,
+        }
+
+    def witness_id(self) -> str:
+        return hashlib.sha256(_canonical_json(self.as_value()).encode("utf-8")).hexdigest()
+
+
+def activation_recovery_witness_id(witness: ActivationRecoveryWitness) -> str:
+    if type(witness) is not ActivationRecoveryWitness:
+        _fail("activationRecoveryWitnessId requires exact ActivationRecoveryWitness")
+    return witness.witness_id()
+
+
+@dataclass(frozen=True)
+class ActivationRecoveryEvidence:
+    schema_version: int
+    evidence_kind: str
+    central_repository_node_id: str
+    implementation_pr_number: int
+    implementation_pr_database_id: int
+    implementation_pr_node_id: str
+    activation_boundary_id: str
+    merged_result_oid: str
+    authority_surface_digest: str
+    new_writer_topology_digest: str
+    activation_run_id: int
+    activation_run_attempt: int
+    pre_recovery_inventory_digest: str
+    ordered_recovery_actions_digest: str
+    recovery_action_count: int
+    post_recovery_inventory_digest: str
+    unresolved_authority_count: int
+    old_run_terminal_digest: str
+    six_workflow_identity_digest: str
+    legacy_inventory_quarantine_migration_digest: str
+    activation_recovery_witness_id: str
+    recovery_result: str
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("ActivationRecoveryEvidence schemaVersion must be exact integer 1")
+        if self.evidence_kind != "G8_ACTIVATION_RECOVERY":
+            _fail("ActivationRecoveryEvidence evidenceKind must be exact G8_ACTIVATION_RECOVERY")
+        if self.central_repository_node_id != G8_CENTRAL_REPOSITORY_NODE_ID:
+            _fail("ActivationRecoveryEvidence centralRepositoryNodeId does not match the frozen contract")
+        if self.implementation_pr_number != G8_IMPLEMENTATION_PR_NUMBER or type(self.implementation_pr_number) is not int:
+            _fail("ActivationRecoveryEvidence implementationPrNumber does not match the frozen contract")
+        if self.implementation_pr_database_id != G8_IMPLEMENTATION_PR_DATABASE_ID or type(self.implementation_pr_database_id) is not int:
+            _fail("ActivationRecoveryEvidence implementationPrDatabaseId does not match the frozen contract")
+        if self.implementation_pr_node_id != G8_IMPLEMENTATION_PR_NODE_ID:
+            _fail("ActivationRecoveryEvidence implementationPrNodeId does not match the frozen contract")
+        _lease_sha(self.merged_result_oid, "mergedResultOid", git=True)
+        for value, label in (
+            (self.authority_surface_digest, "authoritySurfaceDigest"),
+            (self.new_writer_topology_digest, "newWriterTopologyDigest"),
+            (self.pre_recovery_inventory_digest, "preRecoveryInventoryDigest"),
+            (self.ordered_recovery_actions_digest, "orderedRecoveryActionsDigest"),
+            (self.post_recovery_inventory_digest, "postRecoveryInventoryDigest"),
+            (self.old_run_terminal_digest, "oldRunTerminalDigest"),
+            (self.six_workflow_identity_digest, "sixWorkflowIdentityDigest"),
+            (self.legacy_inventory_quarantine_migration_digest, "legacyInventoryQuarantineMigrationDigest"),
+            (self.activation_recovery_witness_id, "activationRecoveryWitnessId"),
+        ):
+            _lease_sha(value, label)
+        _issue_positive_int(self.activation_run_id, "activationRunId")
+        _issue_positive_int(self.activation_run_attempt, "activationRunAttempt")
+        _wave12_nonnegative_int(self.recovery_action_count, "recoveryActionCount")
+        if type(self.unresolved_authority_count) is not int or self.unresolved_authority_count != 0:
+            _fail("ActivationRecoveryEvidence unresolvedAuthorityCount must be exact integer 0")
+        if self.recovery_result != "SUCCESS":
+            _fail("ActivationRecoveryEvidence recoveryResult must be exact SUCCESS")
+        expected_boundary = activation_boundary_id_digest(
+            self.central_repository_node_id,
+            self.implementation_pr_number,
+            self.implementation_pr_database_id,
+            self.implementation_pr_node_id,
+            self.merged_result_oid,
+            self.authority_surface_digest,
+            self.new_writer_topology_digest,
+        )
+        if self.activation_boundary_id != expected_boundary:
+            _fail("ActivationRecoveryEvidence activationBoundaryId does not match canonical boundary material")
+        witness = self.to_witness(validate_id=False)
+        if self.activation_recovery_witness_id != witness.witness_id():
+            _fail("ActivationRecoveryEvidence activationRecoveryWitnessId does not match canonical witness")
+
+    def to_witness(self, *, validate_id: bool = True) -> ActivationRecoveryWitness:
+        witness = ActivationRecoveryWitness(
+            self.schema_version,
+            self.activation_boundary_id,
+            self.activation_run_id,
+            self.activation_run_attempt,
+            self.pre_recovery_inventory_digest,
+            self.ordered_recovery_actions_digest,
+            self.post_recovery_inventory_digest,
+            self.unresolved_authority_count,
+            self.old_run_terminal_digest,
+            self.six_workflow_identity_digest,
+        )
+        if validate_id and witness.witness_id() != self.activation_recovery_witness_id:
+            _fail("ActivationRecoveryEvidence witness reconstruction mismatch")
+        return witness
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": self.schema_version,
+            "evidenceKind": self.evidence_kind,
+            "centralRepositoryNodeId": self.central_repository_node_id,
+            "implementationPrNumber": self.implementation_pr_number,
+            "implementationPrDatabaseId": self.implementation_pr_database_id,
+            "implementationPrNodeId": self.implementation_pr_node_id,
+            "activationBoundaryId": self.activation_boundary_id,
+            "mergedResultOid": self.merged_result_oid,
+            "authoritySurfaceDigest": self.authority_surface_digest,
+            "newWriterTopologyDigest": self.new_writer_topology_digest,
+            "activationRunId": self.activation_run_id,
+            "activationRunAttempt": self.activation_run_attempt,
+            "preRecoveryInventoryDigest": self.pre_recovery_inventory_digest,
+            "orderedRecoveryActionsDigest": self.ordered_recovery_actions_digest,
+            "recoveryActionCount": self.recovery_action_count,
+            "postRecoveryInventoryDigest": self.post_recovery_inventory_digest,
+            "unresolvedAuthorityCount": self.unresolved_authority_count,
+            "oldRunTerminalDigest": self.old_run_terminal_digest,
+            "sixWorkflowIdentityDigest": self.six_workflow_identity_digest,
+            "legacyInventoryQuarantineMigrationDigest": self.legacy_inventory_quarantine_migration_digest,
+            "activationRecoveryWitnessId": self.activation_recovery_witness_id,
+            "recoveryResult": self.recovery_result,
+        }
+
+    def render(self) -> str:
+        text = f"{G8_ACTIVATION_RECOVERY_EVIDENCE_MARKER}\n{_canonical_json(self.as_value())}\n"
+        _check_body_size(
+            text,
+            "ActivationRecoveryEvidence",
+            max_bytes=MAX_G8_ACTIVATION_RECOVERY_EVIDENCE_BYTES,
+        )
+        return text
+
+    def result_digest(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+_ACTIVATION_RECOVERY_EVIDENCE_KEYS = frozenset({
+    "schemaVersion", "evidenceKind", "centralRepositoryNodeId",
+    "implementationPrNumber", "implementationPrDatabaseId", "implementationPrNodeId",
+    "activationBoundaryId", "mergedResultOid", "authoritySurfaceDigest",
+    "newWriterTopologyDigest", "activationRunId", "activationRunAttempt",
+    "preRecoveryInventoryDigest", "orderedRecoveryActionsDigest", "recoveryActionCount",
+    "postRecoveryInventoryDigest", "unresolvedAuthorityCount", "oldRunTerminalDigest",
+    "sixWorkflowIdentityDigest", "legacyInventoryQuarantineMigrationDigest",
+    "activationRecoveryWitnessId", "recoveryResult",
+})
+
+
+def parse_activation_recovery_evidence(text: str) -> ActivationRecoveryEvidence:
+    if type(text) is not str:
+        _fail("ActivationRecoveryEvidence must be text")
+    _check_body_size(text, "ActivationRecoveryEvidence", max_bytes=MAX_G8_ACTIVATION_RECOVERY_EVIDENCE_BYTES)
+    if not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _fail("ActivationRecoveryEvidence must use exact LF-terminated UTF-8 framing")
+    lines = text[:-1].split("\n")
+    if len(lines) != 2 or lines[0] != G8_ACTIVATION_RECOVERY_EVIDENCE_MARKER or not lines[1]:
+        _fail("ActivationRecoveryEvidence marker or JSON line is invalid")
+    try:
+        value = c02.decode_json(lines[1])
+    except Exception as error:
+        _fail(f"invalid ActivationRecoveryEvidence JSON: {error}")
+    if type(value) is not dict or set(value) != _ACTIVATION_RECOVERY_EVIDENCE_KEYS:
+        _fail("ActivationRecoveryEvidence has invalid exact keys")
+    evidence = ActivationRecoveryEvidence(
+        value["schemaVersion"],
+        value["evidenceKind"],
+        value["centralRepositoryNodeId"],
+        value["implementationPrNumber"],
+        value["implementationPrDatabaseId"],
+        value["implementationPrNodeId"],
+        value["activationBoundaryId"],
+        value["mergedResultOid"],
+        value["authoritySurfaceDigest"],
+        value["newWriterTopologyDigest"],
+        value["activationRunId"],
+        value["activationRunAttempt"],
+        value["preRecoveryInventoryDigest"],
+        value["orderedRecoveryActionsDigest"],
+        value["recoveryActionCount"],
+        value["postRecoveryInventoryDigest"],
+        value["unresolvedAuthorityCount"],
+        value["oldRunTerminalDigest"],
+        value["sixWorkflowIdentityDigest"],
+        value["legacyInventoryQuarantineMigrationDigest"],
+        value["activationRecoveryWitnessId"],
+        value["recoveryResult"],
+    )
+    if evidence.render() != text:
+        _fail("ActivationRecoveryEvidence representation is not canonical")
+    return evidence
+
+
+def activation_recovery_result_digest(evidence: ActivationRecoveryEvidence) -> str:
+    if type(evidence) is not ActivationRecoveryEvidence:
+        _fail("activationRecoveryResultDigest requires exact ActivationRecoveryEvidence")
+    return evidence.result_digest()
+
+
+def six_workflow_identity_digest(writers: Iterable[Mapping[str, Any]]) -> str:
+    expected_keys = {"path", "reviewedBlobOid", "reviewedBlobSha256", "workflowId", "workflowState"}
+    normalized: list[dict[str, Any]] = []
+    for index, writer in enumerate(writers):
+        if type(writer) is not dict or set(writer) != expected_keys:
+            _fail("six workflow identity entry has invalid exact keys")
+        if index >= len(G8_NEW_WRITER_PATHS) or writer["path"] != G8_NEW_WRITER_PATHS[index]:
+            _fail("six workflow identities must use exact activation-contract path order")
+        item = {
+            "path": _wave12_workflow_path(writer["path"], "workflow path"),
+            "reviewedBlobOid": _lease_sha(writer["reviewedBlobOid"], "reviewedBlobOid", git=True),
+            "reviewedBlobSha256": _lease_sha(writer["reviewedBlobSha256"], "reviewedBlobSha256"),
+            "workflowId": _issue_positive_int(writer["workflowId"], "workflowId"),
+            "workflowState": _issue_bounded_text(writer["workflowState"], "workflowState", 64),
+        }
+        if item["workflowState"] != "active":
+            _fail("six workflow identity state must be exact active")
+        normalized.append(item)
+    if len(normalized) != len(G8_NEW_WRITER_PATHS):
+        _fail("six workflow identity digest requires exactly six writers")
+    ids = [item["workflowId"] for item in normalized]
+    if len(set(ids)) != len(ids):
+        _fail("six workflow identity IDs must be unique")
+    return hashlib.sha256(_canonical_json({"schemaVersion": 1, "writers": normalized}).encode("utf-8")).hexdigest()
+
+
+def old_path_absence_proof_digest(
+    merged_result_oid: str,
+    current_main_oid: str,
+    old_writers: Iterable[Mapping[str, Any]],
+) -> str:
+    merged = _lease_sha(merged_result_oid, "mergedResultOid", git=True)
+    current = _lease_sha(current_main_oid, "currentMainOid", git=True)
+    if current != merged:
+        _fail("old path absence proof requires currentMainOid == mergedResultOid")
+    expected = sorted(G8_OLD_WRITERS, key=lambda item: item[0].encode("utf-8"))
+    normalized: list[dict[str, Any]] = []
+    for item in old_writers:
+        if type(item) is not dict or set(item) != {"path", "historicWorkflowId", "pathPresent"}:
+            _fail("old path absence entry has invalid exact keys")
+        normalized.append({
+            "path": _wave12_workflow_path(item["path"], "old workflow path"),
+            "historicWorkflowId": _issue_positive_int(item["historicWorkflowId"], "historicWorkflowId"),
+            "pathPresent": item["pathPresent"],
+        })
+    if any(type(item["pathPresent"]) is not bool or item["pathPresent"] for item in normalized):
+        _fail("old path absence proof requires exact false pathPresent values")
+    pairs = [(item["path"], item["historicWorkflowId"]) for item in normalized]
+    if pairs != expected:
+        _fail("old path absence proof requires exact sorted five historic writers")
+    material = {
+        "schemaVersion": 1,
+        "mergedResultOid": merged,
+        "currentMainOid": current,
+        "oldWriters": normalized,
+    }
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+_WORKFLOW_RUN_CONCLUSIONS = frozenset({
+    "success", "failure", "neutral", "cancelled", "skipped",
+    "timed_out", "action_required", "stale", "startup_failure",
+})
+
+
+def old_run_terminal_proof_digest(old_writers: Iterable[Mapping[str, Any]]) -> str:
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(old_writers):
+        if type(item) is not dict or set(item) != {"path", "historicWorkflowId", "enumerationState", "runs"}:
+            _fail("old-run terminal entry has invalid exact keys")
+        if index >= len(G8_OLD_WRITERS) or (item["path"], item["historicWorkflowId"]) != G8_OLD_WRITERS[index]:
+            _fail("old-run terminal proof requires exact five historic writer order")
+        state = item["enumerationState"]
+        if state not in {"COMPLETE", "DELETED_ID_UNAVAILABLE"} or type(state) is not str:
+            _fail("old-run enumerationState is invalid")
+        runs = item["runs"]
+        if type(runs) not in (list, tuple):
+            _fail("old-run observed runs must be an ordered list or tuple")
+        normalized_runs: list[dict[str, Any]] = []
+        previous: tuple[int, int] | None = None
+        for run in runs:
+            exact = {"runId", "runAttempt", "status", "conclusion", "event", "headBranch", "headSha"}
+            if type(run) is not dict or set(run) != exact:
+                _fail("old-run observed tuple has invalid exact keys")
+            run_id = _issue_positive_int(run["runId"], "runId")
+            attempt = _issue_positive_int(run["runAttempt"], "runAttempt")
+            status = _issue_bounded_text(run["status"], "run status", 32)
+            if status != "completed":
+                _fail("old-run terminal proof contains a non-completed run")
+            conclusion = run["conclusion"]
+            if conclusion is not None and (type(conclusion) is not str or conclusion not in _WORKFLOW_RUN_CONCLUSIONS):
+                _fail("old-run conclusion is invalid")
+            event = _issue_bounded_text(run["event"], "run event", 64)
+            head_branch = run["headBranch"]
+            if head_branch is not None:
+                head_branch = _issue_bounded_text(head_branch, "run headBranch", 256)
+            head_sha = _lease_sha(run["headSha"], "run headSha", git=True)
+            key = (run_id, attempt)
+            if previous is not None and key <= previous:
+                _fail("old-run observed tuples must be strictly ordered by runId/runAttempt")
+            previous = key
+            normalized_runs.append({
+                "runId": run_id,
+                "runAttempt": attempt,
+                "status": status,
+                "conclusion": conclusion,
+                "event": event,
+                "headBranch": head_branch,
+                "headSha": head_sha,
+            })
+        if state == "DELETED_ID_UNAVAILABLE" and normalized_runs:
+            _fail("DELETED_ID_UNAVAILABLE cannot contain observed runs")
+        normalized.append({
+            "path": item["path"],
+            "historicWorkflowId": item["historicWorkflowId"],
+            "enumerationState": state,
+            "runs": normalized_runs,
+        })
+    if len(normalized) != len(G8_OLD_WRITERS):
+        _fail("old-run terminal proof requires exactly five historic writers")
+    return hashlib.sha256(_canonical_json({"schemaVersion": 1, "oldWriters": normalized}).encode("utf-8")).hexdigest()
+
+
+def activation_recovery_inventory_digest(stage: str, inventory: Mapping[str, Any]) -> str:
+    if type(stage) is not str or stage not in {"PRE", "POST"}:
+        _fail("activation recovery inventory stage must be PRE or POST")
+    if type(inventory) is not dict:
+        _fail("activation recovery inventory must be an exact mapping")
+    material = {"schemaVersion": 1, "stage": stage, "inventory": dict(inventory)}
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class ActivationWorkflowIdentity:
+    path: str
+    workflow_id: int
+    workflow_state: str
+
+    def __post_init__(self) -> None:
+        _wave12_workflow_path(self.path, "activation workflow path")
+        _issue_positive_int(self.workflow_id, "activation workflowId")
+        if self.workflow_state != "active":
+            _fail("activation workflowState must be exact active")
+
+    def as_value(self) -> dict[str, Any]:
+        return {"path": self.path, "workflowId": self.workflow_id, "workflowState": self.workflow_state}
+
+
+@dataclass(frozen=True)
+class HistoricWorkflowIdentity:
+    path: str
+    historic_workflow_id: int
+
+    def __post_init__(self) -> None:
+        _wave12_workflow_path(self.path, "historic workflow path")
+        _issue_positive_int(self.historic_workflow_id, "historicWorkflowId")
+
+    def as_value(self) -> dict[str, Any]:
+        return {"path": self.path, "historicWorkflowId": self.historic_workflow_id}
+
+
+@dataclass(frozen=True)
+class ActivationEpochRecord:
+    schema_version: int
+    activation_boundary_id: str
+    central_repository_node_id: str
+    implementation_pr_number: int
+    implementation_pr_database_id: int
+    implementation_pr_node_id: str
+    merged_result_oid: str
+    authority_surface_digest: str
+    new_writer_topology_digest: str
+    new_workflows: tuple[ActivationWorkflowIdentity, ...]
+    old_workflows: tuple[HistoricWorkflowIdentity, ...]
+    old_path_absence_proof_digest: str
+    old_run_terminal_proof_digest: str
+    legacy_inventory_quarantine_migration_digest: str
+    activation_recovery_witness_id: str
+    activation_recovery_result_digest: str
+    activation_workflow_run_id: int
+    activation_workflow_run_attempt: int
+    created_at: str
+    evidence_cutover_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            _fail("ActivationEpochRecord schemaVersion must be exact integer 1")
+        _lease_sha(self.activation_boundary_id, "activationBoundaryId")
+        if self.central_repository_node_id != G8_CENTRAL_REPOSITORY_NODE_ID:
+            _fail("ActivationEpochRecord centralRepositoryNodeId does not match frozen contract")
+        if self.implementation_pr_number != G8_IMPLEMENTATION_PR_NUMBER or type(self.implementation_pr_number) is not int:
+            _fail("ActivationEpochRecord implementationPrNumber does not match frozen contract")
+        if self.implementation_pr_database_id != G8_IMPLEMENTATION_PR_DATABASE_ID or type(self.implementation_pr_database_id) is not int:
+            _fail("ActivationEpochRecord implementationPrDatabaseId does not match frozen contract")
+        if self.implementation_pr_node_id != G8_IMPLEMENTATION_PR_NODE_ID:
+            _fail("ActivationEpochRecord implementationPrNodeId does not match frozen contract")
+        _lease_sha(self.merged_result_oid, "mergedResultOid", git=True)
+        for value, label in (
+            (self.authority_surface_digest, "authoritySurfaceDigest"),
+            (self.new_writer_topology_digest, "newWriterTopologyDigest"),
+            (self.old_path_absence_proof_digest, "oldPathAbsenceProofDigest"),
+            (self.old_run_terminal_proof_digest, "oldRunTerminalProofDigest"),
+            (self.legacy_inventory_quarantine_migration_digest, "legacyInventoryQuarantineMigrationDigest"),
+            (self.activation_recovery_witness_id, "activationRecoveryWitnessId"),
+            (self.activation_recovery_result_digest, "activationRecoveryResultDigest"),
+        ):
+            _lease_sha(value, label)
+        if type(self.new_workflows) is not tuple or len(self.new_workflows) != len(G8_NEW_WRITER_PATHS):
+            _fail("ActivationEpochRecord requires exactly six new workflow identities")
+        if any(type(item) is not ActivationWorkflowIdentity for item in self.new_workflows):
+            _fail("ActivationEpochRecord new workflows must be exact ActivationWorkflowIdentity values")
+        if tuple(item.path for item in self.new_workflows) != G8_NEW_WRITER_PATHS:
+            _fail("ActivationEpochRecord new workflows must use exact activation-contract path order")
+        new_ids = tuple(item.workflow_id for item in self.new_workflows)
+        if len(set(new_ids)) != len(new_ids):
+            _fail("ActivationEpochRecord new workflow IDs must be unique")
+        if type(self.old_workflows) is not tuple or len(self.old_workflows) != len(G8_OLD_WRITERS):
+            _fail("ActivationEpochRecord requires exactly five old workflow identities")
+        if any(type(item) is not HistoricWorkflowIdentity for item in self.old_workflows):
+            _fail("ActivationEpochRecord old workflows must be exact HistoricWorkflowIdentity values")
+        if tuple((item.path, item.historic_workflow_id) for item in self.old_workflows) != G8_OLD_WRITERS:
+            _fail("ActivationEpochRecord old workflows must match exact historic tuple")
+        _issue_positive_int(self.activation_workflow_run_id, "activationWorkflowRunId")
+        _issue_positive_int(self.activation_workflow_run_attempt, "activationWorkflowRunAttempt")
+        _canonical_utc_timestamp(self.created_at, "createdAt")
+        if self.evidence_cutover_id is not None:
+            _issue_bounded_text(self.evidence_cutover_id, "evidenceCutoverId", 256)
+        expected_boundary = activation_boundary_id_digest(
+            self.central_repository_node_id,
+            self.implementation_pr_number,
+            self.implementation_pr_database_id,
+            self.implementation_pr_node_id,
+            self.merged_result_oid,
+            self.authority_surface_digest,
+            self.new_writer_topology_digest,
+        )
+        if self.activation_boundary_id != expected_boundary:
+            _fail("ActivationEpochRecord activationBoundaryId does not match canonical boundary material")
+
+    def as_value(self) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "schemaVersion": self.schema_version,
+            "activationBoundaryId": self.activation_boundary_id,
+            "centralRepositoryNodeId": self.central_repository_node_id,
+            "implementationPrNumber": self.implementation_pr_number,
+            "implementationPrDatabaseId": self.implementation_pr_database_id,
+            "implementationPrNodeId": self.implementation_pr_node_id,
+            "mergedResultOid": self.merged_result_oid,
+            "authoritySurfaceDigest": self.authority_surface_digest,
+            "newWriterTopologyDigest": self.new_writer_topology_digest,
+            "newWorkflows": [item.as_value() for item in self.new_workflows],
+            "oldWorkflows": [item.as_value() for item in self.old_workflows],
+            "oldPathAbsenceProofDigest": self.old_path_absence_proof_digest,
+            "oldRunTerminalProofDigest": self.old_run_terminal_proof_digest,
+            "legacyInventoryQuarantineMigrationDigest": self.legacy_inventory_quarantine_migration_digest,
+            "activationRecoveryWitnessId": self.activation_recovery_witness_id,
+            "activationRecoveryResultDigest": self.activation_recovery_result_digest,
+            "activationWorkflowRunId": self.activation_workflow_run_id,
+            "activationWorkflowRunAttempt": self.activation_workflow_run_attempt,
+            "createdAt": self.created_at,
+        }
+        if self.evidence_cutover_id is not None:
+            value["evidenceCutoverId"] = self.evidence_cutover_id
+        return value
+
+    def render(self) -> str:
+        return _canonical_json(self.as_value()) + "\n"
+
+    def record_digest(self) -> str:
+        return hashlib.sha256(self.render().encode("utf-8")).hexdigest()
+
+
+_ACTIVATION_EPOCH_REQUIRED_KEYS = frozenset({
+    "schemaVersion", "activationBoundaryId", "centralRepositoryNodeId",
+    "implementationPrNumber", "implementationPrDatabaseId", "implementationPrNodeId",
+    "mergedResultOid", "authoritySurfaceDigest", "newWriterTopologyDigest",
+    "newWorkflows", "oldWorkflows", "oldPathAbsenceProofDigest",
+    "oldRunTerminalProofDigest", "legacyInventoryQuarantineMigrationDigest",
+    "activationRecoveryWitnessId", "activationRecoveryResultDigest",
+    "activationWorkflowRunId", "activationWorkflowRunAttempt", "createdAt",
+})
+
+
+def parse_activation_epoch_record(text: str) -> ActivationEpochRecord:
+    if type(text) is not str or not text.endswith("\n") or "\r" in text or "\x00" in text:
+        _fail("ActivationEpochRecord must use exact one-LF canonical JSON framing")
+    if text.count("\n") != 1:
+        _fail("ActivationEpochRecord must be one canonical JSON line plus one LF")
+    json_line = text[:-1]
+    try:
+        value = c02.decode_json(json_line)
+    except Exception as error:
+        _fail(f"invalid ActivationEpochRecord JSON: {error}")
+    if type(value) is not dict:
+        _fail("ActivationEpochRecord JSON must be an object")
+    allowed = _ACTIVATION_EPOCH_REQUIRED_KEYS | {"evidenceCutoverId"}
+    if not _ACTIVATION_EPOCH_REQUIRED_KEYS.issubset(value) or not set(value).issubset(allowed):
+        _fail("ActivationEpochRecord has invalid exact keys")
+    new_values = value["newWorkflows"]
+    old_values = value["oldWorkflows"]
+    if type(new_values) is not list or type(old_values) is not list:
+        _fail("ActivationEpochRecord workflow identities must be arrays")
+    new_workflows: list[ActivationWorkflowIdentity] = []
+    for item in new_values:
+        if type(item) is not dict or set(item) != {"path", "workflowId", "workflowState"}:
+            _fail("ActivationEpochRecord new workflow identity has invalid exact keys")
+        new_workflows.append(ActivationWorkflowIdentity(item["path"], item["workflowId"], item["workflowState"]))
+    old_workflows: list[HistoricWorkflowIdentity] = []
+    for item in old_values:
+        if type(item) is not dict or set(item) != {"path", "historicWorkflowId"}:
+            _fail("ActivationEpochRecord old workflow identity has invalid exact keys")
+        old_workflows.append(HistoricWorkflowIdentity(item["path"], item["historicWorkflowId"]))
+    record = ActivationEpochRecord(
+        value["schemaVersion"],
+        value["activationBoundaryId"],
+        value["centralRepositoryNodeId"],
+        value["implementationPrNumber"],
+        value["implementationPrDatabaseId"],
+        value["implementationPrNodeId"],
+        value["mergedResultOid"],
+        value["authoritySurfaceDigest"],
+        value["newWriterTopologyDigest"],
+        tuple(new_workflows),
+        tuple(old_workflows),
+        value["oldPathAbsenceProofDigest"],
+        value["oldRunTerminalProofDigest"],
+        value["legacyInventoryQuarantineMigrationDigest"],
+        value["activationRecoveryWitnessId"],
+        value["activationRecoveryResultDigest"],
+        value["activationWorkflowRunId"],
+        value["activationWorkflowRunAttempt"],
+        value["createdAt"],
+        value.get("evidenceCutoverId"),
+    )
+    if record.render() != text:
+        _fail("ActivationEpochRecord representation is not canonical")
+    return record
+
+
+def activation_record_digest(record: ActivationEpochRecord) -> str:
+    if type(record) is not ActivationEpochRecord:
+        _fail("activationRecordDigest requires exact ActivationEpochRecord")
+    return record.record_digest()
+
+
+def activation_status_evidence_digest(
+    record: ActivationEpochRecord,
+    hae: str,
+    activation_boundary_id: str,
+) -> str:
+    if type(record) is not ActivationEpochRecord:
+        _fail("activation status evidence digest requires exact ActivationEpochRecord")
+    hae_sha = _lease_sha(hae, "HAE", git=True)
+    boundary = _lease_sha(activation_boundary_id, "activationBoundaryId")
+    if boundary != record.activation_boundary_id:
+        _fail("activation status boundary must equal record activationBoundaryId")
+    return hashlib.sha256(
+        record.render().encode("utf-8")
+        + hae_sha.encode("ascii")
+        + boundary.encode("ascii")
+    ).hexdigest()
+
+
+def activation_status_description(
+    record: ActivationEpochRecord,
+    hae: str,
+    activation_boundary_id: str,
+) -> str:
+    digest = activation_status_evidence_digest(record, hae, activation_boundary_id)
+    description = G8_ACTIVATION_STATUS_DESCRIPTION_PREFIX + digest
+    if len(description.encode("ascii")) != 81:
+        _fail("activation status description must be exact 81 ASCII bytes")
+    return description

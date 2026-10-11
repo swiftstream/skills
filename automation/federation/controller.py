@@ -10,7 +10,7 @@ import re
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
@@ -39,6 +39,8 @@ from .github_api import (
     RefUpdate,
     RepositoryMetadata,
     StatusWriteReceipt,
+    WorkflowMetadata,
+    WorkflowRunMetadata,
     ZERO_OID,
 )
 from .request_model import (
@@ -82,6 +84,35 @@ from .request_model import (
     CarrierActivation,
     CarrierRole,
     ActivationBoundaryEvidence,
+    ActivationEpochRecord,
+    ActivationWorkflowIdentity,
+    HistoricWorkflowIdentity,
+    ActivationRecoveryAction,
+    ActivationRecoveryActionClass,
+    ActivationRecoveryEvidence,
+    ActivationRecoveryResultClass,
+    ActivationRecoveryWitness,
+    G8_ACTIVATION_RECOVERY_EVIDENCE_MARKER,
+    G8_ACTIVATION_RECORD_PATH,
+    G8_ACTIVATION_REF,
+    G8_ACTIVATION_STATUS_CONTEXT,
+    G8_CENTRAL_REPOSITORY_NODE_ID,
+    G8_IMPLEMENTATION_PR_NUMBER,
+    G8_IMPLEMENTATION_PR_DATABASE_ID,
+    G8_IMPLEMENTATION_PR_NODE_ID,
+    G8_NEW_WRITER_PATHS,
+    G8_OLD_WRITERS,
+    parse_activation_epoch_record,
+    parse_activation_recovery_evidence,
+    activation_recovery_inventory_digest,
+    activation_recovery_result_digest,
+    activation_recovery_witness_id,
+    activation_record_digest,
+    old_path_absence_proof_digest,
+    old_run_terminal_proof_digest,
+    ordered_recovery_actions_digest,
+    six_workflow_identity_digest,
+    activation_status_description,
     LegacyEvidenceDisposition,
     LegacyQuarantineClass,
     LegacyClassificationOutcome,
@@ -205,21 +236,379 @@ class G8ActivationGuardResult:
             raise ValueError("G8 runtime state must be an exact G8RuntimeState")
         if type(self.ordinary_write_allowed) is not bool or type(self.activation_write_allowed) is not bool:
             raise ValueError("G8 write permissions must be exact booleans")
-        if self.ordinary_write_allowed and self.runtime_state is not G8RuntimeState.ACTIVE_G8:
-            raise ValueError("ordinary writes require ACTIVE_G8")
-        if self.activation_write_allowed:
-            raise ValueError("Wave10 activation writes are always disabled")
-        if self.reason != "WAVE10_INERT_GUARD":
-            raise ValueError("Wave10 guard reason is fixed")
+        expected = {
+            G8RuntimeState.ACTIVE_G8: (True, False, "ACTIVE_G8_EPOCH_PROVEN"),
+            G8RuntimeState.MERGED_UNPROVEN: (False, True, "MERGED_UNPROVEN_NO_VALID_EPOCH"),
+            G8RuntimeState.BLOCKED_POST_MERGE: (False, False, "BLOCKED_POST_MERGE_CONFLICT"),
+            G8RuntimeState.PRE_G8_NOT_APPLICABLE: (False, False, "PRE_G8_NOT_APPLICABLE"),
+        }[self.runtime_state]
+        if (self.ordinary_write_allowed, self.activation_write_allowed, self.reason) != expected:
+            raise ValueError("G8 activation guard tuple does not match the closed runtime-state matrix")
 
 
-def wave10_inert_activation_guard() -> G8ActivationGuardResult:
-    return G8ActivationGuardResult(
-        runtime_state=G8RuntimeState.MERGED_UNPROVEN,
-        ordinary_write_allowed=False,
-        activation_write_allowed=False,
-        reason="WAVE10_INERT_GUARD",
-    )
+def _g8_activation_guard_result(state: G8RuntimeState) -> G8ActivationGuardResult:
+    matrix = {
+        G8RuntimeState.ACTIVE_G8: (True, False, "ACTIVE_G8_EPOCH_PROVEN"),
+        G8RuntimeState.MERGED_UNPROVEN: (False, True, "MERGED_UNPROVEN_NO_VALID_EPOCH"),
+        G8RuntimeState.BLOCKED_POST_MERGE: (False, False, "BLOCKED_POST_MERGE_CONFLICT"),
+        G8RuntimeState.PRE_G8_NOT_APPLICABLE: (False, False, "PRE_G8_NOT_APPLICABLE"),
+    }
+    ordinary, activation, reason = matrix[state]
+    return G8ActivationGuardResult(state, ordinary, activation, reason)
+
+
+_G8_RECOVERY_SUBJECT_PREFIX = "swiftstream-federation-g8-activation-recovery-subject:v1\n"
+_G8_RECOVERY_EFFECT_PREFIX = "swiftstream-federation-g8-activation-recovery-effect:v1\n"
+_G8_LEGACY_RECOVERY_PREFIX = "swiftstream-federation-g8-legacy-quarantine-migration:v1\n"
+
+
+def _g8_recovery_material_digest(prefix: str, material: Mapping[str, Any]) -> str:
+    if prefix not in {
+        _G8_RECOVERY_SUBJECT_PREFIX,
+        _G8_RECOVERY_EFFECT_PREFIX,
+        _G8_LEGACY_RECOVERY_PREFIX,
+    }:
+        raise ValueError("G8 recovery digest domain is not a closed value")
+    if type(material) is not dict:
+        raise ValueError("G8 recovery digest material must be an exact mapping")
+    try:
+        encoded = json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise ValueError("G8 recovery digest material is not canonical JSON") from error
+    return hashlib.sha256(prefix.encode("utf-8") + encoded).hexdigest()
+
+
+def _g8_validate_recovery_action_material(
+    action_class: ActivationRecoveryActionClass,
+    subject: Mapping[str, Any],
+    effect: Mapping[str, Any],
+    result_class: ActivationRecoveryResultClass,
+) -> None:
+    if (
+        type(action_class) is not ActivationRecoveryActionClass
+        or type(result_class) is not ActivationRecoveryResultClass
+        or type(subject) is not dict
+        or type(effect) is not dict
+    ):
+        raise ValueError("G8 recovery action material must use exact closed types")
+
+    def exact_keys(value: Mapping[str, Any], expected: set[str], label: str) -> None:
+        if set(value) != expected:
+            raise ValueError(f"G8 {label} has an invalid exact key set")
+
+    def sha40(value: Any, label: str) -> None:
+        if type(value) is not str or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+            raise ValueError(f"G8 {label} must be exact lowercase 40-hex")
+
+    def positive(value: Any, label: str) -> None:
+        if type(value) is not int or not 1 <= value <= 9_223_372_036_854_775_807:
+            raise ValueError(f"G8 {label} must be an exact positive signed-64 integer")
+
+    def deferred(reason_values: set[str] | None = None) -> None:
+        exact_keys(effect, {"deferredUntil", "reason"}, "deferred recovery effect")
+        if effect["deferredUntil"] != "ACTIVE_G8":
+            raise ValueError("G8 deferred recovery effect must target exact ACTIVE_G8")
+        reason = effect["reason"]
+        if type(reason) is not str or re.fullmatch(r"[A-Z][A-Z0-9_]{0,255}", reason) is None:
+            raise ValueError("G8 deferred recovery reason must be a bounded code token")
+        if reason_values is not None and reason not in reason_values:
+            raise ValueError("G8 deferred recovery reason is outside the exact action policy")
+
+    if action_class is ActivationRecoveryActionClass.LEGACY_FAILURE_STATUS:
+        exact_keys(subject, {"headSha", "legacyEvidence"}, "legacy-failure subject")
+        sha40(subject["headSha"], "legacy-failure headSha")
+        legacy = subject["legacyEvidence"]
+        exact_keys(
+            legacy if type(legacy) is dict else {},
+            {
+                "schemaVersion", "evidenceClass", "centralRepositoryDatabaseId",
+                "centralRepositoryNodeId", "centralRepositoryFullName", "headSha",
+                "evidencePayloadDigest",
+            },
+            "legacy-failure evidence",
+        )
+        if legacy["schemaVersion"] != 1 or legacy["headSha"] != subject["headSha"]:
+            raise ValueError("G8 legacy-failure evidence does not bind its subject head")
+        exact_keys(effect, {
+            "repository", "requestedSha", "method", "route", "state", "context",
+            "description", "targetUrl", "returnedStatusId", "returnedStatusNodeId",
+            "returnedCreatorDatabaseId", "returnedCreatorNodeId", "returnedCreatorLogin",
+            "returnedCreatorType", "returnedCreatedAt", "returnedUpdatedAt",
+        }, "legacy-failure effect")
+        if (
+            result_class is not ActivationRecoveryResultClass.APPLIED
+            or effect["requestedSha"] != subject["headSha"]
+            or effect["method"] != "POST"
+            or effect["state"] != "failure"
+            or effect["context"] != "federation/trusted-validation"
+            or effect["targetUrl"] is not None
+            or effect["returnedCreatorType"] != "Bot"
+        ):
+            raise ValueError("G8 legacy-failure effect is not the exact fail-closed status receipt")
+        positive(effect["returnedStatusId"], "legacy-failure returnedStatusId")
+        positive(effect["returnedCreatorDatabaseId"], "legacy-failure returnedCreatorDatabaseId")
+        return
+
+    if action_class is ActivationRecoveryActionClass.CANCEL_FAILURE_STATUS:
+        exact_keys(
+            subject,
+            {"issueNumber", "fenceId", "cancellationHeadSha", "pullRequestNumber"},
+            "cancel-failure subject",
+        )
+        positive(subject["issueNumber"], "cancel-failure issueNumber")
+        positive(subject["pullRequestNumber"], "cancel-failure pullRequestNumber")
+        sha40(subject["cancellationHeadSha"], "cancel-failure cancellationHeadSha")
+        snapshot = ExactAppRequiredStatusSnapshot.from_value(dict(effect))
+        if (
+            snapshot.disposition != "PRESENT"
+            or snapshot.queried_sha != subject["cancellationHeadSha"]
+            or snapshot.state != "failure"
+            or snapshot.context != "federation/trusted-validation"
+            or snapshot.status_class is not StatusClass.CANCEL
+            or result_class not in {
+                ActivationRecoveryResultClass.APPLIED,
+                ActivationRecoveryResultClass.ALREADY_CONVERGED,
+            }
+        ):
+            raise ValueError("G8 cancel-failure effect is not the exact fail-closed App status snapshot")
+        return
+
+    if action_class is ActivationRecoveryActionClass.LEGACY_MACHINE_MIGRATION:
+        exact_keys(
+            subject,
+            {"headSha", "legacyEvidence", "machineRef", "sourceId", "repositoryId"},
+            "legacy-machine subject",
+        )
+        sha40(subject["headSha"], "legacy-machine before head")
+        legacy = subject["legacyEvidence"]
+        exact_keys(
+            legacy if type(legacy) is dict else {},
+            {
+                "schemaVersion", "evidenceClass", "centralRepositoryDatabaseId",
+                "centralRepositoryNodeId", "centralRepositoryFullName", "headSha",
+                "evidencePayloadDigest",
+            },
+            "legacy-machine evidence",
+        )
+        if (
+            legacy["schemaVersion"] != 1
+            or legacy["evidenceClass"] != LegacyQuarantineClass.MACHINE.value
+            or legacy["headSha"] != subject["headSha"]
+            or subject["machineRef"] != f"refs/heads/bot/federation/{subject['sourceId']}"
+        ):
+            raise ValueError("G8 legacy-machine subject does not bind exact machine quarantine authority")
+        positive(subject["repositoryId"], "legacy-machine repositoryId")
+        exact_keys(effect, {
+            "beforeHeadSha", "afterHeadSha", "afterActivation", "afterRole", "afterMarker",
+            "outcome", "sourceId", "repositoryId", "reason",
+        }, "legacy-machine effect")
+        sha40(effect["beforeHeadSha"], "legacy-machine effect beforeHeadSha")
+        sha40(effect["afterHeadSha"], "legacy-machine effect afterHeadSha")
+        if (
+            effect["beforeHeadSha"] != subject["headSha"]
+            or effect["afterHeadSha"] == subject["headSha"]
+            or effect["afterActivation"] != CarrierActivation.ACTIVE.value
+            or effect["afterRole"] != CarrierRole.MACHINE_PUBLICATION.value
+            or effect["sourceId"] != subject["sourceId"]
+            or effect["repositoryId"] != subject["repositoryId"]
+            or effect["outcome"] not in {"CHANGED", "NOOP"}
+            or type(effect["afterMarker"]) is not str
+            or not effect["afterMarker"]
+            or type(effect["reason"]) is not str
+            or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", effect["reason"]) is None
+            or result_class not in {
+                ActivationRecoveryResultClass.APPLIED,
+                ActivationRecoveryResultClass.ALREADY_CONVERGED,
+            }
+        ):
+            raise ValueError("G8 legacy-machine effect does not bind exact fresh ACTIVE v2 H2 authority")
+        return
+
+    if action_class is ActivationRecoveryActionClass.ISSUE_TERMINAL_CLEANUP:
+        exact_keys(
+            subject,
+            {"issueNumber", "fenceId", "cancellationHeadSha"},
+            "Issue terminal-cleanup subject",
+        )
+        positive(subject["issueNumber"], "Issue terminal-cleanup issueNumber")
+        sha40(subject["cancellationHeadSha"], "Issue terminal-cleanup cancellationHeadSha")
+        if result_class is not ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE:
+            raise ValueError("G8 Issue terminal cleanup is pre-epoch deferred only")
+        deferred({"CANCELLATION_CLEANUP_POST_ACTIVE"})
+        return
+
+    if action_class is ActivationRecoveryActionClass.RESERVED_TRANSITION_RECOVERY:
+        owner_keys = {"headSha", "role", "owningPrNumber"}
+        machine_keys = {"headSha", "role", "machineRef", "sourceId", "repositoryId", "marker"}
+        if set(subject) == owner_keys:
+            sha40(subject["headSha"], "reserved-transition headSha")
+            positive(subject["owningPrNumber"], "reserved-transition owningPrNumber")
+            if subject["role"] not in {
+                CarrierRole.ISSUE_ACTIVE.value,
+                CarrierRole.ISSUE_FINALIZING.value,
+                CarrierRole.ISSUE_CANCEL.value,
+            }:
+                raise ValueError("G8 owner reserved transition must use an exact Issue role")
+            if result_class is not ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE:
+                raise ValueError("G8 owner reserved transition recovery is pre-epoch deferred only")
+            deferred({"RESERVED_ISSUE_TRANSITION_POST_ACTIVE"})
+            return
+        if set(subject) == machine_keys:
+            sha40(subject["headSha"], "reserved-machine headSha")
+            positive(subject["repositoryId"], "reserved-machine repositoryId")
+            if (
+                subject["role"] != CarrierRole.MACHINE_PUBLICATION.value
+                or subject["machineRef"] != f"refs/heads/bot/federation/{subject['sourceId']}"
+                or type(subject["marker"]) is not str
+                or not subject["marker"]
+            ):
+                raise ValueError("G8 reserved-machine subject does not bind exact machine authority")
+            exact_keys(effect, {
+                "afterHeadSha", "afterActivation", "afterRole", "afterMarker",
+                "outcome", "sourceId", "repositoryId", "reason",
+            }, "reserved-machine effect")
+            sha40(effect["afterHeadSha"], "reserved-machine afterHeadSha")
+            if (
+                effect["afterActivation"] != CarrierActivation.ACTIVE.value
+                or effect["afterRole"] != CarrierRole.MACHINE_PUBLICATION.value
+                or effect["sourceId"] != subject["sourceId"]
+                or effect["repositoryId"] != subject["repositoryId"]
+                or effect["outcome"] not in {"CHANGED", "NOOP"}
+                or type(effect["afterMarker"]) is not str
+                or not effect["afterMarker"]
+                or type(effect["reason"]) is not str
+                or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", effect["reason"]) is None
+                or result_class not in {
+                    ActivationRecoveryResultClass.APPLIED,
+                    ActivationRecoveryResultClass.ALREADY_CONVERGED,
+                }
+            ):
+                raise ValueError("G8 reserved-machine effect does not prove exact ACTIVE machine recovery")
+            return
+        raise ValueError("G8 reserved-transition subject has an invalid exact shape")
+
+    if action_class is ActivationRecoveryActionClass.ISSUE_REQUEST_RECOVERY:
+        finalizer_keys = {"headSha", "role", "owningPrNumber"}
+        intent_keys = {"centralRepositoryNodeId", "issueNumber", "target"}
+        if set(subject) == finalizer_keys:
+            sha40(subject["headSha"], "Issue recovery headSha")
+            positive(subject["owningPrNumber"], "Issue recovery owningPrNumber")
+            if subject["role"] not in {
+                CarrierRole.ISSUE_ACTIVE.value,
+                CarrierRole.ISSUE_FINALIZING.value,
+            }:
+                raise ValueError("G8 deferred finalizer subject has an invalid role")
+            deferred({"PASSING_FINALIZER_FORBIDDEN_PRE_EPOCH"})
+        elif set(subject) == intent_keys:
+            if subject["centralRepositoryNodeId"] != G8_CENTRAL_REPOSITORY_NODE_ID:
+                raise ValueError("G8 Issue recovery intent repository identity is not frozen")
+            positive(subject["issueNumber"], "Issue recovery intent issueNumber")
+            if subject["target"] not in {
+                Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY.value,
+                Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY.value,
+            }:
+                raise ValueError("G8 Issue recovery intent target is not a closed Wg1 semantic")
+            deferred()
+        else:
+            raise ValueError("G8 Issue recovery subject has an invalid exact shape")
+        if result_class is not ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE:
+            raise ValueError("G8 Issue request recovery is pre-epoch deferred only")
+        return
+
+    raise ValueError("G8 recovery action class has no exact material schema")
+
+
+@dataclass(frozen=True)
+class G8ActivationWorkflowProof:
+    path: str
+    reviewed_blob_oid: str
+    reviewed_blob_sha256: str
+    workflow_id: int
+    workflow_state: str
+
+    def __post_init__(self) -> None:
+        if self.path not in G8_NEW_WRITER_PATHS:
+            raise ValueError("G8 activation workflow proof path is outside the exact six-writer set")
+        if type(self.reviewed_blob_oid) is not str or re.fullmatch(r"[0-9a-f]{40}", self.reviewed_blob_oid) is None:
+            raise ValueError("G8 activation workflow reviewed blob OID must be lowercase 40-hex")
+        if type(self.reviewed_blob_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", self.reviewed_blob_sha256) is None:
+            raise ValueError("G8 activation workflow reviewed blob digest must be lowercase 64-hex")
+        if type(self.workflow_id) is not int or not 1 <= self.workflow_id <= 9_223_372_036_854_775_807:
+            raise ValueError("G8 activation workflow ID must be a positive signed-64 integer")
+        if self.workflow_state != "active":
+            raise ValueError("G8 activation workflow state must be exact active")
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "reviewedBlobOid": self.reviewed_blob_oid,
+            "reviewedBlobSha256": self.reviewed_blob_sha256,
+            "workflowId": self.workflow_id,
+            "workflowState": self.workflow_state,
+        }
+
+
+@dataclass(frozen=True)
+class G8ActivationPreflightResult:
+    boundary: ActivationBoundaryEvidence
+    current_main_oid: str
+    new_workflows: tuple[G8ActivationWorkflowProof, ...]
+    old_path_absence_proof_digest: str
+    old_run_terminal_digest: str
+    six_workflow_identity_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.boundary) is not ActivationBoundaryEvidence:
+            raise ValueError("G8 activation preflight requires exact boundary evidence")
+        if self.current_main_oid != self.boundary.merged_result_oid:
+            raise ValueError("G8 activation preflight current main must equal the exact merged result")
+        if type(self.new_workflows) is not tuple or tuple(item.path for item in self.new_workflows) != G8_NEW_WRITER_PATHS:
+            raise ValueError("G8 activation preflight requires the exact six workflow proofs in contract order")
+        if len({item.workflow_id for item in self.new_workflows}) != len(self.new_workflows):
+            raise ValueError("G8 activation preflight workflow IDs must be unique")
+        for value, label in (
+            (self.old_path_absence_proof_digest, "old path absence proof digest"),
+            (self.old_run_terminal_digest, "old run terminal digest"),
+            (self.six_workflow_identity_digest, "six workflow identity digest"),
+        ):
+            if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"G8 activation preflight {label} must be lowercase 64-hex")
+
+
+@dataclass(frozen=True)
+class G8ActivationRecoveryExecution:
+    preflight: G8ActivationPreflightResult
+    actions: tuple[ActivationRecoveryAction, ...]
+    witness: ActivationRecoveryWitness
+    evidence: ActivationRecoveryEvidence
+    result_digest: str
+    persisted_comment_database_id: int
+
+    def __post_init__(self) -> None:
+        if type(self.preflight) is not G8ActivationPreflightResult:
+            raise ValueError("G8 activation recovery execution requires exact preflight proof")
+        if type(self.actions) is not tuple or any(type(item) is not ActivationRecoveryAction for item in self.actions):
+            raise ValueError("G8 activation recovery execution actions must be exact immutable actions")
+        if type(self.witness) is not ActivationRecoveryWitness or type(self.evidence) is not ActivationRecoveryEvidence:
+            raise ValueError("G8 activation recovery execution requires exact witness/evidence")
+        if tuple(item.sequence for item in self.actions) != tuple(range(len(self.actions))):
+            raise ValueError("G8 activation recovery execution actions must be contiguous and zero-based")
+        if self.evidence.to_witness() != self.witness:
+            raise ValueError("G8 activation recovery execution evidence does not reconstruct the witness")
+        if self.evidence.recovery_action_count != len(self.actions):
+            raise ValueError("G8 activation recovery action count differs from persisted evidence")
+        if self.evidence.ordered_recovery_actions_digest != ordered_recovery_actions_digest(self.actions):
+            raise ValueError("G8 activation recovery action digest differs from persisted evidence")
+        if self.evidence.result_digest() != self.result_digest:
+            raise ValueError("G8 activation recovery result digest differs from canonical evidence")
+        if type(self.persisted_comment_database_id) is not int or not 1 <= self.persisted_comment_database_id <= 9_223_372_036_854_775_807:
+            raise ValueError("G8 activation recovery persistence requires a positive comment database ID")
 
 
 @dataclass(frozen=True)
@@ -231,6 +620,10 @@ class CandidateDiff:
 
 class R02Error(ControllerError):
     """Bounded, secret-free rejection of an R02 state transition."""
+
+
+class PreG8NotApplicableError(R02Error):
+    """The fixed implementation PR exists but has not yet formed a merged G8 boundary."""
 
 
 class StaleAuthorityError(R02Error):
@@ -5964,11 +6357,11 @@ class C02CandidateBuilder:
         commit = self.client.create_commit(self.central_repository, f"Swift Stream federation {request_class.value}\n", tree_object.sha, [accepted_base_sha], timestamp=bot_timestamp)
         return ProposalCandidate(commit.sha, accepted_base_sha, changed, request_class, source_id, repository_id, False)
 
-    def _machine_desired(self, accepted_base_sha: str, source_id: str) -> tuple[dict[str, tuple[str, bytes]], dict[str, tuple[str, str, str]], c02.SourceDeclaration]:
+    def _machine_desired(self, accepted_base_sha: str, source_id: str) -> tuple[dict[str, tuple[str, bytes]], dict[str, tuple[str, str, str]], c02.SourceDeclaration, RepositoryMetadata]:
         """Compute machine bytes through C02, returning no trust/configuration bytes."""
         if self._capsule_temp_root is None:
             raise R02Error("C02 machine planning requires the trusted execution capsule")
-        _repository, _ = self._current_base(accepted_base_sha)
+        repository, _ = self._current_base(accepted_base_sha)
         accepted_manifest, accepted_lock, accepted_readme, tree = self._central_state(accepted_base_sha)
         sources = [item for item in accepted_manifest.sources if item.source_id == source_id]
         if len(sources) != 1:
@@ -6001,9 +6394,9 @@ class C02CandidateBuilder:
         for path, (_mode, object_type, _sha) in tree.items():
             if path.startswith("skills/") and object_type == "blob" and path not in files:
                 files[path] = ("", b"")
-        return files, tree, sources[0]
+        return files, tree, sources[0], repository
 
-    def _machine_plan(self, accepted_base_sha: str, source_id: str) -> tuple[dict[str, tuple[str, bytes]], dict[str, tuple[str, str, str]], c02.SourceDeclaration]:
+    def _machine_plan(self, accepted_base_sha: str, source_id: str) -> tuple[dict[str, tuple[str, bytes]], dict[str, tuple[str, str, str]], c02.SourceDeclaration, RepositoryMetadata]:
         with trusted_c02_execution() as temp_root:
             self._capsule_temp_root = temp_root
             try:
@@ -6011,10 +6404,18 @@ class C02CandidateBuilder:
             finally:
                 self._capsule_temp_root = None
 
-    def machine_candidate(self, accepted_base_sha: str, source_id: str) -> ProposalCandidate:
-        desired, tree, source = self._machine_plan(accepted_base_sha, source_id)
+    def _machine_candidate(
+        self,
+        accepted_base_sha: str,
+        source_id: str,
+        *,
+        require_claim_generation: bool,
+    ) -> ProposalCandidate:
+        if type(require_claim_generation) is not bool:
+            raise R02Error("machine claim-generation requirement must be an exact bool")
+        desired, tree, source, repository = self._machine_plan(accepted_base_sha, source_id)
         changed = tuple(sorted(path for path, (mode, data) in desired.items() if mode == "" or tree.get(path, (None, None, None))[:2] != (mode, "blob") or (mode != "" and path in tree and self.client.get_blob(self.central_repository, tree[path][2]) != data)))
-        if not changed:
+        if not changed and not require_claim_generation:
             return ProposalCandidate(accepted_base_sha, accepted_base_sha, (), RequestClass.MACHINE_PUBLICATION, source.source_id, source.repository_id, False)
         base_tree, _entries = self.client.get_commit_tree(self.central_repository, accepted_base_sha)
         updates: list[Mapping[str, Any]] = []
@@ -6025,17 +6426,20 @@ class C02CandidateBuilder:
             else:
                 blob = self.client.create_blob(self.central_repository, base64.b64encode(data).decode("ascii"))
                 updates.append({"path": path, "mode": mode, "type": "blob", "sha": blob.sha})
-        tree_object = self.client.create_tree(self.central_repository, base_tree, updates)
+        candidate_tree_sha = (
+            self.client.create_tree(self.central_repository, base_tree, updates).sha
+            if updates
+            else base_tree
+        )
         bot_timestamp = self.client.bot_commit_timestamp_after(self.central_repository, accepted_base_sha)
         changed_paths = tuple(sorted(changed, key=lambda item: item.encode("utf-8")))
         scope_digest = hashlib.sha256(
             b"swiftstream-federation-machine-ref-claim-scope:v1\n"
             + json.dumps(
-                {"schemaVersion": 1, "candidateTreeSha": tree_object.sha, "changedPaths": list(changed_paths)},
+                {"schemaVersion": 1, "candidateTreeSha": candidate_tree_sha, "changedPaths": list(changed_paths)},
                 ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
             ).encode("utf-8")
         ).hexdigest()
-        repository, _current_main = self._current_base(accepted_base_sha)
         owner_key = f"{repository.node_id}:{source.source_id}"
         # Build the marker with one nonce value; no ref preimage participates.
         nonce = new_carrier_nonce()
@@ -6048,7 +6452,7 @@ class C02CandidateBuilder:
                 machine_ref=f"refs/heads/{_machine_branch(source.source_id)}",
                 accepted_base_sha=accepted_base_sha,
                 accepted_base_tree_sha=base_tree,
-                candidate_tree_sha=tree_object.sha,
+                candidate_tree_sha=candidate_tree_sha,
                 candidate_scope_digest=scope_digest,
             ),
             carrier_nonce=nonce,
@@ -6065,14 +6469,33 @@ class C02CandidateBuilder:
             "MACHINE_REF_CLAIM", CarrierRole.MACHINE_PUBLICATION.value, "MACHINE_SOURCE",
             owner_key, generation, nonce, "MACHINE_PUBLICATION",
         )
-        commit = self.client.create_commit(self.central_repository, marker.render(), tree_object.sha, [accepted_base_sha], timestamp=bot_timestamp)
+        commit = self.client.create_commit(self.central_repository, marker.render(), candidate_tree_sha, [accepted_base_sha], timestamp=bot_timestamp)
         return ProposalCandidate(
             commit.sha, accepted_base_sha, changed_paths, RequestClass.MACHINE_PUBLICATION,
-            source.source_id, source.repository_id, True, marker, tree_object.sha,
+            source.source_id, source.repository_id, True, marker, candidate_tree_sha,
+        )
+
+    def machine_candidate(self, accepted_base_sha: str, source_id: str) -> ProposalCandidate:
+        return self._machine_candidate(
+            accepted_base_sha,
+            source_id,
+            require_claim_generation=False,
+        )
+
+    def machine_claim_candidate(self, accepted_base_sha: str, source_id: str) -> ProposalCandidate:
+        """Create a fresh v2 claimed head even when the desired tree is byte-identical.
+
+        This is reserved for exact legacy H -> fresh H2 authority migration. Ordinary
+        machine reconciliation keeps its no-diff NOOP behavior.
+        """
+        return self._machine_candidate(
+            accepted_base_sha,
+            source_id,
+            require_claim_generation=True,
         )
 
     def validate_machine_head(self, accepted_base_sha: str, source_id: str, head_sha: str) -> tuple[bool, str]:
-        desired, base_tree, source = self._machine_plan(accepted_base_sha, source_id)
+        desired, base_tree, source, _repository = self._machine_plan(accepted_base_sha, source_id)
         if source.source_id != source_id:
             return False, "MACHINE_SOURCE_MISMATCH"
         _tree_sha, entries = self.client.get_commit_tree(self.central_repository, head_sha)
@@ -6312,11 +6735,6 @@ class R02Controller:
                 or merged_pr.pull_request_node_id != "PR_kwDOUId1T88AAAABHO6OqA"
                 or merged_pr.pull_request_database_id != 4780363432
                 or merged_pr.pull_request_number != 27
-                or merged_pr.state != "CLOSED"
-                or merged_pr.is_draft is not False
-                or merged_pr.merged is not True
-                or merged_pr.merged_at is None
-                or merged_pr.merge_commit_oid is None
                 or merged_pr.head_ref != "g8/issue-first-federation-implementation"
                 or merged_pr.base_ref != "main"
                 or merged_pr.head_repository_node_id != "R_kgDOUId1Tw"
@@ -6326,7 +6744,22 @@ class R02Controller:
                 or merged_pr.base_repository_database_id != 1351054671
                 or merged_pr.base_repository_full_name != "swiftstream/skills"
             ):
-                raise R02Error("trusted merged PR identity/topology does not match the frozen implementation PR")
+                raise R02Error("trusted implementation PR identity/topology does not match the frozen implementation PR")
+            if (
+                merged_pr.state == "OPEN"
+                and merged_pr.merged is False
+                and merged_pr.merged_at is None
+                and merged_pr.merge_commit_oid is None
+            ):
+                raise PreG8NotApplicableError("fixed implementation PR has not formed a merged G8 boundary")
+            if (
+                merged_pr.state != "CLOSED"
+                or merged_pr.is_draft is not False
+                or merged_pr.merged is not True
+                or merged_pr.merged_at is None
+                or merged_pr.merge_commit_oid is None
+            ):
+                raise R02Error("fixed implementation PR merge state is contradictory")
             merged_result_oid = merged_pr.merge_commit_oid
             try:
                 compare_status, compare_base, compare_merge_base = self.client.compare_commits(
@@ -6389,6 +6822,1779 @@ class R02Controller:
             raise
         except (RequestModelError, GitHubAPIError, ValueError, TypeError) as error:
             raise R02Error(f"trusted activation boundary derivation failed: {_bounded_reason(error)}") from None
+
+    @staticmethod
+    def _g8_authority_surface_paths() -> frozenset[str]:
+        return frozenset({
+            ".github/federation/g8-activation-contract.json",
+            ".github/federation/g8-authority-surface.json",
+            *G8_NEW_WRITER_PATHS,
+            "automation/federation/__init__.py",
+            "automation/federation/controller.py",
+            "automation/federation/github_api.py",
+            "automation/federation/request_model.py",
+            "automation/federation/workspace.py",
+            "scripts/federate.py",
+        })
+
+    def _require_current_g8_guard_surface(
+        self,
+        boundary: ActivationBoundaryEvidence,
+    ) -> str:
+        if type(boundary) is not ActivationBoundaryEvidence:
+            raise R02Error("G8 guard surface validation requires exact ActivationBoundaryEvidence")
+        trusted_checkout = self.environ.get("FEDERATION_TRUSTED_CHECKOUT_SHA")
+        if type(trusted_checkout) is not str or re.fullmatch(r"[0-9a-f]{40}", trusted_checkout) is None:
+            raise R02Error("G8 guard trusted checkout SHA is missing or malformed")
+        repository, current_main = self.current_accepted_main()
+        if (
+            repository.full_name != "swiftstream/skills"
+            or repository.node_id != G8_CENTRAL_REPOSITORY_NODE_ID
+            or repository.id != 1351054671
+            or repository.default_branch != "main"
+        ):
+            raise R02Error("G8 guard fresh repository identity is not the frozen central repository")
+        if current_main != trusted_checkout:
+            raise R02Error("G8 guard trusted checkout is stale relative to protected main")
+        try:
+            compare_status, compare_base, compare_merge_base = self.client.compare_commits(
+                self.central_repository,
+                boundary.merged_result_oid,
+                current_main,
+            )
+        except Exception as error:
+            raise R02Error(f"G8 guard merged-result containment is unavailable: {_bounded_reason(error)}") from None
+        if compare_base != boundary.merged_result_oid or not (
+            compare_status == "identical"
+            and current_main == boundary.merged_result_oid
+            and compare_merge_base == boundary.merged_result_oid
+            or compare_status == "ahead"
+            and compare_merge_base == boundary.merged_result_oid
+        ):
+            raise R02Error("G8 guard current main no longer contains the activation merged result")
+
+        try:
+            _merged_tree, merged_entries = self.client.get_commit_tree(
+                self.central_repository, boundary.merged_result_oid,
+            )
+            _current_tree, current_entries = self.client.get_commit_tree(
+                self.central_repository, current_main,
+            )
+        except Exception as error:
+            raise R02Error(f"G8 guard authority surface tree read failed: {_bounded_reason(error)}") from None
+        merged_by_path = {entry.path: entry for entry in merged_entries}
+        current_by_path = {entry.path: entry for entry in current_entries}
+        if len(merged_by_path) != len(merged_entries) or len(current_by_path) != len(current_entries):
+            raise R02Error("G8 guard authority surface tree contains duplicate paths")
+        for authority_path in self._g8_authority_surface_paths():
+            merged = merged_by_path.get(authority_path)
+            current = current_by_path.get(authority_path)
+            if (
+                merged is None
+                or current is None
+                or merged.object_type != "blob"
+                or current.object_type != "blob"
+                or merged.mode not in {"100644", "100755"}
+                or current.mode != merged.mode
+                or current.sha != merged.sha
+            ):
+                raise R02Error("G8 guard current authority surface differs from activated reviewed surface")
+        return current_main
+
+    @staticmethod
+    def _g8_positive_run_env(environ: Mapping[str, str], key: str) -> int:
+        value = environ.get(key)
+        if type(value) is not str or re.fullmatch(r"[1-9][0-9]{0,18}", value) is None:
+            raise R02Error(f"{key} must be an exact positive decimal integer")
+        parsed = int(value)
+        if parsed > 9_223_372_036_854_775_807:
+            raise R02Error(f"{key} exceeds the signed-64 bound")
+        return parsed
+
+    def _require_g8_activation_run_authority(
+        self,
+        mode: str,
+    ) -> tuple[int, int, str]:
+        if mode != "activate-g8":
+            raise R02Error("G8 activation mode must be exact activate-g8")
+        if self.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+            raise R02Error("G8 activation requires exact workflow_dispatch event authority")
+        if self.environ.get("GITHUB_REF") != "refs/heads/main":
+            raise R02Error("G8 activation requires exact refs/heads/main trigger ref")
+        actor = self.environ.get("GITHUB_ACTOR")
+        if (
+            type(actor) is not str
+            or not 1 <= len(actor) <= 128
+            or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,126}[A-Za-z0-9])?", actor) is None
+        ):
+            raise R02Error("G8 activation actor login is missing or malformed")
+        run_id = self._g8_positive_run_env(self.environ, "GITHUB_RUN_ID")
+        run_attempt = self._g8_positive_run_env(self.environ, "GITHUB_RUN_ATTEMPT")
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            if (
+                type(repository) is not RepositoryMetadata
+                or repository.full_name != "swiftstream/skills"
+                or repository.node_id != G8_CENTRAL_REPOSITORY_NODE_ID
+                or repository.id != 1_351_054_671
+                or repository.default_branch != "main"
+            ):
+                raise R02Error("G8 activation repository identity/default branch is not exact")
+            permission = self.client.get_collaborator_permission(self.central_repository, actor)
+        except R02Error:
+            raise
+        except Exception as error:
+            raise R02Error(f"G8 activation actor authorization is unavailable: {_bounded_reason(error)}") from None
+        if permission != "admin":
+            raise R02Error("G8 activation initiating actor does not have exact admin permission")
+        guard = self.derive_g8_activation_guard()
+        if guard != _g8_activation_guard_result(G8RuntimeState.MERGED_UNPROVEN):
+            raise R02Error("G8 activation requires exact MERGED_UNPROVEN guard authority")
+        return run_id, run_attempt, actor
+
+    def g8_activation_preflight_decision(self) -> str:
+        """Authorize the read-only workflow gate and return a closed decision."""
+        if self.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+            raise R02Error("G8 activation requires exact workflow_dispatch event authority")
+        if self.environ.get("GITHUB_REF") != "refs/heads/main":
+            raise R02Error("G8 activation requires exact refs/heads/main trigger ref")
+        if self.environ.get("INPUT_MODE") != "activate-g8":
+            raise R02Error("G8 activation requires exact activate-g8 dispatch input")
+        trusted_sha = self.environ.get("FEDERATION_TRUSTED_CHECKOUT_SHA")
+        if type(trusted_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", trusted_sha) is None:
+            raise R02Error("G8 activation trusted checkout SHA is missing or malformed")
+        self._g8_positive_run_env(self.environ, "GITHUB_RUN_ID")
+        self._g8_positive_run_env(self.environ, "GITHUB_RUN_ATTEMPT")
+        actor = self.environ.get("GITHUB_ACTOR")
+        if type(actor) is not str or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,126}[A-Za-z0-9])?", actor) is None:
+            raise R02Error("G8 activation actor login is missing or malformed")
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            permission = self.client.get_collaborator_permission(self.central_repository, actor)
+        except Exception as error:
+            raise R02Error(f"G8 activation actor authorization is unavailable: {_bounded_reason(error)}") from None
+        if (
+            type(repository) is not RepositoryMetadata
+            or repository.full_name != "swiftstream/skills"
+            or repository.node_id != G8_CENTRAL_REPOSITORY_NODE_ID
+            or repository.id != 1_351_054_671
+            or repository.default_branch != "main"
+            or permission != "admin"
+        ):
+            raise R02Error("G8 activation repository/admin authorization is not exact")
+        guard = self.derive_g8_activation_guard()
+        if guard == _g8_activation_guard_result(G8RuntimeState.ACTIVE_G8):
+            return "ACTIVE_NOOP"
+        if guard == _g8_activation_guard_result(G8RuntimeState.MERGED_UNPROVEN):
+            try:
+                boundary = self.derive_activation_boundary_evidence()
+                activation_branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+                if f"refs/heads/{activation_branch}" != G8_ACTIVATION_REF:
+                    raise R02Error("G8 activation ref constant is malformed")
+                expected_activation_ref = self.client.get_optional_ref_oid(
+                    self.central_repository, activation_branch,
+                )
+                self._g8_activation_preflight(
+                    boundary,
+                    expected_activation_ref=expected_activation_ref,
+                )
+            except R02Error:
+                raise
+            except Exception as error:
+                raise R02Error(
+                    f"G8 activation read-only preflight is unavailable: {_bounded_reason(error)}"
+                ) from None
+            return "READY"
+        return "BLOCKED"
+
+    def _g8_activation_preflight(
+        self,
+        boundary: ActivationBoundaryEvidence,
+        *,
+        expected_activation_ref: str | None = None,
+    ) -> G8ActivationPreflightResult:
+        if type(boundary) is not ActivationBoundaryEvidence:
+            raise R02Error("G8 activation preflight requires exact boundary evidence")
+        fresh_boundary = self.derive_activation_boundary_evidence()
+        if fresh_boundary != boundary:
+            raise R02Error("G8 activation boundary changed before preflight")
+        current_main = self._require_current_g8_guard_surface(boundary)
+        if current_main != boundary.merged_result_oid:
+            raise R02Error("G8 activation requires current main equal to exact implementation merged result")
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            current_main_again = self.client.get_ref_oid(self.central_repository, "main")
+            current_tree_sha, current_entries = self.client.get_commit_tree(
+                self.central_repository, current_main_again,
+            )
+            del current_tree_sha
+        except Exception as error:
+            raise R02Error(f"G8 activation preflight current tree is unavailable: {_bounded_reason(error)}") from None
+        if (
+            type(repository) is not RepositoryMetadata
+            or repository.full_name != "swiftstream/skills"
+            or repository.node_id != G8_CENTRAL_REPOSITORY_NODE_ID
+            or repository.id != 1_351_054_671
+            or repository.default_branch != "main"
+            or current_main_again != current_main
+        ):
+            raise R02Error("G8 activation repository/main changed during preflight")
+        by_path = {entry.path: entry for entry in current_entries}
+        if len(by_path) != len(current_entries):
+            raise R02Error("G8 activation current main tree contains duplicate paths")
+
+        old_path_rows = []
+        for path, workflow_id in sorted(G8_OLD_WRITERS, key=lambda item: item[0].encode("utf-8")):
+            old_path_rows.append({
+                "path": path,
+                "historicWorkflowId": workflow_id,
+                "pathPresent": path in by_path,
+            })
+        try:
+            old_path_digest = old_path_absence_proof_digest(
+                boundary.merged_result_oid,
+                current_main,
+                old_path_rows,
+            )
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation old writer path proof failed: {_bounded_reason(error)}") from None
+
+        workflow_proofs: list[G8ActivationWorkflowProof] = []
+        seen_workflow_ids: set[int] = set()
+        for path in G8_NEW_WRITER_PATHS:
+            entry = by_path.get(path)
+            if (
+                entry is None
+                or entry.object_type != "blob"
+                or entry.mode not in {"100644", "100755"}
+            ):
+                raise R02Error("G8 activation exact new workflow blob is missing from current main")
+            try:
+                blob_bytes = self.client.get_blob(self.central_repository, entry.sha)
+                by_path_metadata = self.client.get_workflow_metadata_by_path(
+                    self.central_repository, path,
+                )
+                if type(by_path_metadata) is not WorkflowMetadata:
+                    raise R02Error("G8 activation workflow path lookup returned the wrong model")
+                by_id_metadata = self.client.get_workflow_metadata_by_id(
+                    self.central_repository, by_path_metadata.id,
+                )
+            except R02Error:
+                raise
+            except Exception as error:
+                raise R02Error(f"G8 activation new workflow identity is unavailable: {_bounded_reason(error)}") from None
+            if (
+                type(by_id_metadata) is not WorkflowMetadata
+                or by_id_metadata != by_path_metadata
+                or by_path_metadata.path != path
+                or by_path_metadata.state != "active"
+                or by_path_metadata.id in seen_workflow_ids
+            ):
+                raise R02Error("G8 activation new workflow path/ID/state mapping is ambiguous")
+            seen_workflow_ids.add(by_path_metadata.id)
+            workflow_proofs.append(G8ActivationWorkflowProof(
+                path,
+                entry.sha,
+                hashlib.sha256(blob_bytes).hexdigest(),
+                by_path_metadata.id,
+                by_path_metadata.state,
+            ))
+        try:
+            workflow_digest = six_workflow_identity_digest(
+                tuple(item.as_value() for item in workflow_proofs),
+            )
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation six-workflow identity proof failed: {_bounded_reason(error)}") from None
+
+        old_run_rows: list[dict[str, Any]] = []
+        for path, workflow_id in G8_OLD_WRITERS:
+            try:
+                metadata = self.client.get_workflow_metadata_by_id(
+                    self.central_repository, workflow_id,
+                )
+            except NotFoundError:
+                old_run_rows.append({
+                    "path": path,
+                    "historicWorkflowId": workflow_id,
+                    "enumerationState": "DELETED_ID_UNAVAILABLE",
+                    "runs": [],
+                })
+                continue
+            except Exception as error:
+                raise R02Error(f"G8 activation old workflow identity is unavailable: {_bounded_reason(error)}") from None
+            if (
+                type(metadata) is not WorkflowMetadata
+                or metadata.id != workflow_id
+                or metadata.path != path
+                or metadata.state == "active"
+            ):
+                raise R02Error("G8 activation old workflow remains active or has identity drift")
+            try:
+                runs = self.client.list_workflow_runs(
+                    self.central_repository, workflow_id, max_pages=100,
+                )
+            except Exception as error:
+                raise R02Error(f"G8 activation old workflow run inventory is unavailable: {_bounded_reason(error)}") from None
+            normalized_runs: list[dict[str, Any]] = []
+            for run in sorted(runs, key=lambda item: (item.id, item.run_attempt)):
+                if type(run) is not WorkflowRunMetadata or run.workflow_id != workflow_id:
+                    raise R02Error("G8 activation old workflow run inventory contains the wrong model")
+                if run.status != "completed":
+                    raise R02Error("G8 activation old workflow has a nonterminal run")
+                normalized_runs.append({
+                    "runId": run.id,
+                    "runAttempt": run.run_attempt,
+                    "status": run.status,
+                    "conclusion": run.conclusion,
+                    "event": run.event,
+                    "headBranch": run.head_branch,
+                    "headSha": run.head_sha,
+                })
+            old_run_rows.append({
+                "path": path,
+                "historicWorkflowId": workflow_id,
+                "enumerationState": "COMPLETE",
+                "runs": normalized_runs,
+            })
+        try:
+            old_run_digest = old_run_terminal_proof_digest(old_run_rows)
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation old-run terminal proof failed: {_bounded_reason(error)}") from None
+
+        try:
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            if current_app != self.app:
+                raise R02Error("G8 activation App/Bot identity changed during preflight")
+            activation_branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+            if f"refs/heads/{activation_branch}" != G8_ACTIVATION_REF:
+                raise R02Error("G8 activation ref constant is malformed")
+            observed_activation_ref = self.client.get_optional_ref_oid(
+                self.central_repository, activation_branch,
+            )
+            if observed_activation_ref != expected_activation_ref:
+                raise StaleAuthorityError("G8 activation ref changed during final preflight")
+            statuses = self.client.list_commit_statuses(
+                self.central_repository, boundary.merged_result_oid,
+            )
+        except R02Error:
+            raise
+        except Exception as error:
+            raise R02Error(f"G8 activation ref/status preflight is unavailable: {_bounded_reason(error)}") from None
+        if any(
+            status.context == G8_ACTIVATION_STATUS_CONTEXT
+            and status.creator_database_id == current_app.bot_id
+            and status.creator_node_id == current_app.bot_node_id
+            and status.creator_login == current_app.bot_login
+            and status.creator_type == "Bot"
+            for status in statuses
+        ):
+            raise R02Error("G8 activation preflight found a conflicting exact-App activation status")
+
+        return G8ActivationPreflightResult(
+            boundary,
+            current_main,
+            tuple(workflow_proofs),
+            old_path_digest,
+            old_run_digest,
+            workflow_digest,
+        )
+
+    @staticmethod
+    def _g8_activation_inventory_material(
+        result: Wave08UniversalRecoveryResult,
+        preflight: G8ActivationPreflightResult,
+    ) -> dict[str, Any]:
+        if type(result) is not Wave08UniversalRecoveryResult:
+            raise R02Error("G8 activation inventory requires exact universal recovery evidence")
+        if type(preflight) is not G8ActivationPreflightResult:
+            raise R02Error("G8 activation inventory requires exact preflight evidence")
+        if result.status_actions:
+            raise R02Error("G8 activation read-only inventory unexpectedly contains status actions")
+
+        decisions: list[dict[str, Any]] = []
+        for decision in result.decisions:
+            marker = decision.resolution.marker
+            decisions.append({
+                "headSha": decision.head_sha,
+                "activation": decision.resolution.activation.value,
+                "role": None if decision.resolution.role is None else decision.resolution.role.value,
+                "marker": None if marker is None else marker.render(),
+                "pullRequestNumbers": list(decision.pull_request_numbers),
+                "owningPrNumber": decision.owning_pr_number,
+                "kind": decision.kind.value,
+                "reason": decision.reason.value,
+                "dispatchTarget": None if decision.dispatch_target is None else decision.dispatch_target.value,
+            })
+        issues = [{
+            "issueNumber": item.issue_number,
+            "issueDatabaseId": item.issue_database_id,
+            "issueNodeId": item.issue_node_id,
+            "outcome": item.outcome,
+            "reason": item.reason,
+        } for item in result.issue_recoveries]
+        machine_refs = [{
+            "ref": item.ref,
+            "sourceId": item.source_id,
+            "headSha": item.head_sha,
+            "outcome": item.outcome,
+            "reason": item.reason,
+        } for item in result.machine_refs]
+        intents = [{
+            "target": item.target.value,
+            "centralRepositoryNodeId": item.central_repository_node_id,
+            "issueNumber": item.issue_number,
+            "reason": item.reason,
+        } for item in result.dispatch_intents]
+        return {
+            "complete": result.complete,
+            "openPrInventoryCount": result.open_pr_inventory_count,
+            "freshPrCount": result.fresh_pr_count,
+            "distinctPrHeadCount": result.distinct_pr_head_count,
+            "issueInventoryCount": result.issue_inventory_count,
+            "relevantIssueCount": result.relevant_issue_count,
+            "machineRefInventoryCount": result.machine_ref_inventory_count,
+            "decisions": decisions,
+            "issueRecoveries": issues,
+            "machineRefs": machine_refs,
+            "dispatchIntents": intents,
+            "blockedReasons": list(result.blocked_reasons),
+            "deferredCount": result.deferred_count,
+            "oldPathAbsenceProofDigest": preflight.old_path_absence_proof_digest,
+            "oldRunTerminalDigest": preflight.old_run_terminal_digest,
+            "sixWorkflowIdentityDigest": preflight.six_workflow_identity_digest,
+        }
+
+    @staticmethod
+    def _g8_activation_fatal_pre_recovery_reasons(
+        result: Wave08UniversalRecoveryResult,
+    ) -> tuple[str, ...]:
+        if type(result) is not Wave08UniversalRecoveryResult:
+            raise R02Error("G8 activation PRE blocker filter requires exact universal recovery evidence")
+        decisions_by_head = {decision.head_sha: decision for decision in result.decisions}
+        recoverable: set[str] = set()
+        for record in result.machine_refs:
+            decision = decisions_by_head.get(record.head_sha)
+            if decision is None or decision.kind not in {
+                Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED,
+                Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED,
+            }:
+                continue
+            recoverable.add(f"{record.ref}:SHA_ROLE_DOES_NOT_AUTHORIZE_MACHINE_RECOVERY")
+        return tuple(
+            reason for reason in result.blocked_reasons
+            if reason not in recoverable
+        )
+
+    @staticmethod
+    def _g8_require_post_machine_refs_converged(
+        result: Wave08UniversalRecoveryResult,
+    ) -> None:
+        if type(result) is not Wave08UniversalRecoveryResult:
+            raise R02Error("G8 activation POST machine-ref proof requires exact universal recovery evidence")
+        unresolved = tuple(
+            record for record in result.machine_refs
+            if record.outcome != "DISPATCHED"
+        )
+        if unresolved:
+            raise R02Error("G8 activation POST inventory contains a non-converged machine ref")
+
+    def _g8_activation_recovery_mutation_guard(
+        self,
+        boundary: ActivationBoundaryEvidence,
+    ) -> None:
+        fresh_boundary = self.derive_activation_boundary_evidence()
+        if fresh_boundary != boundary:
+            raise StaleAuthorityError("G8 activation boundary changed before recovery mutation")
+        current_main = self._require_current_g8_guard_surface(boundary)
+        if current_main != boundary.merged_result_oid:
+            raise StaleAuthorityError("G8 activation main moved before recovery mutation")
+        guard = self.derive_g8_activation_guard()
+        if guard != _g8_activation_guard_result(G8RuntimeState.MERGED_UNPROVEN):
+            raise StaleAuthorityError("G8 activation guard changed before recovery mutation")
+
+    def _g8_recover_cancel_failure(
+        self,
+        decision: Wave08Decision,
+        boundary: ActivationBoundaryEvidence,
+    ) -> tuple[IssueCancellationFence, ExactAppRequiredStatusSnapshot, bool]:
+        if (
+            type(decision) is not Wave08Decision
+            or decision.kind is not Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY
+            or decision.owning_pr_number is None
+            or decision.resolution.marker is None
+        ):
+            raise R02Error("G8 activation cancellation recovery requires exact ISSUE_CANCEL decision")
+        owner = derive_issue_owner_pr(
+            self.client,
+            self.central_repository,
+            decision.head_sha,
+            decision.resolution,
+            self.app.slug,
+            role_already_resolved=True,
+        )
+        if owner.pull_request_number != decision.owning_pr_number:
+            raise R02Error("G8 activation cancellation owner differs from role-first inventory")
+        current_app = resolve_app_identity(self.client, self.app.slug)
+        if current_app != self.app:
+            raise R02Error("G8 activation cancellation App identity changed")
+        authority = _fresh_issue_cancellation_authority(
+            self.client,
+            self.central_repository,
+            owner.issue_number,
+            current_app,
+            allow_pr_stage_state=True,
+        )
+        current_ref = _read_issue_branch_ref(
+            self.client,
+            self.central_repository,
+            authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        fences, _comments = self._read_issue_cancellation_fences(
+            authority,
+            current_ref or ZERO_OID,
+        )
+        exact = tuple(
+            item.fence
+            for item in fences
+            if (
+                item.fence.cancellation_head_sha == decision.head_sha
+                and _issue_cancellation_fence_marker(item.fence) == decision.resolution.marker
+            )
+        )
+        if (
+            len(exact) != 1
+            or authority.pull_request_number != owner.pull_request_number
+            or current_ref != decision.head_sha
+            or authority.pr.head_oid != decision.head_sha
+            or authority.raw_pr_state != "OPEN"
+            or authority.raw_pr_merged
+        ):
+            raise StaleAuthorityError("G8 activation cancellation authority changed before failure publication")
+        fence = exact[0]
+        existing = _latest_exact_cancel_status_evidence(
+            self.client,
+            self.central_repository,
+            fence,
+            self.app,
+        )
+        self._g8_activation_recovery_mutation_guard(boundary)
+        snapshot = self.publish_issue_cancel_failure(owner.issue_number, fence)
+        return fence, snapshot, existing is not None
+
+    def _g8_exact_app_recovery_evidence_comments(
+        self,
+        app: AppIdentity,
+    ) -> tuple[tuple[IssueComment, ActivationRecoveryEvidence, str], ...]:
+        if type(app) is not AppIdentity:
+            raise R02Error("G8 recovery evidence scan requires exact App identity")
+        try:
+            comments = self.client.list_issue_comments(
+                self.central_repository,
+                G8_IMPLEMENTATION_PR_NUMBER,
+            )
+        except Exception as error:
+            raise R02Error(f"G8 recovery evidence thread is unavailable: {_bounded_reason(error)}") from None
+        found: list[tuple[IssueComment, ActivationRecoveryEvidence, str]] = []
+        for comment in comments:
+            body = comment.body
+            if type(body) is not str or not body.startswith(G8_ACTIVATION_RECOVERY_EVIDENCE_MARKER):
+                continue
+            exact_app = (
+                comment.author_id == app.bot_node_id
+                and comment.author_login == app.bot_login
+                and comment.author_type in {None, "Bot"}
+            )
+            if not exact_app:
+                continue
+            if _issue_comment_edited(comment):
+                raise R02Error("exact-App G8 recovery evidence comment was edited")
+            try:
+                evidence = parse_activation_recovery_evidence(body)
+                digest = activation_recovery_result_digest(evidence)
+            except (RequestModelError, ValueError, TypeError) as error:
+                raise R02Error(f"exact-App G8 recovery evidence is malformed: {_bounded_reason(error)}") from None
+            found.append((comment, evidence, digest))
+        found.sort(key=lambda item: item[0].database_id)
+        return tuple(found)
+
+    def _persist_g8_activation_recovery_evidence(
+        self,
+        evidence: ActivationRecoveryEvidence,
+        app: AppIdentity,
+        boundary: ActivationBoundaryEvidence,
+    ) -> int:
+        if type(evidence) is not ActivationRecoveryEvidence:
+            raise R02Error("G8 activation persistence requires exact recovery evidence")
+        if type(app) is not AppIdentity or type(boundary) is not ActivationBoundaryEvidence:
+            raise R02Error("G8 activation persistence requires exact App/boundary authority")
+        if app != self.app:
+            raise R02Error("G8 activation persistence App identity differs from configured exact App")
+        if (
+            evidence.central_repository_node_id != boundary.central_repository_node_id
+            or evidence.implementation_pr_number != boundary.implementation_pr_number
+            or evidence.implementation_pr_database_id != boundary.implementation_pr_database_id
+            or evidence.implementation_pr_node_id != boundary.implementation_pr_node_id
+            or evidence.activation_boundary_id != boundary.activation_boundary_id
+            or evidence.merged_result_oid != boundary.merged_result_oid
+            or evidence.authority_surface_digest != boundary.authority_surface_digest
+            or evidence.new_writer_topology_digest != boundary.new_writer_topology_digest
+        ):
+            raise R02Error("G8 activation persistence evidence does not bind the selected boundary")
+        body = evidence.render()
+        run_key = (
+            evidence.activation_boundary_id,
+            evidence.activation_run_id,
+            evidence.activation_run_attempt,
+        )
+
+        def select(
+            rows: tuple[tuple[IssueComment, ActivationRecoveryEvidence, str], ...],
+        ) -> int | None:
+            same_run = [
+                (comment, candidate)
+                for comment, candidate, _digest in rows
+                if (
+                    candidate.activation_boundary_id,
+                    candidate.activation_run_id,
+                    candidate.activation_run_attempt,
+                ) == run_key
+            ]
+            bodies = {candidate.render() for _comment, candidate in same_run}
+            if len(bodies) > 1:
+                raise R02Error("G8 recovery evidence has conflicting exact-App same-run bodies")
+            if same_run and bodies != {body}:
+                raise R02Error("G8 recovery evidence same-run key is already bound to different content")
+            exact = [
+                comment.database_id
+                for comment, candidate in same_run
+                if candidate.render() == body
+            ]
+            return min(exact) if exact else None
+
+        existing = select(self._g8_exact_app_recovery_evidence_comments(app))
+        if existing is not None:
+            return existing
+
+        self._g8_activation_recovery_mutation_guard(boundary)
+        post_error: Exception | None = None
+        try:
+            self.client.create_issue_comment(
+                self.central_repository,
+                G8_IMPLEMENTATION_PR_NUMBER,
+                body,
+            )
+        except Exception as error:
+            post_error = error
+
+        # The POST response is never persistence authority. Full immutable thread
+        # read-back is mandatory for success and also resolves response-loss.
+        try:
+            reread = self._g8_exact_app_recovery_evidence_comments(app)
+            persisted = select(reread)
+        except Exception:
+            raise
+        if persisted is not None:
+            return persisted
+        if post_error is not None:
+            raise R02Error(
+                f"G8 recovery evidence POST was not confirmed by durable read-back: {_bounded_reason(post_error)}"
+            ) from None
+        raise R02Error("G8 recovery evidence POST returned but durable read-back did not contain exact evidence")
+
+    def _g8_recovery_action(
+        self,
+        sequence: int,
+        action_class: ActivationRecoveryActionClass,
+        subject: Mapping[str, Any],
+        effect: Mapping[str, Any],
+        result_class: ActivationRecoveryResultClass,
+    ) -> ActivationRecoveryAction:
+        try:
+            subject_value = dict(subject)
+            effect_value = dict(effect)
+            _g8_validate_recovery_action_material(
+                action_class,
+                subject_value,
+                effect_value,
+                result_class,
+            )
+            return ActivationRecoveryAction(
+                1,
+                sequence,
+                action_class,
+                _g8_recovery_material_digest(_G8_RECOVERY_SUBJECT_PREFIX, subject_value),
+                _g8_recovery_material_digest(_G8_RECOVERY_EFFECT_PREFIX, effect_value),
+                result_class,
+            )
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation recovery action construction failed: {_bounded_reason(error)}") from None
+
+    def _run_g8_activation_recovery(
+        self,
+        boundary: ActivationBoundaryEvidence,
+        preflight: G8ActivationPreflightResult,
+        pre: Wave08UniversalRecoveryResult,
+    ) -> tuple[ActivationRecoveryAction, ...]:
+        if not pre.complete or self._g8_activation_fatal_pre_recovery_reasons(pre):
+            raise R02Error("G8 activation pre-recovery inventory is incomplete or has fatal unresolved authority")
+        actions: list[ActivationRecoveryAction] = []
+
+        def append(
+            action_class: ActivationRecoveryActionClass,
+            subject: Mapping[str, Any],
+            effect: Mapping[str, Any],
+            result_class: ActivationRecoveryResultClass,
+        ) -> None:
+            actions.append(self._g8_recovery_action(
+                len(actions), action_class, subject, effect, result_class,
+            ))
+
+        def publish_and_record_legacy_failure(
+            head_sha: str,
+            evidence: LegacyQuarantineEvidence,
+        ) -> StatusWriteReceipt:
+            self._g8_activation_recovery_mutation_guard(boundary)
+            receipt = self.publish_legacy_failure(
+                head_sha,
+                boundary.activation_boundary_id,
+                implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+            )
+            returned = receipt.returned_status
+            append(
+                ActivationRecoveryActionClass.LEGACY_FAILURE_STATUS,
+                {
+                    "headSha": head_sha,
+                    "legacyEvidence": evidence.as_value(),
+                },
+                {
+                    "repository": receipt.repository,
+                    "requestedSha": receipt.requested_sha,
+                    "method": receipt.method,
+                    "route": receipt.route,
+                    "state": receipt.requested_state,
+                    "context": receipt.requested_context,
+                    "description": receipt.requested_description,
+                    "targetUrl": receipt.requested_target_url,
+                    "returnedStatusId": returned.id,
+                    "returnedStatusNodeId": returned.node_id,
+                    "returnedCreatorDatabaseId": returned.creator_database_id,
+                    "returnedCreatorNodeId": returned.creator_node_id,
+                    "returnedCreatorLogin": returned.creator_login,
+                    "returnedCreatorType": returned.creator_type,
+                    "returnedCreatedAt": returned.created_at,
+                    "returnedUpdatedAt": returned.updated_at,
+                },
+                ActivationRecoveryResultClass.APPLIED,
+            )
+            return receipt
+
+        def recover_current_reserved_machine(
+            record: Wave08MachineRefRecord,
+            resolution: ShaCarrierResolution,
+        ) -> None:
+            marker = resolution.marker
+            if (
+                resolution.activation is not CarrierActivation.RESERVED_INACTIVE
+                or resolution.role is not CarrierRole.MACHINE_PUBLICATION
+                or marker is None
+                or marker.claim_kind != "MACHINE_REF_CLAIM"
+                or marker.owner_kind != "MACHINE_SOURCE"
+                or record.ref != f"refs/heads/bot/federation/{record.source_id}"
+            ):
+                raise R02Error("G8 activation reserved machine recovery requires exact current v2 machine authority")
+            repository, current_main = self.current_accepted_main()
+            if current_main != boundary.merged_result_oid:
+                raise StaleAuthorityError("G8 activation main moved before reserved machine recovery")
+            sources = tuple(
+                source for source in self._accepted_sources(current_main)
+                if source.source_id == record.source_id
+                and marker.owner_key == f"{repository.node_id}:{source.source_id}"
+            )
+            if len(sources) != 1:
+                raise R02Error("G8 activation reserved machine source is not exactly accepted")
+            try:
+                current_ref = self.client.get_ref_oid(
+                    self.central_repository,
+                    record.ref.removeprefix("refs/heads/"),
+                )
+            except Exception as error:
+                raise R02Error(
+                    f"G8 activation reserved machine ref read failed: {_bounded_reason(error)}"
+                ) from None
+            if current_ref != record.head_sha:
+                raise StaleAuthorityError("G8 activation reserved machine ref changed since bounded inventory")
+
+            self._g8_activation_recovery_mutation_guard(boundary)
+            result = self.reconcile(
+                sources[0].repository_id,
+                pre_mutation_guard=lambda: self._g8_activation_recovery_mutation_guard(boundary),
+                dispatch_finalizer=False,
+            )
+            if result.outcome == "FAIL":
+                raise R02Error(f"G8 activation reserved machine recovery failed: {result.reason}")
+            try:
+                after_head = self.client.get_ref_oid(
+                    self.central_repository,
+                    record.ref.removeprefix("refs/heads/"),
+                )
+                after_resolution = self.resolve_current_sha_carrier_role(after_head)
+            except Exception as error:
+                raise R02Error(
+                    f"G8 activation reserved machine recovery read-back failed: {_bounded_reason(error)}"
+                ) from None
+            if (
+                after_resolution.activation is not CarrierActivation.ACTIVE
+                or after_resolution.role is not CarrierRole.MACHINE_PUBLICATION
+                or after_resolution.marker is None
+                or after_resolution.marker.claim_kind != "MACHINE_REF_CLAIM"
+                or after_resolution.marker.owner_kind != "MACHINE_SOURCE"
+                or after_resolution.marker.owner_key != marker.owner_key
+            ):
+                raise R02Error("G8 activation reserved machine recovery did not converge to exact ACTIVE authority")
+            append(
+                ActivationRecoveryActionClass.RESERVED_TRANSITION_RECOVERY,
+                {
+                    "headSha": record.head_sha,
+                    "role": CarrierRole.MACHINE_PUBLICATION.value,
+                    "machineRef": record.ref,
+                    "sourceId": record.source_id,
+                    "repositoryId": sources[0].repository_id,
+                    "marker": marker.render(),
+                },
+                {
+                    "afterHeadSha": after_head,
+                    "afterActivation": after_resolution.activation.value,
+                    "afterRole": after_resolution.role.value,
+                    "afterMarker": after_resolution.marker.render(),
+                    "outcome": result.outcome,
+                    "sourceId": result.source_id,
+                    "repositoryId": result.repository_id,
+                    "reason": result.reason,
+                },
+                (
+                    ActivationRecoveryResultClass.APPLIED
+                    if result.outcome == "CHANGED"
+                    else ActivationRecoveryResultClass.ALREADY_CONVERGED
+                ),
+            )
+
+        recovery_decisions = list(pre.decisions)
+        covered_heads = {decision.head_sha for decision in recovery_decisions}
+        uncovered_reserved_machine: list[tuple[Wave08MachineRefRecord, ShaCarrierResolution]] = []
+        seen_machine_heads: set[str] = set()
+        for record in sorted(pre.machine_refs, key=lambda item: (item.ref, item.source_id, item.head_sha)):
+            if record.head_sha in seen_machine_heads:
+                raise R02Error("G8 activation machine-ref inventory maps one head through multiple refs")
+            seen_machine_heads.add(record.head_sha)
+            if record.head_sha in covered_heads:
+                continue
+            resolution = self.resolve_current_sha_carrier_role(record.head_sha)
+            if resolution.activation is CarrierActivation.LEGACY_CUTOVER_QUARANTINE:
+                classification = self.classify_legacy_head(
+                    record.head_sha,
+                    implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                )
+                if (
+                    type(classification) is not LegacyClassificationResult
+                    or classification.outcome is not LegacyClassificationOutcome.QUARANTINE
+                    or classification.evidence is None
+                    or classification.evidence.evidence_class is not LegacyQuarantineClass.MACHINE
+                    or classification.evidence.head_sha != record.head_sha
+                ):
+                    raise R02Error("G8 activation uncovered machine ref is not exact legacy-machine authority")
+                recovery_decisions.append(Wave08Decision(
+                    record.head_sha,
+                    resolution,
+                    (),
+                    None,
+                    Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED,
+                    Wave08DecisionReason.LEGACY_CLASSIFIER_DEFERRED,
+                ))
+                covered_heads.add(record.head_sha)
+                continue
+            if (
+                resolution.activation is CarrierActivation.RESERVED_INACTIVE
+                and resolution.role is CarrierRole.MACHINE_PUBLICATION
+            ):
+                uncovered_reserved_machine.append((record, resolution))
+                covered_heads.add(record.head_sha)
+                continue
+            raise R02Error("G8 activation uncovered machine ref has unresolved or contradictory authority")
+
+        for decision in sorted(recovery_decisions, key=lambda item: item.head_sha):
+            if decision.kind is Wave08DecisionKind.CONFLICTING_BLOCKED:
+                raise R02Error("G8 activation recovery encountered a conflicting SHA role")
+            if decision.kind is Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED:
+                classification = self.classify_legacy_head(
+                    decision.head_sha,
+                    implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                )
+                if (
+                    type(classification) is not LegacyClassificationResult
+                    or classification.outcome is not LegacyClassificationOutcome.QUARANTINE
+                    or classification.evidence is None
+                    or classification.evidence.head_sha != decision.head_sha
+                ):
+                    raise StaleAuthorityError("G8 activation legacy classification changed before recovery")
+                subject = {
+                    "headSha": decision.head_sha,
+                    "legacyEvidence": classification.evidence.as_value(),
+                }
+                if classification.evidence.evidence_class is LegacyQuarantineClass.MACHINE:
+                    matching_refs = tuple(
+                        item for item in pre.machine_refs
+                        if item.head_sha == decision.head_sha
+                        and item.ref == f"refs/heads/bot/federation/{item.source_id}"
+                    )
+                    if len(matching_refs) != 1:
+                        raise R02Error("G8 activation legacy machine recovery requires one exact machine ref")
+                    repository, current_main = self.current_accepted_main()
+                    if current_main != boundary.merged_result_oid:
+                        raise StaleAuthorityError("G8 activation main moved before legacy machine migration")
+                    sources = tuple(
+                        source for source in self._accepted_sources(current_main)
+                        if source.source_id == matching_refs[0].source_id
+                    )
+                    if len(sources) != 1:
+                        raise R02Error("G8 activation legacy machine source is not exactly accepted")
+                    legacy_failure_receipt = publish_and_record_legacy_failure(
+                        decision.head_sha,
+                        classification.evidence,
+                    )
+                    self._g8_activation_recovery_mutation_guard(boundary)
+                    result = self.reconcile(
+                        sources[0].repository_id,
+                        pre_mutation_guard=lambda: self._g8_activation_recovery_mutation_guard(boundary),
+                        dispatch_finalizer=False,
+                        legacy_failure_receipt=legacy_failure_receipt,
+                    )
+                    if result.outcome == "FAIL":
+                        raise R02Error(f"G8 activation legacy machine migration failed: {result.reason}")
+                    try:
+                        after_head = self.client.get_ref_oid(
+                            self.central_repository,
+                            matching_refs[0].ref.removeprefix("refs/heads/"),
+                        )
+                        after_resolution = self.resolve_current_sha_carrier_role(after_head)
+                    except Exception as error:
+                        raise R02Error(
+                            f"G8 activation legacy machine migration read-back failed: {_bounded_reason(error)}"
+                        ) from None
+                    if (
+                        after_head == decision.head_sha
+                        or after_resolution.activation is not CarrierActivation.ACTIVE
+                        or after_resolution.role is not CarrierRole.MACHINE_PUBLICATION
+                        or after_resolution.marker is None
+                        or after_resolution.marker.claim_kind != "MACHINE_REF_CLAIM"
+                        or after_resolution.marker.owner_kind != "MACHINE_SOURCE"
+                    ):
+                        raise R02Error("G8 activation legacy machine migration did not establish exact fresh v2 H2 authority")
+                    append(
+                        ActivationRecoveryActionClass.LEGACY_MACHINE_MIGRATION,
+                        {
+                            **subject,
+                            "machineRef": matching_refs[0].ref,
+                            "sourceId": sources[0].source_id,
+                            "repositoryId": sources[0].repository_id,
+                        },
+                        {
+                            "beforeHeadSha": decision.head_sha,
+                            "afterHeadSha": after_head,
+                            "afterActivation": after_resolution.activation.value,
+                            "afterRole": after_resolution.role.value,
+                            "afterMarker": after_resolution.marker.render(),
+                            "outcome": result.outcome,
+                            "sourceId": result.source_id,
+                            "repositoryId": result.repository_id,
+                            "reason": result.reason,
+                        },
+                        (
+                            ActivationRecoveryResultClass.APPLIED
+                            if result.outcome == "CHANGED"
+                            else ActivationRecoveryResultClass.ALREADY_CONVERGED
+                        ),
+                    )
+                else:
+                    publish_and_record_legacy_failure(
+                        decision.head_sha,
+                        classification.evidence,
+                    )
+                continue
+
+            if decision.kind is Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY:
+                fence, status, reused = self._g8_recover_cancel_failure(decision, boundary)
+                append(
+                    ActivationRecoveryActionClass.CANCEL_FAILURE_STATUS,
+                    {
+                        "issueNumber": fence.issue_number,
+                        "fenceId": fence.fence_id,
+                        "cancellationHeadSha": fence.cancellation_head_sha,
+                        "pullRequestNumber": fence.pull_request_number,
+                    },
+                    status.as_value(),
+                    (
+                        ActivationRecoveryResultClass.ALREADY_CONVERGED
+                        if reused
+                        else ActivationRecoveryResultClass.APPLIED
+                    ),
+                )
+                append(
+                    ActivationRecoveryActionClass.ISSUE_TERMINAL_CLEANUP,
+                    {
+                        "issueNumber": fence.issue_number,
+                        "fenceId": fence.fence_id,
+                        "cancellationHeadSha": fence.cancellation_head_sha,
+                    },
+                    {"deferredUntil": "ACTIVE_G8", "reason": "CANCELLATION_CLEANUP_POST_ACTIVE"},
+                    ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE,
+                )
+                continue
+
+            if decision.kind is Wave08DecisionKind.RESERVED_OWNER_RECOVERY:
+                append(
+                    ActivationRecoveryActionClass.RESERVED_TRANSITION_RECOVERY,
+                    {
+                        "headSha": decision.head_sha,
+                        "role": decision.resolution.role.value if decision.resolution.role is not None else None,
+                        "owningPrNumber": decision.owning_pr_number,
+                    },
+                    {"deferredUntil": "ACTIVE_G8", "reason": "RESERVED_ISSUE_TRANSITION_POST_ACTIVE"},
+                    ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE,
+                )
+                continue
+
+            if decision.kind is Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED:
+                matching_refs = tuple(
+                    item for item in pre.machine_refs
+                    if item.head_sha == decision.head_sha
+                    and item.ref == f"refs/heads/bot/federation/{item.source_id}"
+                )
+                if len(matching_refs) != 1:
+                    raise R02Error(
+                        "G8 activation reserved machine decision requires one exact machine ref"
+                    )
+                if decision.resolution != self.resolve_current_sha_carrier_role(decision.head_sha):
+                    raise StaleAuthorityError(
+                        "G8 activation reserved machine role changed before recovery"
+                    )
+                recover_current_reserved_machine(matching_refs[0], decision.resolution)
+                continue
+
+            if decision.kind is Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY:
+                append(
+                    ActivationRecoveryActionClass.ISSUE_REQUEST_RECOVERY,
+                    {
+                        "headSha": decision.head_sha,
+                        "role": decision.resolution.role.value if decision.resolution.role is not None else None,
+                        "owningPrNumber": decision.owning_pr_number,
+                    },
+                    {"deferredUntil": "ACTIVE_G8", "reason": "PASSING_FINALIZER_FORBIDDEN_PRE_EPOCH"},
+                    ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE,
+                )
+
+        for record, resolution in uncovered_reserved_machine:
+            recover_current_reserved_machine(record, resolution)
+
+        seen_issue_intents: set[tuple[str, int, str]] = set()
+        for intent in sorted(
+            pre.dispatch_intents,
+            key=lambda item: (item.central_repository_node_id, item.issue_number, item.target.value),
+        ):
+            key = (intent.central_repository_node_id, intent.issue_number, intent.target.value)
+            if key in seen_issue_intents:
+                raise R02Error("G8 activation recovery inventory contains duplicate Issue dispatch intents")
+            seen_issue_intents.add(key)
+            append(
+                ActivationRecoveryActionClass.ISSUE_REQUEST_RECOVERY,
+                {
+                    "centralRepositoryNodeId": intent.central_repository_node_id,
+                    "issueNumber": intent.issue_number,
+                    "target": intent.target.value,
+                },
+                {"deferredUntil": "ACTIVE_G8", "reason": intent.reason},
+                ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE,
+            )
+        return tuple(actions)
+
+    def run_g8_activation_recovery(
+        self,
+        mode: str,
+    ) -> G8ActivationRecoveryExecution:
+        run_id, run_attempt, _actor = self._require_g8_activation_run_authority(mode)
+        boundary = self.derive_activation_boundary_evidence()
+        preflight = self._g8_activation_preflight(boundary)
+
+        pre = self.recover_universal_role_first(None, read_only=True)
+        if not pre.complete or self._g8_activation_fatal_pre_recovery_reasons(pre):
+            raise R02Error("G8 activation pre-recovery inventory is incomplete or fatally unresolved")
+        try:
+            pre_digest = activation_recovery_inventory_digest(
+                "PRE",
+                self._g8_activation_inventory_material(pre, preflight),
+            )
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation pre-recovery digest failed: {_bounded_reason(error)}") from None
+
+        actions = self._run_g8_activation_recovery(boundary, preflight, pre)
+
+        final_boundary = self.derive_activation_boundary_evidence()
+        if final_boundary != boundary:
+            raise StaleAuthorityError("G8 activation boundary changed after recovery")
+        final_preflight = self._g8_activation_preflight(boundary)
+        if final_preflight != preflight:
+            raise StaleAuthorityError("G8 activation workflow/run preflight changed after recovery")
+
+        post = self.recover_universal_role_first(None, read_only=True)
+        if not post.complete or post.blocked_reasons:
+            raise R02Error("G8 activation post-recovery inventory is incomplete or unresolved")
+        self._g8_require_post_machine_refs_converged(post)
+        try:
+            post_digest = activation_recovery_inventory_digest(
+                "POST",
+                self._g8_activation_inventory_material(post, final_preflight),
+            )
+            actions_digest = ordered_recovery_actions_digest(actions)
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation recovery digest construction failed: {_bounded_reason(error)}") from None
+
+        pre_legacy = [
+            item for item in self._g8_activation_inventory_material(pre, preflight)["decisions"]
+            if item["activation"] == CarrierActivation.LEGACY_CUTOVER_QUARANTINE.value
+        ]
+        post_legacy = [
+            item for item in self._g8_activation_inventory_material(post, final_preflight)["decisions"]
+            if item["activation"] == CarrierActivation.LEGACY_CUTOVER_QUARANTINE.value
+        ]
+        legacy_actions = [
+            item.as_value()
+            for item in actions
+            if item.action_class in {
+                ActivationRecoveryActionClass.LEGACY_FAILURE_STATUS,
+                ActivationRecoveryActionClass.LEGACY_MACHINE_MIGRATION,
+            }
+        ]
+        try:
+            legacy_digest = _g8_recovery_material_digest(
+                _G8_LEGACY_RECOVERY_PREFIX,
+                {
+                    "schemaVersion": 1,
+                    "activationBoundaryId": boundary.activation_boundary_id,
+                    "centralRepositoryNodeId": boundary.central_repository_node_id,
+                    "centralRepositoryFullName": self.central_repository,
+                    "preLegacy": pre_legacy,
+                    "legacyActions": legacy_actions,
+                    "postLegacy": post_legacy,
+                },
+            )
+            witness = ActivationRecoveryWitness(
+                1,
+                boundary.activation_boundary_id,
+                run_id,
+                run_attempt,
+                pre_digest,
+                actions_digest,
+                post_digest,
+                0,
+                final_preflight.old_run_terminal_digest,
+                final_preflight.six_workflow_identity_digest,
+            )
+            evidence = ActivationRecoveryEvidence(
+                1,
+                "G8_ACTIVATION_RECOVERY",
+                boundary.central_repository_node_id,
+                boundary.implementation_pr_number,
+                boundary.implementation_pr_database_id,
+                boundary.implementation_pr_node_id,
+                boundary.activation_boundary_id,
+                boundary.merged_result_oid,
+                boundary.authority_surface_digest,
+                boundary.new_writer_topology_digest,
+                run_id,
+                run_attempt,
+                pre_digest,
+                actions_digest,
+                len(actions),
+                post_digest,
+                0,
+                final_preflight.old_run_terminal_digest,
+                final_preflight.six_workflow_identity_digest,
+                legacy_digest,
+                witness.witness_id(),
+                "SUCCESS",
+            )
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation witness/evidence construction failed: {_bounded_reason(error)}") from None
+
+        current_app = resolve_app_identity(self.client, self.app.slug)
+        if current_app != self.app:
+            raise StaleAuthorityError("G8 activation App identity changed before evidence persistence")
+        comment_id = self._persist_g8_activation_recovery_evidence(
+            evidence,
+            current_app,
+            boundary,
+        )
+        return G8ActivationRecoveryExecution(
+            final_preflight,
+            actions,
+            witness,
+            evidence,
+            evidence.result_digest(),
+            comment_id,
+        )
+
+    def _read_g8_activation_epoch(
+        self,
+        boundary: ActivationBoundaryEvidence,
+        hae: str,
+    ) -> ActivationEpochRecord:
+        if type(hae) is not str or re.fullmatch(r"[0-9a-f]{40}", hae) is None:
+            raise R02Error("G8 activation HAE must be exact lowercase 40-hex")
+        try:
+            commit = self.client.get_git_commit_object(self.central_repository, hae)
+        except Exception as error:
+            raise R02Error(f"G8 activation HAE commit is unavailable: {_bounded_reason(error)}") from None
+        if (
+            type(commit) is not GitCommitObject
+            or commit.sha != hae
+            or commit.parents != (boundary.merged_result_oid,)
+            or commit.author.name != "Swift Stream Federation"
+            or commit.author.email != "automation@swiftstream.invalid"
+            or commit.committer.name != "Swift Stream Federation"
+            or commit.committer.email != "automation@swiftstream.invalid"
+            or commit.author.date != commit.committer.date
+        ):
+            raise R02Error("G8 activation HAE commit identity/parent/author is invalid")
+
+        try:
+            _base_tree, base_entries = self.client.get_commit_tree(
+                self.central_repository, boundary.merged_result_oid,
+            )
+            hae_tree_sha, hae_entries = self.client.get_tree(
+                self.central_repository, commit.tree_sha,
+            )
+        except Exception as error:
+            raise R02Error(f"G8 activation HAE tree is unavailable: {_bounded_reason(error)}") from None
+        if hae_tree_sha != commit.tree_sha:
+            raise R02Error("G8 activation HAE tree identity does not match commit")
+        base_by_path = {entry.path: entry for entry in base_entries}
+        hae_by_path = {entry.path: entry for entry in hae_entries}
+        if len(base_by_path) != len(base_entries) or len(hae_by_path) != len(hae_entries):
+            raise R02Error("G8 activation HAE/base tree contains duplicate paths")
+        if G8_ACTIVATION_RECORD_PATH in base_by_path:
+            raise R02Error("G8 activation record path already existed at merged result")
+        if set(hae_by_path) != set(base_by_path) | {G8_ACTIVATION_RECORD_PATH}:
+            raise R02Error("G8 activation HAE tree delta is not exactly one activation record path")
+        for existing_path, existing_entry in base_by_path.items():
+            if hae_by_path.get(existing_path) != existing_entry:
+                raise R02Error("G8 activation HAE rewrites a merged-result tree entry")
+        record_entry = hae_by_path[G8_ACTIVATION_RECORD_PATH]
+        if record_entry.mode != "100644" or record_entry.object_type != "blob":
+            raise R02Error("G8 activation record is not an exact root 100644 blob")
+        try:
+            record_bytes = self.client.get_blob(self.central_repository, record_entry.sha)
+            record_text = record_bytes.decode("utf-8")
+            record = parse_activation_epoch_record(record_text)
+        except (UnicodeError, RequestModelError, GitHubAPIError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation record is invalid: {_bounded_reason(error)}") from None
+        expected_message = (
+            "swiftstream-federation-g8-activation:v1\n"
+            f"boundary={boundary.activation_boundary_id}\n"
+            f"record={activation_record_digest(record)}"
+        )
+        if commit.message != expected_message:
+            raise R02Error("G8 activation HAE commit marker does not bind boundary/record")
+        if (
+            record.central_repository_node_id != boundary.central_repository_node_id
+            or record.implementation_pr_number != boundary.implementation_pr_number
+            or record.implementation_pr_database_id != boundary.implementation_pr_database_id
+            or record.implementation_pr_node_id != boundary.implementation_pr_node_id
+            or record.activation_boundary_id != boundary.activation_boundary_id
+            or record.merged_result_oid != boundary.merged_result_oid
+            or record.authority_surface_digest != boundary.authority_surface_digest
+            or record.new_writer_topology_digest != boundary.new_writer_topology_digest
+            or record.created_at != commit.author.date
+        ):
+            raise R02Error("G8 activation record does not bind the fresh activation boundary")
+        return record
+
+    def _read_selected_g8_recovery_evidence(
+        self,
+        boundary: ActivationBoundaryEvidence,
+        record: ActivationEpochRecord,
+        app: AppIdentity,
+    ) -> ActivationRecoveryEvidence:
+        if (
+            boundary.central_repository_node_id != G8_CENTRAL_REPOSITORY_NODE_ID
+            or boundary.implementation_pr_number != G8_IMPLEMENTATION_PR_NUMBER
+            or boundary.implementation_pr_database_id != G8_IMPLEMENTATION_PR_DATABASE_ID
+            or boundary.implementation_pr_node_id != G8_IMPLEMENTATION_PR_NODE_ID
+        ):
+            raise R02Error("G8 recovery evidence lookup is not bound to fixed implementation PR identity")
+        exact_app_evidence = [
+            (evidence, digest)
+            for _comment, evidence, digest in self._g8_exact_app_recovery_evidence_comments(app)
+        ]
+
+        selected = [
+            (evidence, digest)
+            for evidence, digest in exact_app_evidence
+            if digest == record.activation_recovery_result_digest
+        ]
+        if not selected:
+            raise R02Error("G8 activation record selected recovery evidence is missing")
+        rendered_selected = {evidence.render() for evidence, _digest in selected}
+        if len(rendered_selected) != 1:
+            raise R02Error("G8 selected recovery result digest maps to conflicting canonical evidence")
+        evidence = selected[0][0]
+        run_key = (
+            evidence.activation_boundary_id,
+            evidence.activation_run_id,
+            evidence.activation_run_attempt,
+        )
+        same_run_bodies = {
+            candidate.render()
+            for candidate, _digest in exact_app_evidence
+            if (
+                candidate.activation_boundary_id,
+                candidate.activation_run_id,
+                candidate.activation_run_attempt,
+            ) == run_key
+        }
+        if len(same_run_bodies) != 1:
+            raise R02Error("G8 recovery evidence contains conflicting exact-App same-run bodies")
+        try:
+            witness = evidence.to_witness()
+            witness_id = activation_recovery_witness_id(witness)
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 recovery evidence witness is invalid: {_bounded_reason(error)}") from None
+        if (
+            evidence.central_repository_node_id != boundary.central_repository_node_id
+            or evidence.implementation_pr_number != boundary.implementation_pr_number
+            or evidence.implementation_pr_database_id != boundary.implementation_pr_database_id
+            or evidence.implementation_pr_node_id != boundary.implementation_pr_node_id
+            or evidence.activation_boundary_id != boundary.activation_boundary_id
+            or evidence.merged_result_oid != boundary.merged_result_oid
+            or evidence.authority_surface_digest != boundary.authority_surface_digest
+            or evidence.new_writer_topology_digest != boundary.new_writer_topology_digest
+            or evidence.activation_recovery_witness_id != record.activation_recovery_witness_id
+            or witness_id != record.activation_recovery_witness_id
+            or evidence.result_digest() != record.activation_recovery_result_digest
+            or evidence.legacy_inventory_quarantine_migration_digest
+            != record.legacy_inventory_quarantine_migration_digest
+        ):
+            raise R02Error("G8 selected recovery evidence does not bind the activation record/current boundary")
+        return evidence
+
+    def _has_exact_g8_activation_status(
+        self,
+        record: ActivationEpochRecord,
+        hae: str,
+        boundary: ActivationBoundaryEvidence,
+        app: AppIdentity,
+    ) -> bool:
+        try:
+            statuses = self.client.list_commit_statuses(self.central_repository, hae)
+        except Exception as error:
+            raise R02Error(f"G8 activation status inventory is unavailable: {_bounded_reason(error)}") from None
+        exact_app_context = [
+            status
+            for status in statuses
+            if (
+                status.context == G8_ACTIVATION_STATUS_CONTEXT
+                and status.creator_database_id == app.bot_id
+                and status.creator_node_id == app.bot_node_id
+                and status.creator_login == app.bot_login
+                and status.creator_type == "Bot"
+            )
+        ]
+        if not exact_app_context:
+            return False
+        latest = max(exact_app_context, key=lambda status: (status.updated_at, status.created_at, status.id))
+        expected_description = activation_status_description(
+            record, hae, boundary.activation_boundary_id,
+        )
+        if (
+            latest.state != "success"
+            or latest.context != G8_ACTIVATION_STATUS_CONTEXT
+            or latest.description != expected_description
+            or latest.target_url is not None
+        ):
+            raise R02Error("latest exact-App G8 activation status conflicts with selected epoch")
+        return True
+
+    @staticmethod
+    def _g8_activation_record_matches_evidence(
+        record: ActivationEpochRecord,
+        boundary: ActivationBoundaryEvidence,
+        preflight: G8ActivationPreflightResult,
+        evidence: ActivationRecoveryEvidence,
+    ) -> bool:
+        workflows = tuple(
+            ActivationWorkflowIdentity(item.path, item.workflow_id, item.workflow_state)
+            for item in preflight.new_workflows
+        )
+        old_workflows = tuple(
+            HistoricWorkflowIdentity(path, workflow_id)
+            for path, workflow_id in G8_OLD_WRITERS
+        )
+        return (
+            record.activation_boundary_id == boundary.activation_boundary_id
+            and record.central_repository_node_id == boundary.central_repository_node_id
+            and record.implementation_pr_number == boundary.implementation_pr_number
+            and record.implementation_pr_database_id == boundary.implementation_pr_database_id
+            and record.implementation_pr_node_id == boundary.implementation_pr_node_id
+            and record.merged_result_oid == boundary.merged_result_oid
+            and record.authority_surface_digest == boundary.authority_surface_digest
+            and record.new_writer_topology_digest == boundary.new_writer_topology_digest
+            and record.new_workflows == workflows
+            and record.old_workflows == old_workflows
+            and record.old_path_absence_proof_digest == preflight.old_path_absence_proof_digest
+            and record.old_run_terminal_proof_digest == preflight.old_run_terminal_digest
+            and record.activation_recovery_witness_id == evidence.activation_recovery_witness_id
+            and record.activation_recovery_result_digest == evidence.result_digest()
+            and record.legacy_inventory_quarantine_migration_digest
+            == evidence.legacy_inventory_quarantine_migration_digest
+            and record.activation_workflow_run_id == evidence.activation_run_id
+            and record.activation_workflow_run_attempt == evidence.activation_run_attempt
+        )
+
+    def _revalidate_g8_activation_epoch(
+        self,
+        record: ActivationEpochRecord,
+        expected_ref: str | None,
+    ) -> tuple[ActivationBoundaryEvidence, AppIdentity, ActivationRecoveryEvidence]:
+        """Rebuild every mutable authority input before an epoch write or status retry."""
+        try:
+            boundary = self.derive_activation_boundary_evidence()
+            if (
+                type(boundary) is not ActivationBoundaryEvidence
+                or boundary.activation_boundary_id != record.activation_boundary_id
+                or boundary.merged_result_oid != record.merged_result_oid
+                or boundary.authority_surface_digest != record.authority_surface_digest
+                or boundary.new_writer_topology_digest != record.new_writer_topology_digest
+            ):
+                raise StaleAuthorityError("G8 activation boundary changed since selected epoch")
+            self._require_current_g8_guard_surface(boundary)
+            preflight = self._g8_activation_preflight(
+                boundary,
+                expected_activation_ref=expected_ref,
+            )
+            app = resolve_app_identity(self.client, self.app.slug)
+            if app != self.app:
+                raise StaleAuthorityError("G8 activation App identity changed during revalidation")
+            evidence = self._read_selected_g8_recovery_evidence(boundary, record, app)
+            # Reconstruct the exact prior-run witness from durable evidence. No
+            # process-local witness or body participates in a restarted attempt.
+            witness = evidence.to_witness()
+            if (
+                activation_recovery_witness_id(witness) != record.activation_recovery_witness_id
+                or evidence.old_run_terminal_digest != preflight.old_run_terminal_digest
+                or evidence.six_workflow_identity_digest != preflight.six_workflow_identity_digest
+                or not self._g8_activation_record_matches_evidence(
+                    record, boundary, preflight, evidence,
+                )
+            ):
+                raise R02Error("G8 selected durable evidence does not reconstruct the exact epoch")
+            post = self.recover_universal_role_first(None, read_only=True)
+            if not post.complete or post.blocked_reasons:
+                raise R02Error("G8 final activation inventory is incomplete or newly ambiguous")
+            self._g8_require_post_machine_refs_converged(post)
+            post_digest = activation_recovery_inventory_digest(
+                "POST",
+                self._g8_activation_inventory_material(post, preflight),
+            )
+            if post_digest != evidence.post_recovery_inventory_digest:
+                raise StaleAuthorityError("G8 post-recovery inventory changed since selected evidence")
+            # Final boundary/surface/ref reads close the revalidation window.
+            final_boundary = self.derive_activation_boundary_evidence()
+            if final_boundary != boundary:
+                raise StaleAuthorityError("G8 activation boundary changed at final revalidation")
+            self._require_current_g8_guard_surface(final_boundary)
+            final_app = resolve_app_identity(self.client, self.app.slug)
+            if final_app != app:
+                raise StaleAuthorityError("G8 activation App identity changed at final revalidation")
+            branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+            if self.client.get_optional_ref_oid(self.central_repository, branch) != expected_ref:
+                raise StaleAuthorityError("G8 activation ref changed at final revalidation")
+            # Evidence may have been edited or removed during the preceding reads.
+            final_evidence = self._read_selected_g8_recovery_evidence(
+                final_boundary, record, final_app,
+            )
+            if final_evidence.render() != evidence.render():
+                raise StaleAuthorityError("G8 selected recovery evidence changed during final revalidation")
+            return final_boundary, final_app, final_evidence
+        except (R02Error, StaleAuthorityError):
+            raise
+        except Exception as error:
+            raise R02Error(f"G8 activation final revalidation failed: {_bounded_reason(error)}") from None
+
+    @staticmethod
+    def _g8_activation_record_from_execution(
+        execution: G8ActivationRecoveryExecution,
+        created_at: str,
+    ) -> ActivationEpochRecord:
+        if type(execution) is not G8ActivationRecoveryExecution:
+            raise R02Error("G8 activation epoch publication requires exact recovery execution")
+        preflight = execution.preflight
+        evidence = execution.evidence
+        return ActivationEpochRecord(
+            1,
+            preflight.boundary.activation_boundary_id,
+            preflight.boundary.central_repository_node_id,
+            preflight.boundary.implementation_pr_number,
+            preflight.boundary.implementation_pr_database_id,
+            preflight.boundary.implementation_pr_node_id,
+            preflight.boundary.merged_result_oid,
+            preflight.boundary.authority_surface_digest,
+            preflight.boundary.new_writer_topology_digest,
+            tuple(
+                ActivationWorkflowIdentity(item.path, item.workflow_id, item.workflow_state)
+                for item in preflight.new_workflows
+            ),
+            tuple(HistoricWorkflowIdentity(path, workflow_id) for path, workflow_id in G8_OLD_WRITERS),
+            preflight.old_path_absence_proof_digest,
+            preflight.old_run_terminal_digest,
+            evidence.legacy_inventory_quarantine_migration_digest,
+            execution.witness.witness_id(),
+            execution.result_digest,
+            evidence.activation_run_id,
+            evidence.activation_run_attempt,
+            created_at,
+        )
+
+    def _publish_exact_g8_activation_status(
+        self,
+        record: ActivationEpochRecord,
+        hae: str,
+        boundary: ActivationBoundaryEvidence,
+        app: AppIdentity,
+    ) -> None:
+        if self.client.get_optional_ref_oid(
+            self.central_repository,
+            G8_ACTIVATION_REF.removeprefix("refs/heads/"),
+        ) != hae:
+            raise StaleAuthorityError("G8 activation status requires exact persisted HAE ref")
+        if not self._has_exact_g8_activation_status(record, hae, boundary, app):
+            description = activation_status_description(
+                record, hae, boundary.activation_boundary_id,
+            )
+            write_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    receipt = self.client.create_commit_status(
+                        self.central_repository,
+                        hae,
+                        "success",
+                        G8_ACTIVATION_STATUS_CONTEXT,
+                        description,
+                        None,
+                    )
+                    returned = receipt.returned_status
+                    if (
+                        returned.context != G8_ACTIVATION_STATUS_CONTEXT
+                        or returned.state != "success"
+                        or returned.description != description
+                        or returned.target_url is not None
+                        or returned.creator_database_id != app.bot_id
+                        or returned.creator_node_id != app.bot_node_id
+                        or returned.creator_login != app.bot_login
+                        or returned.creator_type != "Bot"
+                    ):
+                        raise R02Error("G8 activation status response is not the exact configured-App tuple")
+                    write_error = None
+                    break
+                except Exception as error:
+                    write_error = error
+                    # The response may have been lost after acceptance. Always
+                    # read the exact-App latest tuple before any retry.
+                    try:
+                        if self._has_exact_g8_activation_status(record, hae, boundary, app):
+                            write_error = None
+                            break
+                    except Exception:
+                        raise
+                    if attempt == 0:
+                        # Retry is status-only, follows a full fresh proof, and
+                        # uses the same exact persisted candidate.
+                        fresh_boundary, fresh_app, _evidence = self._revalidate_g8_activation_epoch(
+                            record, hae,
+                        )
+                        if fresh_boundary != boundary or fresh_app != app:
+                            raise StaleAuthorityError(
+                                "G8 activation status retry authority changed after ambiguous response"
+                            )
+                        continue
+                    break
+            if write_error is not None:
+                raise R02Error(
+                    f"G8 activation status publication failed: {_bounded_reason(write_error)}"
+                ) from None
+        if not self._has_exact_g8_activation_status(record, hae, boundary, app):
+            raise R02Error("G8 activation status readback did not prove the exact latest-App tuple")
+        if self.client.get_optional_ref_oid(
+            self.central_repository,
+            G8_ACTIVATION_REF.removeprefix("refs/heads/"),
+        ) != hae:
+            raise StaleAuthorityError("G8 activation ref changed during status publication/readback")
+
+    def publish_g8_activation_epoch(
+        self,
+        execution: G8ActivationRecoveryExecution,
+        *,
+        created_at: str,
+    ) -> tuple[ActivationEpochRecord, str]:
+        """Publish one deterministic local Task03 HAE/ref/status candidate."""
+        record = self._g8_activation_record_from_execution(execution, created_at)
+        branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+        initial_ref = self.client.get_optional_ref_oid(self.central_repository, branch)
+        if initial_ref is not None:
+            initial_boundary = self.derive_activation_boundary_evidence()
+            existing_record = self._read_g8_activation_epoch(initial_boundary, initial_ref)
+            if existing_record.render() != record.render():
+                raise R02Error("existing G8 activation ref selects a different epoch")
+        boundary, app, evidence = self._revalidate_g8_activation_epoch(record, initial_ref)
+        if evidence.render() != execution.evidence.render():
+            raise StaleAuthorityError("G8 selected evidence differs from durable recovery execution")
+        current_ref = self.client.get_optional_ref_oid(self.central_repository, branch)
+        if current_ref is None:
+            try:
+                _base_tree, base_entries = self.client.get_commit_tree(
+                    self.central_repository, boundary.merged_result_oid,
+                )
+                if any(entry.path == G8_ACTIVATION_RECORD_PATH for entry in base_entries):
+                    raise R02Error("G8 activation record path already exists in merged result")
+                record_blob = self.client.create_blob(
+                    self.central_repository,
+                    base64.b64encode(record.render().encode("utf-8")).decode("ascii"),
+                    encoding="base64",
+                )
+                tree = self.client.create_tree(
+                    self.central_repository,
+                    _base_tree,
+                    [{
+                        "path": G8_ACTIVATION_RECORD_PATH,
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": record_blob.sha,
+                    }],
+                )
+                message = (
+                    "swiftstream-federation-g8-activation:v1\n"
+                    f"boundary={boundary.activation_boundary_id}\n"
+                    f"record={activation_record_digest(record)}"
+                )
+                commit = self.client.create_commit(
+                    self.central_repository,
+                    message,
+                    tree.sha,
+                    [boundary.merged_result_oid],
+                    timestamp=created_at,
+                )
+                hae = commit.sha
+            except Exception as error:
+                if isinstance(error, R02Error):
+                    raise
+                raise R02Error(f"G8 activation HAE creation failed: {_bounded_reason(error)}") from None
+            readback = self._read_g8_activation_epoch(boundary, hae)
+            if readback.render() != record.render():
+                raise R02Error("G8 activation HAE readback differs from exact candidate")
+            expected = None
+            for attempt in range(2):
+                self._revalidate_g8_activation_epoch(record, expected)
+                try:
+                    self.client.update_refs(
+                        boundary.central_repository_node_id,
+                        [RefUpdate(G8_ACTIVATION_REF, ZERO_OID, hae, force=False)],
+                    )
+                    expected = hae
+                    break
+                except Exception as error:
+                    try:
+                        observed = self.client.get_optional_ref_oid(self.central_repository, branch)
+                    except Exception as read_error:
+                        raise R02Error(
+                            f"G8 activation ref response ambiguous and fresh read failed: {_bounded_reason(read_error)}"
+                        ) from None
+                    if observed == hae:
+                        expected = hae
+                        break
+                    if observed is not None:
+                        raise R02Error("G8 activation ref CAS encountered a third value") from None
+                    if attempt == 0:
+                        continue
+                    raise R02Error(
+                        f"G8 activation ref CAS failed after one same-candidate retry: {_bounded_reason(error)}"
+                    ) from None
+        else:
+            hae = current_ref
+            readback = self._read_g8_activation_epoch(boundary, hae)
+            if readback.render() != record.render():
+                raise R02Error("existing G8 activation ref selects a different epoch")
+            self._revalidate_g8_activation_epoch(record, hae)
+        final_boundary, final_app, final_evidence = self._revalidate_g8_activation_epoch(record, hae)
+        if final_evidence.render() != evidence.render():
+            raise StaleAuthorityError("G8 selected evidence changed before status publication")
+        self._publish_exact_g8_activation_status(record, hae, final_boundary, final_app)
+        return record, hae
+
+    def resume_g8_activation_epoch(self) -> tuple[ActivationEpochRecord, str]:
+        """Recover a persisted HAE after process restart and retry only its status."""
+        try:
+            boundary = self.derive_activation_boundary_evidence()
+            branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+            hae = self.client.get_optional_ref_oid(self.central_repository, branch)
+            if hae is None:
+                raise R02Error("G8 activation resume requires an already-persisted activation ref")
+            record = self._read_g8_activation_epoch(boundary, hae)
+            final_boundary, app, _evidence = self._revalidate_g8_activation_epoch(record, hae)
+            self._publish_exact_g8_activation_status(record, hae, final_boundary, app)
+            return record, hae
+        except (R02Error, StaleAuthorityError):
+            raise
+        except Exception as error:
+            raise R02Error(f"G8 activation restart recovery failed: {_bounded_reason(error)}") from None
+
+    def derive_g8_activation_guard(self) -> G8ActivationGuardResult:
+        """Derive the one production Wave12 guard from fresh platform reads only."""
+        try:
+            boundary = self.derive_activation_boundary_evidence()
+        except PreG8NotApplicableError:
+            return _g8_activation_guard_result(G8RuntimeState.PRE_G8_NOT_APPLICABLE)
+        except Exception:
+            return _g8_activation_guard_result(G8RuntimeState.BLOCKED_POST_MERGE)
+
+        try:
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            if current_app != self.app:
+                raise R02Error("G8 guard App identity changed during evaluation")
+            self._require_current_g8_guard_surface(boundary)
+            branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+            if f"refs/heads/{branch}" != G8_ACTIVATION_REF:
+                raise R02Error("G8 activation ref constant is malformed")
+            hae = self.client.get_optional_ref_oid(self.central_repository, branch)
+            if hae is None:
+                return _g8_activation_guard_result(G8RuntimeState.MERGED_UNPROVEN)
+            record = self._read_g8_activation_epoch(boundary, hae)
+            self._read_selected_g8_recovery_evidence(boundary, record, current_app)
+            self._require_current_g8_guard_surface(boundary)
+            if not self._has_exact_g8_activation_status(record, hae, boundary, current_app):
+                return _g8_activation_guard_result(G8RuntimeState.MERGED_UNPROVEN)
+            final_boundary = self.derive_activation_boundary_evidence()
+            if final_boundary != boundary:
+                raise R02Error("G8 activation boundary changed during guard proof")
+            final_app = resolve_app_identity(self.client, self.app.slug)
+            if final_app != current_app:
+                raise R02Error("G8 guard App identity changed before final proof")
+            self._require_current_g8_guard_surface(final_boundary)
+            self._read_selected_g8_recovery_evidence(final_boundary, record, final_app)
+            if not self._has_exact_g8_activation_status(record, hae, final_boundary, final_app):
+                raise R02Error("G8 activation status disappeared before final proof")
+            final_ref = self.client.get_optional_ref_oid(self.central_repository, branch)
+            if final_ref != hae:
+                raise R02Error("G8 activation ref changed during guard proof")
+            return _g8_activation_guard_result(G8RuntimeState.ACTIVE_G8)
+        except Exception:
+            return _g8_activation_guard_result(G8RuntimeState.BLOCKED_POST_MERGE)
 
     def resolve_current_sha_carrier_role(self, head_sha: str) -> ShaCarrierResolution:
         """Resolve one SHA's role from fresh trusted authority, without caller role input."""
@@ -6958,6 +9164,52 @@ class R02Controller:
             return LegacyClassificationResult(LegacyClassificationOutcome.QUARANTINE, evidence, reason)
         return absent("EXACT_LEGACY_EVIDENCE_ABSENT")
 
+    def _require_exact_legacy_failure_receipt(
+        self,
+        receipt: StatusWriteReceipt,
+        evidence: LegacyQuarantineEvidence,
+        trusted_activation_boundary_id: str,
+        app: AppIdentity,
+    ) -> StatusWriteReceipt:
+        if (
+            type(receipt) is not StatusWriteReceipt
+            or type(evidence) is not LegacyQuarantineEvidence
+            or type(app) is not AppIdentity
+            or type(trusted_activation_boundary_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", trusted_activation_boundary_id) is None
+        ):
+            raise R02Error("legacy failure receipt verification requires exact typed authority")
+        description = render_status_description(
+            StatusClass.LEGACY,
+            legacy_status_evidence_digest(evidence, trusted_activation_boundary_id),
+        )
+        expected_route = f"/repos/{evidence.central_repository_full_name}/statuses/{evidence.head_sha}"
+        if (
+            receipt.repository != evidence.central_repository_full_name
+            or receipt.requested_sha != evidence.head_sha
+            or receipt.method != "POST"
+            or receipt.route != expected_route
+            or receipt.requested_state != "failure"
+            or receipt.requested_context != _EXTERNAL_STATUS_CONTEXT
+            or receipt.requested_description != description
+            or receipt.requested_target_url is not None
+        ):
+            raise R02Error("legacy failure receipt does not bind exact current quarantine evidence")
+        status = receipt.returned_status
+        if (
+            type(status) is not CommitStatus
+            or status.state != "failure"
+            or status.context != _EXTERNAL_STATUS_CONTEXT
+            or status.description != description
+            or status.target_url is not None
+            or status.creator_database_id != app.bot_id
+            or status.creator_node_id != app.bot_node_id
+            or status.creator_login != app.bot_login
+            or status.creator_type != "Bot"
+        ):
+            raise R02Error("legacy failure receipt does not bind the exact App Bot response")
+        return receipt
+
     def publish_legacy_failure(
         self,
         head_sha: str,
@@ -7141,8 +9393,11 @@ class R02Controller:
         *,
         pre_mutation_guard: Callable[[], None] | None = None,
         dispatch_finalizer: bool = True,
+        legacy_failure_receipt: StatusWriteReceipt | None = None,
     ) -> MachineReconcileResult:
         """Reconcile one accepted source; the wake input never supplies source semantics."""
+        if legacy_failure_receipt is not None and type(legacy_failure_receipt) is not StatusWriteReceipt:
+            raise R02Error("legacy failure receipt override must be an exact StatusWriteReceipt")
         hinted_id = parse_repository_id_hint(repository_id)
         for attempt in range(3):
             repository, current_main = self.current_accepted_main()
@@ -7156,6 +9411,7 @@ class R02Controller:
             source = sources[0]
             branch = _machine_branch(source.source_id)
             machine_ref = f"refs/heads/{branch}"
+            legacy_machine_migration_required = False
             try:
                 # B is captured before any candidate commit is generated. It is
                 # transition state only; the shared v2 helper never receives it.
@@ -7253,11 +9509,19 @@ class R02Controller:
                             return MachineReconcileResult("FAIL", source.source_id, hinted_id, "LEGACY_MACHINE_AUTHORITY_NOT_EXACT")
                         if pre_mutation_guard is not None:
                             pre_mutation_guard()
-                        self.publish_legacy_failure(
-                            before_oid,
-                            boundary.activation_boundary_id,
-                            implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
-                        )
+                        if legacy_failure_receipt is None:
+                            self.publish_legacy_failure(
+                                before_oid,
+                                boundary.activation_boundary_id,
+                                implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                            )
+                        else:
+                            self._require_exact_legacy_failure_receipt(
+                                legacy_failure_receipt,
+                                classification.evidence,
+                                boundary.activation_boundary_id,
+                                initial_app,
+                            )
                         fresh_repository, fresh_main = self.current_accepted_main()
                         fresh_sources = tuple(item for item in self._accepted_sources(fresh_main) if item == source)
                         fresh_app = resolve_app_identity(self.client, self.app.slug)
@@ -7271,12 +9535,21 @@ class R02Controller:
                             or fresh_legacy_ref != before_oid
                         ):
                             return MachineReconcileResult("FAIL", source.source_id, hinted_id, "LEGACY_MACHINE_AUTHORITY_CHANGED")
+                        legacy_machine_migration_required = True
 
-                candidate = self.candidate_builder.machine_candidate(current_main, source.source_id)  # type: ignore[attr-defined]
+                if legacy_failure_receipt is not None and not legacy_machine_migration_required:
+                    return MachineReconcileResult(
+                        "FAIL", source.source_id, hinted_id,
+                        "LEGACY_FAILURE_RECEIPT_WITHOUT_EXACT_LEGACY_MACHINE",
+                    )
+                if legacy_machine_migration_required and hasattr(self.candidate_builder, "machine_claim_candidate"):
+                    candidate = self.candidate_builder.machine_claim_candidate(current_main, source.source_id)  # type: ignore[attr-defined]
+                else:
+                    candidate = self.candidate_builder.machine_candidate(current_main, source.source_id)  # type: ignore[attr-defined]
                 validate_proposal_scope(RequestClass.UPDATE, candidate.changed_paths)
                 if any(path == "federation.json" or path.startswith(".github/") or path.startswith("automation/") for path in candidate.changed_paths):
                     raise CandidateScopeError("machine candidate changed a forbidden path")
-                if candidate.changed_paths:
+                if candidate.changed_paths or legacy_machine_migration_required:
                     marker = candidate.claimed_head_marker
                     if (
                         candidate.request_class is not RequestClass.MACHINE_PUBLICATION
@@ -7305,7 +9578,7 @@ class R02Controller:
                 raise
             except Exception as error:
                 return MachineReconcileResult("FAIL", source.source_id, hinted_id, _bounded_reason(error))
-            if not candidate.changed_paths:
+            if not candidate.changed_paths and not legacy_machine_migration_required:
                 if len(initial_machine_prs) == 1:
                     self._close_machine_pr_guarded(
                         initial_machine_prs[0].number,
@@ -7385,6 +9658,8 @@ class R02Controller:
                         or retry_prs != initial_machine_prs
                     ):
                         return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_AMBIGUOUS_AUTHORITY_CHANGED")
+                    if pre_mutation_guard is not None:
+                        pre_mutation_guard()
                 except Exception as error:
                     return MachineReconcileResult("FAIL", source.source_id, hinted_id, _bounded_reason(error))
                 try:
@@ -12343,19 +14618,9 @@ def main(argv: list[str] | None = None) -> int:
         "trusted-validation-manual", "trusted-validation-machine",
         "state-finalize", "state-finalize-route", "state-finalize-manual",
         "state-finalize-machine", "universal-recovery", "reconcile",
-        "main-advance", "activation-guard",
+        "main-advance", "activation-guard", "activation-preflight", "activate-g8",
     ))
     args = parser.parse_args(argv)
-    if args.command == "activation-guard":
-        result = wave10_inert_activation_guard()
-        payload = {
-            "activationWriteAllowed": result.activation_write_allowed,
-            "ordinaryWriteAllowed": result.ordinary_write_allowed,
-            "reason": result.reason,
-            "runtimeState": result.runtime_state.value,
-        }
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
-        return 0
     client: GitHubClient | None = None
     number: int | None = None
     result_kind = "proposal"
@@ -12382,7 +14647,75 @@ def main(argv: list[str] | None = None) -> int:
         trusted_checkout_sha = env.get("FEDERATION_TRUSTED_CHECKOUT_SHA")
         if type(trusted_checkout_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", trusted_checkout_sha):
             raise R02Error("trusted checkout SHA environment is missing or malformed")
-        controller = R02Controller(client, repository, app, candidate_builder=C02CandidateBuilder(client, repository, trusted_checkout_sha=trusted_checkout_sha), environ=env)
+        if args.command in {"activation-guard", "activation-preflight"}:
+            controller = R02Controller(client, repository, app, environ=env)
+            if args.command == "activation-preflight":
+                decision = controller.g8_activation_preflight_decision()
+                print(json.dumps(
+                    {"decision": decision},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ))
+                return 0
+            result = controller.derive_g8_activation_guard()
+            payload = {
+                "activationWriteAllowed": result.activation_write_allowed,
+                "ordinaryWriteAllowed": result.ordinary_write_allowed,
+                "reason": result.reason,
+                "runtimeState": result.runtime_state.value,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
+            return 0
+        controller = R02Controller(
+            client,
+            repository,
+            app,
+            candidate_builder=C02CandidateBuilder(
+                client, repository, trusted_checkout_sha=trusted_checkout_sha,
+            ),
+            environ=env,
+        )
+        if args.command == "activate-g8":
+            controller._require_g8_activation_run_authority("activate-g8")
+            if env.get("INPUT_MODE") != "activate-g8":
+                raise R02Error("G8 activation requires exact activate-g8 dispatch input")
+            branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+            persisted_hae = client.get_optional_ref_oid(repository, branch)
+            if persisted_hae is None:
+                execution = controller.run_g8_activation_recovery("activate-g8")
+                record, hae = controller.publish_g8_activation_epoch(
+                    execution,
+                    created_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                )
+                del record
+                outcome = "PUBLISHED"
+            else:
+                record, hae = controller.resume_g8_activation_epoch()
+                del record
+                outcome = "RESUMED"
+            guard = controller.derive_g8_activation_guard()
+            if guard != _g8_activation_guard_result(G8RuntimeState.ACTIVE_G8):
+                raise R02Error("G8 activation common guard did not freshly prove ACTIVE_G8")
+            try:
+                client.dispatch_workflow(
+                    repository,
+                    "federation-g8-reconcile.yml",
+                    "refs/heads/main",
+                    {"mode": "recover"},
+                )
+                catchup = "DISPATCHED"
+            except Exception:
+                catchup = "UNCERTAIN"
+            print(json.dumps(
+                {"catchup": catchup, "epoch": outcome, "hae": hae},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ))
+            return 0
         number_text = env.get("FEDERATION_WAKE_PULL_NUMBER")
         number = int(number_text) if number_text and number_text.isdigit() else _event_pull_number(env.get("FEDERATION_EVENT_PATH"))
         event_kind, triggering_comment_id, triggering_comment_author = _event_trigger(env.get("FEDERATION_EVENT_PATH"))

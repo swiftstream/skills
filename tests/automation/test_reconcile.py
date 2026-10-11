@@ -21,7 +21,7 @@ from automation.federation.controller import (
     render_check_run_output,
     verify_machine_check_identity,
 )
-from automation.federation.github_api import CheckRun, GitCommitIdentity, GitCommitObject, GitHubAPIError, GitHubClient, GitTreeEntry, HttpResponse, IssueComment, NotFoundError, PullRequestMetadata, RepositoryMetadata, RefCASConflict
+from automation.federation.github_api import CheckRun, CommitStatus, GitCommitIdentity, GitCommitObject, GitHubAPIError, GitHubClient, GitTreeEntry, HttpResponse, IssueComment, NotFoundError, PullRequestMetadata, RepositoryMetadata, RefCASConflict
 from automation.federation.request_model import ANCHOR_MARKER, ActivationBoundaryEvidence, CarrierRole, ClaimedHeadMarker, IssuePRBinding, LegacyClassificationOutcome, LegacyClassificationResult, LegacyQuarantineClass, LegacyQuarantineEvidence, RequestClass, RequestAnchor, activation_boundary_id_digest, body_sha256, claim_generation_id, machine_ref_claim_authority_digest, parse_request_body
 from scripts import federate as c02
 import automation.federation.controller as controller_module
@@ -282,6 +282,39 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(client.updates[0].before_oid, "0" * 40)
         self.assertEqual(client.updates[0].after_oid, candidate.commit_sha)
 
+    def test_ambiguous_retry_guard_rejection_stops_before_second_cas(self):
+        class AmbiguousClient(ReconcileClient):
+            def __init__(self):
+                super().__init__()
+                self.updates = []
+            def update_refs(self, _repository_id, updates):
+                self.updates.extend(updates)
+                raise GitHubAPIError("CAS outcome ambiguous")
+
+        client = AmbiguousClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
+        builder = type("Builder", (), {"machine_candidate": lambda _self, _base, _source_id: candidate})()
+        controller, _ = self._controller_with_source(client, source, builder)
+        guard_calls = []
+
+        def guard():
+            guard_calls.append(None)
+            if len(guard_calls) == 2:
+                raise R02Error("Task02 mutation authority became stale")
+
+        result = controller.reconcile(99, pre_mutation_guard=guard, dispatch_finalizer=False)
+
+        self.assertEqual(result.outcome, "FAIL")
+        self.assertEqual(len(guard_calls), 2)
+        self.assertEqual(len(client.updates), 1)
+        self.assertEqual(client.updates[0].before_oid, "0" * 40)
+        self.assertEqual(client.updates[0].after_oid, candidate.commit_sha)
+        self.assertEqual(client.ref_values, {})
+        self.assertEqual(client.refs, [])
+        self.assertFalse(hasattr(client, "created_pr"))
+        self.assertEqual(client.dispatches, [])
+
     def test_ambiguous_retry_exhaustion_does_not_create_h3_or_new_nonce(self):
         class StuckClient(ReconcileClient):
             def __init__(self):
@@ -457,6 +490,223 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(client.commit_objects[legacy_head].message, "Swift Stream federation machine publication\n")
         self.assertNotEqual(candidate.claimed_head_marker.carrier_nonce, "4" * 64)
         self.assertEqual(client.pull_requests[40].head_oid, candidate.commit_sha)
+
+    def test_machine_claim_candidate_mints_fresh_v2_head_for_empty_file_diff(self):
+        source = c02.SourceDeclaration(
+            "demo", "Owner/Repo", 99, "skills", "Demo",
+            (c02.LineDeclaration("refs/heads/main", ("demo",)),),
+        )
+
+        class ClaimClient:
+            def __init__(self):
+                self.tree_calls = 0
+                self.commit_calls = []
+
+            def get_commit_tree(self, repository, sha):
+                self.assertion = (repository, sha)
+                return "b" * 40, ()
+
+            def bot_commit_timestamp_after(self, repository, sha):
+                return "2026-10-10T00:00:01Z"
+
+            def create_tree(self, *_args, **_kwargs):
+                self.tree_calls += 1
+                raise AssertionError("empty-diff claim migration must reuse the exact base tree")
+
+            def create_commit(self, repository, message, tree, parents, *, timestamp=None):
+                self.commit_calls.append((repository, message, tree, tuple(parents), timestamp))
+                return type("GitObject", (), {"sha": "e" * 40})()
+
+        client = ClaimClient()
+        builder = controller_module.C02CandidateBuilder(
+            client,
+            "swiftstream/skills",
+            trusted_checkout_sha="a" * 40,
+        )
+        builder._machine_plan = lambda base, source_id: (
+            {},
+            {},
+            source,
+            RepositoryMetadata(7, "R_central", "swiftstream/skills", "main"),
+        )
+        with patch.object(controller_module, "new_carrier_nonce", return_value="5" * 64):
+            candidate = builder.machine_claim_candidate("a" * 40, "demo")
+
+        self.assertEqual(candidate.changed_paths, ())
+        self.assertTrue(candidate.marker_present)
+        self.assertEqual(candidate.commit_sha, "e" * 40)
+        self.assertEqual(candidate.candidate_tree_sha, "b" * 40)
+        self.assertEqual(candidate.claimed_head_marker.carrier_nonce, "5" * 64)
+        self.assertEqual(candidate.claimed_head_marker.claim_kind, "MACHINE_REF_CLAIM")
+        self.assertEqual(candidate.claimed_head_marker.role, "MACHINE_PUBLICATION")
+        self.assertEqual(client.tree_calls, 0)
+        self.assertEqual(client.commit_calls[0][2], "b" * 40)
+        self.assertEqual(client.commit_calls[0][3], ("a" * 40,))
+
+    def test_legacy_machine_byte_identical_tree_still_migrates_to_fresh_claimed_h2(self):
+        client = ReconcileClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        legacy_head = "c" * 40
+        client.ref_values["bot/federation/demo"] = legacy_head
+        client.commit_objects[legacy_head] = GitCommitObject(
+            legacy_head, "Swift Stream federation machine publication\n", "b" * 40,
+            (client.main,), client.identity, client.identity,
+        )
+        client.pull_requests[40] = PullRequestMetadata(
+            40, "PR_node", "U", "app[bot]", legacy_head, client.main,
+            "bot/federation/demo", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+        claimed = self._candidate(
+            client,
+            source,
+            "e" * 40,
+            (),
+            tree_sha="b" * 40,
+            nonce="5" * 64,
+        )
+        ordinary_noop = ProposalCandidate(
+            client.main,
+            client.main,
+            (),
+            RequestClass.MACHINE_PUBLICATION,
+            source.source_id,
+            source.repository_id,
+            False,
+        )
+        builder = type("Builder", (), {
+            "machine_candidate": lambda _self, _base, _source_id: ordinary_noop,
+            "machine_claim_candidate": lambda _self, _base, _source_id: claimed,
+            "validate_machine_head": lambda _self, _base, _source_id, _head: (True, "MATCHES"),
+        })()
+        controller, _ = self._controller_with_source(client, source, builder)
+        boundary_id = activation_boundary_id_digest("R_central", 27, 100, "PR_node", "f" * 40, "1" * 64, "2" * 64)
+        boundary = ActivationBoundaryEvidence(1, "R_central", 27, 100, "PR_node", "f" * 40, "f" * 40, "1" * 64, "2" * 64, boundary_id)
+        legacy_evidence = LegacyQuarantineEvidence(
+            1, LegacyQuarantineClass.MACHINE, 7, "R_central",
+            "swiftstream/skills", legacy_head, "f" * 64,
+        )
+        classification = LegacyClassificationResult(
+            LegacyClassificationOutcome.QUARANTINE,
+            legacy_evidence,
+            "EXACT_LEGACY_MACHINE",
+        )
+        original_resolver = controller.resolve_current_sha_carrier_role
+        controller.resolve_current_sha_carrier_role = lambda sha: (
+            controller_module.ShaCarrierResolution(controller_module.CarrierActivation.LEGACY_CUTOVER_QUARANTINE)
+            if sha == legacy_head else original_resolver(sha)
+        )
+        controller.derive_activation_boundary_evidence = lambda: boundary
+        controller.classify_legacy_head = lambda _sha, *, implementation_reviewed_head_sha: classification
+        controller.publish_legacy_failure = lambda *_args, **_kwargs: None
+
+        result = controller.reconcile(99)
+
+        self.assertEqual(result.outcome, "CHANGED")
+        self.assertEqual(len(client.refs), 1)
+        self.assertEqual(client.refs[0].before_oid, legacy_head)
+        self.assertEqual(client.refs[0].after_oid, claimed.commit_sha)
+        self.assertNotEqual(client.refs[0].after_oid, legacy_head)
+        self.assertEqual(claimed.changed_paths, ())
+        self.assertTrue(claimed.marker_present)
+        self.assertIsNotNone(claimed.claimed_head_marker)
+        self.assertEqual(client.pull_requests[40].head_oid, claimed.commit_sha)
+
+    def test_legacy_machine_reconcile_accepts_exact_preconfirmed_failure_receipt_without_duplicate_post(self):
+        client = ReconcileClient()
+        source = c02.SourceDeclaration(
+            "demo", "Owner/Repo", 99, "skills", "Demo",
+            (c02.LineDeclaration("refs/heads/main", ("demo",)),),
+        )
+        legacy_head = "c" * 40
+        client.ref_values["bot/federation/demo"] = legacy_head
+        client.commit_objects[legacy_head] = GitCommitObject(
+            legacy_head, "Swift Stream federation machine publication\n", "d" * 40,
+            (client.main,), client.identity, client.identity,
+        )
+        client.pull_requests[40] = PullRequestMetadata(
+            40, "PR_node", "U", "app[bot]", legacy_head, client.main,
+            "bot/federation/demo", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+        candidate = self._candidate(client, source, "e" * 40, ("README.md",), nonce="5" * 64)
+        builder = type("Builder", (), {
+            "machine_candidate": lambda _self, _base, _source_id: candidate,
+            "machine_claim_candidate": lambda _self, _base, _source_id: candidate,
+            "validate_machine_head": lambda _self, _base, _source_id, _head: (True, "MATCHES"),
+        })()
+        controller, _ = self._controller_with_source(client, source, builder)
+        boundary_id = activation_boundary_id_digest(
+            "R_central", 27, 100, "PR_node",
+            "f" * 40, "1" * 64, "2" * 64,
+        )
+        boundary = ActivationBoundaryEvidence(
+            1, "R_central", 27, 100, "PR_node",
+            "f" * 40, "f" * 40, "1" * 64, "2" * 64, boundary_id,
+        )
+        legacy_evidence = LegacyQuarantineEvidence(
+            1, LegacyQuarantineClass.MACHINE, 7, "R_central",
+            "swiftstream/skills", legacy_head, "f" * 64,
+        )
+        classification = LegacyClassificationResult(
+            LegacyClassificationOutcome.QUARANTINE,
+            legacy_evidence,
+            "EXACT_LEGACY_MACHINE",
+        )
+        original_resolver = controller.resolve_current_sha_carrier_role
+        controller.resolve_current_sha_carrier_role = lambda sha: (
+            controller_module.ShaCarrierResolution(
+                controller_module.CarrierActivation.LEGACY_CUTOVER_QUARANTINE,
+            )
+            if sha == legacy_head else original_resolver(sha)
+        )
+        controller.derive_activation_boundary_evidence = lambda: boundary
+        controller.classify_legacy_head = lambda _sha, *, implementation_reviewed_head_sha: classification
+
+        digest = controller_module.legacy_status_evidence_digest(
+            legacy_evidence,
+            boundary_id,
+        )
+        description = controller_module.render_status_description(
+            controller_module.StatusClass.LEGACY,
+            digest,
+        )
+        status = CommitStatus(
+            77,
+            "CS_77",
+            "failure",
+            "federation/trusted-validation",
+            description,
+            None,
+            controller.app.bot_id,
+            controller.app.bot_node_id,
+            controller.app.bot_login,
+            "Bot",
+            "2026-10-10T00:00:00Z",
+            "2026-10-10T00:00:00Z",
+        )
+        receipt = controller_module.StatusWriteReceipt(
+            "swiftstream/skills",
+            legacy_head,
+            "POST",
+            f"/repos/swiftstream/skills/statuses/{legacy_head}",
+            "failure",
+            "federation/trusted-validation",
+            description,
+            None,
+            status,
+        )
+        controller.publish_legacy_failure = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preconfirmed receipt must suppress duplicate legacy failure POST")
+        )
+
+        result = controller.reconcile(
+            99,
+            legacy_failure_receipt=receipt,
+        )
+        self.assertEqual(result.outcome, "CHANGED")
+        self.assertEqual(client.refs[0].before_oid, legacy_head)
+        self.assertEqual(client.refs[0].after_oid, candidate.commit_sha)
 
     def test_third_ref_makes_old_h_lose_and_successor_uses_fresh_nonce_and_head(self):
         class ThirdValueClient(ReconcileClient):

@@ -132,10 +132,10 @@ EXPECTED_TRIGGERS = {
         type: string""",
 }
 
-# This is copied from PRIMARY_PLAN_CORRECTION_02.md §10. The $ placeholders are
+# This mirrors the frozen Wave12 Task01 guard transport. The $ placeholders are
 # replaced with a literal dollar sign after the test file is written.
 FROZEN_GUARD_WRAPPER = r"""set -euo pipefail
-guard_stdout="${RUNNER_TEMP}/g8-wave10-activation-guard.out"
+guard_stdout="${RUNNER_TEMP}/g8-wave12-activation-guard.out"
 : > "${guard_stdout}"
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m automation.federation.controller activation-guard > "${guard_stdout}"
 python3 - "${guard_stdout}" "${GITHUB_OUTPUT}" <<'PY'
@@ -191,14 +191,22 @@ if type(value["reason"]) is not str:
 if type(value["runtimeState"]) is not str:
     raise SystemExit("invalid runtimeState type")
 
-if value["activationWriteAllowed"] is not False:
-    raise SystemExit("activation writes unexpectedly allowed")
-if value["ordinaryWriteAllowed"] is not False:
-    raise SystemExit("ordinary writes unexpectedly allowed")
-if value["reason"] != "WAVE10_INERT_GUARD":
-    raise SystemExit("unexpected activation guard reason")
-if value["runtimeState"] != "MERGED_UNPROVEN":
+allowed = {
+    "ACTIVE_G8": (True, False, "ACTIVE_G8_EPOCH_PROVEN"),
+    "MERGED_UNPROVEN": (False, True, "MERGED_UNPROVEN_NO_VALID_EPOCH"),
+    "BLOCKED_POST_MERGE": (False, False, "BLOCKED_POST_MERGE_CONFLICT"),
+    "PRE_G8_NOT_APPLICABLE": (False, False, "PRE_G8_NOT_APPLICABLE"),
+}
+runtime_state = value["runtimeState"]
+if runtime_state not in allowed:
     raise SystemExit("unexpected activation guard runtime state")
+ordinary_expected, activation_expected, reason_expected = allowed[runtime_state]
+if value["ordinaryWriteAllowed"] is not ordinary_expected:
+    raise SystemExit("ordinaryWriteAllowed does not match runtime state")
+if value["activationWriteAllowed"] is not activation_expected:
+    raise SystemExit("activationWriteAllowed does not match runtime state")
+if value["reason"] != reason_expected:
+    raise SystemExit("activation guard reason does not match runtime state")
 
 canonical = (
     json.dumps(
@@ -214,9 +222,9 @@ if canonical != raw:
     raise SystemExit("non-canonical activation guard bytes")
 
 with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8", newline="\n") as output:
-    output.write("runtime_state=MERGED_UNPROVEN\n")
-    output.write("ordinary_write_allowed=false\n")
-    output.write("activation_write_allowed=false\n")
+    output.write("runtime_state=" + value["runtimeState"] + "\n")
+    output.write("ordinary_write_allowed=" + ("true" if value["ordinaryWriteAllowed"] else "false") + "\n")
+    output.write("activation_write_allowed=" + ("true" if value["activationWriteAllowed"] else "false") + "\n")
 PY
 """
 
@@ -415,14 +423,20 @@ def _top_level_job_blocks(text: str) -> tuple[tuple[str, str], ...]:
 
 
 def _extract_guard_wrapper(job_text: str) -> str:
-    marker = "        name: Validate frozen activation guard output\n"
+    marker = "        name: Validate Wave12 activation guard output\n"
     if job_text.count(marker) != 1:
         raise AssertionError("activation guard parser step is not unique")
     after_marker = job_text.split(marker, 1)[1]
-    run_marker = "        run: |\n"
-    if not after_marker.startswith(run_marker):
+    run_prefix = (
+        "        env:\n"
+        "          FEDERATION_GITHUB_TOKEN: ${{ steps.guard-token.outputs.token }}\n"
+        "          FEDERATION_APP_SLUG: ${{ steps.guard-token.outputs.app-slug }}\n"
+        "          FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ steps.trusted-checkout.outputs.sha }}\n"
+        "        run: |\n"
+    )
+    if not after_marker.startswith(run_prefix):
         raise AssertionError("activation guard parser run block is ambiguous")
-    remaining = after_marker[len(run_marker):]
+    remaining = after_marker[len(run_prefix):]
     collected: list[str] = []
     for line in remaining.splitlines(keepends=True):
         if line.strip() and len(line) - len(line.lstrip(" ")) < 10:
@@ -577,11 +591,35 @@ def compute_python_authority_closure() -> tuple[str, ...]:
 
 def _guard_json_value() -> dict[str, object]:
     return {
-        "activationWriteAllowed": False,
+        "activationWriteAllowed": True,
         "ordinaryWriteAllowed": False,
-        "reason": "WAVE10_INERT_GUARD",
+        "reason": "MERGED_UNPROVEN_NO_VALID_EPOCH",
         "runtimeState": "MERGED_UNPROVEN",
     }
+
+
+def _guard_positive_values() -> tuple[dict[str, object], ...]:
+    return (
+        {
+            "activationWriteAllowed": False,
+            "ordinaryWriteAllowed": True,
+            "reason": "ACTIVE_G8_EPOCH_PROVEN",
+            "runtimeState": "ACTIVE_G8",
+        },
+        _guard_json_value(),
+        {
+            "activationWriteAllowed": False,
+            "ordinaryWriteAllowed": False,
+            "reason": "BLOCKED_POST_MERGE_CONFLICT",
+            "runtimeState": "BLOCKED_POST_MERGE",
+        },
+        {
+            "activationWriteAllowed": False,
+            "ordinaryWriteAllowed": False,
+            "reason": "PRE_G8_NOT_APPLICABLE",
+            "runtimeState": "PRE_G8_NOT_APPLICABLE",
+        },
+    )
 
 
 def _guard_negative_fixtures() -> tuple[tuple[str, bytes], ...]:
@@ -589,10 +627,10 @@ def _guard_negative_fixtures() -> tuple[tuple[str, bytes], ...]:
     canonical = canonical_json(good)
     keys_without = lambda key: {name: value for name, value in good.items() if name != key}
     duplicate_key_fixtures = {
-        "G17": b'{"activationWriteAllowed":false,"activationWriteAllowed":false,"ordinaryWriteAllowed":false,"reason":"WAVE10_INERT_GUARD","runtimeState":"MERGED_UNPROVEN"}\n',
-        "G18": b'{"activationWriteAllowed":false,"ordinaryWriteAllowed":false,"ordinaryWriteAllowed":false,"reason":"WAVE10_INERT_GUARD","runtimeState":"MERGED_UNPROVEN"}\n',
-        "G19": b'{"activationWriteAllowed":false,"ordinaryWriteAllowed":false,"reason":"WAVE10_INERT_GUARD","reason":"WAVE10_INERT_GUARD","runtimeState":"MERGED_UNPROVEN"}\n',
-        "G20": b'{"activationWriteAllowed":false,"ordinaryWriteAllowed":false,"reason":"WAVE10_INERT_GUARD","runtimeState":"MERGED_UNPROVEN","runtimeState":"MERGED_UNPROVEN"}\n',
+        "G17": b'{"activationWriteAllowed":true,"activationWriteAllowed":true,"ordinaryWriteAllowed":false,"reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","runtimeState":"MERGED_UNPROVEN"}\n',
+        "G18": b'{"activationWriteAllowed":true,"ordinaryWriteAllowed":false,"ordinaryWriteAllowed":false,"reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","runtimeState":"MERGED_UNPROVEN"}\n',
+        "G19": b'{"activationWriteAllowed":true,"ordinaryWriteAllowed":false,"reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","runtimeState":"MERGED_UNPROVEN"}\n',
+        "G20": b'{"activationWriteAllowed":true,"ordinaryWriteAllowed":false,"reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","runtimeState":"MERGED_UNPROVEN","runtimeState":"MERGED_UNPROVEN"}\n',
     }
     values: dict[str, bytes] = {
         "G01": b"",
@@ -612,10 +650,10 @@ def _guard_negative_fixtures() -> tuple[tuple[str, bytes], ...]:
         "G15": canonical_json(keys_without("runtimeState")),
         "G16": canonical_json({**good, "extra": False}),
         **duplicate_key_fixtures,
-        "G21": canonical_json({**good, "activationWriteAllowed": True}),
-        "G22": b'{"activationWriteAllowed":0,"ordinaryWriteAllowed":false,"reason":"WAVE10_INERT_GUARD","runtimeState":"MERGED_UNPROVEN"}\n',
+        "G21": canonical_json({**good, "activationWriteAllowed": False}),
+        "G22": b'{"activationWriteAllowed":0,"ordinaryWriteAllowed":false,"reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","runtimeState":"MERGED_UNPROVEN"}\n',
         "G23": canonical_json({**good, "ordinaryWriteAllowed": True}),
-        "G24": b'{"activationWriteAllowed":false,"ordinaryWriteAllowed":0,"reason":"WAVE10_INERT_GUARD","runtimeState":"MERGED_UNPROVEN"}\n',
+        "G24": b'{"activationWriteAllowed":true,"ordinaryWriteAllowed":0,"reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","runtimeState":"MERGED_UNPROVEN"}\n',
         "G25": canonical_json({**good, "reason": "OTHER"}),
         "G26": canonical_json({**good, "reason": 1}),
         "G27": canonical_json({**good, "runtimeState": "ACTIVE_G8"}),
@@ -623,17 +661,17 @@ def _guard_negative_fixtures() -> tuple[tuple[str, bytes], ...]:
         "G29": canonical_json({**good, "runtimeState": "PRE_G8_NOT_APPLICABLE"}),
         "G30": canonical_json({**good, "runtimeState": "UNKNOWN"}),
         "G31": canonical_json({**good, "runtimeState": 1}),
-        "G32": b'{"runtimeState":"MERGED_UNPROVEN","reason":"WAVE10_INERT_GUARD","ordinaryWriteAllowed":false,"activationWriteAllowed":false}\n',
-        "G33": b'{"activationWriteAllowed": false, "ordinaryWriteAllowed": false, "reason": "WAVE10_INERT_GUARD", "runtimeState": "MERGED_UNPROVEN"}\n',
+        "G32": b'{"runtimeState":"MERGED_UNPROVEN","reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","ordinaryWriteAllowed":false,"activationWriteAllowed":true}\n',
+        "G33": b'{"activationWriteAllowed": true, "ordinaryWriteAllowed": false, "reason": "MERGED_UNPROVEN_NO_VALID_EPOCH", "runtimeState": "MERGED_UNPROVEN"}\n',
         "G34": b" " + canonical,
         "G35": canonical[:-1] + b" \n",
         "G36": canonical[:-1] + b" trailing text\n",
         "G37": canonical + b'{"fallback":"first line only"}\n',
         "G38": b"runtimeState=MERGED_UNPROVEN\n",
         "G39": canonical_json({**good, "runtimeState": "FALLBACK_TO_ACTIVE_G8"}),
-        "G40": b'{"activationWriteAllowed":false,"ordinaryWriteAllowed":false,"reason":"WAVE10_INERT_GUARD","runtimeState":NaN}\n',
-        "G41": b'{"activationWriteAllowed":false,"ordinaryWriteAllowed":false,"reason":"WAVE10_INERT_GUARD","runtimeState":Infinity}\n',
-        "G42": b'{"activationWriteAllowed":false,"ordinaryWriteAllowed":false,"reason":"WAVE10_INERT_GUARD","runtimeState":-Infinity}\n',
+        "G40": b'{"activationWriteAllowed":true,"ordinaryWriteAllowed":false,"reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","runtimeState":NaN}\n',
+        "G41": b'{"activationWriteAllowed":true,"ordinaryWriteAllowed":false,"reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","runtimeState":Infinity}\n',
+        "G42": b'{"activationWriteAllowed":true,"ordinaryWriteAllowed":false,"reason":"MERGED_UNPROVEN_NO_VALID_EPOCH","runtimeState":-Infinity}\n',
     }
     if set(values) != {f"G{number:02}" for number in range(1, 43)}:
         raise AssertionError("guard fixture IDs are incomplete")
@@ -770,12 +808,20 @@ class G8WorkflowEpochTests(unittest.TestCase):
                 self.assertEqual(jobs[0][0], "activation-guard")
                 guard = jobs[0][1]
                 self.assertIn("permissions:\n      contents: read\n", guard)
-                self.assertNotIn(APP_TOKEN_ACTION, guard)
+                self.assertEqual(guard.count(APP_TOKEN_ACTION), 1)
+                for permission in ("contents", "issues", "pull-requests", "statuses"):
+                    self.assertEqual(guard.count(f"permission-{permission}: read"), 1)
+                    self.assertNotIn(f"permission-{permission}: write", guard)
+                self.assertNotIn("permission-actions:", guard)
+                self.assertNotIn("permission-checks:", guard)
                 self.assertIn(f"uses: {CHECKOUT_ACTION}", guard)
                 self.assertIn("ref: refs/heads/main", guard)
                 self.assertIn("persist-credentials: false", guard)
                 self.assertIn("submodules: false", guard)
                 self.assertIn("lfs: false", guard)
+                self.assertIn("FEDERATION_GITHUB_TOKEN: ${{ steps.guard-token.outputs.token }}", guard)
+                self.assertIn("FEDERATION_APP_SLUG: ${{ steps.guard-token.outputs.app-slug }}", guard)
+                self.assertIn("FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ steps.trusted-checkout.outputs.sha }}", guard)
                 self.assertIn("automation.federation.controller activation-guard", guard)
                 self.assertNotRegex(guard, r"\b(?:grep|sed|awk|jq|head|tail|cut)\b")
                 wrapper = _extract_guard_wrapper(guard)
@@ -804,13 +850,12 @@ class G8WorkflowEpochTests(unittest.TestCase):
         parser_body = wrapper[parser_start:parser_end + 1]
         self.assertTrue(parser_body.endswith("\n"))
 
-        positive = (
-            b'{"activationWriteAllowed":false,"ordinaryWriteAllowed":false,'
-            b'"reason":"WAVE10_INERT_GUARD","runtimeState":"MERGED_UNPROVEN"}\n'
-        )
         negatives = _guard_negative_fixtures()
         self.assertEqual(len(negatives), 42)
-        self.assertEqual(tuple(case_id for case_id, _ in negatives), tuple(f"G{number:02}" for number in range(1, 43)))
+        self.assertEqual(
+            tuple(case_id for case_id, _ in negatives),
+            tuple(f"G{number:02}" for number in range(1, 43)),
+        )
         python3 = shutil.which("python3") or sys.executable
 
         with tempfile.TemporaryDirectory(prefix="g8-actual-parser-") as temp_dir:
@@ -818,13 +863,36 @@ class G8WorkflowEpochTests(unittest.TestCase):
             parser_path = temp / "actual_workflow_parser.py"
             parser_path.write_text(parser_body, encoding="utf-8", newline="\n")
 
-            fallback_mutant_body = _replace_once(
-                parser_body,
-                'if value["runtimeState"] != "MERGED_UNPROVEN":\n'
-                '    raise SystemExit("unexpected activation guard runtime state")\n',
-                'if value["runtimeState"] not in {"MERGED_UNPROVEN", "FALLBACK_TO_ACTIVE_G8"}:\n'
-                '    raise SystemExit("unexpected activation guard runtime state")\n',
+            strict_matrix = (
+                'runtime_state = value["runtimeState"]\n'
+                'if runtime_state not in allowed:\n'
+                '    raise SystemExit("unexpected activation guard runtime state")\n'
+                'ordinary_expected, activation_expected, reason_expected = allowed[runtime_state]\n'
+                'if value["ordinaryWriteAllowed"] is not ordinary_expected:\n'
+                '    raise SystemExit("ordinaryWriteAllowed does not match runtime state")\n'
+                'if value["activationWriteAllowed"] is not activation_expected:\n'
+                '    raise SystemExit("activationWriteAllowed does not match runtime state")\n'
+                'if value["reason"] != reason_expected:\n'
+                '    raise SystemExit("activation guard reason does not match runtime state")\n'
             )
+            fallback_matrix = (
+                'runtime_state = value["runtimeState"]\n'
+                'if runtime_state == "FALLBACK_TO_ACTIVE_G8":\n'
+                '    ordinary_expected = value["ordinaryWriteAllowed"]\n'
+                '    activation_expected = value["activationWriteAllowed"]\n'
+                '    reason_expected = value["reason"]\n'
+                'elif runtime_state not in allowed:\n'
+                '    raise SystemExit("unexpected activation guard runtime state")\n'
+                'else:\n'
+                '    ordinary_expected, activation_expected, reason_expected = allowed[runtime_state]\n'
+                'if value["ordinaryWriteAllowed"] is not ordinary_expected:\n'
+                '    raise SystemExit("ordinaryWriteAllowed does not match runtime state")\n'
+                'if value["activationWriteAllowed"] is not activation_expected:\n'
+                '    raise SystemExit("activationWriteAllowed does not match runtime state")\n'
+                'if value["reason"] != reason_expected:\n'
+                '    raise SystemExit("activation guard reason does not match runtime state")\n'
+            )
+            fallback_mutant_body = _replace_once(parser_body, strict_matrix, fallback_matrix)
             fallback_mutant_body = _replace_once(
                 fallback_mutant_body,
                 'if canonical != raw:\n'
@@ -834,60 +902,69 @@ class G8WorkflowEpochTests(unittest.TestCase):
                 'if value["runtimeState"] == "FALLBACK_TO_ACTIVE_G8":\n'
                 '    value["runtimeState"] = "ACTIVE_G8"\n',
             )
-            fallback_mutant_body = _replace_once(
-                fallback_mutant_body,
-                '    output.write("runtime_state=MERGED_UNPROVEN\\n")\n',
-                '    output.write("runtime_state=" + value["runtimeState"] + "\\n")\n',
-            )
             self.assertNotEqual(fallback_mutant_body, parser_body)
             fallback_mutant_path = temp / "controlled_fallback_mutant.py"
             fallback_mutant_path.write_text(fallback_mutant_body, encoding="utf-8", newline="\n")
 
-            def execute(raw: bytes, index: str) -> subprocess.CompletedProcess[bytes]:
+            def execute(
+                raw: bytes,
+                index: str,
+                *,
+                parser: Path = parser_path,
+            ) -> tuple[subprocess.CompletedProcess[bytes], Path]:
                 stdout_path = temp / f"{index}.stdout"
                 output_path = temp / f"{index}.github_output"
                 stdout_path.write_bytes(raw)
                 output_path.write_bytes(b"")
-                return subprocess.run(
-                    [python3, str(parser_path), str(stdout_path), str(output_path)],
+                result = subprocess.run(
+                    [python3, str(parser), str(stdout_path), str(output_path)],
                     capture_output=True,
                     check=False,
                     timeout=10,
                 )
+                return result, output_path
 
-            accepted = execute(positive, "positive")
-            self.assertEqual(accepted.returncode, 0, accepted.stderr.decode("utf-8", "replace"))
-            self.assertEqual(accepted.stdout, b"")
-            self.assertEqual(
-                (temp / "positive.github_output").read_bytes(),
-                b"runtime_state=MERGED_UNPROVEN\nordinary_write_allowed=false\nactivation_write_allowed=false\n",
-            )
+            for index, value in enumerate(_guard_positive_values(), start=1):
+                with self.subTest(positive=value["runtimeState"]):
+                    accepted, output_path = execute(canonical_json(value), f"positive-{index}")
+                    self.assertEqual(
+                        accepted.returncode,
+                        0,
+                        accepted.stderr.decode("utf-8", "replace"),
+                    )
+                    self.assertEqual(accepted.stdout, b"")
+                    expected_output = (
+                        f'runtime_state={value["runtimeState"]}\n'
+                        f'ordinary_write_allowed={"true" if value["ordinaryWriteAllowed"] else "false"}\n'
+                        f'activation_write_allowed={"true" if value["activationWriteAllowed"] else "false"}\n'
+                    ).encode()
+                    self.assertEqual(output_path.read_bytes(), expected_output)
 
             for case_id, raw in negatives:
                 with self.subTest(case=case_id):
-                    rejected = execute(raw, case_id)
+                    rejected, output_path = execute(raw, case_id)
                     self.assertNotEqual(rejected.returncode, 0)
-                    self.assertEqual((temp / f"{case_id}.github_output").read_bytes(), b"")
+                    self.assertEqual(output_path.read_bytes(), b"")
+
             g39_raw = dict(negatives)["G39"]
-            g27_raw = dict(negatives)["G27"]
-            self.assertNotEqual(g39_raw, g27_raw)
             g39_strict_output = temp / "G39.github_output"
             self.assertEqual(g39_strict_output.read_bytes(), b"")
-            g39_stdout = temp / "G39.stdout"
-            g39_stdout.write_bytes(g39_raw)
-            g39_mutant_output = temp / "G39.fallback_mutant.github_output"
-            g39_mutant_output.write_bytes(b"")
-            fallback_result = subprocess.run(
-                [python3, str(fallback_mutant_path), str(g39_stdout), str(g39_mutant_output)],
-                capture_output=True,
-                check=False,
-                timeout=10,
+            fallback_result, fallback_output = execute(
+                g39_raw,
+                "G39-fallback-mutant",
+                parser=fallback_mutant_path,
             )
-            self.assertEqual(fallback_result.returncode, 0, fallback_result.stderr.decode("utf-8", "replace"))
+            self.assertEqual(
+                fallback_result.returncode,
+                0,
+                fallback_result.stderr.decode("utf-8", "replace"),
+            )
             self.assertEqual(fallback_result.stdout, b"")
             self.assertEqual(
-                g39_mutant_output.read_bytes(),
-                b"runtime_state=ACTIVE_G8\nordinary_write_allowed=false\nactivation_write_allowed=false\n",
+                fallback_output.read_bytes(),
+                b"runtime_state=ACTIVE_G8\n"
+                b"ordinary_write_allowed=false\n"
+                b"activation_write_allowed=true\n",
             )
         self.assertEqual(len(negatives), 42)
 
@@ -914,6 +991,8 @@ class G8WorkflowEpochTests(unittest.TestCase):
             },
             "federation-g8-reconcile.yml": {
                 "recover": {"actions": "write", "statuses": "write", "contents": "write", "issues": "read", "pull-requests": "write"},
+                "activation-preflight": {"actions": "read", "contents": "read", "statuses": "read", "issues": "read", "pull-requests": "read"},
+                "activate-g8": {"actions": "write", "statuses": "write", "contents": "write", "issues": "write", "pull-requests": "write"},
             },
         }
         for relative_path in NEW_WRITER_PATHS:
@@ -922,13 +1001,33 @@ class G8WorkflowEpochTests(unittest.TestCase):
             jobs = _top_level_job_blocks(text)
             self.assertEqual(jobs[0][0], "activation-guard")
             guard = jobs[0][1]
-            self.assertNotIn(APP_TOKEN_ACTION, guard)
+            self.assertEqual(guard.count(APP_TOKEN_ACTION), 1)
             self.assertIn("permissions:\n      contents: read\n", guard)
+            for permission in ("contents", "issues", "pull-requests", "statuses"):
+                self.assertEqual(guard.count(f"permission-{permission}: read"), 1)
+                self.assertNotIn(f"permission-{permission}: write", guard)
+            self.assertNotIn("permission-actions:", guard)
+            self.assertNotIn("permission-checks:", guard)
+            self.assertIn("FEDERATION_GITHUB_TOKEN: ${{ steps.guard-token.outputs.token }}", guard)
+            self.assertIn("FEDERATION_APP_SLUG: ${{ steps.guard-token.outputs.app-slug }}", guard)
+            self.assertIn("FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ steps.trusted-checkout.outputs.sha }}", guard)
             for job_name, job_text in jobs[1:]:
                 token_count = job_text.count(APP_TOKEN_ACTION)
                 if token_count:
                     self.assertEqual(token_count, 1)
-                    if filename == "federation-g8-trusted-validation.yml" and job_name != "role-router":
+                    if filename == "federation-g8-reconcile.yml" and job_name == "activation-preflight":
+                        self.assertIn("needs: activation-guard\n", job_text)
+                        self.assertIn("inputs.mode == 'activate-g8'", job_text)
+                        self.assertIn("github.ref == 'refs/heads/main'", job_text)
+                        self.assertIn("activation-preflight", job_text)
+                        self.assertNotRegex(job_text, r"^\s+permission-[a-z-]+:\s+write\s*$")
+                    elif filename == "federation-g8-reconcile.yml" and job_name == "activate-g8":
+                        self.assertIn("needs: activation-preflight\n", job_text)
+                        self.assertIn("needs.activation-preflight.outputs.decision == 'READY'", job_text)
+                        self.assertIn("github.event_name == 'workflow_dispatch'", job_text)
+                        self.assertIn("inputs.mode == 'activate-g8'", job_text)
+                        self.assertIn("github.ref == 'refs/heads/main'", job_text)
+                    elif filename == "federation-g8-trusted-validation.yml" and job_name != "role-router":
                         self.assertIn("needs: [activation-guard, role-router]\n", job_text)
                         route = "MANUAL_STATUS" if job_name == "manual-status-validation" else "MACHINE_VALIDATION"
                         self.assertIn(
@@ -972,12 +1071,11 @@ class G8WorkflowEpochTests(unittest.TestCase):
             }
             self.assertEqual(observed, expected_permissions[filename])
             if filename == "federation-g8-reconcile.yml":
-                activate_job = dict(jobs)["activate-g8-wave10-blocked"]
-                self.assertNotIn(APP_TOKEN_ACTION, activate_job)
-                self.assertIn("contents: read", activate_job)
-                self.assertIn("WAVE10_ACTIVATION_NOT_IMPLEMENTED", activate_job)
-                self.assertNotIn("ActivationRecoveryWitness", activate_job)
-                self.assertNotIn("ActivationEpoch", activate_job)
+                self.assertNotIn("activate-g8-wave10-blocked", text)
+                activate_job = dict(jobs)["activate-g8"]
+                self.assertIn("automation.federation.controller activate-g8", activate_job)
+                self.assertNotIn("permission-checks:", activate_job)
+                self.assertNotIn("PAT", activate_job)
 
             if filename == "federation-g8-trusted-validation.yml":
                 self.assertIn(
@@ -1030,40 +1128,78 @@ class G8WorkflowEpochTests(unittest.TestCase):
                             r"^\s*PYTHONDONTWRITEBYTECODE=1 python3 -B -m automation\.federation\.controller(?:\s|$)",
                         )
 
-    def test_old_dispatch_targets_and_wave11_wave12_runtime_are_absent(self):
-        production = "\n".join(
+    def test_old_dispatch_targets_and_activation_writer_reachability_remain_absent(self):
+        request_model_path = ROOT / "automation" / "federation" / "request_model.py"
+        production_without_historic_identity = "\n".join(
             path.read_text(encoding="utf-8")
             for path in sorted((ROOT / "automation" / "federation").rglob("*.py"))
+            if path != request_model_path
         )
-        for retired in (
-            "federation-interactive.yml",
-            "federation-trusted-validation.yml",
-            "federation-state-finalize.yml",
-            "federation-main-advance.yml",
-            "federation-reconcile.yml",
-        ):
-            self.assertNotIn(retired, production)
-        wave10_production = "\n".join(
-            [
-                (ROOT / "automation" / "federation" / "controller.py").read_text(encoding="utf-8"),
-                *[(ROOT / path).read_text(encoding="utf-8") for path in NEW_WRITER_PATHS],
-            ]
+        retired_names = tuple(Path(path).name for path in OLD_WRITER_PATHS)
+        for retired in retired_names:
+            self.assertNotIn(retired, production_without_historic_identity)
+
+        request_model = request_model_path.read_text(encoding="utf-8")
+        for retired in retired_names:
+            self.assertEqual(request_model.count(retired), 1)
+
+        request_model_tree = ast.parse(request_model)
+        old_writer_assignments = [
+            node
+            for node in request_model_tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "G8_OLD_WRITERS" for target in node.targets)
+        ]
+        self.assertEqual(len(old_writer_assignments), 1)
+        old_writer_identities = ast.literal_eval(old_writer_assignments[0].value)
+        expected_old_writer_identities = (
+            (".github/workflows/federation-interactive.yml", 350485971),
+            (".github/workflows/federation-trusted-validation.yml", 350485976),
+            (".github/workflows/federation-state-finalize.yml", 350485975),
+            (".github/workflows/federation-main-advance.yml", 350485973),
+            (".github/workflows/federation-reconcile.yml", 350485974),
         )
-        for forbidden in (
-            "ActivationRecoveryWitness",
-            "class ActivationEpoch",
-        ):
-            self.assertNotIn(forbidden, wave10_production)
+        self.assertEqual(old_writer_identities, expected_old_writer_identities)
+        self.assertEqual(tuple(path for path, _workflow_id in old_writer_identities), OLD_WRITER_PATHS)
+        self.assertEqual(len({path for path, _workflow_id in old_writer_identities}), 5)
+        self.assertEqual(len({_workflow_id for _path, _workflow_id in old_writer_identities}), 5)
+
         controller = (ROOT / "automation" / "federation" / "controller.py").read_text(encoding="utf-8")
-        self.assertNotIn("activate-g8", controller)
+        controller_tree = ast.parse(controller)
+        dispatch_targets = []
+        for node in ast.walk(controller_tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if not (isinstance(function, ast.Attribute) and function.attr == "dispatch_workflow"):
+                continue
+            self.assertGreaterEqual(len(node.args), 2)
+            workflow_argument = node.args[1]
+            self.assertIsInstance(workflow_argument, ast.Constant)
+            self.assertIsInstance(workflow_argument.value, str)
+            dispatch_targets.append(workflow_argument.value)
+        self.assertTrue(dispatch_targets)
+        for retired in retired_names:
+            self.assertNotIn(retired, dispatch_targets)
+
+        self.assertIn("def derive_g8_activation_guard(", controller)
+        self.assertNotIn("wave10_inert_activation_guard", controller)
+        activation_authority = next(
+            node for node in ast.walk(controller_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_require_g8_activation_run_authority"
+        )
+        activation_authority_source = ast.get_source_segment(controller, activation_authority)
+        self.assertIn('if mode != "activate-g8":', activation_authority_source)
+        self.assertIn('"activate-g8"', controller)
         for path in NEW_WRITER_PATHS:
             text = (ROOT / path).read_text(encoding="utf-8")
             if Path(path).name != "federation-g8-reconcile.yml":
                 self.assertNotIn("activate-g8", text)
         reconcile = (ROOT / ".github" / "workflows" / "federation-g8-reconcile.yml").read_text(encoding="utf-8")
         self.assertIn("activate-g8", reconcile)
-        self.assertIn("activate-g8-wave10-blocked", reconcile)
-        self.assertNotIn(APP_TOKEN_ACTION, dict(_top_level_job_blocks(reconcile))["activate-g8-wave10-blocked"])
+        self.assertNotIn("activate-g8-wave10-blocked", reconcile)
+        self.assertIn("federation-g8-reconcile.yml", controller)
 
     def test_wg3_route_transport_parser_rejects_noncanonical_outputs(self):
         workflow = (WORKFLOWS / "federation-g8-trusted-validation.yml").read_text(encoding="utf-8")

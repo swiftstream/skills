@@ -141,9 +141,18 @@ class Wave11RuntimeStaticProofTests(unittest.TestCase):
             fixture.controller(merged_tuple).derive_activation_boundary_evidence()
 
         source = CONTROLLER.read_text(encoding="utf-8")
-        method = source.split("    def derive_activation_boundary_evidence(", 1)[1].split(
-            "    def resolve_current_sha_carrier_role(", 1,
-        )[0]
+        tree = ast.parse(source)
+        controller_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "R02Controller"
+        )
+        function = next(
+            node for node in controller_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "derive_activation_boundary_evidence"
+        )
+        method = ast.get_source_segment(source, function)
+        self.assertIsNotNone(method)
         self.assertIn('contract_path = ".github/federation/g8-activation-contract.json"', method)
         self.assertIn('get_merged_pull_request_metadata(self.central_repository, 27)', method)
         self.assertIn("merged_contract_bytes != discovery_bytes", method)
@@ -207,10 +216,28 @@ class Wave11RuntimeStaticProofTests(unittest.TestCase):
         self.assertEqual(model.count('MACHINE_REF_CLAIM_AUTHORITY_PREFIX = "swiftstream-federation-machine-ref-claim-authority:v2\\n"'), 1)
 
         controller = CONTROLLER.read_text(encoding="utf-8")
-        builder = controller.split("    def machine_candidate(", 1)[1].split("    def validate_machine_head(", 1)[0]
+        controller_tree = ast.parse(controller)
+        controller_class = next(
+            node for node in controller_tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "C02CandidateBuilder"
+        )
+        methods = {
+            node.name: ast.get_source_segment(controller, node)
+            for node in controller_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        shared_builder = methods["_machine_candidate"]
+        ordinary_builder = methods["machine_candidate"]
+        claim_builder = methods["machine_claim_candidate"]
         resolver = controller.split("    def _resolve_machine_v2_carrier(", 1)[1].split("    def ", 1)[0]
         reconcile = controller.split("    def reconcile(", 1)[1].split("    def ", 1)[0]
-        self.assertIn("machine_ref_claim_authority_digest(", builder)
+        self.assertIn("machine_ref_claim_authority_digest(", shared_builder)
+        self.assertIn("require_claim_generation: bool", shared_builder)
+        self.assertIn("claim_generation_id(", shared_builder)
+        self.assertIn("self._machine_candidate(", ordinary_builder)
+        self.assertIn("require_claim_generation=False", ordinary_builder)
+        self.assertIn("self._machine_candidate(", claim_builder)
+        self.assertIn("require_claim_generation=True", claim_builder)
         self.assertIn("machine_ref_claim_authority_digest(", resolver)
         self.assertIn("current_ref = self.client.get_ref_oid(", resolver)
         self.assertIn("if current_ref == head_sha", resolver)
@@ -360,17 +387,570 @@ class Wave11RuntimeStaticProofTests(unittest.TestCase):
         self.assertIn("runtime_state == 'ACTIVE_G8'", manual)
         self.assertIn("runtime_state == 'ACTIVE_G8'", machine)
 
-        reconcile_workflow = (ROOT / ".github/workflows/federation-g8-reconcile.yml").read_text(encoding="utf-8")
+        reconcile_workflow_path = ROOT / ".github/workflows/federation-g8-reconcile.yml"
+        reconcile_workflow_bytes = reconcile_workflow_path.read_bytes()
+        self.assertEqual(
+            importlib.import_module("hashlib").sha256(reconcile_workflow_bytes).hexdigest(),
+            "b7be9b3828b2b432681df95de874860b124c72bbdf474425ca21fa338b00e602",
+        )
+        reconcile_workflow = reconcile_workflow_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            [line for line in reconcile_workflow.splitlines() if line and not line[0].isspace()],
+            ["name: Federation G8 reconcile", "on:", "permissions:", "concurrency:", "jobs:"],
+        )
         self.assertIn("controller universal-recovery", reconcile_workflow)
         self.assertNotIn("controller reconcile\n", reconcile_workflow)
+        self.assertNotIn("activate-g8-wave10-blocked:", reconcile_workflow)
+        self.assertNotIn("WAVE10_ACTIVATION_NOT_IMPLEMENTED", reconcile_workflow)
         self.assertNotIn("permission-checks:", reconcile_workflow)
-        blocked_job = reconcile_workflow.split("activate-g8-wave10-blocked:", 1)[1]
-        self.assertIn("inputs.mode == 'activate-g8'", blocked_job)
-        self.assertIn("WAVE10_ACTIVATION_NOT_IMPLEMENTED", blocked_job)
-        self.assertNotIn("actions/create-github-app-token", blocked_job)
 
-    def test_wave12_runtime_and_authority_surface_are_absent(self):
+        jobs_headers = list(re.finditer(r"(?m)^jobs:[ \t]*$", reconcile_workflow))
+        self.assertEqual(len(jobs_headers), 1)
+        jobs_source = reconcile_workflow[jobs_headers[0].end():]
+        job_headers = list(re.finditer(r"(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):[ \t]*$", jobs_source))
+        job_names = [match.group(1) for match in job_headers]
+        self.assertEqual(len(job_names), len(set(job_names)))
+        self.assertEqual(
+            job_names,
+            ["activation-guard", "recover", "activation-preflight", "activate-g8"],
+        )
+        self.assertEqual(
+            [line for line in jobs_source.splitlines() if re.match(r"^  \S", line)],
+            [
+                "  activation-guard:",
+                "  recover:",
+                "  activation-preflight:",
+                "  activate-g8:",
+            ],
+        )
+        job_slices = {}
+        for index, header in enumerate(job_headers):
+            end = job_headers[index + 1].start() if index + 1 < len(job_headers) else len(jobs_source)
+            job_slices[header.group(1)] = jobs_source[header.start():end]
+        self.assertIn("activation-preflight", job_slices)
+        self.assertIn("activate-g8", job_slices)
+        preflight_job = job_slices["activation-preflight"]
+        expected_preflight_job = "\n".join(
+            (
+                '  activation-preflight:',
+                '    needs: activation-guard',
+                "    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'activate-g8' && github.ref == 'refs/heads/main'",
+                '    runs-on: ubuntu-latest',
+                '    permissions:',
+                '      contents: read',
+                '    outputs:',
+                '      decision: ${{ steps.parse-preflight.outputs.decision }}',
+                '      trusted_sha: ${{ steps.trusted-checkout.outputs.sha }}',
+                '    steps:',
+                '      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+                '        with:',
+                '          ref: refs/heads/main',
+                '          persist-credentials: false',
+                '          submodules: false',
+                '          lfs: false',
+                '      - id: trusted-checkout',
+                '        name: Bind read-only preflight checkout to HEAD',
+                '        run: |',
+                '          set -euo pipefail',
+                '          trusted_head="$(git rev-parse --verify HEAD^{commit})"',
+                '          if [[ ! "$trusted_head" =~ ^[0-9a-f]{40}$ ]]; then',
+                '            echo "trusted checkout HEAD is not a lowercase commit SHA" >&2',
+                '            exit 1',
+                '          fi',
+                '          echo "sha=$trusted_head" >> "$GITHUB_OUTPUT"',
+                '      - id: preflight-token',
+                '        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1',
+                '        with:',
+                '          client-id: ${{ vars.APP_CLIENT_ID }}',
+                '          private-key: ${{ secrets.APP_PRIVATE_KEY }}',
+                '          permission-actions: read',
+                '          permission-contents: read',
+                '          permission-statuses: read',
+                '          permission-issues: read',
+                '          permission-pull-requests: read',
+                '      - id: preflight',
+                '        name: Re-read exact admin and activation guard',
+                '        env:',
+                '          FEDERATION_GITHUB_TOKEN: ${{ steps.preflight-token.outputs.token }}',
+                '          FEDERATION_APP_SLUG: ${{ steps.preflight-token.outputs.app-slug }}',
+                '          FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ steps.trusted-checkout.outputs.sha }}',
+                '          INPUT_MODE: ${{ inputs.mode }}',
+                '        run: |',
+                '          set -euo pipefail',
+                '          PYTHONDONTWRITEBYTECODE=1 python3 -B -m automation.federation.controller activation-preflight > "${RUNNER_TEMP}/g8-activation-preflight.out"',
+                '      - id: parse-preflight',
+                '        name: Strictly validate activation preflight decision',
+                '        run: |',
+                '          set -euo pipefail',
+                '          python3 - "${RUNNER_TEMP}/g8-activation-preflight.out" "$GITHUB_OUTPUT" <<\'PY\'',
+                '          import json',
+                '          import pathlib',
+                '          import sys',
+                '',
+                '          def unique_object(pairs):',
+                '              result = {}',
+                '              for key, value in pairs:',
+                '                  if key in result:',
+                '                      raise ValueError("duplicate JSON key")',
+                '                  result[key] = value',
+                '              return result',
+                '',
+                '          def reject_constant(value):',
+                '              raise ValueError("non-standard JSON constant")',
+                '',
+                '          raw = pathlib.Path(sys.argv[1]).read_bytes()',
+                '          if not raw or raw.count(b"\\n") != 1 or not raw.endswith(b"\\n") or b"\\r" in raw:',
+                '              raise SystemExit("invalid activation preflight framing")',
+                '          try:',
+                '              value = json.loads(raw[:-1].decode("utf-8"), object_pairs_hook=unique_object, parse_constant=reject_constant)',
+                '          except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:',
+                '              raise SystemExit("invalid activation preflight JSON") from exc',
+                '          if type(value) is not dict or set(value) != {"decision"} or type(value["decision"]) is not str:',
+                '              raise SystemExit("invalid activation preflight shape")',
+                '          decision = value["decision"]',
+                '          if decision not in {"READY", "ACTIVE_NOOP", "BLOCKED"}:',
+                '              raise SystemExit("unknown activation preflight decision")',
+                '          canonical = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\\n")',
+                '          if canonical != raw:',
+                '              raise SystemExit("non-canonical activation preflight bytes")',
+                '          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8", newline="\\n") as output:',
+                '              output.write("decision=" + decision + "\\n")',
+                '          PY',
+                '',
+                ''
+            )
+        )
+        self.assertEqual(preflight_job, expected_preflight_job)
+        activate_job = job_slices["activate-g8"]
+        expected_activate_job = "\n".join(
+            (
+                "  activate-g8:",
+                "    needs: activation-preflight",
+                "    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'activate-g8' && github.ref == 'refs/heads/main' && needs.activation-preflight.outputs.decision == 'READY'",
+                "    runs-on: ubuntu-latest",
+                "    permissions:",
+                "      contents: read",
+                "    steps:",
+                "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+                "        with:",
+                "          ref: refs/heads/main",
+                "          persist-credentials: false",
+                "          submodules: false",
+                "          lfs: false",
+                "      - name: Require the exact preflight checkout",
+                "        env:",
+                "          PREFLIGHT_SHA: ${{ needs.activation-preflight.outputs.trusted_sha }}",
+                "        run: |",
+                "          set -euo pipefail",
+                "          current=\"$(git rev-parse --verify HEAD^{commit})\"",
+                "          if [[ ! \"$current\" =~ ^[0-9a-f]{40}$ || \"$current\" != \"$PREFLIGHT_SHA\" ]]; then",
+                "            echo \"trusted main changed after read-only activation preflight\" >&2",
+                "            exit 1",
+                "          fi",
+                "      - id: activation-token",
+                "        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+                "        with:",
+                "          client-id: ${{ vars.APP_CLIENT_ID }}",
+                "          private-key: ${{ secrets.APP_PRIVATE_KEY }}",
+                "          permission-actions: write",
+                "          permission-statuses: write",
+                "          permission-contents: write",
+                "          permission-issues: write",
+                "          permission-pull-requests: write",
+                "      - name: Execute exact activate-g8 controller command",
+                "        env:",
+                "          FEDERATION_GITHUB_TOKEN: ${{ steps.activation-token.outputs.token }}",
+                "          FEDERATION_APP_SLUG: ${{ steps.activation-token.outputs.app-slug }}",
+                "          FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ needs.activation-preflight.outputs.trusted_sha }}",
+                "          INPUT_MODE: ${{ inputs.mode }}",
+                "        run: |",
+                "          set -euo pipefail",
+                "          PYTHONDONTWRITEBYTECODE=1 python3 -B -m automation.federation.controller activate-g8",
+                "",
+            )
+        )
+        self.assertEqual(activate_job, expected_activate_job)
+        activate_step_headers = re.findall(r"(?m)^      - (.+?)[ \t]*$", activate_job)
+        self.assertEqual(
+            activate_step_headers,
+            [
+                "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+                "name: Require the exact preflight checkout",
+                "id: activation-token",
+                "name: Execute exact activate-g8 controller command",
+            ],
+        )
+        activation_token_step_headers = [
+            header for header in activate_step_headers if header == "id: activation-token"
+        ]
+        self.assertEqual(activation_token_step_headers, ["id: activation-token"])
+        activation_token_step_index = activate_step_headers.index("id: activation-token")
+        post_token_step_headers = activate_step_headers[activation_token_step_index + 1:]
+        self.assertEqual(len(post_token_step_headers), 1)
+        self.assertEqual(
+            post_token_step_headers,
+            ["name: Execute exact activate-g8 controller command"],
+        )
+
+        def job_step(job, header):
+            marker = f"      - {header}\n"
+            self.assertEqual(job.count(marker), 1, f"expected one workflow step {header!r}")
+            start = job.index(marker)
+            after = job[start + len(marker):]
+            next_step = re.search(r"(?m)^      - ", after)
+            end = len(after) if next_step is None else next_step.start()
+            return job[start:start + len(marker) + end]
+
+        def job_level_permissions(job):
+            permission_blocks = list(re.finditer(r"(?m)^    permissions:[ \t]*$", job))
+            self.assertEqual(len(permission_blocks), 1)
+            permission_lines = []
+            for line in job[permission_blocks[0].end():].splitlines():
+                if not line.strip():
+                    continue
+                indentation = len(line) - len(line.lstrip(" "))
+                if indentation < 6:
+                    break
+                permission_lines.append(line)
+            permission_pairs = []
+            for line in permission_lines:
+                match = re.fullmatch(
+                    r"      ([A-Za-z_][A-Za-z0-9_-]*):[ \t]*([^ \t#]+)[ \t]*(?:#.*)?",
+                    line,
+                )
+                self.assertIsNotNone(match, f"malformed job-level permissions line: {line!r}")
+                permission_pairs.append(match.groups())
+            self.assertTrue(permission_pairs, "job-level permissions must be a nonempty mapping")
+            permissions = dict(permission_pairs)
+            self.assertEqual(len(permission_pairs), len(permissions), "duplicate job-level permission key")
+            self.assertEqual(permissions, {"contents": "read"})
+            self.assertFalse(any(value.endswith("write") for value in permissions.values()))
+            return permissions
+
+        def step_run_body(step):
+            run_blocks = list(re.finditer(r"(?m)^        run:[ \t]*\|[ \t]*$", step))
+            self.assertEqual(len(run_blocks), 1)
+            body = []
+            for line in step[run_blocks[0].end():].splitlines():
+                if not line.strip():
+                    body.append("")
+                    continue
+                indentation = len(line) - len(line.lstrip(" "))
+                if indentation < 10:
+                    break
+                body.append(line[10:])
+            return body
+
+        preflight_gate = (
+            "github.event_name == 'workflow_dispatch' && "
+            "inputs.mode == 'activate-g8' && "
+            "github.ref == 'refs/heads/main'"
+        )
+        self.assertEqual(
+            re.findall(r"(?m)^    if:[ \t]*(.*)$", preflight_job),
+            [preflight_gate],
+        )
+        self.assertEqual(
+            re.findall(r"(?m)^    needs:[ \t]*(.*)$", preflight_job),
+            ["activation-guard"],
+        )
+        self.assertEqual(job_level_permissions(preflight_job), {"contents": "read"})
+        self.assertNotIn("permission-checks:", preflight_job)
+        self.assertEqual(preflight_job.count("actions/create-github-app-token@"), 1)
+
+        preflight_token = job_step(preflight_job, "id: preflight-token")
+        self.assertEqual(preflight_token.count("actions/create-github-app-token@"), 1)
+        preflight_permissions = re.findall(
+            r"(?m)^[ \t]+permission-([a-z-]+):[ \t]*([^ \t\r\n#]+)[ \t]*$",
+            preflight_token,
+        )
+        expected_preflight_permissions = {
+            "actions": "read",
+            "contents": "read",
+            "statuses": "read",
+            "issues": "read",
+            "pull-requests": "read",
+        }
+        self.assertEqual(len(preflight_permissions), len(expected_preflight_permissions))
+        self.assertEqual(dict(preflight_permissions), expected_preflight_permissions)
+        self.assertNotRegex(preflight_token, r"(?m)^[ \t]+permission-[a-z-]+:[ \t]*write[ \t]*$")
+
+        preflight_command = job_step(preflight_job, "id: preflight")
+        self.assertIn(
+            "FEDERATION_GITHUB_TOKEN: ${{ steps.preflight-token.outputs.token }}",
+            preflight_command,
+        )
+        self.assertEqual(
+            re.findall(
+                r"(?m)^[ \t]*PYTHONDONTWRITEBYTECODE=1 python3 -B -m "
+                r"automation\.federation\.controller ([a-z-]+)(?:[ \t]+>|[ \t]*$)",
+                preflight_command,
+            ),
+            ["activation-preflight"],
+        )
+        decision_parser = job_step(preflight_job, "id: parse-preflight")
+        parser_run_lines = step_run_body(decision_parser)
+        parser_run_body = "\n".join(parser_run_lines)
+        parser_command_pattern = re.compile(
+            r"""^python3 - "\$\{RUNNER_TEMP\}/g8-activation-preflight\.out" "\$GITHUB_OUTPUT" <<'PY'$"""
+        )
+        parser_command_indices = [
+            index for index, line in enumerate(parser_run_lines)
+            if parser_command_pattern.fullmatch(line.strip())
+        ]
+        self.assertEqual(len(parser_command_indices), 1)
+        parser_command_index = parser_command_indices[0]
+        parser_prefix_commands = [
+            line.strip()
+            for line in parser_run_lines[:parser_command_index]
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertEqual(parser_prefix_commands, ["set -euo pipefail"])
+        parser_terminators = [
+            index for index, line in enumerate(parser_run_lines)
+            if index > parser_command_index and line.strip() == "PY"
+        ]
+        self.assertEqual(len(parser_terminators), 1)
+        parser_postlude_commands = [
+            line.strip()
+            for line in parser_run_lines[parser_terminators[0] + 1:]
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertEqual(parser_postlude_commands, [])
+        parser_blocks = re.findall(
+            r"(?ms)^python3 - .* <<'PY'[ \t]*\n(.*?)^PY[ \t]*$",
+            parser_run_body,
+        )
+        self.assertEqual(len(parser_blocks), 1)
+        parser_source = parser_blocks[0]
+        parser_tree = ast.parse(parser_source)
+        expected_parser_source = "\n".join(
+            (
+                "import json",
+                "import pathlib",
+                "import sys",
+                "",
+                "def unique_object(pairs):",
+                "    result = {}",
+                "    for key, value in pairs:",
+                "        if key in result:",
+                '            raise ValueError("duplicate JSON key")',
+                "        result[key] = value",
+                "    return result",
+                "",
+                "def reject_constant(value):",
+                '    raise ValueError("non-standard JSON constant")',
+                "",
+                "raw = pathlib.Path(sys.argv[1]).read_bytes()",
+                'if not raw or raw.count(b"\\n") != 1 or not raw.endswith(b"\\n") or b"\\r" in raw:',
+                '    raise SystemExit("invalid activation preflight framing")',
+                "try:",
+                '    value = json.loads(raw[:-1].decode("utf-8"), object_pairs_hook=unique_object, parse_constant=reject_constant)',
+                "except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:",
+                '    raise SystemExit("invalid activation preflight JSON") from exc',
+                'if type(value) is not dict or set(value) != {"decision"} or type(value["decision"]) is not str:',
+                '    raise SystemExit("invalid activation preflight shape")',
+                'decision = value["decision"]',
+                'if decision not in {"READY", "ACTIVE_NOOP", "BLOCKED"}:',
+                '    raise SystemExit("unknown activation preflight decision")',
+                'canonical = (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\\n")',
+                "if canonical != raw:",
+                '    raise SystemExit("non-canonical activation preflight bytes")',
+                'with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8", newline="\\n") as output:',
+                '    output.write("decision=" + decision + "\\n")',
+            )
+        )
+        expected_parser_tree = ast.parse(expected_parser_source)
+        self.assertEqual(
+            ast.dump(parser_tree, include_attributes=False),
+            ast.dump(expected_parser_tree, include_attributes=False),
+            "parse-preflight executable Python AST differs from frozen parser",
+        )
+        expected_shape_condition = (
+            'type(value) is not dict or set(value) != {"decision"} '
+            'or type(value["decision"]) is not str'
+        )
+        shape_guards = [
+            node for node in ast.walk(parser_tree)
+            if isinstance(node, ast.If)
+            and ast.get_source_segment(parser_source, node.test) == expected_shape_condition
+        ]
+        self.assertEqual(len(shape_guards), 1)
+        self.assertEqual(len(shape_guards[0].body), 1)
+        self.assertIsInstance(shape_guards[0].body[0], ast.Raise)
+        self.assertEqual(shape_guards[0].orelse, [])
+
+        decision_stores = [
+            node for node in ast.walk(parser_tree)
+            if isinstance(node, ast.Name)
+            and node.id == "decision"
+            and isinstance(node.ctx, ast.Store)
+        ]
+        self.assertEqual(len(decision_stores), 1, "decision must never be reassigned")
+        decision_assignments = [
+            node for node in ast.walk(parser_tree)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "decision"
+        ]
+        self.assertEqual(len(decision_assignments), 1)
+        decision_assignment = decision_assignments[0]
+        self.assertEqual(
+            ast.get_source_segment(parser_source, decision_assignment),
+            'decision = value["decision"]',
+        )
+
+        decision_checks = [
+            node for node in ast.walk(parser_tree)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.NotIn)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "decision"
+        ]
+        self.assertEqual(len(decision_checks), 1)
+        decision_check = decision_checks[0]
+        self.assertEqual(
+            ast.literal_eval(decision_check.test.comparators[0]),
+            {"READY", "ACTIVE_NOOP", "BLOCKED"},
+        )
+        self.assertEqual(len(decision_check.body), 1)
+        self.assertIsInstance(decision_check.body[0], ast.Raise)
+        self.assertEqual(decision_check.orelse, [])
+
+        output_writes = [
+            node for node in ast.walk(parser_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "output"
+            and node.func.attr == "write"
+        ]
+        self.assertEqual(len(output_writes), 1)
+        output_write = output_writes[0]
+        self.assertEqual(
+            ast.get_source_segment(parser_source, output_write),
+            'output.write("decision=" + decision + "\\n")',
+        )
+        self.assertLess(shape_guards[0].lineno, decision_assignment.lineno)
+        self.assertLess(decision_assignment.lineno, decision_check.lineno)
+        self.assertLess(decision_check.lineno, output_write.lineno)
+        self.assertEqual(
+            re.findall(r"(?m)^      decision:[ \t]*(.*)$", preflight_job),
+            ["${{ steps.parse-preflight.outputs.decision }}"],
+        )
+
+        activate_gate = (
+            "github.event_name == 'workflow_dispatch' && "
+            "inputs.mode == 'activate-g8' && "
+            "github.ref == 'refs/heads/main' && "
+            "needs.activation-preflight.outputs.decision == 'READY'"
+        )
+        self.assertEqual(
+            re.findall(r"(?m)^    if:[ \t]*(.*)$", activate_job),
+            [activate_gate],
+        )
+        self.assertEqual(
+            re.findall(r"(?m)^    needs:[ \t]*(.*)$", activate_job),
+            ["activation-preflight"],
+        )
+        self.assertEqual(job_level_permissions(activate_job), {"contents": "read"})
+        self.assertNotIn("always()", activate_job)
+        self.assertNotIn("permission-checks:", activate_job)
+        self.assertEqual(activate_job.count("actions/create-github-app-token@"), 1)
+
+        activate_token = job_step(activate_job, "id: activation-token")
+        self.assertEqual(activate_token.count("actions/create-github-app-token@"), 1)
+        activate_permissions = re.findall(
+            r"(?m)^[ \t]+permission-([a-z-]+):[ \t]*([^ \t\r\n#]+)[ \t]*$",
+            activate_token,
+        )
+        expected_activate_permissions = {
+            "actions": "write",
+            "statuses": "write",
+            "contents": "write",
+            "issues": "write",
+            "pull-requests": "write",
+        }
+        self.assertEqual(len(activate_permissions), len(expected_activate_permissions))
+        self.assertEqual(dict(activate_permissions), expected_activate_permissions)
+        self.assertNotIn("permission-checks:", activate_token)
+
+        activate_command = job_step(activate_job, "name: Execute exact activate-g8 controller command")
+        self.assertIn(
+            "FEDERATION_GITHUB_TOKEN: ${{ steps.activation-token.outputs.token }}",
+            activate_command,
+        )
+        writer_executable_lines = [
+            line.strip()
+            for line in step_run_body(activate_command)
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertEqual(
+            writer_executable_lines,
+            [
+                "set -euo pipefail",
+                "PYTHONDONTWRITEBYTECODE=1 python3 -B -m automation.federation.controller activate-g8",
+            ],
+        )
+        activate_step_expressions = [
+            expression.strip()
+            for expression in re.findall(r"\$\{\{(.*?)\}\}", activate_job)
+            if re.search(r"\bsteps\b", expression, re.IGNORECASE)
+        ]
+        self.assertEqual(
+            activate_step_expressions,
+            [
+                "steps.activation-token.outputs.token",
+                "steps.activation-token.outputs.app-slug",
+            ],
+        )
+        token_output_reference = re.compile(
+            r"(?ix)\bsteps\s*"
+            r"(?:\.\s*activation-token|\[\s*['\"]activation-token['\"]\s*\])\s*"
+            r"\.\s*outputs\s*"
+            r"(?:\.\s*token|\[\s*['\"]token['\"]\s*\])"
+        )
+        token_output_expressions = [
+            expression
+            for expression in activate_step_expressions
+            if token_output_reference.search(expression)
+        ]
+        self.assertEqual(token_output_expressions, ["steps.activation-token.outputs.token"])
+        writer_step_expressions = [
+            expression.strip()
+            for expression in re.findall(r"\$\{\{(.*?)\}\}", activate_command)
+            if re.search(r"\bsteps\b", expression, re.IGNORECASE)
+        ]
+        writer_token_output_expressions = [
+            expression
+            for expression in writer_step_expressions
+            if token_output_reference.search(expression)
+        ]
+        self.assertEqual(
+            writer_token_output_expressions,
+            ["steps.activation-token.outputs.token"],
+        )
+        self.assertEqual(token_output_expressions, writer_token_output_expressions)
+
+    def test_wave12_runtime_and_authority_surface_preserves_task02_recovery_only(self):
         controller = CONTROLLER.read_text(encoding="utf-8")
+        controller_tree = ast.parse(controller)
+        recovery_method = next(
+            node for node in ast.walk(controller_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "run_g8_activation_recovery"
+        )
+        recovery_source = ast.get_source_segment(controller, recovery_method)
+        witness_constructions = [
+            node for node in ast.walk(recovery_method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ActivationRecoveryWitness"
+        ]
+        self.assertTrue(witness_constructions)
+        self.assertIn("ActivationRecoveryWitness(", recovery_source)
         workflows = "\n".join(
             (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
             for name in (
@@ -381,7 +961,7 @@ class Wave11RuntimeStaticProofTests(unittest.TestCase):
         )
         active_source = controller + workflows
         for forbidden in (
-            "ActivationRecoveryWitness", "class ActivationEpoch",
+            "class ActivationEpoch",
             "create_activation_ref", "update_activation_ref", 'runtime_state = "ACTIVE_G8"',
             "post_activation_catch_up",
         ):
