@@ -14407,7 +14407,6 @@ class R02Controller:
         sources = self._accepted_sources(current_main)
         machine = self._machine_prs(current_main, repository, sources)
         wake_finalizer = False
-        updated_manual = 0
         dispatched: set[str] = set()
         managed_issue_noop: IssueManagedRouteResult | None = None
         for source_id in sorted(machine):
@@ -14444,38 +14443,14 @@ class R02Controller:
                         if route_result.outcome == "NOOP":
                             managed_issue_noop = route_result
                     continue
-                comments = self.client.list_issue_comments(self.central_repository, number)
-                anchors = _anchor_candidates(comments)
-                if pr.base_oid != current_main:
-                    # Initial marker-only manual requests are safe to normalize
-                    # automatically when main advances.  The trusted main-advance
-                    # and interactive workflows share one repository-wide GitHub
-                    # Actions concurrency group, so RequestAnchor creation cannot
-                    # overlap this no-anchor classification/update authority
-                    # window.  Validate the request head against the PR's own
-                    # accepted historical base first, then let GitHub merge
-                    # current main into the head with an expected-head CAS.  The
-                    # resulting synchronize event wakes the ordinary
-                    # interactive/trusted-validation cloud path.
-                    if anchors:
-                        continue
-                    request_class = read_request_marker(self.client, self.central_repository, pr.head_oid)
-                    if request_class not in MANUAL_CLASSES:
-                        continue
-                    validate_existing_request_head(self.client, self.central_repository, pr, request_class, pr.base_oid)
-                    self.client.update_pull_request_branch(self.central_repository, number, expected_head_sha=pr.head_oid)
-                    updated_manual += 1
-                    continue
-                if len(anchors) == 1 and anchors[0].anchor.request_class in MANUAL_CLASSES:
-                    validate_unique_anchor(comments, pr, anchors[0].anchor.request_class, self.app)
-                    wake_finalizer = True
+                continue
             except (GitHubAPIError, R02Error, RequestModelError):
                 continue
         if wake_finalizer:
             self.client.dispatch_workflow(self.central_repository, "federation-g8-state-finalize.yml", "refs/heads/main", {})
-        if not (dispatched or wake_finalizer or updated_manual) and managed_issue_noop is not None:
+        if not (dispatched or wake_finalizer) and managed_issue_noop is not None:
             return managed_issue_noop
-        return f"MAIN_ADVANCE_DISPATCHED:{len(dispatched)}" if (dispatched or wake_finalizer or updated_manual) else "MAIN_ADVANCE_NOOP"
+        return f"MAIN_ADVANCE_DISPATCHED:{len(dispatched)}" if (dispatched or wake_finalizer) else "MAIN_ADVANCE_NOOP"
 
     def finalize_one_manual_pr(self, summary: Mapping[str, Any]) -> IssueManagedRouteResult | None:
         """Re-derive one current manual PR; never treats an enumeration hint as authority."""
@@ -14623,8 +14598,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     client: GitHubClient | None = None
     number: int | None = None
-    result_kind = "proposal"
-    result_identity: int | None = None
     reserved_issue_pr = False
     fresh_wake_dispatched = False
 
@@ -14786,48 +14759,7 @@ def main(argv: list[str] | None = None) -> int:
                         issue_number, controller.current_issue_source_authority,
                     )
                     return 0
-                comments = client.list_issue_comments(repository, number)
-                anchors = _anchor_candidates(comments)
-                if anchors:
-                    request_class = anchors[0].anchor.request_class
-                else:
-                    pr = client.get_pull_request_metadata(repository, number)
-                    request_class = read_optional_request_marker(client, repository, pr.head_oid)
-                    if request_class is None:
-                        return 0
-                repository_metadata, accepted_main = controller.current_accepted_main()
-                pr = client.get_pull_request_metadata(repository, number)
-                if request_class is RequestClass.RECONCILE:
-                    result_kind = "reconcile"
-                    anchor = validate_unique_anchor(comments, pr, request_class, app) if anchors else None
-                    if anchor is not None:
-                        result_identity = anchor.comment.database_id
-                    controller.reconcile_interactive_request(number, accepted_main)
-                    return 0
-                if event_kind == "issue_comment":
-                    if triggering_comment_id is None:
-                        raise R02Error("issue-comment trigger ID is unavailable")
-                    result_kind = "patch"
-                    result_identity = triggering_comment_id
-                    trigger_comment = next((item for item in comments if item.database_id == triggering_comment_id), None)
-                    if trigger_comment is None:
-                        raise R02Error("triggering issue comment is not present in the authoritative comment fold")
-                    _pr, trigger_anchor, trigger_fold, _fold_comments = controller.interactive_anchor_and_reconstruct(number, request_class)
-                    trigger_result, should_apply = _trigger_result(trigger_fold.evidence, triggering_comment_id)
-                    if has_result_for_comment(comments, result_kind, result_identity):
-                        return 0
-                    if not should_apply:
-                        _post_bounded_result(client, repository, number, comments, kind=result_kind, identity=result_identity, result=trigger_result, reason="trigger-comment-not-applied")
-                        return 0
-                if event_kind != "issue_comment":
-                    controller.interactive_anchor_and_reconstruct(number, request_class)
-                candidate = controller.interactive_proposal(number, request_class, accepted_main, f"refs/heads/{pr.head_ref}")
-                updated_comments = client.list_issue_comments(repository, number)
-                anchor = validate_unique_anchor(updated_comments, pr, request_class, app)
-                if result_identity is None:
-                    result_identity = anchor.comment.database_id
-                _post_bounded_result(client, repository, number, updated_comments, kind=result_kind, identity=result_identity, result="PROPOSAL_UPDATED", reason=f"{request_class.value}:{len(candidate.changed_paths)}")
-                client.dispatch_workflow(repository, "federation-g8-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
+                return 0
             else:
                 initial_pr = client.get_pull_request_metadata(repository, number)
                 if _is_reserved_issue_pr_head(initial_pr.head_ref):
@@ -14899,20 +14831,14 @@ def main(argv: list[str] | None = None) -> int:
             controller._state_finalize_machine_sweep(max_iterations=int(work_limit_text), self_wake=wake_fresh_finalizer)
         return 0
     except Exception as error:
-        if args.command != "trusted-validation-route" and isinstance(error, StaleAuthorityError) and client is not None:
+        if (
+            args.command != "trusted-validation-route"
+            and isinstance(error, StaleAuthorityError)
+            and client is not None
+            and (args.command != "interactive" or reserved_issue_pr)
+        ):
             try:
                 wake_fresh_finalizer()
-            except Exception:
-                pass
-        if args.command == "interactive" and client is not None and number is not None and not reserved_issue_pr:
-            try:
-                comments = client.list_issue_comments(repository, number)
-                identity = result_identity
-                if identity is None:
-                    anchor = next(iter(_anchor_candidates(comments)), None)
-                    identity = anchor.comment.database_id if anchor is not None else None
-                if identity is not None:
-                    _post_bounded_result(client, repository, number, comments, kind=result_kind, identity=identity, result="PROPOSAL_BLOCKED", reason=_bounded_error_reason(error))
             except Exception:
                 pass
         if isinstance(error, GraphQLError):

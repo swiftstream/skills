@@ -10,6 +10,7 @@ from automation.federation.controller import (
     AppIdentity,
     DuplicateCheckRunError,
     MissingTrustedCheckError,
+    C02CandidateBuilder,
     R02Controller,
     R02Error,
     MachinePRAuthority,
@@ -40,6 +41,22 @@ from tests.automation.test_interactive import ProductionAddClient, trusted_previ
 
 ROOT = Path(__file__).resolve().parents[2]
 APP = AppIdentity("swiftstream-federation", 77, "A_app", 88, "U_bot", "swiftstream-federation[bot]")
+
+
+def seed_legacy_add_proposal(fake):
+    """Seed historical standalone state through compatibility helpers for downstream tests."""
+    repository = "swiftstream/skills"
+    controller = R02Controller(
+        fake,
+        repository,
+        APP,
+        candidate_builder=C02CandidateBuilder(fake, repository, trusted_checkout_sha=fake.main_oid),
+    )
+    controller.interactive_anchor_and_reconstruct(7, RequestClass.ADD)
+    _repository, accepted_main = controller.current_accepted_main()
+    controller.interactive_proposal(
+        7, RequestClass.ADD, accepted_main, f"refs/heads/{fake.current_pr.head_ref}"
+    )
 
 
 class ValidationTests(unittest.TestCase):
@@ -341,7 +358,7 @@ class ValidationTests(unittest.TestCase):
         fake = ProductionAddClient()
         base_env = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, base_env, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             self.assertEqual(main(["trusted-validation"]), 0)
             self.assertEqual(main(["trusted-validation"]), 0)
         self.assertEqual(fake.checks[-1][1], TRUSTED_VALIDATION_NAME)
@@ -376,7 +393,7 @@ class ValidationTests(unittest.TestCase):
         fake = ProductionAddClient()
         env = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "999", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, env, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             self.assertEqual(main(["state-finalize"]), 0)
             # The finalizer may create the missing App check and publish success after revalidation.
             self.assertEqual(len(fake.check_objects), 1)
@@ -448,7 +465,7 @@ class ValidationTests(unittest.TestCase):
 
         calls = []
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, base_env, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             dispatch_count = len(fake.dispatches)
             with patch.object(controller_module, "C02CandidateBuilder", HeadRaceBuilder):
                 self.assertEqual(main(["trusted-validation"]), 1, (fake.current_pr.head_oid, calls, fake.dispatches))
@@ -469,7 +486,7 @@ class ValidationTests(unittest.TestCase):
                 return True, "CANDIDATE_MATCHES_C02"
 
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, base_env, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             dispatch_count = len(fake.dispatches)
             with patch.object(controller_module, "C02CandidateBuilder", CommentRaceBuilder):
                 self.assertEqual(main(["trusted-validation"]), 1)
@@ -496,7 +513,7 @@ class ValidationTests(unittest.TestCase):
         fake = RuntimeClient()
         env = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, env, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             fake.ref_reads = 0
             self.assertEqual(main(["state-finalize"]), 1)
         self.assertFalse(any(item[3].get("conclusion") == "success" for item in fake.checks))
@@ -508,7 +525,7 @@ class ValidationTests(unittest.TestCase):
         fake = ProductionAddClient()
         good = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, good, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             refs_before = len(fake.ref_calls)
             stale = dict(good, FEDERATION_TRUSTED_CHECKOUT_SHA="0" * 40)
             with patch.dict(os.environ, stale, clear=False):
@@ -531,13 +548,15 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(result, "swept-all-manual-trust-prs")
         self.assertEqual(seen, [2, 9, 13])
 
-    def test_stale_trusted_checkout_blocks_production_main_before_any_cas(self):
+    def test_nonreserved_interactive_is_inert_even_with_stale_trusted_checkout(self):
         from tests.automation.test_interactive import ProductionAddClient
         fake = ProductionAddClient()
         env = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": "0" * 40}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, env, clear=False):
-            self.assertEqual(main(["interactive"]), 1)
+            self.assertEqual(main(["interactive"]), 0)
         self.assertEqual(fake.ref_calls, [])
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.dispatches, [])
 
     def test_upsert_finalizer_can_create_missing_check_and_publish_success(self):
         class Checks:

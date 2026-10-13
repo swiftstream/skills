@@ -1213,6 +1213,7 @@ class ReconcileTests(unittest.TestCase):
                 super().__init__()
                 self.prs = prs
                 self.updated_branches = []
+                self.comment_reads = 0
 
             def list_open_pull_requests(self, _repository):
                 return tuple({"number": number} for number in self.prs)
@@ -1221,6 +1222,7 @@ class ReconcileTests(unittest.TestCase):
                 return self.prs[number]
 
             def list_issue_comments(self, _repository, number):
+                self.comment_reads += 1
                 return tuple(comments_by_pr.get(number, ()))
 
             def update_pull_request_branch(self, _repository, number, *, expected_head_sha):
@@ -1253,7 +1255,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual([item[2]["repository_id"] for item in client.dispatches[:2]], ["1", "2"])
         self.assertEqual(sum(item[0] == "federation-g8-state-finalize.yml" for item in client.dispatches), 1)
 
-    def test_main_advance_owned_manual_pr_wakes_only_shared_finalizer(self):
+    def test_main_advance_owned_standalone_manual_pr_is_inert(self):
         body = "Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\nDemo\nBranch:\nmain\nSkills root:\nskills\nSkill prefixes:\ndemo\n"
         request = parse_request_body(RequestClass.ADD, body)
         anchor = RequestAnchor(8, RequestClass.ADD, "U_author", "alice", body_sha256(body), request)
@@ -1264,6 +1266,7 @@ class ReconcileTests(unittest.TestCase):
                 super().__init__()
                 self.pr = PullRequestMetadata(8, body, "U_author", "alice", "d" * 40, self.main, "request", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False)
                 self.comments = [comment]
+                self.comment_reads = 0
 
             def list_open_pull_requests(self, _repository):
                 return ({"number": 8},)
@@ -1272,6 +1275,7 @@ class ReconcileTests(unittest.TestCase):
                 return self.pr
 
             def list_issue_comments(self, _repository, _number):
+                self.comment_reads += 1
                 return tuple(self.comments)
 
         client = ManualAdvanceClient()
@@ -1279,18 +1283,21 @@ class ReconcileTests(unittest.TestCase):
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U_bot", "app[bot]"))
         controller._accepted_sources = lambda _main=None: (source,)
         controller._machine_prs = lambda _main, _repository, _sources: {"demo": []}
-        self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
-        self.assertEqual(client.dispatches, [("federation-g8-state-finalize.yml", "refs/heads/main", {})])
+        self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        self.assertEqual(client.comment_reads, 0)
+        self.assertEqual(client.dispatches, [])
 
-    def test_main_advance_valid_central_manual_add_update_remove_each_wakes_one_shared_finalizer(self):
+    def test_main_advance_valid_standalone_manual_add_update_remove_are_inert(self):
         for request_class in (RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE):
             with self.subTest(request_class=request_class):
                 pr, comment = self._manual_main_advance_pr(request_class)
                 client, controller = self._main_advance_with_prs({pr.number: pr}, {pr.number: (comment,)})
-                self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
-                self.assertEqual(client.dispatches, [("federation-g8-state-finalize.yml", "refs/heads/main", {})])
+                self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+                self.assertEqual(client.comment_reads, 0)
+                self.assertEqual(client.updated_branches, [])
+                self.assertEqual(client.dispatches, [])
 
-    def test_main_advance_manual_requires_central_trusted_head_and_exact_head_identity(self):
+    def test_main_advance_standalone_manual_is_inert_before_head_or_comment_authority(self):
         cases = (
             {"head_repository_id": "R_fork", "head_repository": "attacker/fork"},
             {"head_ref": "request..invalid"},
@@ -1301,9 +1308,11 @@ class ReconcileTests(unittest.TestCase):
                 pr, comment = self._manual_main_advance_pr(**overrides)
                 client, controller = self._main_advance_with_prs({pr.number: pr}, {pr.number: (comment,)})
                 self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+                self.assertEqual(client.comment_reads, 0)
+                self.assertEqual(client.updated_branches, [])
                 self.assertEqual(client.dispatches, [])
 
-    def test_main_advance_manual_invalid_anchor_forms_do_not_wake(self):
+    def test_main_advance_does_not_inspect_standalone_anchor_forms(self):
         pr, valid_comment = self._manual_main_advance_pr()
         cases = (
             ("malformed", (replace(valid_comment, body=f"{ANCHOR_MARKER}\nnot-json\n"),)),
@@ -1314,6 +1323,8 @@ class ReconcileTests(unittest.TestCase):
             with self.subTest(anchor=label):
                 client, controller = self._main_advance_with_prs({pr.number: pr}, {pr.number: comments})
                 self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+                self.assertEqual(client.comment_reads, 0)
+                self.assertEqual(client.updated_branches, [])
                 self.assertEqual(client.dispatches, [])
 
     def test_main_advance_machine_pr_stays_under_machine_authority(self):
@@ -1329,7 +1340,7 @@ class ReconcileTests(unittest.TestCase):
             ("federation-g8-state-finalize.yml", "refs/heads/main", {}),
         ])
 
-    def test_main_advance_valid_machine_and_manual_work_coalesce_to_one_shared_finalizer_wake(self):
+    def test_main_advance_manual_pr_does_not_change_machine_dispatch_or_finalizer_wake(self):
         machine_pr, _ = self._manual_main_advance_pr(number=41, head_ref="bot/federation/demo", author_id="U_bot", author_login="app[bot]")
         manual_pr, manual_comment = self._manual_main_advance_pr(number=8, request_class=RequestClass.UPDATE)
         client, controller = self._main_advance_with_prs(
@@ -1340,6 +1351,8 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:1")
         self.assertEqual(sum(item[0] == "federation-g8-state-finalize.yml" for item in client.dispatches), 1)
         self.assertEqual(len(client.dispatches), 2)
+        self.assertEqual(client.comment_reads, 0)
+        self.assertEqual(client.updated_branches, [])
 
     def test_main_advance_stale_base_and_unrelated_prs_remain_no_wake(self):
         stale_pr, stale_comment = self._manual_main_advance_pr(base_oid="b" * 40)
@@ -1349,17 +1362,19 @@ class ReconcileTests(unittest.TestCase):
             {stale_pr.number: (stale_comment,), unrelated_pr.number: ()},
         )
         self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        self.assertEqual(client.comment_reads, 0)
         self.assertEqual(client.dispatches, [])
         self.assertEqual(client.updated_branches, [])
 
-    def test_main_advance_stale_initial_marker_request_is_cloud_normalized_with_head_cas(self):
+    def test_main_advance_stale_marker_only_manual_pr_is_not_normalized(self):
         stale_pr, _ = self._manual_main_advance_pr(base_oid="b" * 40)
         client, controller = self._main_advance_with_prs({stale_pr.number: stale_pr}, {stale_pr.number: ()})
         with patch.object(controller_module, "read_request_marker", return_value=RequestClass.ADD) as read_marker, patch.object(controller_module, "validate_existing_request_head") as validate_head:
-            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
-        read_marker.assert_called_once_with(client, "swiftstream/skills", stale_pr.head_oid)
-        validate_head.assert_called_once_with(client, "swiftstream/skills", stale_pr, RequestClass.ADD, stale_pr.base_oid)
-        self.assertEqual(client.updated_branches, [(stale_pr.number, stale_pr.head_oid)])
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        read_marker.assert_not_called()
+        validate_head.assert_not_called()
+        self.assertEqual(client.comment_reads, 0)
+        self.assertEqual(client.updated_branches, [])
         self.assertEqual(client.dispatches, [])
 
     def test_main_advance_reserved_issue_pr_is_quarantined_at_current_and_stale_bases(self):
@@ -1443,10 +1458,11 @@ class ReconcileTests(unittest.TestCase):
         with patch.object(controller_module, "read_request_marker") as read_marker:
             self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
         read_marker.assert_not_called()
+        self.assertEqual(client.comment_reads, 0)
         self.assertEqual(client.updated_branches, [])
         self.assertEqual(client.dispatches, [])
 
-    def test_main_advance_stale_initial_request_ignores_ordinary_non_request_anchor_comment(self):
+    def test_main_advance_stale_marker_only_pr_ignores_all_comments_and_stays_inert(self):
         stale_pr, _ = self._manual_main_advance_pr(base_oid="b" * 40)
         compatibility_comment = IssueComment(
             "IC_compat",
@@ -1466,15 +1482,21 @@ class ReconcileTests(unittest.TestCase):
             {stale_pr.number: (compatibility_comment,)},
         )
         with patch.object(controller_module, "read_request_marker", return_value=RequestClass.ADD), patch.object(controller_module, "validate_existing_request_head"):
-            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
-        self.assertEqual(client.updated_branches, [(stale_pr.number, stale_pr.head_oid)])
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        self.assertEqual(client.comment_reads, 0)
+        self.assertEqual(client.updated_branches, [])
         self.assertEqual(client.dispatches, [])
 
-    def test_main_advance_stale_initial_request_fails_closed_before_update_on_scope_error(self):
+    def test_main_advance_stale_marker_only_pr_does_not_validate_or_update_branch(self):
         stale_pr, _ = self._manual_main_advance_pr(base_oid="b" * 40)
         client, controller = self._main_advance_with_prs({stale_pr.number: stale_pr}, {stale_pr.number: ()})
-        with patch.object(controller_module, "read_request_marker", return_value=RequestClass.ADD), patch.object(controller_module, "validate_existing_request_head", side_effect=R02Error("unsafe stale request")):
+        with patch.object(controller_module, "read_request_marker") as read_marker, patch.object(
+            controller_module, "validate_existing_request_head", side_effect=R02Error("unsafe stale request")
+        ) as validate_head:
             self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        read_marker.assert_not_called()
+        validate_head.assert_not_called()
+        self.assertEqual(client.comment_reads, 0)
         self.assertEqual(client.updated_branches, [])
         self.assertEqual(client.dispatches, [])
 
