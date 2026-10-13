@@ -6,14 +6,17 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from automation.federation.controller import (
     AppIdentity,
     CandidateScopeError,
     DuplicateAnchorError,
     ForkHeadError,
+    IssueManagedNoSemanticChange,
+    IssueManagedRouteResult,
     R02Error,
+    ReservedIssuePRPendingManagedAuthority,
     StaleAuthorityError,
     allowed_proposal_paths,
     authorized_patch_events,
@@ -36,7 +39,7 @@ from automation.federation.controller import (
 import automation.federation.controller as controller_module
 from contextlib import contextmanager
 from scripts import federate as c02
-from automation.federation.github_api import GraphQLError, RefCASConflict
+from automation.federation.github_api import GitHubAPIError, GraphQLError, RefCASConflict
 from automation.federation.github_api import CheckRun, GitCommitMetadata, GitObject, GitTreeEntry, IssueComment, PullRequestMetadata, RepositoryMetadata
 from automation.federation.request_model import RequestClass, body_sha256, parse_request_body, RequestAnchor
 
@@ -56,7 +59,7 @@ BODY = "Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\nA source\n
 
 
 def pr(head="a" * 40, body=BODY, head_repo="swiftstream/skills", author_id="U_author", author_login="alice"):
-    return PullRequestMetadata(7, body, author_id, author_login, head, "b" * 40, "proposal", "main", "7", head_repo, "7", "swiftstream/skills", None, False)
+    return PullRequestMetadata(7, body, author_id, author_login, head, "b" * 40, "proposal", "main", "7", head_repo, "7", "swiftstream/skills", None, False, False)
 
 
 def comment(number, body, author_id="U_author", author_login="alice", author_type="User", editor_id=None, edited=None, created=False):
@@ -334,6 +337,150 @@ class InteractiveTests(unittest.TestCase):
         controller.interactive_anchor_and_reconstruct(7, RequestClass.ADD)
         self.assertEqual(len(fake.created), 1)
 
+    def test_reserved_issue_pr_blocks_legacy_anchor_proposal_validation_and_finalizer_paths(self):
+        class ReservedClient(FakeClient):
+            def __init__(self, branch="bot/federation/request/issue-7"):
+                super().__init__(current_pr=replace(pr(), head_ref=branch))
+                self.comment_reads = 0
+
+            def list_issue_comments(self, repository, number):
+                self.comment_reads += 1
+                return super().list_issue_comments(repository, number)
+
+        fake = ReservedClient()
+        old_anchor = self.anchor(pr_value=fake.current_pr)
+        fake.comments = [comment(100, old_anchor.render(), APP.bot_node_id, APP.bot_login, "Bot")]
+        candidate_builder = Mock()
+        controller = R02Controller(fake, "swiftstream/skills", APP, candidate_builder=candidate_builder)
+        managed_route_results = []
+        route_impl = controller.interactive_issue_managed_route
+
+        def run_managed_route(*args, **kwargs):
+            result = route_impl(*args, **kwargs)
+            managed_route_results.append(result)
+            return result
+
+        with patch.object(controller_module, "validate_unique_anchor") as validate_anchor, patch.object(
+            controller_module, "create_anchor_once", wraps=controller_module.create_anchor_once
+        ) as create_anchor:
+            with self.assertRaises(ReservedIssuePRPendingManagedAuthority):
+                controller.interactive_anchor_and_reconstruct(7, RequestClass.ADD)
+            with self.assertRaises(ReservedIssuePRPendingManagedAuthority):
+                controller.anchor_and_reconstruct_existing(7, RequestClass.ADD)
+            with self.assertRaises(ReservedIssuePRPendingManagedAuthority):
+                controller.interactive_proposal(7, RequestClass.ADD, fake.main_oid, "refs/heads/topic")
+            with self.assertRaises(ReservedIssuePRPendingManagedAuthority):
+                controller.trusted_validation(7, fake.main_oid, candidate_builder)
+            with patch.object(controller, "current_accepted_main", return_value=(RepositoryMetadata(7, "R_7", "swiftstream/skills", "main"), fake.main_oid)), patch.object(
+                controller, "interactive_proposal"
+            ) as proposal, patch.object(controller, "trusted_validation") as validation, patch.object(
+                controller, "publish_finalizer_result"
+            ) as publish, patch.object(controller, "dispatch_trusted_validation_recovery") as dispatch, patch.object(
+                controller,
+                "interactive_issue_managed_route",
+                side_effect=run_managed_route,
+            ) as managed_route, patch.object(
+                controller,
+                "interactive_issue_managed_proposal",
+                side_effect=IssueManagedNoSemanticChange(RequestClass.ADD),
+            ):
+                finalizer_result = controller.finalize_one_manual_pr({"number": 7})
+            proposal.assert_not_called()
+            validation.assert_not_called()
+            publish.assert_not_called()
+            dispatch.assert_not_called()
+            managed_route.assert_called_once()
+            self.assertEqual(managed_route_results, [IssueManagedRouteResult(
+                "NOOP", "NO_SEMANTIC_CHANGE", RequestClass.ADD,
+            )])
+            self.assertIs(finalizer_result, managed_route_results[0])
+            self.assertIs(finalizer_result.request_class, RequestClass.ADD)
+        validate_anchor.assert_not_called()
+        create_anchor.assert_not_called()
+        candidate_builder.assert_not_called()
+        self.assertEqual(fake.comment_reads, 0)
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.ref_calls, [])
+
+    def test_reserved_namespace_classifier_is_exact_and_malformed_attempts_are_quarantined(self):
+        class ReservedClient(FakeClient):
+            def __init__(self, branch):
+                super().__init__(current_pr=replace(pr(), head_ref=branch))
+                self.comment_reads = 0
+
+            def list_issue_comments(self, repository, number):
+                self.comment_reads += 1
+                return super().list_issue_comments(repository, number)
+
+        for branch in ("bot/federation/request/issue-7", "bot/federation/request/issue-01", "refs/heads/bot/federation/request/issue-7"):
+            with self.subTest(branch=branch):
+                fake = ReservedClient(branch)
+                controller = R02Controller(fake, "swiftstream/skills", APP)
+                with self.assertRaises(ReservedIssuePRPendingManagedAuthority):
+                    controller.anchor_and_reconstruct_existing(7, RequestClass.ADD)
+                self.assertEqual(fake.comment_reads, 0)
+
+        fake = ReservedClient("bot/federation/requested/issue-7")
+        controller = R02Controller(fake, "swiftstream/skills", APP)
+        with self.assertRaises(DuplicateAnchorError):
+            controller.anchor_and_reconstruct_existing(7, RequestClass.ADD)
+        self.assertEqual(fake.comment_reads, 1)
+
+    def test_live_reserved_issue_pr_commands_fail_before_legacy_mutation(self):
+        class ReservedRuntimeClient(ProductionAddClient):
+            def __init__(self):
+                super().__init__()
+                self.current_pr = replace(self.current_pr, head_ref="bot/federation/request/issue-7")
+                self.comment_reads = 0
+                self.file_reads = 0
+
+            def list_issue_comments(self, repository, number):
+                self.comment_reads += 1
+                return super().list_issue_comments(repository, number)
+
+            def list_pull_request_files(self, repository, number):
+                self.file_reads += 1
+                return super().list_pull_request_files(repository, number)
+
+        for command in ("interactive", "trusted-validation"):
+            with self.subTest(command=command):
+                fake = ReservedRuntimeClient()
+                environment = {
+                    "GITHUB_REPOSITORY": "swiftstream/skills",
+                    "FEDERATION_GITHUB_TOKEN": "token",
+                    "FEDERATION_APP_SLUG": APP.slug,
+                    "FEDERATION_WAKE_PULL_NUMBER": "7",
+                    "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
+                }
+                with (
+                    patch("automation.federation.controller.GitHubClient", return_value=fake),
+                    trusted_previous_patches(),
+                    patch.object(
+                        R02Controller,
+                        "interactive_issue_managed_route",
+                        return_value=IssueManagedRouteResult("NOOP", "NO_SEMANTIC_CHANGE", RequestClass.ADD),
+                    ) as managed_route,
+                    patch.object(R02Controller, "validate_issue_managed_head_history") as validate_history,
+                    patch.dict(os.environ, environment, clear=False),
+                ):
+                    self.assertEqual(main([command]), 0)
+                self.assertEqual(fake.dispatches, [])
+                if command == "interactive":
+                    managed_route.assert_called_once()
+                    self.assertEqual(managed_route.call_args.args[0], 7)
+                    validate_history.assert_not_called()
+                else:
+                    validate_history.assert_called_once_with(7)
+                    managed_route.assert_not_called()
+                self.assertEqual(fake.created, [])
+                self.assertEqual(fake.ref_calls, [])
+                self.assertEqual(fake.dispatches, [])
+                self.assertEqual(fake.checks, [])
+                self.assertEqual(fake.check_objects, [])
+                self.assertEqual(fake.comment_reads, 0)
+                if command == "trusted-validation":
+                    self.assertEqual(fake.file_reads, 0)
+
     def test_state_finalizer_cannot_recreate_anchor_after_authority_disappears(self):
         current_pr = replace(pr(), base_oid="c" * 40)
         anchor = self.anchor(pr_value=current_pr)
@@ -360,7 +507,7 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(fake.created, [])
 
     def test_pre_anchor_edit_is_rejected(self):
-        edited_pr = PullRequestMetadata(7, BODY, "U_author", "alice", "a" * 40, "b" * 40, "proposal", "main", "7", "swiftstream/skills", "7", "swiftstream/skills", "2026-01-01", True)
+        edited_pr = PullRequestMetadata(7, BODY, "U_author", "alice", "a" * 40, "b" * 40, "proposal", "main", "7", "swiftstream/skills", "7", "swiftstream/skills", "2026-01-01", True, False)
         with self.assertRaises(R02Error):
             create_anchor_once(FakeClient(edited_pr), "swiftstream/skills", edited_pr, RequestClass.ADD, APP, ())
 
@@ -374,25 +521,75 @@ class InteractiveTests(unittest.TestCase):
         with self.assertRaises(StaleAuthorityError):
             create_anchor_once(RaceClient(), "swiftstream/skills", pr(), RequestClass.ADD, APP, ())
 
-    def test_production_main_reads_exact_head_marker_builds_with_real_c02_builder_and_wakes_finalizer(self):
-        fake = ProductionAddClient()
-        environment = {
-            "GITHUB_REPOSITORY": "swiftstream/skills",
-            "FEDERATION_GITHUB_TOKEN": "token",
-            "FEDERATION_APP_SLUG": APP.slug,
-            "FEDERATION_WAKE_PULL_NUMBER": "7",
-            "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
-        }
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
-        self.assertEqual(fake.marker_read, ("swiftstream/skills", "a" * 40, ".federation-request", "100644"))
-        self.assertEqual(fake.asserted_repository_id, fake.central_node_id)
-        self.assertEqual(fake.created_commit[2], [fake.main_oid])
-        created_manifest = json.loads(__import__("base64").b64decode(fake.created_blob))
-        self.assertEqual(created_manifest["sources"][0]["description"], "A source")
-        self.assertEqual(len(fake.created), 2)
-        self.assertEqual(fake.dispatches, [("swiftstream/skills", "federation-state-finalize.yml", "refs/heads/main", {"pull_number": "7"})])
-        self.assertNotIn("FEDERATION_REQUEST_CLASS", environment)
+    def test_nonreserved_production_interactive_is_inert_for_marker_and_anchor_authority(self):
+        class ObservedClient(ProductionAddClient):
+            def __init__(self):
+                super().__init__()
+                self.marker_bytes = b"add-source\n"
+                self.marker_reads = 0
+                self.comment_reads = 0
+
+            def read_optional_commit_file(self, repository, commit_sha, path, *, expected_mode=None):
+                if path == ".federation-request":
+                    self.marker_reads += 1
+                    return self.marker_bytes
+                return super().read_optional_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
+
+            def list_issue_comments(self, repository, number):
+                self.comment_reads += 1
+                return super().list_issue_comments(repository, number)
+
+        fake = ObservedClient()
+        anchor = self.anchor(pr_value=fake.current_pr)
+        cases = (
+            ("ADD", b"add-source\n", ()),
+            ("UPDATE", b"update-source\n", ()),
+            ("REMOVE", b"remove-source\n", ()),
+            ("RECONCILE", b"reconcile-source\n", ()),
+            ("existing RequestAnchor", None, (comment(100, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot"),)),
+        )
+        for label, marker_bytes, comments in cases:
+            with self.subTest(authority=label):
+                fake.marker_bytes = marker_bytes
+                fake.comments = list(comments)
+                fake.created.clear()
+                fake.ref_calls.clear()
+                fake.dispatches.clear()
+                fake.marker_reads = 0
+                fake.comment_reads = 0
+                environment = {
+                    "GITHUB_REPOSITORY": "swiftstream/skills",
+                    "FEDERATION_GITHUB_TOKEN": "token",
+                    "FEDERATION_APP_SLUG": APP.slug,
+                    "FEDERATION_WAKE_PULL_NUMBER": "7",
+                    "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
+                    "FEDERATION_EVENT_PATH": "",
+                }
+                with (
+                    patch("automation.federation.controller.GitHubClient", return_value=fake),
+                    patch.object(R02Controller, "current_accepted_main", side_effect=AssertionError("standalone route reached accepted-main authority")) as accepted_main,
+                    patch.object(R02Controller, "interactive_anchor_and_reconstruct", side_effect=AssertionError("standalone route reached anchor authority")) as anchor_route,
+                    patch.object(R02Controller, "interactive_proposal", side_effect=AssertionError("standalone route reached proposal authority")) as proposal,
+                    patch.object(R02Controller, "reconcile_interactive_request", side_effect=AssertionError("standalone route reached RECONCILE authority")) as reconcile,
+                    patch.object(R02Controller, "interactive_issue_managed_route", side_effect=AssertionError("non-reserved PR entered Issue route")) as issue_route,
+                    patch.object(controller_module, "read_optional_request_marker", wraps=controller_module.read_optional_request_marker) as read_marker,
+                    patch.object(controller_module, "create_anchor_once", wraps=create_anchor_once) as create_anchor,
+                    patch.dict(os.environ, environment, clear=False),
+                ):
+                    self.assertEqual(main(["interactive"]), 0)
+                accepted_main.assert_not_called()
+                anchor_route.assert_not_called()
+                proposal.assert_not_called()
+                reconcile.assert_not_called()
+                issue_route.assert_not_called()
+                read_marker.assert_not_called()
+                create_anchor.assert_not_called()
+                self.assertEqual(fake.marker_reads, 0)
+                self.assertEqual(fake.comment_reads, 0)
+                self.assertEqual(fake.created, [])
+                self.assertEqual(fake.comments, list(comments))
+                self.assertEqual(fake.ref_calls, [])
+                self.assertEqual(fake.dispatches, [])
 
     def test_unrelated_pr_without_marker_is_clean_noop_for_federation_entrypoints(self):
         class UnrelatedClient(ProductionAddClient):
@@ -456,7 +653,7 @@ class InteractiveTests(unittest.TestCase):
         self.assertNotEqual(fake.check_objects[0].conclusion, "skipped")
         self.assertNotEqual(fake.check_objects[0].conclusion, "success")
 
-    def test_c05_hostile_environment_uses_verified_git_exact_env_and_restores_parent(self):
+    def test_c05_hostile_environment_cannot_reactivate_nonreserved_interactive_authority(self):
         fake = ProductionAddClient()
         original_environment = dict(os.environ)
         hostile = {
@@ -489,15 +686,6 @@ class InteractiveTests(unittest.TestCase):
             "GITHUB_TOKEN": "wrong-source-token-sentinel",
             "GH_TOKEN": "wrong-source-token-sentinel",
         }
-        expected_child_environment = {
-            "PATH": "/usr/bin:/bin",
-            "LANG": "C",
-            "LC_ALL": "C",
-            "TZ": "UTC",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-        }
         real_run = subprocess.run
 
         def capture_run(argv, *args, **kwargs):
@@ -519,21 +707,11 @@ class InteractiveTests(unittest.TestCase):
             self.assertEqual(main(["interactive"]), 0)
             self.assertEqual(dict(os.environ), expected_environment)
         self.assertEqual(dict(os.environ), original_environment)
-        self.assertTrue(fake.git_invocations)
-        for argv, child_environment, _cwd in fake.git_invocations:
-            self.assertEqual(argv[0], "/usr/bin/git")
-            self.assertEqual(child_environment, expected_child_environment)
-            self.assertNotIn("FEDERATION_NO_BYPASS_PROOF_V2", child_environment)
-            self.assertNotIn("FEDERATION_GITHUB_TOKEN", child_environment)
-        self.assertTrue(any("-C" in argv and "/tmp/" in argv[argv.index("-C") + 1] for argv, _env, _cwd in fake.git_invocations if "-C" in argv))
-        for _url, headers, observed_environment in fake.source_http_observations:
-            self.assertNotIn("Authorization", headers)
-            self.assertNotIn("FEDERATION_GITHUB_TOKEN", observed_environment)
-            self.assertNotIn("FEDERATION_NO_BYPASS_PROOF_V2", observed_environment)
-            self.assertNotIn("GITHUB_TOKEN", observed_environment)
-            self.assertNotIn("HTTPS_PROXY", observed_environment)
-            self.assertNotIn("HTTP_PROXY", observed_environment)
-            self.assertNotIn("ALL_PROXY", observed_environment)
+        self.assertEqual(fake.git_invocations, [])
+        self.assertEqual(fake.source_http_observations, [])
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.ref_calls, [])
+        self.assertEqual(fake.dispatches, [])
         self.assertEqual(set(Path("/tmp").glob("swiftstream-federation-workspace-*")), before_roots)
 
     def test_c05_capsule_failure_restores_parent_and_cleans_exact_trusted_root(self):
@@ -551,46 +729,34 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(dict(os.environ), original_environment)
         self.assertEqual(set(Path("/tmp").glob("swiftstream-federation-workspace-*")), before_roots)
 
-    def test_c05_production_main_update_uses_c02_desired_state_inside_capsule(self):
+    def test_production_interactive_update_marker_is_inert_before_marker_read(self):
         class UpdateClient(ProductionAddClient):
             def __init__(self):
                 super().__init__()
-                self.current_pr = replace(self.current_pr, body=BODY)
-
-            def get_blob(self, repository, blob_sha):
-                if blob_sha == "4" * 40:
-                    return b"update-source\n"
-                return super().get_blob(repository, blob_sha)
-
-            def read_commit_file(self, repository, commit_sha, path, *, expected_mode=None):
-                if commit_sha == self.marker_head and path == ".federation-request":
-                    return b"update-source\n"
-                return super().read_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
+                self.marker_reads = 0
 
             def read_optional_commit_file(self, repository, commit_sha, path, *, expected_mode=None):
-                if commit_sha == self.marker_head and path == ".federation-request":
+                if path == ".federation-request":
+                    self.marker_reads += 1
                     return b"update-source\n"
                 return super().read_optional_commit_file(repository, commit_sha, path, expected_mode=expected_mode)
 
-        source = c02.SourceDeclaration("owner-repo", "Owner/Repo", 99, "skills", "A source repository", (c02.LineDeclaration("refs/heads/main", ("swiftstream",)),))
-        previous_manifest = c02.Manifest((source,))
-        previous_lock = c02.LockState((source.source_id,), {})
         fake = UpdateClient()
         environment = {
             "GITHUB_REPOSITORY": "swiftstream/skills",
-            "FEDERATION_GITHUB_TOKEN": "central-app-secret-sentinel",
+            "FEDERATION_GITHUB_TOKEN": "token",
             "FEDERATION_APP_SLUG": APP.slug,
             "FEDERATION_WAKE_PULL_NUMBER": "7",
             "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
         }
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", c02.git_fetch_configured_branch), patch.object(c02, "repository_git_url", lambda repository: fake.source_bare.as_uri()), patch.object(c02, "load_trusted_previous_manifest", return_value=previous_manifest), patch.object(c02, "load_trusted_previous_lock", return_value=previous_lock), patch.dict(os.environ, environment, clear=False):
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["interactive"]), 0)
-        self.assertEqual(fake.ref_calls[0].before_oid, fake.marker_head)
-        self.assertEqual(fake.created_commit[2], [fake.main_oid])
-        self.assertEqual(fake.current_pr.head_oid, fake.candidate_head)
-        self.assertTrue(any(item["path"] == "federation.lock.json" for item in fake.created_tree[1]))
+        self.assertEqual(fake.marker_reads, 0)
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.ref_calls, [])
+        self.assertEqual(fake.dispatches, [])
 
-    def test_identical_interactive_regeneration_is_deterministic_and_does_not_repeat_cas(self):
+    def test_repeated_nonreserved_interactive_invocation_remains_inert(self):
         fake = ProductionAddClient()
         environment = {
             "GITHUB_REPOSITORY": "swiftstream/skills",
@@ -602,10 +768,12 @@ class InteractiveTests(unittest.TestCase):
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["interactive"]), 0)
             first_ref_count = len(fake.ref_calls)
-            first_commit = fake.created_commit
+            first_commit = getattr(fake, "created_commit", None)
             self.assertEqual(main(["interactive"]), 0)
         self.assertEqual(len(fake.ref_calls), first_ref_count)
-        self.assertEqual(fake.created_commit, first_commit)
+        self.assertEqual(getattr(fake, "created_commit", None), first_commit)
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.dispatches, [])
 
     def test_realistic_recursive_tree_candidate_accepts_directories_and_rejects_unsafe_leaves(self):
         from automation.federation.controller import C02CandidateBuilder
@@ -687,13 +855,15 @@ class InteractiveTests(unittest.TestCase):
         with self.assertRaises(CandidateScopeError):
             validate_existing_request_head(fake, "swiftstream/skills", pr(head=head_sha), RequestClass.UPDATE, base_sha)
 
-    def test_current_main_mismatch_blocks_before_cas_and_post_anchor_edit_restore_blocks_before_cas(self):
+    def test_nonreserved_route_stays_inert_and_helper_rejects_post_anchor_edit_restore(self):
         fake = ProductionAddClient()
         fake.current_pr = replace(fake.current_pr, base_oid="e" * 40)
         environment = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
-            self.assertEqual(main(["interactive"]), 1)
+            self.assertEqual(main(["interactive"]), 0)
         self.assertEqual(fake.ref_calls, [])
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.dispatches, [])
 
         race = ProductionAddClient()
         def edit_and_restore(_request, _request_class, _base, _head):
@@ -785,7 +955,7 @@ class InteractiveTests(unittest.TestCase):
         with self.assertRaises(CandidateScopeError):
             validate_existing_request_head(fake, "swiftstream/skills", fake.current_pr, RequestClass.ADD, fake.main_oid)
 
-    def test_issue_comment_result_uses_exact_trigger_id_when_later_patch_arrives_after_cas(self):
+    def test_issue_comment_manual_patch_event_is_inert_for_nonreserved_pr(self):
         class RaceClient(ProductionAddClient):
             def update_refs(self, repository_id, updates):
                 super().update_refs(repository_id, updates)
@@ -800,13 +970,16 @@ class InteractiveTests(unittest.TestCase):
             "GITHUB_REPOSITORY": "swiftstream/skills",
             "FEDERATION_GITHUB_TOKEN": "token",
             "FEDERATION_APP_SLUG": APP.slug,
+            "FEDERATION_WAKE_PULL_NUMBER": "",
             "FEDERATION_EVENT_PATH": str(event_file),
             "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid,
         }
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, environment, clear=False):
             self.assertEqual(main(["interactive"]), 0)
-        self.assertTrue(any(f"patch:{trigger_id}" in item.body for item in fake.created))
-        self.assertFalse(any("patch:201" in item.body for item in fake.created))
+        self.assertEqual(fake.comments, [comment(trigger_id, "Federation PATCH\n\nDescription:\nTriggered\n")])
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.ref_calls, [])
+        self.assertEqual(fake.dispatches, [])
         event_file.unlink(missing_ok=True)
 
     def test_app_bot_issue_comment_triggers_are_ignored(self):
@@ -860,32 +1033,27 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(non_graphql, "C03-R02 controller blocked: R02Error\n")
         self.assertNotIn("user-secret-sentinel", non_graphql)
 
-    def test_proposal_blocked_reason_contains_bounded_error_message(self):
-        fake = FakeClient()
-        anchor = self.anchor()
-        fake.comments.append(comment(50, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot"))
-        environment = {
-            "GITHUB_REPOSITORY": "swiftstream/skills",
-            "FEDERATION_GITHUB_TOKEN": "token",
-            "FEDERATION_APP_SLUG": APP.slug,
-            "FEDERATION_WAKE_PULL_NUMBER": "7",
-            "FEDERATION_TRUSTED_CHECKOUT_SHA": "c" * 40,
-        }
-        error = R02Error("operator-why-sentinel")
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(
-            controller_module, "resolve_app_identity", return_value=APP
-        ), patch.object(controller_module.R02Controller, "current_accepted_main", side_effect=error), patch.dict(
-            os.environ, environment, clear=True
-        ):
-            self.assertEqual(main(["interactive"]), 1)
-        blocked = [item for item in fake.created if "PROPOSAL_BLOCKED" in item.body]
-        self.assertEqual(len(blocked), 1)
-        self.assertIn("R02Error", blocked[0].body)
-        self.assertIn("operator-why-sentinel", blocked[0].body)
-        self.assertIn("R02Error:operator-why-sentinel", blocked[0].body)
+    def test_interactive_metadata_api_failure_does_not_read_or_write_blocked_result(self):
+        class ObservedClient(FakeClient):
+            def __init__(self, error):
+                super().__init__()
+                self.error = error
+                self.metadata_reads = 0
+                self.comment_reads = 0
+                self.dispatches = []
 
-    def test_proposal_blocked_reason_bounds_extremely_long_error_message(self):
-        fake = FakeClient()
+            def get_pull_request_metadata(self, repository, number):
+                self.metadata_reads += 1
+                raise self.error
+
+            def list_issue_comments(self, repository, number):
+                self.comment_reads += 1
+                return super().list_issue_comments(repository, number)
+
+            def dispatch_workflow(self, repository, workflow, ref, inputs=None):
+                self.dispatches.append((repository, workflow, ref, inputs))
+
+        fake = ObservedClient(GitHubAPIError("metadata API unavailable"))
         anchor = self.anchor()
         fake.comments.append(comment(50, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot"))
         environment = {
@@ -895,21 +1063,87 @@ class InteractiveTests(unittest.TestCase):
             "FEDERATION_WAKE_PULL_NUMBER": "7",
             "FEDERATION_TRUSTED_CHECKOUT_SHA": "c" * 40,
         }
-        long_message = "x" * 400 + " Traceback File \"" + "y" * 40
-        error = R02Error(long_message)
-        with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(
+        stderr = io.StringIO()
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(
             controller_module, "resolve_app_identity", return_value=APP
-        ), patch.object(controller_module.R02Controller, "current_accepted_main", side_effect=error), patch.dict(
-            os.environ, environment, clear=True
-        ):
+        ), patch.dict(os.environ, environment, clear=True), patch("sys.stderr", stderr):
             self.assertEqual(main(["interactive"]), 1)
-        blocked = [item for item in fake.created if "PROPOSAL_BLOCKED" in item.body]
-        self.assertEqual(len(blocked), 1)
-        body = blocked[0].body
-        self.assertIn("R02Error:", body)
-        self.assertLessEqual(len(body), 512)
-        self.assertNotIn("Traceback", body)
-        self.assertNotIn('File "', body)
+        self.assertEqual(stderr.getvalue(), "C03-R02 controller blocked: GitHubAPIError\n")
+        self.assertEqual(fake.metadata_reads, 1)
+        self.assertEqual(fake.comment_reads, 0)
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.comments, [comment(50, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot")])
+        self.assertEqual(fake.ref_calls, [])
+        self.assertEqual(fake.dispatches, [])
+
+    def test_interactive_preclassification_stale_skips_comment_reporting_and_wakes_only_reserved(self):
+        class ObservedClient(FakeClient):
+            def __init__(self, error=None, current_pr=None):
+                super().__init__(current_pr=current_pr)
+                self.error = error
+                self.metadata_reads = 0
+                self.comment_reads = 0
+                self.dispatches = []
+
+            def get_pull_request_metadata(self, repository, number):
+                self.metadata_reads += 1
+                if self.error is not None:
+                    raise self.error
+                return self.current_pr
+
+            def list_issue_comments(self, repository, number):
+                self.comment_reads += 1
+                return super().list_issue_comments(repository, number)
+
+            def dispatch_workflow(self, repository, workflow, ref, inputs=None):
+                self.dispatches.append((repository, workflow, ref, inputs))
+
+        environment = {
+            "GITHUB_REPOSITORY": "swiftstream/skills",
+            "FEDERATION_GITHUB_TOKEN": "token",
+            "FEDERATION_APP_SLUG": APP.slug,
+            "FEDERATION_WAKE_PULL_NUMBER": "7",
+            "FEDERATION_TRUSTED_CHECKOUT_SHA": "c" * 40,
+        }
+        fake = ObservedClient(StaleAuthorityError("metadata authority changed"))
+        anchor = self.anchor()
+        fake.comments.append(comment(50, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot"))
+        stderr = io.StringIO()
+        with patch("automation.federation.controller.GitHubClient", return_value=fake), patch.object(
+            controller_module, "resolve_app_identity", return_value=APP
+        ), patch.dict(os.environ, environment, clear=True), patch("sys.stderr", stderr):
+            self.assertEqual(main(["interactive"]), 1)
+        self.assertEqual(stderr.getvalue(), "C03-R02 controller blocked: StaleAuthorityError\n")
+        self.assertEqual(fake.metadata_reads, 1)
+        self.assertEqual(fake.comment_reads, 0)
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.ref_calls, [])
+        self.assertEqual(fake.dispatches, [])
+
+        reserved = ObservedClient(
+            current_pr=replace(pr(), head_ref="bot/federation/request/issue-7"),
+        )
+        reserved_anchor = self.anchor(pr_value=reserved.current_pr)
+        reserved.comments.append(comment(51, reserved_anchor.render(), APP.bot_node_id, APP.bot_login, "Bot"))
+        reserved_stderr = io.StringIO()
+        with patch("automation.federation.controller.GitHubClient", return_value=reserved), patch.object(
+            controller_module, "resolve_app_identity", return_value=APP
+        ), patch.object(
+            R02Controller,
+            "interactive_issue_managed_route",
+            side_effect=StaleAuthorityError("classified Issue authority changed"),
+        ), patch.dict(os.environ, environment, clear=True), patch("sys.stderr", reserved_stderr):
+            self.assertEqual(main(["interactive"]), 1)
+        self.assertEqual(reserved_stderr.getvalue(), "C03-R02 controller blocked: StaleAuthorityError\n")
+        self.assertEqual(reserved.metadata_reads, 1)
+        self.assertEqual(reserved.comment_reads, 0)
+        self.assertEqual(reserved.created, [])
+        self.assertEqual(reserved.comments, [comment(51, reserved_anchor.render(), APP.bot_node_id, APP.bot_login, "Bot")])
+        self.assertEqual(reserved.ref_calls, [])
+        self.assertEqual(
+            reserved.dispatches,
+            [("swiftstream/skills", "federation-g8-state-finalize.yml", "refs/heads/main", {})],
+        )
 
     def test_proposal_blocked_reason_retains_exception_type_name(self):
         from automation.federation.controller import _bounded_error_reason
@@ -930,7 +1164,7 @@ class InteractiveTests(unittest.TestCase):
         self.assertEqual(_bounded_error_reason(short_error), "R02Error:why")
 
     def test_workflows_have_exact_triggers_pins_and_no_pr_head_execution(self):
-        for name in ("federation-interactive.yml", "federation-trusted-validation.yml", "federation-state-finalize.yml"):
+        for name in ("federation-g8-interactive.yml", "federation-g8-trusted-validation.yml", "federation-g8-state-finalize.yml"):
             text = (ROOT / ".github/workflows" / name).read_text()
             self.assertIn("FEDERATION_EVENT_PATH: ${{ github.event_path }}", text)
             self.assertNotIn("FEDERATION_EVENT_PATH: $GITHUB_EVENT_PATH", text)

@@ -10,8 +10,10 @@ from automation.federation.controller import (
     AppIdentity,
     DuplicateCheckRunError,
     MissingTrustedCheckError,
+    C02CandidateBuilder,
     R02Controller,
     R02Error,
+    MachinePRAuthority,
     AnchorComment,
     StaleAuthorityError,
     authorized_patch_events,
@@ -30,7 +32,10 @@ import automation.federation.controller as controller_module
 from scripts import federate as c02
 from automation.federation.github_api import CheckRun, IssueComment, PullRequestMetadata, RepositoryMetadata
 from automation.federation.github_api import ISSUE_COMMENT_NODES_QUERY, REST_BASE_URL, GitHubClient, HttpResponse, UrllibTransport
-from automation.federation.request_model import RequestAnchor, RequestClass, body_sha256, parse_request_body
+from automation.federation.request_model import (
+    CarrierActivation, CarrierRole, ClaimedHeadMarker, RequestAnchor,
+    RequestClass, ShaCarrierResolution, body_sha256, parse_request_body,
+)
 from tests.automation.test_interactive import ProductionAddClient, trusted_previous_patches
 
 
@@ -38,7 +43,136 @@ ROOT = Path(__file__).resolve().parents[2]
 APP = AppIdentity("swiftstream-federation", 77, "A_app", 88, "U_bot", "swiftstream-federation[bot]")
 
 
+def seed_legacy_add_proposal(fake):
+    """Seed historical standalone state through compatibility helpers for downstream tests."""
+    repository = "swiftstream/skills"
+    controller = R02Controller(
+        fake,
+        repository,
+        APP,
+        candidate_builder=C02CandidateBuilder(fake, repository, trusted_checkout_sha=fake.main_oid),
+    )
+    controller.interactive_anchor_and_reconstruct(7, RequestClass.ADD)
+    _repository, accepted_main = controller.current_accepted_main()
+    controller.interactive_proposal(
+        7, RequestClass.ADD, accepted_main, f"refs/heads/{fake.current_pr.head_ref}"
+    )
+
+
 class ValidationTests(unittest.TestCase):
+    def test_wave11_router_is_read_only_and_selects_only_exact_machine_lane(self):
+        repository = RepositoryMetadata(7, "R_central", "swiftstream/skills", "main")
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        head = "a" * 40
+        pr = PullRequestMetadata(
+            7, "", "U_author", "alice", head, "b" * 40,
+            "bot/federation/demo", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+
+        class Client:
+            def __init__(self):
+                self.writes = []
+            def get_pull_request_metadata(self, _repository, number):
+                self.assert_number = number
+                return pr
+            def get_ref_oid(self, _repository, ref):
+                self.assert_ref = ref
+                return head
+
+        controller = object.__new__(R02Controller)
+        controller.central_repository = "swiftstream/skills"
+        controller.client = Client()
+        controller.current_accepted_main = lambda: (repository, "b" * 40)
+        controller._accepted_sources = lambda _main: (source,)
+        marker = ClaimedHeadMarker(
+            "MACHINE_REF_CLAIM", CarrierRole.MACHINE_PUBLICATION.value,
+            "MACHINE_SOURCE", "R_central:demo", "c" * 64, "d" * 64,
+            "MACHINE_PUBLICATION",
+        )
+        controller.resolve_current_sha_carrier_role = lambda _sha: ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION, marker,
+        )
+        controller._machine_authority = lambda *_args: MachinePRAuthority(7, "demo", 99, head)
+        self.assertEqual(controller.trusted_validation_route(7), "MACHINE_VALIDATION")
+        self.assertEqual(controller.client.assert_ref, "bot/federation/demo")
+        self.assertEqual(controller.client.writes, [])
+
+        controller.resolve_current_sha_carrier_role = lambda _sha: ShaCarrierResolution(
+            CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION,
+        )
+        self.assertEqual(controller.trusted_validation_route(7), "MANUAL_STATUS")
+        self.assertEqual(controller.client.writes, [])
+
+    def test_wave11_manual_writer_rejects_machine_role_before_any_mutation(self):
+        repository = RepositoryMetadata(7, "R_central", "swiftstream/skills", "main")
+        head = "a" * 40
+        pr = PullRequestMetadata(
+            7, "", "U_author", "alice", head, "b" * 40,
+            "bot/federation/demo", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+        marker = ClaimedHeadMarker(
+            "MACHINE_REF_CLAIM", CarrierRole.MACHINE_PUBLICATION.value,
+            "MACHINE_SOURCE", "R_central:demo", "c" * 64, "d" * 64,
+            "MACHINE_PUBLICATION",
+        )
+        class Client:
+            def get_pull_request_metadata(self, _repository, _number):
+                return pr
+        controller = object.__new__(R02Controller)
+        controller.central_repository = "swiftstream/skills"
+        controller.client = Client()
+        controller.current_accepted_main = lambda: (repository, "b" * 40)
+        controller.resolve_current_sha_carrier_role = lambda _sha: ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION, marker,
+        )
+        controller.trusted_validation_role_first = lambda *_args, **_kwargs: self.fail("machine role must be rejected before role-first writer dispatch")
+        self.assertEqual(controller.trusted_validation_manual(7), "NOOP_MACHINE_ROLE")
+
+    def test_wave11_machine_writer_rejects_issue_role_before_check_mutation(self):
+        repository = RepositoryMetadata(7, "R_central", "swiftstream/skills", "main")
+        head = "a" * 40
+        pr = PullRequestMetadata(
+            7, "", "U_author", "alice", head, "b" * 40,
+            "proposal", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+        marker = ClaimedHeadMarker(
+            "ISSUE_HEAD_CLAIM", CarrierRole.ISSUE_ACTIVE.value,
+            "ISSUE", "R_central:7", "c" * 64, "d" * 64,
+            "ISSUE_HEAD_CLAIM",
+        )
+        class Client:
+            def get_pull_request_metadata(self, _repository, _number):
+                return pr
+        controller = object.__new__(R02Controller)
+        controller.central_repository = "swiftstream/skills"
+        controller.client = Client()
+        controller.current_accepted_main = lambda: (repository, "b" * 40)
+        controller.resolve_current_sha_carrier_role = lambda _sha: ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE, marker,
+        )
+        controller.trusted_machine_validation = lambda *_args, **_kwargs: self.fail("Issue role must be rejected before machine validation")
+        controller.publish_validation_result = lambda *_args, **_kwargs: self.fail("Issue role must not write a Check Run")
+        with self.assertRaises(StaleAuthorityError):
+            controller.trusted_validation_machine(7)
+
+    def test_wave11_writer_entrypoints_revalidate_and_keep_capabilities_split(self):
+        source = (ROOT / "automation/federation/controller.py").read_text(encoding="utf-8")
+        route = source.split("    def trusted_validation_route(", 1)[1].split("    def trusted_validation_manual(", 1)[0]
+        manual = source.split("    def trusted_validation_manual(", 1)[1].split("    def trusted_validation_machine(", 1)[0]
+        machine = source.split("    def trusted_validation_machine(", 1)[1].split("    def trusted_validation(", 1)[0]
+        self.assertNotRegex(route, r"(?:create_commit_status|update_check_run|dispatch_workflow|update_pull_request_state|update_refs)\(")
+        self.assertIn("resolve_current_sha_carrier_role", manual)
+        self.assertIn("trusted_validation_role_first", manual)
+        self.assertNotIn("publish_validation_result", manual)
+        self.assertNotIn("update_check_run(", manual)
+        self.assertGreaterEqual(machine.count("resolve_current_sha_carrier_role"), 2)
+        self.assertIn("publish_validation_result", machine)
+        self.assertNotIn("create_commit_status(", machine)
+        self.assertIn('args.command != "trusted-validation-route"', source)
+
     def test_valid_fixture_only_can_pass_and_exact_check_output_is_bounded(self):
         request_class = __import__("automation.federation.request_model", fromlist=["RequestClass"]).RequestClass.ADD
         result = evaluate_trusted_validation(request_class, "a" * 40, "b" * 40, lambda: (True, "candidate-ok"), allow_success=True)
@@ -63,6 +197,7 @@ class ValidationTests(unittest.TestCase):
                     return HttpResponse(200, url, json.dumps({
                         "number": 7,
                         "body": "body",
+                        "draft": False,
                         "user": {"login": "alice", "node_id": "U_author"},
                         "head": {"sha": "a" * 40, "ref": "proposal", "repo": {"node_id": "7", "full_name": "swiftstream/skills"}},
                         "base": {"sha": "b" * 40, "ref": "main", "repo": {"node_id": "7", "full_name": "swiftstream/skills"}},
@@ -73,7 +208,7 @@ class ValidationTests(unittest.TestCase):
                     return HttpResponse(200, url, json.dumps([comment]).encode())
                 payload = json.loads(body)
                 if "FederationPullRequestRoutingBefore" in payload["query"] or "FederationPullRequestRoutingAfter" in payload["query"]:
-                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
+                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "isDraft": False, "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
                 if payload["query"] == ISSUE_COMMENT_NODES_QUERY:
                     self.assert_comment_query(payload)
                     node = {"__typename": "IssueComment", "id": "IC_1", "fullDatabaseId": "1", "body": "comment", "createdAt": "2026-09-10T00:00:00Z", "updatedAt": "2026-09-10T00:00:00Z", "author": {"id": "U_author", "login": "alice", "__typename": "User"}, "editor": None, "lastEditedAt": None, "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
@@ -117,6 +252,7 @@ class ValidationTests(unittest.TestCase):
                     return HttpResponse(200, url, json.dumps({
                         "number": 7,
                         "body": body,
+                        "draft": False,
                         "user": {"login": "alice", "node_id": "U_author"},
                         "head": {"sha": "a" * 40, "ref": "proposal", "repo": {"node_id": "N_head", "full_name": "swiftstream/skills"}},
                         "base": {"sha": "b" * 40, "ref": "main", "repo": {"node_id": "N_base", "full_name": "swiftstream/skills"}},
@@ -127,7 +263,7 @@ class ValidationTests(unittest.TestCase):
                     return HttpResponse(200, url, json.dumps([comment]).encode())
                 payload = json.loads(request_body)
                 if "FederationPullRequestRoutingBefore" in payload["query"] or "FederationPullRequestRoutingAfter" in payload["query"]:
-                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
+                    return HttpResponse(200, url, json.dumps({"data": {"repository": {"nameWithOwner": "swiftstream/skills", "pullRequest": {"number": 7, "headRefOid": "a" * 40, "baseRefOid": "b" * 40, "headRefName": "proposal", "baseRefName": "main", "isDraft": False, "lastEditedAt": None, "includesCreatedEdit": False}}}}).encode())
                 if payload["query"] == ISSUE_COMMENT_NODES_QUERY:
                     node = {"__typename": "IssueComment", "id": "IC_anchor", "fullDatabaseId": "1", "body": anchor_body, "createdAt": "2026-09-10T00:00:00Z", "updatedAt": "2026-09-10T00:00:00Z", "author": {"id": "U_bot", "login": "swift-stream-federation", "__typename": "Bot"}, "editor": None, "lastEditedAt": None, "includesCreatedEdit": False, "userContentEdits": {"totalCount": 0}}
                     return HttpResponse(200, url, json.dumps({"data": {"nodes": [node]}}).encode())
@@ -143,7 +279,7 @@ class ValidationTests(unittest.TestCase):
     def _compatibility_fixture(self):
         body = "Repository URL:\nhttps://github.com/example/source\nDescription:\nA source\nBranch:\nmain\nSkills root:\nskills\nSkill prefixes:\nexample\n"
         request = parse_request_body(RequestClass.ADD, body)
-        pr = PullRequestMetadata(7, body, "U_author", "alice", "a" * 40, "b" * 40, "proposal", "main", "N_head", "swiftstream/skills", "N_base", "swiftstream/skills", None, False)
+        pr = PullRequestMetadata(7, body, "U_author", "alice", "a" * 40, "b" * 40, "proposal", "main", "N_head", "swiftstream/skills", "N_base", "swiftstream/skills", None, False, False)
         anchor = RequestAnchor(7, RequestClass.ADD, "U_author", "alice", body_sha256(body), request)
         anchor_comment = IssueComment("IC_anchor", 1, anchor.render(), APP.bot_node_id, APP.bot_login, "Bot", None, None, None, None, False)
         return pr, anchor, AnchorComment(anchor, anchor_comment)
@@ -222,7 +358,7 @@ class ValidationTests(unittest.TestCase):
         fake = ProductionAddClient()
         base_env = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, base_env, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             self.assertEqual(main(["trusted-validation"]), 0)
             self.assertEqual(main(["trusted-validation"]), 0)
         self.assertEqual(fake.checks[-1][1], TRUSTED_VALIDATION_NAME)
@@ -232,7 +368,7 @@ class ValidationTests(unittest.TestCase):
         payload = fake.checks[-1][3]["output"]
         self.assertEqual(set(payload), {"title", "summary", "text"})
         self.assertEqual(fake.checks[-1][3]["conclusion"], "failure")
-        self.assertEqual(fake.dispatches[-1][1], "federation-state-finalize.yml")
+        self.assertEqual(fake.dispatches[-1][1], "federation-g8-state-finalize.yml")
 
     def test_c05_central_transport_has_explicit_empty_proxy_handler(self):
         transport = UrllibTransport()
@@ -257,7 +393,7 @@ class ValidationTests(unittest.TestCase):
         fake = ProductionAddClient()
         env = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "999", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, env, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             self.assertEqual(main(["state-finalize"]), 0)
             # The finalizer may create the missing App check and publish success after revalidation.
             self.assertEqual(len(fake.check_objects), 1)
@@ -329,7 +465,7 @@ class ValidationTests(unittest.TestCase):
 
         calls = []
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, base_env, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             dispatch_count = len(fake.dispatches)
             with patch.object(controller_module, "C02CandidateBuilder", HeadRaceBuilder):
                 self.assertEqual(main(["trusted-validation"]), 1, (fake.current_pr.head_oid, calls, fake.dispatches))
@@ -350,7 +486,7 @@ class ValidationTests(unittest.TestCase):
                 return True, "CANDIDATE_MATCHES_C02"
 
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, base_env, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             dispatch_count = len(fake.dispatches)
             with patch.object(controller_module, "C02CandidateBuilder", CommentRaceBuilder):
                 self.assertEqual(main(["trusted-validation"]), 1)
@@ -377,11 +513,11 @@ class ValidationTests(unittest.TestCase):
         fake = RuntimeClient()
         env = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, env, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             fake.ref_reads = 0
             self.assertEqual(main(["state-finalize"]), 1)
         self.assertFalse(any(item[3].get("conclusion") == "success" for item in fake.checks))
-        self.assertEqual(fake.dispatches[-1][1], "federation-state-finalize.yml")
+        self.assertEqual(fake.dispatches[-1][1], "federation-g8-state-finalize.yml")
 
     def test_state_finalize_stale_checkout_self_wakes_without_cas_or_green(self):
         from tests.automation.test_interactive import ProductionAddClient
@@ -389,7 +525,7 @@ class ValidationTests(unittest.TestCase):
         fake = ProductionAddClient()
         good = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": fake.main_oid}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, good, clear=False):
-            self.assertEqual(main(["interactive"]), 0)
+            seed_legacy_add_proposal(fake)
             refs_before = len(fake.ref_calls)
             stale = dict(good, FEDERATION_TRUSTED_CHECKOUT_SHA="0" * 40)
             with patch.dict(os.environ, stale, clear=False):
@@ -412,13 +548,15 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(result, "swept-all-manual-trust-prs")
         self.assertEqual(seen, [2, 9, 13])
 
-    def test_stale_trusted_checkout_blocks_production_main_before_any_cas(self):
+    def test_nonreserved_interactive_is_inert_even_with_stale_trusted_checkout(self):
         from tests.automation.test_interactive import ProductionAddClient
         fake = ProductionAddClient()
         env = {"GITHUB_REPOSITORY": "swiftstream/skills", "FEDERATION_GITHUB_TOKEN": "token", "FEDERATION_APP_SLUG": APP.slug, "FEDERATION_WAKE_PULL_NUMBER": "7", "FEDERATION_TRUSTED_CHECKOUT_SHA": "0" * 40}
         with patch("automation.federation.controller.GitHubClient", return_value=fake), trusted_previous_patches(), patch.object(controller_module, "SOURCE_HTTP_GET", fake.source_http_get), patch.object(controller_module, "SOURCE_BRANCH_FETCHER", fake.source_branch_fetcher), patch.dict(os.environ, env, clear=False):
-            self.assertEqual(main(["interactive"]), 1)
+            self.assertEqual(main(["interactive"]), 0)
         self.assertEqual(fake.ref_calls, [])
+        self.assertEqual(fake.created, [])
+        self.assertEqual(fake.dispatches, [])
 
     def test_upsert_finalizer_can_create_missing_check_and_publish_success(self):
         class Checks:
@@ -553,7 +691,7 @@ class ValidationTests(unittest.TestCase):
         class Client:
             def __init__(self, main_oid):
                 self.main_oid = main_oid
-                self.pr = PullRequestMetadata(7, "", "U_a", "alice", head, base, "proposal", "main", "7", "swiftstream/skills", "7", "swiftstream/skills", None, False)
+                self.pr = PullRequestMetadata(7, "", "U_a", "alice", head, base, "proposal", "main", "7", "swiftstream/skills", "7", "swiftstream/skills", None, False, False)
 
             def get_pull_request_metadata(self, repository, number):
                 return self.pr

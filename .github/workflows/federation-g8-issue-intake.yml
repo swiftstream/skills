@@ -1,0 +1,199 @@
+name: Federation G8 issue intake
+
+on:
+  issues:
+    types: [opened, edited, reopened, closed]
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        required: false
+        type: number
+  schedule:
+    - cron: '2,17,32,47 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swiftstream-skills-federation-manual-authority
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  activation-guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      runtime_state: ${{ steps.parse-guard.outputs.runtime_state }}
+      ordinary_write_allowed: ${{ steps.parse-guard.outputs.ordinary_write_allowed }}
+      activation_write_allowed: ${{ steps.parse-guard.outputs.activation_write_allowed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - id: trusted-checkout
+        name: Bind trusted checkout to HEAD
+        run: |
+          trusted_head="$(git rev-parse --verify HEAD^{commit})"
+          if [[ ! "$trusted_head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "trusted checkout HEAD is not a lowercase commit SHA" >&2
+            exit 1
+          fi
+          echo "sha=$trusted_head" >> "$GITHUB_OUTPUT"
+      - id: guard-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-issues: read
+          permission-pull-requests: read
+          permission-statuses: read
+      - id: parse-guard
+        name: Validate Wave12 activation guard output
+        env:
+          FEDERATION_GITHUB_TOKEN: ${{ steps.guard-token.outputs.token }}
+          FEDERATION_APP_SLUG: ${{ steps.guard-token.outputs.app-slug }}
+          FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ steps.trusted-checkout.outputs.sha }}
+        run: |
+          set -euo pipefail
+          guard_stdout="${RUNNER_TEMP}/g8-wave12-activation-guard.out"
+          : > "${guard_stdout}"
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m automation.federation.controller activation-guard > "${guard_stdout}"
+          python3 - "${guard_stdout}" "${GITHUB_OUTPUT}" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          def reject_constant(value):
+              raise ValueError(f"non-standard JSON constant: {value}")
+
+          def unique_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise ValueError(f"duplicate JSON key: {key}")
+                  result[key] = value
+              return result
+
+          raw = pathlib.Path(sys.argv[1]).read_bytes()
+          if not raw or raw.count(b"\n") != 1 or not raw.endswith(b"\n") or b"\r" in raw:
+              raise SystemExit("invalid activation guard framing")
+
+          body = raw[:-1]
+          try:
+              text = body.decode("utf-8")
+          except UnicodeDecodeError as exc:
+              raise SystemExit("invalid activation guard utf8") from exc
+
+          try:
+              value = json.loads(
+                  text,
+                  object_pairs_hook=unique_object,
+                  parse_constant=reject_constant,
+              )
+          except (json.JSONDecodeError, ValueError) as exc:
+              raise SystemExit("invalid activation guard json") from exc
+
+          expected_keys = {
+              "activationWriteAllowed",
+              "ordinaryWriteAllowed",
+              "reason",
+              "runtimeState",
+          }
+          if type(value) is not dict or set(value) != expected_keys:
+              raise SystemExit("invalid activation guard shape")
+
+          if type(value["activationWriteAllowed"]) is not bool:
+              raise SystemExit("invalid activationWriteAllowed type")
+          if type(value["ordinaryWriteAllowed"]) is not bool:
+              raise SystemExit("invalid ordinaryWriteAllowed type")
+          if type(value["reason"]) is not str:
+              raise SystemExit("invalid reason type")
+          if type(value["runtimeState"]) is not str:
+              raise SystemExit("invalid runtimeState type")
+
+          allowed = {
+              "ACTIVE_G8": (True, False, "ACTIVE_G8_EPOCH_PROVEN"),
+              "MERGED_UNPROVEN": (False, True, "MERGED_UNPROVEN_NO_VALID_EPOCH"),
+              "BLOCKED_POST_MERGE": (False, False, "BLOCKED_POST_MERGE_CONFLICT"),
+              "PRE_G8_NOT_APPLICABLE": (False, False, "PRE_G8_NOT_APPLICABLE"),
+          }
+          runtime_state = value["runtimeState"]
+          if runtime_state not in allowed:
+              raise SystemExit("unexpected activation guard runtime state")
+          ordinary_expected, activation_expected, reason_expected = allowed[runtime_state]
+          if value["ordinaryWriteAllowed"] is not ordinary_expected:
+              raise SystemExit("ordinaryWriteAllowed does not match runtime state")
+          if value["activationWriteAllowed"] is not activation_expected:
+              raise SystemExit("activationWriteAllowed does not match runtime state")
+          if value["reason"] != reason_expected:
+              raise SystemExit("activation guard reason does not match runtime state")
+
+          canonical = (
+              json.dumps(
+                  value,
+                  sort_keys=True,
+                  separators=(",", ":"),
+                  ensure_ascii=False,
+                  allow_nan=False,
+              ).encode("utf-8")
+              + b"\n"
+          )
+          if canonical != raw:
+              raise SystemExit("non-canonical activation guard bytes")
+
+          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8", newline="\n") as output:
+              output.write("runtime_state=" + value["runtimeState"] + "\n")
+              output.write("ordinary_write_allowed=" + ("true" if value["ordinaryWriteAllowed"] else "false") + "\n")
+              output.write("activation_write_allowed=" + ("true" if value["activationWriteAllowed"] else "false") + "\n")
+          PY
+  issue-intake:
+    needs: activation-guard
+    if: needs.activation-guard.outputs.runtime_state == 'ACTIVE_G8'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: refs/heads/main
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - id: trusted-checkout
+        name: Bind trusted checkout to HEAD
+        run: |
+          trusted_head="$(git rev-parse --verify HEAD^{commit})"
+          if [[ ! "$trusted_head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "trusted checkout HEAD is not a lowercase commit SHA" >&2
+            exit 1
+          fi
+          echo "sha=$trusted_head" >> "$GITHUB_OUTPUT"
+      - id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-actions: write
+          permission-statuses: write
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+      - name: Run trusted federation controller
+        env:
+          FEDERATION_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          FEDERATION_APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          FEDERATION_EVENT_PATH: ${{ github.event_path }}
+          FEDERATION_WAKE_ISSUE_NUMBER: ${{ inputs.issue_number }}
+          FEDERATION_TRUSTED_CHECKOUT_SHA: ${{ steps.trusted-checkout.outputs.sha }}
+        run: |
+          echo "WAVE10_ISSUE_INTAKE_NOT_IMPLEMENTED"

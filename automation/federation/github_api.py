@@ -9,13 +9,20 @@ import re
 import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Literal, Mapping, Protocol
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from scripts import federate as c02
 from automation.federation.workspace import WorkspaceError, validate_trusted_ref
+from automation.federation.request_model import (
+    MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES,
+    RequestModelError,
+    parse_issue_patch_projection,
+    parse_status_description,
+    reserved_issue_branch_number,
+)
 
 REST_BASE_URL = "https://api.github.com"
 GRAPHQL_ENDPOINT = "https://api.github.com/graphql"
@@ -39,6 +46,97 @@ UPDATE_REFS_MUTATION = """mutation FederationUpdateRefs($repositoryId: ID!, $ref
   }
 }"""
 
+REOPEN_PULL_REQUEST_MUTATION = """mutation FederationReopenPullRequest($pullRequestId: ID!, $clientMutationId: String!) {
+  reopenPullRequest(input: {pullRequestId: $pullRequestId, clientMutationId: $clientMutationId}) {
+    clientMutationId
+    pullRequest {
+      id
+      fullDatabaseId
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      headRepository { id }
+      baseRepository { id }
+    }
+  }
+}"""
+
+MARK_PULL_REQUEST_READY_FOR_REVIEW_MUTATION = """mutation FederationMarkPullRequestReadyForReview($pullRequestId: ID!, $clientMutationId: String!) {
+  markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId, clientMutationId: $clientMutationId}) {
+    clientMutationId
+    pullRequest {
+      id
+      fullDatabaseId
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      headRepository { id }
+      baseRepository { id }
+    }
+  }
+}"""
+
+CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION = """mutation FederationConvertPullRequestToDraft($pullRequestId: ID!, $clientMutationId: String!) {
+  convertPullRequestToDraft(input: {pullRequestId: $pullRequestId, clientMutationId: $clientMutationId}) {
+    clientMutationId
+    pullRequest {
+      id
+      fullDatabaseId
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      headRepository { id }
+      baseRepository { id }
+    }
+  }
+}"""
+
+CLOSE_PULL_REQUEST_MUTATION = """mutation FederationClosePullRequest($pullRequestId: ID!, $clientMutationId: String!) {
+  closePullRequest(input: {pullRequestId: $pullRequestId, clientMutationId: $clientMutationId}) {
+    clientMutationId
+    pullRequest {
+      id
+      fullDatabaseId
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      headRepository { id }
+      baseRepository { id }
+    }
+  }
+}"""
+
+_PULL_REQUEST_STAGE_MUTATIONS = {
+    "REOPEN": (REOPEN_PULL_REQUEST_MUTATION, "reopenPullRequest"),
+    "READY_FOR_REVIEW": (MARK_PULL_REQUEST_READY_FOR_REVIEW_MUTATION, "markPullRequestReadyForReview"),
+    "CONVERT_TO_DRAFT": (CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION, "convertPullRequestToDraft"),
+    "CLOSE": (CLOSE_PULL_REQUEST_MUTATION, "closePullRequest"),
+}
+
 # These documents are deliberately fixed strings.  All repository, login, ref,
 # and comment values enter as GraphQL variables; none can become query syntax.
 PULL_REQUEST_ROUTING_BEFORE_QUERY = """query FederationPullRequestRoutingBefore($owner: String!, $name: String!, $number: Int!) {
@@ -50,6 +148,7 @@ PULL_REQUEST_ROUTING_BEFORE_QUERY = """query FederationPullRequestRoutingBefore(
       baseRefOid
       headRefName
       baseRefName
+      isDraft
       lastEditedAt
       includesCreatedEdit
     }
@@ -65,8 +164,55 @@ PULL_REQUEST_ROUTING_AFTER_QUERY = """query FederationPullRequestRoutingAfter($o
       baseRefOid
       headRefName
       baseRefName
+      isDraft
       lastEditedAt
       includesCreatedEdit
+    }
+  }
+}"""
+
+ISSUE_ROUTING_BEFORE_QUERY = """query FederationIssueRoutingBefore($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    issueOrPullRequest(number: $number) {
+      __typename
+      ... on Issue {
+        id
+        number
+        lastEditedAt
+        includesCreatedEdit
+        closed
+      }
+      ... on PullRequest {
+        id
+        number
+        lastEditedAt
+        includesCreatedEdit
+        closed
+      }
+    }
+  }
+}"""
+
+ISSUE_ROUTING_AFTER_QUERY = """query FederationIssueRoutingAfter($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    issueOrPullRequest(number: $number) {
+      __typename
+      ... on Issue {
+        id
+        number
+        lastEditedAt
+        includesCreatedEdit
+        closed
+      }
+      ... on PullRequest {
+        id
+        number
+        lastEditedAt
+        includesCreatedEdit
+        closed
+      }
     }
   }
 }"""
@@ -77,6 +223,30 @@ PULL_REQUEST_BODY_FALLBACK_QUERY = """query FederationPullRequestBodyFallback($o
     pullRequest(number: $number) {
       number
       body
+    }
+  }
+}"""
+
+MERGED_PULL_REQUEST_QUERY = """query FederationMergedPullRequest($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    id
+    databaseId
+    nameWithOwner
+    pullRequest(number: $number) {
+      id
+      databaseId
+      number
+      state
+      isDraft
+      merged
+      mergedAt
+      mergeCommit { oid }
+      headRefOid
+      baseRefOid
+      headRefName
+      baseRefName
+      headRepository { id databaseId nameWithOwner }
+      baseRepository { id databaseId nameWithOwner }
     }
   }
 }"""
@@ -128,6 +298,40 @@ def _positive_id(value: Any, label: str) -> int:
     if type(value) is not int or type(value) is bool or not 1 <= value <= 9_223_372_036_854_775_807:
         raise InvalidResponseError(f"{label} must be a positive bounded integer")
     return value
+
+
+def _positive_graphql_bigint(value: Any, label: str = "PullRequest.fullDatabaseId") -> int:
+    """Parse GitHub BigInt JSON only from its canonical decimal string form."""
+    if type(value) is not str or re.fullmatch(r"[1-9][0-9]*", value) is None:
+        raise InvalidResponseError(f"{label} must be canonical positive decimal text")
+    try:
+        parsed = int(value)
+    except (ValueError, OverflowError):
+        raise InvalidResponseError(f"{label} is invalid") from None
+    if parsed <= 0:
+        raise InvalidResponseError(f"{label} must be positive")
+    return parsed
+
+
+def _canonical_stage_timestamp(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str or re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z", value
+    ) is None:
+        raise InvalidResponseError(f"{label} must be a canonical UTC timestamp or null")
+    try:
+        datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        raise InvalidResponseError(f"{label} must be a canonical UTC timestamp or null") from None
+    return value
+
+
+def _stage_client_mutation_id(value: Any, label: str) -> str:
+    text = _bounded_text(value, label, 256)
+    if len(text.encode("utf-8")) > 256:
+        raise InvalidResponseError(f"{label} exceeds 256 UTF-8 bytes")
+    return text
 
 
 def _optional_iso(value: Any, label: str) -> str | None:
@@ -281,6 +485,72 @@ class BotMetadata:
     type: str
 
 
+_WORKFLOW_STATES = frozenset({
+    "active", "deleted", "disabled_fork", "disabled_inactivity", "disabled_manually",
+})
+_WORKFLOW_RUN_STATUSES = frozenset({
+    "queued", "in_progress", "completed", "waiting", "requested", "pending",
+})
+_WORKFLOW_RUN_CONCLUSIONS = frozenset({
+    "success", "failure", "neutral", "cancelled", "skipped",
+    "timed_out", "action_required", "stale", "startup_failure",
+})
+
+
+@dataclass(frozen=True)
+class WorkflowMetadata:
+    id: int
+    node_id: str
+    name: str
+    path: str
+    state: str
+
+    def __post_init__(self) -> None:
+        _positive_id(self.id, "workflow.id")
+        _bounded_text(self.node_id, "workflow.node_id", 256)
+        _bounded_text(self.name, "workflow.name", 256)
+        path = _bounded_text(self.path, "workflow.path", 256)
+        prefix = ".github/workflows/"
+        if (
+            not path.startswith(prefix)
+            or path == prefix
+            or "/" in path[len(prefix):]
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+        ):
+            raise InvalidResponseError("workflow.path must be an exact workflow file path")
+        if type(self.state) is not str or self.state not in _WORKFLOW_STATES:
+            raise InvalidResponseError("workflow.state is not a closed known value")
+
+
+@dataclass(frozen=True)
+class WorkflowRunMetadata:
+    id: int
+    run_attempt: int
+    status: str
+    conclusion: str | None
+    workflow_id: int
+    event: str
+    head_branch: str | None
+    head_sha: str
+
+    def __post_init__(self) -> None:
+        _positive_id(self.id, "workflow_run.id")
+        _positive_id(self.run_attempt, "workflow_run.run_attempt")
+        _positive_id(self.workflow_id, "workflow_run.workflow_id")
+        if type(self.status) is not str or self.status not in _WORKFLOW_RUN_STATUSES:
+            raise InvalidResponseError("workflow_run.status is not a closed known value")
+        if self.conclusion is not None and (
+            type(self.conclusion) is not str or self.conclusion not in _WORKFLOW_RUN_CONCLUSIONS
+        ):
+            raise InvalidResponseError("workflow_run.conclusion is not a closed known value")
+        _bounded_text(self.event, "workflow_run.event", 64)
+        if self.head_branch is not None:
+            _bounded_text(self.head_branch, "workflow_run.head_branch", 256)
+        if type(self.head_sha) is not str or not _SHA40_RE.fullmatch(self.head_sha):
+            raise InvalidResponseError("workflow_run.head_sha must be lowercase 40-hex")
+
+
 @dataclass(frozen=True)
 class PullRequestMetadata:
     number: int
@@ -297,6 +567,106 @@ class PullRequestMetadata:
     base_repository: str
     last_edited_at: str | None
     includes_created_edit: bool
+    draft: bool
+
+
+@dataclass(frozen=True)
+class MergedPullRequestMetadata:
+    repository_full_name: str
+    repository_node_id: str
+    repository_database_id: int
+    pull_request_node_id: str
+    pull_request_database_id: int
+    pull_request_number: int
+    state: str
+    is_draft: bool
+    merged: bool
+    merged_at: str | None
+    merge_commit_oid: str | None
+    head_oid: str
+    base_oid: str
+    head_ref: str
+    base_ref: str
+    head_repository_node_id: str
+    head_repository_database_id: int
+    head_repository_full_name: str
+    base_repository_node_id: str
+    base_repository_database_id: int
+    base_repository_full_name: str
+
+
+@dataclass(frozen=True)
+class PullRequestStageMutationReceipt:
+    """Exact PR identity and topology returned by one fixed GraphQL mutation."""
+
+    operation: str
+    requested_pull_request_node_id: str
+    requested_client_mutation_id: str
+    returned_client_mutation_id: str
+    pull_request_node_id: str
+    pull_request_database_id: int
+    pull_request_number: int
+    state: str
+    is_draft: bool
+    merged: bool
+    merged_at: str | None
+    head_oid: str
+    base_oid: str
+    head_ref: str
+    base_ref: str
+    head_repository_node_id: str
+    base_repository_node_id: str
+
+    def __post_init__(self) -> None:
+        if self.operation not in _PULL_REQUEST_STAGE_MUTATIONS or type(self.operation) is not str:
+            raise InvalidResponseError("PR-stage operation is invalid")
+        _bounded_text(self.requested_pull_request_node_id, "requested pullRequestId", 256)
+        _stage_client_mutation_id(self.requested_client_mutation_id, "requested clientMutationId")
+        _stage_client_mutation_id(self.returned_client_mutation_id, "returned clientMutationId")
+        _bounded_text(self.pull_request_node_id, "pullRequest.id", 256)
+        if self.requested_pull_request_node_id != self.pull_request_node_id:
+            raise InvalidResponseError("PR-stage response node ID does not match requested PR")
+        if self.requested_client_mutation_id != self.returned_client_mutation_id:
+            raise InvalidResponseError("PR-stage response clientMutationId does not match request")
+        if type(self.pull_request_database_id) is not int or self.pull_request_database_id <= 0:
+            raise InvalidResponseError("pullRequest.fullDatabaseId must be a positive Python integer")
+        _positive_id(self.pull_request_number, "pullRequest.number")
+        if self.state not in {"OPEN", "CLOSED"} or type(self.state) is not str:
+            raise InvalidResponseError("pullRequest.state is invalid")
+        if type(self.is_draft) is not bool or type(self.merged) is not bool:
+            raise InvalidResponseError("pullRequest draft/merge fields must be exact booleans")
+        _canonical_stage_timestamp(self.merged_at, "pullRequest.mergedAt")
+        if not self.merged and self.merged_at is not None:
+            raise InvalidResponseError("unmerged PR-stage response must have null mergedAt")
+        for value, label in ((self.head_oid, "pullRequest.headRefOid"), (self.base_oid, "pullRequest.baseRefOid")):
+            if type(value) is not str or not _SHA40_RE.fullmatch(value):
+                raise InvalidResponseError(f"{label} must be lowercase 40-hex")
+        for value, label in ((self.head_ref, "pullRequest.headRefName"), (self.base_ref, "pullRequest.baseRefName")):
+            _bounded_text(value, label, 256)
+        _bounded_text(self.head_repository_node_id, "pullRequest.headRepository.id", 256)
+        _bounded_text(self.base_repository_node_id, "pullRequest.baseRepository.id", 256)
+        if self.operation == "REOPEN" and (self.state != "OPEN" or self.merged or self.merged_at is not None):
+            raise InvalidResponseError("reopen mutation did not return OPEN unmerged PR")
+        if self.operation == "READY_FOR_REVIEW" and (self.state != "OPEN" or self.is_draft or self.merged or self.merged_at is not None):
+            raise InvalidResponseError("ready mutation did not return OPEN ready unmerged PR")
+        if self.operation == "CONVERT_TO_DRAFT" and (self.state != "OPEN" or not self.is_draft or self.merged or self.merged_at is not None):
+            raise InvalidResponseError("draft mutation did not return OPEN draft unmerged PR")
+        if self.operation == "CLOSE" and (self.state != "CLOSED" or self.merged or self.merged_at is not None):
+            raise InvalidResponseError("close mutation did not return CLOSED unmerged PR")
+
+
+@dataclass(frozen=True)
+class IssueMetadata:
+    number: int
+    database_id: int
+    node_id: str
+    body: str
+    state: Literal["open", "closed"]
+    author_id: str
+    author_login: str
+    last_edited_at: str | None
+    includes_created_edit: bool
+    is_pull_request: bool
 
 
 @dataclass(frozen=True)
@@ -306,8 +676,35 @@ class _PullRequestRoutingSnapshot:
     base_oid: str
     head_ref: str
     base_ref: str
+    draft: bool
     last_edited_at: str | None
     includes_created_edit: bool
+
+
+@dataclass(frozen=True)
+class _IssueRoutingSnapshot:
+    typename: str
+    node_id: str
+    number: int
+    last_edited_at: str | None
+    includes_created_edit: bool
+    closed: bool
+
+    @property
+    def is_pull_request(self) -> bool:
+        return self.typename == "PullRequest"
+
+
+@dataclass(frozen=True)
+class _IssueRESTDetail:
+    number: int
+    database_id: int
+    node_id: str
+    body: str
+    state: str
+    author_id: str
+    author_login: str
+    is_pull_request: bool
 
 
 @dataclass(frozen=True)
@@ -320,6 +717,7 @@ class _PullRequestRESTDetail:
     base_oid: str
     head_ref: str
     base_ref: str
+    draft: bool
     head_repository_id: str
     head_repository: str
     base_repository_id: str
@@ -376,6 +774,121 @@ class GitCommitMetadata:
 
 
 @dataclass(frozen=True)
+class GitCommitIdentity:
+    name: str
+    email: str
+    date: str
+
+    def __post_init__(self) -> None:
+        _bounded_text(self.name, "commit identity name", 256)
+        _bounded_text(self.email, "commit identity email", 320)
+        _canonical_utc_timestamp(self.date, "commit identity date")
+
+
+@dataclass(frozen=True)
+class GitCommitObject:
+    sha: str
+    message: str
+    tree_sha: str
+    parents: tuple[str, ...]
+    author: GitCommitIdentity
+    committer: GitCommitIdentity
+
+    def __post_init__(self) -> None:
+        if type(self.sha) is not str or not _SHA40_RE.fullmatch(self.sha):
+            raise GitHubAPIError("commit object sha must be lowercase 40-hex")
+        if type(self.tree_sha) is not str or not _SHA40_RE.fullmatch(self.tree_sha):
+            raise GitHubAPIError("commit object tree sha must be lowercase 40-hex")
+        if type(self.message) is not str:
+            raise GitHubAPIError("commit object message must be a string")
+        try:
+            message_bytes = self.message.encode("utf-8")
+        except UnicodeEncodeError:
+            raise GitHubAPIError("commit object message must be valid UTF-8") from None
+        if len(message_bytes) > 65_536 or "\x00" in self.message:
+            raise GitHubAPIError("commit object message exceeds bounds or contains NUL")
+        if type(self.parents) is not tuple or len(self.parents) > 1_000:
+            raise GitHubAPIError("commit object parents must be a bounded tuple")
+        if any(type(parent) is not str or not _SHA40_RE.fullmatch(parent) for parent in self.parents):
+            raise GitHubAPIError("commit object parent sha must be lowercase 40-hex")
+        if type(self.author) is not GitCommitIdentity or type(self.committer) is not GitCommitIdentity:
+            raise GitHubAPIError("commit object author and committer metadata are required")
+
+
+@dataclass(frozen=True)
+class CommitStatus:
+    id: int
+    node_id: str | None
+    state: str
+    context: str
+    description: str | None
+    target_url: str | None
+    creator_database_id: int
+    creator_node_id: str
+    creator_login: str
+    creator_type: str
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self) -> None:
+        _positive_id(self.id, "status.id")
+        if self.node_id is not None:
+            _bounded_text(self.node_id, "status.node_id")
+        if type(self.state) is not str or self.state not in {"error", "failure", "pending", "success"}:
+            raise GitHubAPIError("status.state is invalid")
+        _bounded_text(self.context, "status.context", 100)
+        if self.description is not None:
+            text = _optional_bounded_text(self.description, "status.description", 140)
+            if text.startswith("ssf:v1"):
+                try:
+                    parse_status_description(text)
+                except RequestModelError as error:
+                    raise GitHubAPIError(f"status.description is invalid: {error}") from None
+        if self.target_url is not None:
+            _optional_bounded_text(self.target_url, "status.target_url", 2_048)
+        _positive_id(self.creator_database_id, "status.creator.id")
+        _bounded_text(self.creator_node_id, "status.creator.node_id")
+        _bounded_text(self.creator_login, "status.creator.login")
+        if type(self.creator_type) is not str or self.creator_type not in {"Bot", "User"}:
+            raise GitHubAPIError("status.creator.type must be exact Bot or User")
+        _canonical_utc_timestamp(self.created_at, "status.created_at")
+        _canonical_utc_timestamp(self.updated_at, "status.updated_at")
+
+
+@dataclass(frozen=True)
+class StatusWriteReceipt:
+    repository: str
+    requested_sha: str
+    method: str
+    route: str
+    requested_state: str
+    requested_context: str
+    requested_description: str | None
+    requested_target_url: str | None
+    returned_status: CommitStatus
+
+    def __post_init__(self) -> None:
+        expected_route = _canonical_status_route(self.repository, self.requested_sha)
+        if self.method != "POST":
+            raise GitHubAPIError("status receipt method must be exact POST")
+        if self.route != expected_route:
+            raise GitHubAPIError("status receipt route does not match repository and SHA")
+        _validate_status_request(
+            self.requested_state, self.requested_context,
+            self.requested_description, self.requested_target_url,
+        )
+        if type(self.returned_status) is not CommitStatus:
+            raise GitHubAPIError("status receipt must contain the exact returned CommitStatus")
+        if (
+            self.returned_status.state != self.requested_state
+            or self.returned_status.context != self.requested_context
+            or self.returned_status.description != self.requested_description
+            or self.returned_status.target_url != self.requested_target_url
+        ):
+            raise InvalidResponseError("returned commit status does not match the request receipt")
+
+
+@dataclass(frozen=True)
 class CheckRun:
     id: int
     name: str
@@ -396,6 +909,32 @@ class MergeResult:
 class HttpTransport(Protocol):
     def request(self, method: str, url: str, headers: Mapping[str, str], body: bytes | None, timeout: float) -> HttpResponse:
         ...
+
+
+def latest_exact_app_status(
+    statuses: Iterable[CommitStatus],
+    context: str,
+    *,
+    bot_database_id: int,
+    bot_node_id: str,
+    bot_login: str,
+) -> CommitStatus | None:
+    _bounded_text(context, "status context", 100)
+    _positive_id(bot_database_id, "status bot database ID")
+    _bounded_text(bot_node_id, "status bot node ID")
+    _bounded_text(bot_login, "status bot login")
+    for status in statuses:
+        if type(status) is not CommitStatus:
+            raise InvalidResponseError("status history contains a non-CommitStatus value")
+        if (
+            status.context == context
+            and status.creator_database_id == bot_database_id
+            and status.creator_node_id == bot_node_id
+            and status.creator_login == bot_login
+            and status.creator_type == "Bot"
+        ):
+            return status
+    return None
 
 
 class _NoRedirectHandler(urlrequest.HTTPRedirectHandler):
@@ -470,6 +1009,49 @@ def _validate_segment(segment: str) -> str:
     return urlparse.quote(segment, safe="-._~")
 
 
+_CANONICAL_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+
+
+def _canonical_utc_timestamp(value: Any, label: str) -> str:
+    if type(value) is not str or not _CANONICAL_UTC_RE.fullmatch(value):
+        raise InvalidResponseError(f"{label} must be canonical UTC timestamp text")
+    instant = _parse_github_timestamp(value, label)
+    if instant.isoformat(timespec="seconds").replace("+00:00", "Z") != value:
+        raise InvalidResponseError(f"{label} must be canonical UTC timestamp text")
+    return value
+
+
+def _canonical_repository_parts(repository: Any) -> tuple[str, str, str, str]:
+    if type(repository) is not str or repository.count("/") != 1 or len(repository) > 512:
+        raise GitHubAPIError("repository must be exact OWNER/REPO text")
+    owner, name = repository.split("/")
+    if not owner or not name:
+        raise GitHubAPIError("repository must be exact OWNER/REPO text")
+    return owner, name, _validate_segment(owner), _validate_segment(name)
+
+
+def _canonical_status_route(repository: Any, requested_sha: Any) -> str:
+    _owner, _name, owner_path, name_path = _canonical_repository_parts(repository)
+    if type(requested_sha) is not str or not _SHA40_RE.fullmatch(requested_sha):
+        raise GitHubAPIError("requested status SHA must be lowercase 40-hex")
+    return f"/repos/{owner_path}/{name_path}/statuses/{requested_sha}"
+
+
+def _validate_status_request(state: Any, context: Any, description: Any, target_url: Any) -> None:
+    if type(state) is not str or state not in {"error", "failure", "pending", "success"}:
+        raise GitHubAPIError("commit status state is invalid")
+    _bounded_text(context, "commit status context", 100)
+    if description is not None:
+        _optional_bounded_text(description, "commit status description", 140)
+        if description.startswith("ssf:v1"):
+            try:
+                parse_status_description(description)
+            except RequestModelError as error:
+                raise GitHubAPIError(f"canonical status description is invalid: {error}") from None
+    if target_url is not None:
+        _optional_bounded_text(target_url, "commit status target_url", 2_048)
+
+
 def _validate_tree_path(path: str) -> str:
     if type(path) is not str or not path or path.startswith("/") or "\\" in path or "\x00" in path or c02.contains_control(path):
         raise GitHubAPIError("Git tree path is invalid")
@@ -528,7 +1110,7 @@ class GitHubClient:
             headers["Authorization"] = f"Bearer {self._token}"
         return headers
 
-    def _request(self, method: str, url: str, payload: Any = None) -> Any:
+    def _request_response(self, method: str, url: str, payload: Any = None) -> HttpResponse:
         if url not in {GRAPHQL_ENDPOINT} and not url.startswith(REST_BASE_URL + "/"):
             raise GitHubAPIError("GitHub URL is outside the fixed API endpoints")
         body = _json_bytes(payload) if payload is not None else None
@@ -549,6 +1131,10 @@ class GitHubClient:
         if response.url != url:
             raise RedirectError("redirects are forbidden")
         self._raise_for_status(response.status)
+        return response
+
+    def _request(self, method: str, url: str, payload: Any = None) -> Any:
+        response = self._request_response(method, url, payload)
         if response.status == 204 and not response.body:
             return {}
         return _decode_json(response.body)
@@ -581,11 +1167,18 @@ class GitHubClient:
         if type(document) is not str or document not in {
             PULL_REQUEST_ROUTING_BEFORE_QUERY,
             PULL_REQUEST_ROUTING_AFTER_QUERY,
+            ISSUE_ROUTING_BEFORE_QUERY,
+            ISSUE_ROUTING_AFTER_QUERY,
             PULL_REQUEST_BODY_FALLBACK_QUERY,
+            MERGED_PULL_REQUEST_QUERY,
             ISSUE_COMMENT_NODES_QUERY,
             APP_QUERY,
             BOT_QUERY,
             UPDATE_REFS_MUTATION,
+            REOPEN_PULL_REQUEST_MUTATION,
+            MARK_PULL_REQUEST_READY_FOR_REVIEW_MUTATION,
+            CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION,
+            CLOSE_PULL_REQUEST_MUTATION,
         }:
             raise GitHubAPIError("GraphQL document is not an accepted trusted document")
         result = self._request("POST", GRAPHQL_ENDPOINT, {"query": document, "variables": dict(variables)})
@@ -598,6 +1191,66 @@ class GitHubClient:
         if set(result) != {"data"} or type(result["data"]) is not dict:
             raise InvalidResponseError("GraphQL response has invalid exact top-level shape")
         return result["data"]
+
+    @classmethod
+    def _parse_pull_request_stage_mutation(
+        cls, data: Any, *, operation: str, mutation_field: str,
+        requested_pull_request_node_id: str, requested_client_mutation_id: str,
+    ) -> PullRequestStageMutationReceipt:
+        if type(data) is not dict or set(data) != {mutation_field} or type(data.get(mutation_field)) is not dict:
+            raise InvalidResponseError("PR-stage mutation data has invalid exact shape")
+        payload = data[mutation_field]
+        if set(payload) != {"clientMutationId", "pullRequest"}:
+            raise InvalidResponseError("PR-stage mutation payload has invalid exact shape")
+        returned_client_mutation_id = _stage_client_mutation_id(payload["clientMutationId"], "clientMutationId")
+        pull = payload["pullRequest"]
+        pull_keys = {
+            "id", "fullDatabaseId", "number", "state", "isDraft", "merged", "mergedAt",
+            "headRefOid", "baseRefOid", "headRefName", "baseRefName", "headRepository", "baseRepository",
+        }
+        if type(pull) is not dict or set(pull) != pull_keys:
+            raise InvalidResponseError("PR-stage mutation PullRequest has invalid exact shape")
+        for key, label in (("headRepository", "headRepository"), ("baseRepository", "baseRepository")):
+            if type(pull[key]) is not dict or set(pull[key]) != {"id"}:
+                raise InvalidResponseError(f"PR-stage mutation {label} has invalid exact shape")
+        receipt = PullRequestStageMutationReceipt(
+            operation=operation,
+            requested_pull_request_node_id=requested_pull_request_node_id,
+            requested_client_mutation_id=requested_client_mutation_id,
+            returned_client_mutation_id=returned_client_mutation_id,
+            pull_request_node_id=_bounded_text(pull["id"], "pullRequest.id", 256),
+            pull_request_database_id=_positive_graphql_bigint(pull["fullDatabaseId"]),
+            pull_request_number=_positive_id(pull["number"], "pullRequest.number"),
+            state=pull["state"],
+            is_draft=pull["isDraft"],
+            merged=pull["merged"],
+            merged_at=_canonical_stage_timestamp(pull["mergedAt"], "pullRequest.mergedAt"),
+            head_oid=cls._sha(pull["headRefOid"], "pullRequest.headRefOid"),
+            base_oid=cls._sha(pull["baseRefOid"], "pullRequest.baseRefOid"),
+            head_ref=_bounded_text(pull["headRefName"], "pullRequest.headRefName", 256),
+            base_ref=_bounded_text(pull["baseRefName"], "pullRequest.baseRefName", 256),
+            head_repository_node_id=_bounded_text(pull["headRepository"]["id"], "headRepository.id", 256),
+            base_repository_node_id=_bounded_text(pull["baseRepository"]["id"], "baseRepository.id", 256),
+        )
+        return receipt
+
+    def _pull_request_stage_mutation(
+        self, operation: str, pull_request_node_id: str, client_mutation_id: str,
+    ) -> PullRequestStageMutationReceipt:
+        if operation not in _PULL_REQUEST_STAGE_MUTATIONS:
+            raise GitHubAPIError("unsupported PR-stage operation")
+        node_id = _bounded_text(pull_request_node_id, "pullRequestId", 256)
+        mutation_id = _stage_client_mutation_id(client_mutation_id, "clientMutationId")
+        document, mutation_field = _PULL_REQUEST_STAGE_MUTATIONS[operation]
+        data = self._graphql(
+            document,
+            {"pullRequestId": node_id, "clientMutationId": mutation_id},
+            operation=f"prStage{operation}",
+        )
+        return self._parse_pull_request_stage_mutation(
+            data, operation=operation, mutation_field=mutation_field,
+            requested_pull_request_node_id=node_id, requested_client_mutation_id=mutation_id,
+        )
 
     @staticmethod
     def _owner_repo(repository: str) -> tuple[str, str]:
@@ -646,13 +1299,148 @@ class GitHubClient:
             author_date = _parse_github_timestamp(author["date"], "commit.author.date").strftime("%Y-%m-%dT%H:%M:%SZ")
         return GitCommitMetadata(commit, tree_sha, tuple(parents), author_date)
 
-    def get_commit_tree(self, repository: str, commit_sha: str) -> tuple[str, tuple[GitTreeEntry, ...]]:
-        owner, name = self._owner_repo(repository)
-        metadata = self.get_commit_metadata(repository, commit_sha)
-        url = f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/git/trees/{urlparse.quote(metadata.tree_sha)}?recursive=1"
+    def get_git_commit_object(self, repository: str, sha: str) -> GitCommitObject:
+        _owner, _name, owner_path, name_path = _canonical_repository_parts(repository)
+        commit = self._sha(sha, "commit.sha")
+        url = f"{REST_BASE_URL}/repos/{owner_path}/{name_path}/git/commits/{commit}"
         value = self._request("GET", url)
+        if type(value) is not dict or type(value.get("tree")) is not dict or type(value.get("parents")) is not list:
+            raise InvalidResponseError("Git commit object has invalid shape")
+        returned_sha = self._sha(value.get("sha"), "commit.sha")
+        if returned_sha != commit:
+            raise InvalidResponseError("Git commit object identity does not match requested SHA")
+        tree_sha = self._sha(value["tree"].get("sha"), "commit.tree.sha")
+        message = value.get("message")
+        if type(message) is not str:
+            raise InvalidResponseError("Git commit message must be exact string text")
+        try:
+            message_size = len(message.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise InvalidResponseError("Git commit message is not valid UTF-8") from None
+        if message_size > 65_536 or "\x00" in message:
+            raise InvalidResponseError("Git commit message exceeds bounds or contains NUL")
+        parents: list[str] = []
+        for parent in value["parents"]:
+            if type(parent) is not dict:
+                raise InvalidResponseError("Git commit parent has invalid shape")
+            parents.append(self._sha(parent.get("sha"), "commit.parent.sha"))
+        if len(parents) > 1_000:
+            raise InvalidResponseError("Git commit parent list exceeds bound")
+
+        def parse_identity(identity: Any, label: str) -> GitCommitIdentity:
+            if type(identity) is not dict:
+                raise InvalidResponseError(f"{label} metadata must be an object")
+            try:
+                return GitCommitIdentity(
+                    _bounded_text(identity.get("name"), f"{label}.name", 256),
+                    _bounded_text(identity.get("email"), f"{label}.email", 320),
+                    _canonical_utc_timestamp(identity.get("date"), f"{label}.date"),
+                )
+            except (GitHubAPIError, InvalidResponseError) as error:
+                raise InvalidResponseError(f"{label} metadata is invalid: {error}") from None
+
+        return GitCommitObject(
+            returned_sha,
+            message,
+            tree_sha,
+            tuple(parents),
+            parse_identity(value.get("author"), "commit.author"),
+            parse_identity(value.get("committer"), "commit.committer"),
+        )
+
+    @staticmethod
+    def _parse_commit_status(value: Any) -> CommitStatus:
+        if type(value) is not dict:
+            raise InvalidResponseError("commit status must be an object")
+        creator = value.get("creator")
+        if type(creator) is not dict:
+            raise InvalidResponseError("commit status creator must be an object")
+        try:
+            return CommitStatus(
+                id=_positive_id(value.get("id"), "status.id"),
+                node_id=None if value.get("node_id") is None else _bounded_text(value.get("node_id"), "status.node_id"),
+                state=value.get("state"),
+                context=_bounded_text(value.get("context"), "status.context", 100),
+                description=None if value.get("description") is None else _optional_bounded_text(value.get("description"), "status.description", 140),
+                target_url=None if value.get("target_url") is None else _optional_bounded_text(value.get("target_url"), "status.target_url", 2_048),
+                creator_database_id=_positive_id(creator.get("id"), "status.creator.id"),
+                creator_node_id=_bounded_text(creator.get("node_id"), "status.creator.node_id"),
+                creator_login=_bounded_text(creator.get("login"), "status.creator.login"),
+                creator_type=creator.get("type"),
+                created_at=_canonical_utc_timestamp(value.get("created_at"), "status.created_at"),
+                updated_at=_canonical_utc_timestamp(value.get("updated_at"), "status.updated_at"),
+            )
+        except GitHubAPIError as error:
+            raise InvalidResponseError(f"commit status is invalid: {error}") from None
+
+    def create_commit_status(
+        self,
+        repository: str,
+        requested_sha: str,
+        state: str,
+        context: str,
+        description: str | None,
+        target_url: str | None = None,
+    ) -> StatusWriteReceipt:
+        route = _canonical_status_route(repository, requested_sha)
+        _validate_status_request(state, context, description, target_url)
+        payload = {
+            "state": state,
+            "context": context,
+            "description": description,
+            "target_url": target_url,
+        }
+        response = self._request_response("POST", REST_BASE_URL + route, payload)
+        if response.status != 201:
+            raise UnexpectedStatusError("commit status creation requires same-response HTTP 201")
+        returned = self._parse_commit_status(_decode_json(response.body))
+        return StatusWriteReceipt(
+            repository=repository,
+            requested_sha=requested_sha,
+            method="POST",
+            route=route,
+            requested_state=state,
+            requested_context=context,
+            requested_description=description,
+            requested_target_url=target_url,
+            returned_status=returned,
+        )
+
+    def list_commit_statuses(
+        self,
+        repository: str,
+        queried_sha: str,
+        *,
+        max_pages: int = 100,
+    ) -> tuple[CommitStatus, ...]:
+        _owner, _name, owner_path, name_path = _canonical_repository_parts(repository)
+        sha = self._sha(queried_sha, "queried status SHA")
+        if type(max_pages) is not int or not 1 <= max_pages <= 100:
+            raise GitHubAPIError("status max_pages must be an integer from 1 through 100")
+        statuses: list[CommitStatus] = []
+        for page in range(1, max_pages + 1):
+            url = (
+                f"{REST_BASE_URL}/repos/{owner_path}/{name_path}/commits/{sha}/statuses"
+                f"?per_page=100&page={page}"
+            )
+            value = self._request("GET", url)
+            if type(value) is not list:
+                raise InvalidResponseError("commit status page must be a list")
+            page_statuses = tuple(self._parse_commit_status(item) for item in value)
+            if len(page_statuses) > 100:
+                raise InvalidResponseError("commit status page exceeds 100 entries")
+            statuses.extend(page_statuses)
+            if len(page_statuses) < 100:
+                return tuple(statuses)
+        raise InvalidResponseError("commit status pagination exceeds configured page bound")
+
+    @classmethod
+    def _parse_tree_response(cls, tree_sha: str, value: Any) -> tuple[str, tuple[GitTreeEntry, ...]]:
+        tree = cls._sha(tree_sha, "tree.sha")
         if type(value) is not dict or type(value.get("tree")) is not list or value.get("truncated") is not False:
             raise InvalidResponseError("Git tree response is truncated or malformed")
+        if "sha" in value and value["sha"] != tree:
+            raise InvalidResponseError("Git tree response identity does not match requested tree")
         entries: list[GitTreeEntry] = []
         for item in value["tree"]:
             if type(item) is not dict:
@@ -672,10 +1460,23 @@ class GitHubClient:
                 raise InvalidResponseError("Git tree gitlink mode/type combination is invalid")
             if object_type == "blob" and mode not in {"100644", "100755", "120000"}:
                 raise InvalidResponseError("Git tree blob mode/type combination is invalid")
-            entries.append(GitTreeEntry(path, mode, object_type, self._sha(item.get("sha"), "tree.entry.sha")))
+            entries.append(GitTreeEntry(path, mode, object_type, cls._sha(item.get("sha"), "tree.entry.sha")))
         if len(entries) > 100_000 or len({item.path for item in entries}) != len(entries):
             raise InvalidResponseError("Git tree entry count or identity is invalid")
-        return metadata.tree_sha, tuple(sorted(entries, key=lambda item: item.path.encode("utf-8")))
+        return tree, tuple(sorted(entries, key=lambda item: item.path.encode("utf-8")))
+
+    def get_tree(self, repository: str, tree_sha: str) -> tuple[str, tuple[GitTreeEntry, ...]]:
+        owner, name = self._owner_repo(repository)
+        tree = self._sha(tree_sha, "tree.sha")
+        url = f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/git/trees/{urlparse.quote(tree)}?recursive=1"
+        return self._parse_tree_response(tree, self._request("GET", url))
+
+    def get_commit_tree(self, repository: str, commit_sha: str) -> tuple[str, tuple[GitTreeEntry, ...]]:
+        metadata = self.get_commit_metadata(repository, commit_sha)
+        tree_sha, entries = self.get_tree(repository, metadata.tree_sha)
+        if tree_sha != metadata.tree_sha:
+            raise InvalidResponseError("Git tree response identity does not match commit metadata")
+        return tree_sha, entries
 
     def get_blob(self, repository: str, blob_sha: str) -> bytes:
         owner, name = self._owner_repo(repository)
@@ -755,12 +1556,15 @@ class GitHubClient:
             raise InvalidResponseError("pull request routing number does not match requested number")
         if type(pull.get("includesCreatedEdit")) is not bool:
             raise InvalidResponseError("PR.includesCreatedEdit must be boolean")
+        if type(pull.get("isDraft")) is not bool:
+            raise InvalidResponseError("PR.isDraft must be boolean")
         return _PullRequestRoutingSnapshot(
             number,
             GitHubClient._sha(pull.get("headRefOid"), "PR.headRefOid"),
             GitHubClient._sha(pull.get("baseRefOid"), "PR.baseRefOid"),
             _bounded_text(pull.get("headRefName"), "PR.headRefName"),
             _bounded_text(pull.get("baseRefName"), "PR.baseRefName"),
+            pull["isDraft"],
             _optional_iso(pull.get("lastEditedAt"), "PR.lastEditedAt"),
             pull["includesCreatedEdit"],
         )
@@ -772,6 +1576,17 @@ class GitHubClient:
         try:
             if len(value.encode("utf-8")) > 16_384:
                 raise InvalidResponseError(f"{label} exceeds 16KiB")
+        except UnicodeEncodeError:
+            raise InvalidResponseError(f"{label} is not valid UTF-8") from None
+        return value
+
+    @staticmethod
+    def _issue_comment_body_text(value: Any, label: str) -> str:
+        if type(value) is not str:
+            raise InvalidResponseError(f"{label} must be a string")
+        try:
+            if len(value.encode("utf-8")) > MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES:
+                raise InvalidResponseError(f"{label} exceeds the Issue comment bound")
         except UnicodeEncodeError:
             raise InvalidResponseError(f"{label} is not valid UTF-8") from None
         return value
@@ -788,6 +1603,8 @@ class GitHubClient:
         body = None if body_value is None else cls._body_text(body_value, "pull request REST body")
         if type(value.get("user")) is not dict or type(value.get("head")) is not dict or type(value.get("base")) is not dict:
             raise InvalidResponseError("pull request REST identity metadata is incomplete")
+        if type(value.get("draft")) is not bool:
+            raise InvalidResponseError("pull request REST draft must be boolean")
         user = value["user"]
         head = value["head"]
         base = value["base"]
@@ -804,6 +1621,7 @@ class GitHubClient:
             cls._sha(base.get("sha"), "PR.base.sha"),
             _bounded_text(head.get("ref"), "PR.head.ref"),
             _bounded_text(base.get("ref"), "PR.base.ref"),
+            value["draft"],
             _bounded_text(head_repo.get("node_id"), "PR.head.repo.node_id"),
             _bounded_text(head_repo.get("full_name"), "PR.head.repo.full_name"),
             _bounded_text(base_repo.get("node_id"), "PR.base.repo.node_id"),
@@ -849,6 +1667,8 @@ class GitHubClient:
             before.base_ref,
         ):
             raise InvalidResponseError("pull request REST topology does not match routing authority")
+        if rest.draft != before.draft:
+            raise InvalidResponseError("pull request REST draft does not match routing authority")
         return PullRequestMetadata(
             before.number,
             body,
@@ -864,6 +1684,227 @@ class GitHubClient:
             rest.base_repository,
             before.last_edited_at,
             before.includes_created_edit,
+            before.draft,
+        )
+
+    def get_merged_pull_request_metadata(self, repository: str, number: int) -> MergedPullRequestMetadata:
+        """Read one exact PR merge/topology snapshot using a fixed read-only query."""
+        owner, name = self._owner_repo(repository)
+        if type(number) is not int or type(number) is bool or number <= 0:
+            raise GitHubAPIError("pull request number must be positive")
+        data = self._graphql(
+            MERGED_PULL_REQUEST_QUERY,
+            {"owner": owner, "name": name, "number": number},
+            operation="mergedPullRequest",
+        )
+        if type(data) is not dict or set(data) != {"repository"} or type(data.get("repository")) is not dict:
+            raise InvalidResponseError("merged PR response has invalid exact top-level shape")
+        repo = data["repository"]
+        if set(repo) != {"id", "databaseId", "nameWithOwner", "pullRequest"}:
+            raise InvalidResponseError("merged PR repository response has invalid exact shape")
+        repo_full_name = _bounded_text(repo.get("nameWithOwner"), "repository.nameWithOwner", 512)
+        repo_node_id = _bounded_text(repo.get("id"), "repository.id", 256)
+        repo_database_id = _positive_id(repo.get("databaseId"), "repository.databaseId")
+        pull = repo.get("pullRequest")
+        expected_pull_keys = {
+            "id", "databaseId", "number", "state", "isDraft", "merged", "mergedAt", "mergeCommit",
+            "headRefOid", "baseRefOid", "headRefName", "baseRefName", "headRepository", "baseRepository",
+        }
+        if type(pull) is not dict or set(pull) != expected_pull_keys:
+            raise InvalidResponseError("merged PR response has invalid exact pull request shape")
+        returned_number = pull.get("number")
+        if type(returned_number) is not int or type(returned_number) is bool or returned_number != number:
+            raise InvalidResponseError("merged PR number does not match requested number")
+        state = pull.get("state")
+        if type(state) is not str or state not in {"OPEN", "CLOSED"}:
+            raise InvalidResponseError("merged PR state is invalid")
+        is_draft, merged = pull.get("isDraft"), pull.get("merged")
+        if type(is_draft) is not bool or type(merged) is not bool:
+            raise InvalidResponseError("merged PR draft/merged fields must be exact booleans")
+        merged_at = pull.get("mergedAt")
+        if merged_at is not None:
+            merged_at = _canonical_utc_timestamp(merged_at, "pullRequest.mergedAt")
+        merge_commit = pull.get("mergeCommit")
+        if merge_commit is None:
+            merge_commit_oid = None
+        elif type(merge_commit) is dict and set(merge_commit) == {"oid"}:
+            merge_commit_oid = self._sha(merge_commit.get("oid"), "pullRequest.mergeCommit.oid")
+        else:
+            raise InvalidResponseError("merged PR mergeCommit is malformed")
+
+        def repository_identity(raw: Any, label: str) -> tuple[str, int, str]:
+            if type(raw) is not dict or set(raw) != {"id", "databaseId", "nameWithOwner"}:
+                raise InvalidResponseError(f"{label} repository identity is malformed")
+            return (
+                _bounded_text(raw.get("id"), f"{label}.id", 256),
+                _positive_id(raw.get("databaseId"), f"{label}.databaseId"),
+                _bounded_text(raw.get("nameWithOwner"), f"{label}.nameWithOwner", 512),
+            )
+
+        head_repo = repository_identity(pull.get("headRepository"), "headRepository")
+        base_repo = repository_identity(pull.get("baseRepository"), "baseRepository")
+        return MergedPullRequestMetadata(
+            repo_full_name, repo_node_id, repo_database_id,
+            _bounded_text(pull.get("id"), "pullRequest.id", 256),
+            _positive_id(pull.get("databaseId"), "pullRequest.databaseId"),
+            returned_number, state, is_draft, merged, merged_at, merge_commit_oid,
+            self._sha(pull.get("headRefOid"), "pullRequest.headRefOid"),
+            self._sha(pull.get("baseRefOid"), "pullRequest.baseRefOid"),
+            _bounded_text(pull.get("headRefName"), "pullRequest.headRefName", 256),
+            _bounded_text(pull.get("baseRefName"), "pullRequest.baseRefName", 256),
+            *head_repo, *base_repo,
+        )
+
+    def compare_commits(self, repository: str, base_sha: str, head_sha: str) -> tuple[str, str, str]:
+        """Return strict (status, base SHA, merge-base SHA) for bounded ancestry proof."""
+        owner, name = self._owner_repo(repository)
+        base, head = self._sha(base_sha, "compare base SHA"), self._sha(head_sha, "compare head SHA")
+        url = (
+            f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}"
+            f"/compare/{base}...{head}"
+        )
+        value = self._request("GET", url)
+        if type(value) is not dict or type(value.get("base_commit")) is not dict or type(value.get("merge_base_commit")) is not dict:
+            raise InvalidResponseError("commit compare response is malformed")
+        returned_base = self._sha(value["base_commit"].get("sha"), "compare.base_commit.sha")
+        raw_commits = value.get("commits")
+        if type(raw_commits) is not list or any(type(item) is not dict for item in raw_commits):
+            raise InvalidResponseError("commit compare commits list is malformed")
+        merge_base = self._sha(value["merge_base_commit"].get("sha"), "compare.merge_base_commit.sha")
+        status = value.get("status")
+        if type(status) is not str or status not in {"identical", "ahead", "behind", "diverged"}:
+            raise InvalidResponseError("commit compare status is invalid")
+        if returned_base != base:
+            raise InvalidResponseError("commit compare response base identity differs from request")
+        returned_head = base if not raw_commits else self._sha(raw_commits[-1].get("sha"), "compare.head SHA")
+        if status == "identical":
+            coherent = head == base and not raw_commits and merge_base == base
+        elif status == "ahead":
+            coherent = returned_head == head and merge_base == base
+        elif status == "behind":
+            coherent = not raw_commits and merge_base == head
+        else:
+            coherent = returned_head == head and merge_base not in {base, head}
+        if not coherent:
+            raise InvalidResponseError("commit compare response status, head, and merge base are inconsistent")
+        return status, returned_base, merge_base
+
+    def reopen_pull_request(self, pull_request_node_id: str, client_mutation_id: str) -> PullRequestStageMutationReceipt:
+        return self._pull_request_stage_mutation("REOPEN", pull_request_node_id, client_mutation_id)
+
+    def mark_pull_request_ready_for_review(self, pull_request_node_id: str, client_mutation_id: str) -> PullRequestStageMutationReceipt:
+        return self._pull_request_stage_mutation("READY_FOR_REVIEW", pull_request_node_id, client_mutation_id)
+
+    def convert_pull_request_to_draft(self, pull_request_node_id: str, client_mutation_id: str) -> PullRequestStageMutationReceipt:
+        return self._pull_request_stage_mutation("CONVERT_TO_DRAFT", pull_request_node_id, client_mutation_id)
+
+    def close_pull_request(self, pull_request_node_id: str, client_mutation_id: str) -> PullRequestStageMutationReceipt:
+        return self._pull_request_stage_mutation("CLOSE", pull_request_node_id, client_mutation_id)
+
+    @staticmethod
+    def _parse_issue_routing(data: Mapping[str, Any], repository: str, number: int) -> _IssueRoutingSnapshot:
+        if type(data) is not dict or set(data) != {"repository"} or type(data.get("repository")) is not dict:
+            raise InvalidResponseError("Issue routing response has invalid repository shape")
+        repo = data["repository"]
+        if _bounded_text(repo.get("nameWithOwner"), "repository.nameWithOwner") != repository:
+            raise InvalidResponseError("Issue routing repository does not match requested repository")
+        item = repo.get("issueOrPullRequest")
+        if type(item) is not dict:
+            raise InvalidResponseError("Issue routing union member is missing or null")
+        typename = item.get("__typename")
+        if type(typename) is not str or typename not in {"Issue", "PullRequest"}:
+            raise InvalidResponseError("Issue routing union member type is unknown")
+        expected_fields = {"__typename", "id", "number", "lastEditedAt", "includesCreatedEdit", "closed"}
+        if set(item) != expected_fields:
+            raise InvalidResponseError("Issue routing union member has invalid exact fields")
+        returned_number = item.get("number")
+        if type(returned_number) is not int or type(returned_number) is bool or returned_number != number:
+            raise InvalidResponseError("Issue routing number does not match requested number")
+        includes_created_edit = item.get("includesCreatedEdit")
+        closed = item.get("closed")
+        last_edited_at = item.get("lastEditedAt")
+        if type(includes_created_edit) is not bool:
+            raise InvalidResponseError("Issue.includesCreatedEdit must be boolean")
+        if type(closed) is not bool:
+            raise InvalidResponseError("Issue.closed must be boolean")
+        if last_edited_at is not None:
+            _parse_github_timestamp(last_edited_at, "Issue.lastEditedAt")
+        return _IssueRoutingSnapshot(
+            typename,
+            _bounded_text(item.get("id"), "Issue.node_id"),
+            returned_number,
+            last_edited_at,
+            includes_created_edit,
+            closed,
+        )
+
+    @classmethod
+    def _parse_issue_rest_detail(cls, value: Any, number: int) -> _IssueRESTDetail:
+        if type(value) is not dict:
+            raise InvalidResponseError("Issue REST response must be an object")
+        returned_number = value.get("number")
+        if type(returned_number) is not int or type(returned_number) is bool or returned_number != number:
+            raise InvalidResponseError("Issue REST number does not match requested number")
+        body = cls._body_text(value.get("body"), "Issue REST body")
+        state = value.get("state")
+        if type(state) is not str or state not in {"open", "closed"}:
+            raise InvalidResponseError("Issue REST state must be exactly open or closed")
+        user = value.get("user")
+        if type(user) is not dict:
+            raise InvalidResponseError("Issue REST author metadata is missing or malformed")
+        if "pull_request" in value and type(value["pull_request"]) is not dict:
+            raise InvalidResponseError("Issue REST pull_request discriminator is malformed")
+        return _IssueRESTDetail(
+            returned_number,
+            _positive_id(value.get("id"), "Issue.id"),
+            _bounded_text(value.get("node_id"), "Issue.node_id"),
+            body,
+            state,
+            _bounded_text(user.get("node_id"), "Issue.author.node_id"),
+            _bounded_text(user.get("login"), "Issue.author.login"),
+            "pull_request" in value,
+        )
+
+    def get_issue_metadata(self, repository: str, number: int) -> IssueMetadata:
+        owner, name = self._owner_repo(repository)
+        if type(number) is not int or type(number) is bool or number <= 0:
+            raise GitHubAPIError("Issue number must be positive")
+        variables = {"owner": owner, "name": name, "number": number}
+        before = self._parse_issue_routing(
+            self._graphql(ISSUE_ROUTING_BEFORE_QUERY, variables, operation="issueRoutingBefore"),
+            repository,
+            number,
+        )
+        rest = self._parse_issue_rest_detail(
+            self.request_json("GET", ["repos", owner, name, "issues", str(number)]),
+            number,
+        )
+        after = self._parse_issue_routing(
+            self._graphql(ISSUE_ROUTING_AFTER_QUERY, variables, operation="issueRoutingAfter"),
+            repository,
+            number,
+        )
+        if before != after:
+            raise InvalidResponseError("Issue routing authority changed during composite read")
+        if (rest.number, rest.node_id, rest.is_pull_request) != (
+            before.number,
+            before.node_id,
+            before.is_pull_request,
+        ):
+            raise InvalidResponseError("Issue REST identity/type does not match routing authority")
+        if (rest.state == "closed") != before.closed:
+            raise InvalidResponseError("Issue REST lifecycle state does not match routing authority")
+        return IssueMetadata(
+            rest.number,
+            rest.database_id,
+            rest.node_id,
+            rest.body,
+            rest.state,
+            rest.author_id,
+            rest.author_login,
+            before.last_edited_at,
+            before.includes_created_edit,
+            before.is_pull_request,
         )
 
     @classmethod
@@ -872,7 +1913,7 @@ class GitHubClient:
             raise InvalidResponseError("issue comment REST record must be an object")
         database_id = _positive_id(value.get("id"), "comment.id")
         node_id = _bounded_text(value.get("node_id"), "comment.node_id")
-        body = cls._body_text(value.get("body"), "comment.body")
+        body = cls._issue_comment_body_text(value.get("body"), "comment.body")
         created_at = _bounded_text(value.get("created_at"), "comment.created_at", 128)
         updated_at = _bounded_text(value.get("updated_at"), "comment.updated_at", 128)
         created_instant = _parse_github_timestamp(created_at, "comment.created_at")
@@ -1012,7 +2053,7 @@ class GitHubClient:
         if database_id != rest.database_id:
             raise InvalidResponseError("comment GraphQL database ID does not match REST")
 
-        body = cls._body_text(value.get("body"), "comment.body")
+        body = cls._issue_comment_body_text(value.get("body"), "comment.body")
         if body != rest.body:
             raise InvalidResponseError("comment body does not match REST")
         created_at = _bounded_text(value.get("createdAt"), "comment.createdAt", 128)
@@ -1144,6 +2185,40 @@ class GitHubClient:
             None, None, None, None, None, None, None, False,
         )
 
+    def create_issue_patch_projection_comment(self, repository: str, number: int, body: str) -> IssueComment:
+        """Create an exact canonical machine projection with its dedicated wider bound."""
+        owner, name = self._owner_repo(repository)
+        if type(number) is not int or type(number) is bool or number <= 0:
+            raise GitHubAPIError("issue number must be positive")
+        if type(body) is not str or not body:
+            raise GitHubAPIError("IssuePatchProjection body must be nonempty text")
+        try:
+            body_bytes = body.encode("utf-8")
+        except UnicodeEncodeError:
+            raise GitHubAPIError("IssuePatchProjection body is not valid UTF-8") from None
+        if len(body_bytes) > MAX_ISSUE_PATCH_PROJECTION_COMMENT_BYTES:
+            raise GitHubAPIError("IssuePatchProjection body exceeds the bound")
+        try:
+            projection = parse_issue_patch_projection(body)
+        except RequestModelError as error:
+            raise GitHubAPIError("IssuePatchProjection body is not canonical") from error
+        value = self.request_json(
+            "POST",
+            ["repos", owner, name, "issues", str(number), "comments"],
+            {"body": body},
+        )
+        if type(value) is not dict:
+            raise InvalidResponseError("created projection comment must be an object")
+        returned_body = self._issue_comment_body_text(value.get("body"), "created projection comment.body")
+        if returned_body != body:
+            raise InvalidResponseError("created projection comment body differs from the exact canonical payload")
+        return IssueComment(
+            _bounded_text(value.get("node_id"), "created projection comment.node_id"),
+            _positive_id(value.get("id"), "created projection comment.id"),
+            returned_body,
+            None, None, None, None, None, None, None, False,
+        )
+
     def get_collaborator_permission(self, repository: str, login: str) -> str:
         owner, name = self._owner_repo(repository)
         value = self.request_json("GET", ["repos", owner, name, "collaborators", _validate_segment(login), "permission"])
@@ -1178,6 +2253,12 @@ class GitHubClient:
         if type(value) is not dict or type(value.get("object")) is not dict:
             raise InvalidResponseError("Git ref response is malformed")
         return self._sha(value["object"].get("sha"), "ref.object.sha")
+
+    def get_optional_ref_oid(self, repository: str, branch: str) -> str | None:
+        try:
+            return self.get_ref_oid(repository, branch)
+        except NotFoundError:
+            return None
 
     def create_blob(self, repository: str, content: str, *, encoding: str = "base64") -> GitObject:
         owner, name = self._owner_repo(repository)
@@ -1333,6 +2414,146 @@ class GitHubClient:
             output_text,
         )
 
+    @staticmethod
+    def _workflow_path(value: Any) -> str:
+        path = _bounded_text(value, "workflow path", 256)
+        prefix = ".github/workflows/"
+        if (
+            not path.startswith(prefix)
+            or path == prefix
+            or "/" in path[len(prefix):]
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+        ):
+            raise GitHubAPIError("workflow path must be an exact .github/workflows file")
+        return path
+
+    @classmethod
+    def _parse_workflow_metadata(
+        cls,
+        value: Any,
+        *,
+        expected_path: str | None = None,
+        expected_id: int | None = None,
+    ) -> WorkflowMetadata:
+        exact_keys = {
+            "id", "node_id", "name", "path", "state",
+            "created_at", "updated_at", "url", "html_url", "badge_url",
+        }
+        if type(value) is not dict or set(value) != exact_keys:
+            raise InvalidResponseError("workflow metadata response has invalid exact shape")
+        metadata = WorkflowMetadata(
+            _positive_id(value["id"], "workflow.id"),
+            _bounded_text(value["node_id"], "workflow.node_id", 256),
+            _bounded_text(value["name"], "workflow.name", 256),
+            _bounded_text(value["path"], "workflow.path", 256),
+            _bounded_text(value["state"], "workflow.state", 64),
+        )
+        _parse_github_timestamp(value["created_at"], "workflow.created_at")
+        _parse_github_timestamp(value["updated_at"], "workflow.updated_at")
+        for key in ("url", "html_url", "badge_url"):
+            _bounded_text(value[key], f"workflow.{key}", 2_048)
+        if expected_path is not None and metadata.path != expected_path:
+            raise InvalidResponseError("workflow metadata path does not match the exact requested path")
+        if expected_id is not None and metadata.id != expected_id:
+            raise InvalidResponseError("workflow metadata ID does not match the exact requested ID")
+        return metadata
+
+    def get_workflow_metadata_by_path(self, repository: str, workflow_path: str) -> WorkflowMetadata:
+        owner, name = self._owner_repo(repository)
+        path = self._workflow_path(workflow_path)
+        filename = path.removeprefix(".github/workflows/")
+        value = self.request_json(
+            "GET",
+            ["repos", owner, name, "actions", "workflows", filename],
+        )
+        return self._parse_workflow_metadata(value, expected_path=path)
+
+    def get_workflow_metadata_by_id(self, repository: str, workflow_id: int) -> WorkflowMetadata:
+        owner, name = self._owner_repo(repository)
+        identifier = _positive_id(workflow_id, "workflow ID")
+        value = self.request_json(
+            "GET",
+            ["repos", owner, name, "actions", "workflows", str(identifier)],
+        )
+        return self._parse_workflow_metadata(value, expected_id=identifier)
+
+    @classmethod
+    def _parse_workflow_run(cls, value: Any, *, expected_workflow_id: int) -> WorkflowRunMetadata:
+        if type(value) is not dict:
+            raise InvalidResponseError("workflow run must be an object")
+        required = {
+            "id", "run_attempt", "status", "conclusion",
+            "workflow_id", "event", "head_branch", "head_sha",
+        }
+        if not required.issubset(value):
+            raise InvalidResponseError("workflow run is missing required exact metadata")
+        head_branch = value["head_branch"]
+        if head_branch is not None:
+            head_branch = _bounded_text(head_branch, "workflow_run.head_branch", 256)
+        run = WorkflowRunMetadata(
+            _positive_id(value["id"], "workflow_run.id"),
+            _positive_id(value["run_attempt"], "workflow_run.run_attempt"),
+            _bounded_text(value["status"], "workflow_run.status", 32),
+            None if value["conclusion"] is None else _bounded_text(value["conclusion"], "workflow_run.conclusion", 64),
+            _positive_id(value["workflow_id"], "workflow_run.workflow_id"),
+            _bounded_text(value["event"], "workflow_run.event", 64),
+            head_branch,
+            cls._sha(value["head_sha"], "workflow_run.head_sha"),
+        )
+        if run.workflow_id != expected_workflow_id:
+            raise InvalidResponseError("workflow run workflow_id does not match requested workflow")
+        return run
+
+    def list_workflow_runs(
+        self,
+        repository: str,
+        workflow_id: int,
+        *,
+        max_pages: int = 100,
+    ) -> tuple[WorkflowRunMetadata, ...]:
+        owner, name = self._owner_repo(repository)
+        identifier = _positive_id(workflow_id, "workflow ID")
+        if type(max_pages) is not int or type(max_pages) is bool or not 1 <= max_pages <= 100:
+            raise GitHubAPIError("workflow run max_pages must be an exact integer from 1 to 100")
+        runs: list[WorkflowRunMetadata] = []
+        seen_run_ids: set[int] = set()
+        expected_total: int | None = None
+        for page in range(1, max_pages + 1):
+            value = self._request(
+                "GET",
+                f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/actions/workflows/{identifier}/runs?per_page=100&page={page}",
+            )
+            if type(value) is not dict or set(value) != {"total_count", "workflow_runs"}:
+                raise InvalidResponseError("workflow run list response has invalid exact shape")
+            total_count = value["total_count"]
+            page_runs = value["workflow_runs"]
+            if (
+                type(total_count) is not int
+                or type(total_count) is bool
+                or not 0 <= total_count <= 9_223_372_036_854_775_807
+                or type(page_runs) is not list
+                or len(page_runs) > 100
+            ):
+                raise InvalidResponseError("workflow run list count/page is invalid")
+            if expected_total is None:
+                expected_total = total_count
+            elif total_count != expected_total:
+                raise InvalidResponseError("workflow run total_count changed during pagination")
+            for raw in page_runs:
+                run = self._parse_workflow_run(raw, expected_workflow_id=identifier)
+                if run.id in seen_run_ids:
+                    raise InvalidResponseError("workflow run ID is duplicated across pagination")
+                seen_run_ids.add(run.id)
+                runs.append(run)
+            if len(runs) > total_count:
+                raise InvalidResponseError("workflow run pages exceed declared total_count")
+            if len(runs) == total_count:
+                return tuple(runs)
+            if len(page_runs) < 100:
+                raise InvalidResponseError("workflow run pagination ended before declared total_count")
+        raise InvalidResponseError("workflow run pagination exceeds configured page bound")
+
     def dispatch_workflow(self, repository: str, workflow: str, ref: str, inputs: Mapping[str, str] | None = None) -> None:
         owner, name = self._owner_repo(repository)
         if type(workflow) is not str or not workflow or "/" in workflow or "\\" in workflow:
@@ -1345,17 +2566,107 @@ class GitHubClient:
             raise GitHubAPIError("workflow inputs must be string data")
         self.request_json("POST", ["repos", owner, name, "actions", "workflows", workflow, "dispatches"], {"ref": ref, "inputs": dict(inputs or {})})
 
-    def list_open_pull_requests(self, repository: str, *, max_pages: int = 100) -> tuple[dict[str, Any], ...]:
+    def list_pull_requests(
+        self, repository: str, *, state: str = "open", max_pages: int = 100,
+    ) -> tuple[dict[str, Any], ...]:
+        if type(state) is not str or state not in {"open", "closed", "all"}:
+            raise GitHubAPIError("pull request state must be open, closed, or all")
+        if type(max_pages) is not int or not 1 <= max_pages <= 100:
+            raise GitHubAPIError("pull request max_pages must be an exact integer from 1 to 100")
         owner, name = self._owner_repo(repository)
         result: list[dict[str, Any]] = []
+        seen_numbers: set[int] = set()
         for page in range(1, max_pages + 1):
-            value = self._request("GET", f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/pulls?state=open&per_page=100&page={page}")
-            if type(value) is not list or any(type(item) is not dict for item in value):
-                raise InvalidResponseError("open PR enumeration is malformed")
+            value = self._request(
+                "GET",
+                f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/pulls?state={state}&per_page=100&page={page}",
+            )
+            if type(value) is not list or len(value) > 100 or any(type(item) is not dict for item in value):
+                raise InvalidResponseError("PR enumeration is malformed")
+            for item in value:
+                number = _positive_id(item.get("number"), "PR.number")
+                if number in seen_numbers:
+                    raise InvalidResponseError("PR enumeration contains duplicate numbers")
+                seen_numbers.add(number)
             result.extend(value)
             if len(value) < 100:
                 return tuple(sorted(result, key=lambda item: _positive_id(item.get("number"), "PR.number")))
-        raise InvalidResponseError("open PR enumeration exceeds bound")
+        raise InvalidResponseError("PR enumeration reached bounded pagination exhaustion")
+
+    def list_open_pull_requests(self, repository: str, *, max_pages: int = 100) -> tuple[dict[str, Any], ...]:
+        return self.list_pull_requests(repository, state="open", max_pages=max_pages)
+
+    def list_repository_issues(
+        self, repository: str, *, state: str = "open", max_pages: int = 100,
+    ) -> tuple[dict[str, int], ...]:
+        """Enumerate bounded Issue-number discovery hints, excluding PR rows."""
+        if type(state) is not str or state not in {"open", "closed", "all"}:
+            raise GitHubAPIError("Issue state must be open, closed, or all")
+        if type(max_pages) is not int or not 1 <= max_pages <= 100:
+            raise GitHubAPIError("Issue max_pages must be an exact integer from 1 to 100")
+        owner, name = self._owner_repo(repository)
+        numbers: set[int] = set()
+        for page in range(1, max_pages + 1):
+            value = self._request(
+                "GET",
+                f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/issues?state={state}&per_page=100&page={page}",
+            )
+            if type(value) is not list or len(value) > 100 or any(type(item) is not dict for item in value):
+                raise InvalidResponseError("Issue enumeration is malformed")
+            for item in value:
+                # GitHub's Issues endpoint deliberately includes pull requests.
+                # Their number must not enter the Issue authority inventory.
+                if "pull_request" in item:
+                    continue
+                number = _positive_id(item.get("number"), "Issue.number")
+                if number in numbers:
+                    raise InvalidResponseError("Issue enumeration contains duplicate Issue numbers")
+                numbers.add(number)
+            if len(value) < 100:
+                return tuple({"number": number} for number in sorted(numbers))
+        raise InvalidResponseError("Issue enumeration reached bounded pagination exhaustion")
+
+    def list_machine_refs(self, repository: str, *, max_pages: int = 100) -> tuple[dict[str, str], ...]:
+        """Enumerate canonical machine publication refs; namespace is discovery only."""
+        if type(max_pages) is not int or not 1 <= max_pages <= 100:
+            raise GitHubAPIError("machine-ref max_pages must be an exact integer from 1 to 100")
+        owner, name = self._owner_repo(repository)
+        prefix = "refs/heads/bot/federation/"
+        refs: dict[str, dict[str, str]] = {}
+        source_ids: set[str] = set()
+        for page in range(1, max_pages + 1):
+            value = self._request(
+                "GET",
+                f"{REST_BASE_URL}/repos/{urlparse.quote(owner)}/{urlparse.quote(name)}/git/matching-refs/heads/bot/federation?per_page=100&page={page}",
+            )
+            if type(value) is not list or len(value) > 100 or any(type(item) is not dict for item in value):
+                raise InvalidResponseError("machine-ref enumeration is malformed")
+            for item in value:
+                ref = item.get("ref")
+                if type(ref) is not str or not ref.startswith(prefix):
+                    raise InvalidResponseError("machine-ref row has a malformed ref name")
+                suffix = ref[len(prefix):]
+                target = item.get("object")
+                if type(target) is not dict:
+                    raise InvalidResponseError("machine-ref target object is malformed")
+                if "type" in target and target["type"] != "commit":
+                    raise InvalidResponseError("machine-ref target is not a commit")
+                sha = self._sha(target.get("sha"), "machine-ref object.sha")
+                # Matching refs also returns nested Issue/request refs. Validate
+                # their endpoint shape, then keep them outside this inventory.
+                if not suffix or "/" in suffix:
+                    continue
+                try:
+                    source_id = c02.validate_source_id(suffix)
+                except c02.FederationError:
+                    raise InvalidResponseError("machine-ref sourceId is not canonical") from None
+                if ref in refs or source_id in source_ids:
+                    raise InvalidResponseError("machine-ref enumeration contains duplicate ref/sourceId")
+                refs[ref] = {"ref": ref, "source_id": source_id, "sha": sha}
+                source_ids.add(source_id)
+            if len(value) < 100:
+                return tuple(refs[key] for key in sorted(refs, key=lambda ref: (refs[ref]["source_id"], ref)))
+        raise InvalidResponseError("machine-ref enumeration reached bounded pagination exhaustion")
 
     def create_machine_pull_request(self, repository: str, *, head: str, base: str, title: str, body: str) -> int:
         """Create a bounded machine PR; branch and base are data, never URL/query syntax."""
@@ -1377,6 +2688,50 @@ class GitHubClient:
         if type(value) is not dict:
             raise InvalidResponseError("created machine PR response is malformed")
         return _positive_id(value.get("number"), "created machine PR.number")
+
+    def create_issue_pull_request(self, repository: str, *, head: str, base: str, title: str, body: str) -> int:
+        """Create exactly one nondraft central PR for the reserved Issue branch."""
+        owner, name = self._owner_repo(repository)
+        if type(head) is not str or not head or ":" in head or head.startswith("refs/"):
+            raise GitHubAPIError("Issue PR head must be a reserved short central branch")
+        try:
+            reserved_number = reserved_issue_branch_number(head)
+        except RequestModelError:
+            raise GitHubAPIError("Issue PR head must be an exact reserved Issue branch") from None
+        if reserved_number is None:
+            raise GitHubAPIError("Issue PR head must be an exact reserved Issue branch")
+        try:
+            validate_trusted_ref(f"refs/heads/{head}")
+        except (c02.FederationError, WorkspaceError):
+            raise GitHubAPIError("Issue PR head is not a valid trusted branch") from None
+        if type(base) is not str or base != "main":
+            raise GitHubAPIError("Issue PR base must be exact main")
+        if type(title) is not str:
+            raise GitHubAPIError("Issue PR title is invalid or exceeds its bound")
+        try:
+            title_bytes = title.encode("utf-8")
+        except UnicodeEncodeError:
+            raise GitHubAPIError("Issue PR title is invalid or exceeds its bound") from None
+        if not title or len(title_bytes) > 256 or c02.contains_control(title):
+            raise GitHubAPIError("Issue PR title is invalid or exceeds its bound")
+        if type(body) is not str:
+            raise GitHubAPIError("Issue PR body is invalid or exceeds its bound")
+        try:
+            body_bytes = body.encode("utf-8")
+        except UnicodeEncodeError:
+            raise GitHubAPIError("Issue PR body is invalid or exceeds its bound") from None
+        if (
+            not body or len(body_bytes) > 16_384
+            or any((ord(character) < 0x20 and character != "\n") or ord(character) == 0x7F for character in body)
+        ):
+            raise GitHubAPIError("Issue PR body is invalid or exceeds its bound")
+        value = self.request_json(
+            "POST", ["repos", owner, name, "pulls"],
+            {"title": title, "head": head, "base": base, "body": body, "draft": False},
+        )
+        if type(value) is not dict:
+            raise InvalidResponseError("created Issue PR response is malformed")
+        return _positive_id(value.get("number"), "created Issue PR.number")
 
     def update_pull_request_state(self, repository: str, number: int, *, state: str) -> None:
         owner, name = self._owner_repo(repository)

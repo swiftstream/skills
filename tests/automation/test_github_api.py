@@ -6,16 +6,27 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from automation.federation import github_api as github_api_module
 from automation.federation.github_api import (
+    REOPEN_PULL_REQUEST_MUTATION,
+    MARK_PULL_REQUEST_READY_FOR_REVIEW_MUTATION,
+    CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION,
+    CLOSE_PULL_REQUEST_MUTATION,
     GRAPHQL_ENDPOINT,
+    ISSUE_ROUTING_AFTER_QUERY,
+    ISSUE_ROUTING_BEFORE_QUERY,
     ISSUE_COMMENT_NODES_QUERY,
     PULL_REQUEST_BODY_FALLBACK_QUERY,
+    MERGED_PULL_REQUEST_QUERY,
     PULL_REQUEST_ROUTING_AFTER_QUERY,
     PULL_REQUEST_ROUTING_BEFORE_QUERY,
     UPDATE_REFS_MUTATION,
     ZERO_OID,
     GitHubClient,
+    PullRequestStageMutationReceipt,
+    MergedPullRequestMetadata,
     GitHubAPIError,
+    IssueMetadata,
     GitTreeEntry,
     GraphQLError,
     HttpResponse,
@@ -34,6 +45,24 @@ from automation.federation.github_api import (
     ServerError,
     UnexpectedStatusError,
     REST_BASE_URL,
+    GitCommitMetadata,
+    GitCommitObject,
+    GitCommitIdentity,
+    CommitStatus,
+    StatusWriteReceipt,
+    latest_exact_app_status,
+)
+from automation.federation.request_model import (
+    MAX_BODY_BYTES,
+    MAX_CANONICAL_PATCH_BYTES,
+    IssuePatchProjection,
+    PATCH_SENTINEL,
+    Patch,
+    RequestClass,
+    parse_patch,
+    parse_request_body,
+    render_patch,
+    render_request_body,
 )
 
 
@@ -47,22 +76,83 @@ class FakeTransport:
         return self.response
 
 
+class SequenceTransport:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def request(self, method, url, headers, body, timeout):
+        self.calls.append((method, url, headers, body, timeout))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def _canonical_projection_at_max_size():
+    def prefix_value(length):
+        count = (length + 65) // 65
+        lengths = [1] * count
+        remaining = length - (count - 1) - count
+        for index in range(count):
+            added = min(63, remaining)
+            lengths[index] += added
+            remaining -= added
+        if remaining or any(size > 64 for size in lengths):
+            raise AssertionError("requested prefix length is not representable")
+        return ",".join(
+            f"p{index}" + "x" * (size - len(f"p{index}"))
+            for index, size in enumerate(lengths)
+        )
+
+    lines = [
+        PATCH_SENTINEL,
+        "Description:", "d",
+        "Branch:", "main",
+        "Skills root:", "skills",
+        "Skill prefixes:", "",
+        "Publication lines:", "refs/heads/main=foo",
+        "Dropped publication lines:", "refs/heads/old",
+    ]
+    raw_size = MAX_BODY_BYTES
+    prefix_length = raw_size - len("\n".join(lines).encode("utf-8"))
+    lines[8] = prefix_value(prefix_length)
+    raw = "\n".join(lines)
+    if len(raw.encode("utf-8")) != raw_size:
+        raise AssertionError("PATCH generator produced the wrong size")
+    patch = parse_patch(raw)
+    canonical = render_patch(patch)
+    if len(canonical.encode("utf-8")) != MAX_CANONICAL_PATCH_BYTES:
+        raise AssertionError("canonical PATCH generator produced the wrong size")
+    return IssuePatchProjection(
+        1,
+        9_223_372_036_854_775_807,
+        7,
+        9_223_372_036_854_775_807,
+        9_223_372_036_854_775_807,
+        "a" * 64,
+        "b" * 64,
+        patch,
+    ).render()
+
+
 def _routing_payload(*, repository="swiftstream/skills", number=7, head_oid="a" * 40, base_oid="b" * 40,
-                     head_ref="proposal", base_ref="main", last_edited_at=None, includes_created_edit=False):
+                     head_ref="proposal", base_ref="main", draft=False, last_edited_at=None, includes_created_edit=False):
     return {"data": {"repository": {"nameWithOwner": repository, "pullRequest": {
         "number": number,
         "headRefOid": head_oid,
         "baseRefOid": base_oid,
         "headRefName": head_ref,
         "baseRefName": base_ref,
+        "isDraft": draft,
         "lastEditedAt": last_edited_at,
         "includesCreatedEdit": includes_created_edit,
     }}}}
 
 
 def _rest_payload(*, body="body", number=7, head_oid="a" * 40, base_oid="b" * 40,
-                  head_ref="proposal", base_ref="main"):
-    return {"number": number, "body": body,
+                  head_ref="proposal", base_ref="main", draft=False):
+    return {"number": number, "body": body, "draft": draft,
             "user": {"login": "alice", "node_id": "U_author"},
             "head": {"sha": head_oid, "ref": head_ref,
                      "repo": {"node_id": "N_head", "full_name": "alice/skills"}},
@@ -92,6 +182,76 @@ class PullMetadataTransport:
                 raise AssertionError(query)
             return HttpResponse(200, url, json.dumps(payload, separators=(",", ":")).encode())
         if url == REST_BASE_URL + "/repos/swiftstream/skills/pulls/7":
+            return HttpResponse(200, url, json.dumps(self.rest, separators=(",", ":")).encode())
+        raise AssertionError((method, url))
+
+
+def _issue_routing_payload(
+    *,
+    repository="swiftstream/skills",
+    typename="Issue",
+    number=7,
+    node_id="I_node",
+    last_edited_at=None,
+    includes_created_edit=False,
+    closed=False,
+):
+    return {"data": {"repository": {
+        "nameWithOwner": repository,
+        "issueOrPullRequest": {
+            "__typename": typename,
+            "id": node_id,
+            "number": number,
+            "lastEditedAt": last_edited_at,
+            "includesCreatedEdit": includes_created_edit,
+            "closed": closed,
+        },
+    }}}
+
+
+def _issue_rest_payload(
+    *,
+    body="Issue body",
+    number=7,
+    database_id=700,
+    node_id="I_node",
+    state="open",
+    author_id="U_author",
+    author_login="alice",
+    is_pull_request=False,
+):
+    value = {
+        "number": number,
+        "id": database_id,
+        "node_id": node_id,
+        "body": body,
+        "state": state,
+        "user": {"node_id": author_id, "login": author_login},
+    }
+    if is_pull_request:
+        value["pull_request"] = {"url": "https://api.github.com/repos/swiftstream/skills/pulls/7"}
+    return value
+
+
+class IssueMetadataTransport:
+    def __init__(self, *, before=None, rest=None, after=None):
+        self.before = _issue_routing_payload() if before is None else before
+        self.rest = _issue_rest_payload() if rest is None else rest
+        self.after = _issue_routing_payload() if after is None else after
+        self.calls = []
+
+    def request(self, method, url, headers, body, timeout):
+        self.calls.append((method, url, headers, body, timeout))
+        if url == GRAPHQL_ENDPOINT:
+            query = json.loads(body)["query"]
+            if query == ISSUE_ROUTING_BEFORE_QUERY:
+                payload = self.before
+            elif query == ISSUE_ROUTING_AFTER_QUERY:
+                payload = self.after
+            else:
+                raise AssertionError(query)
+            return HttpResponse(200, url, json.dumps(payload, separators=(",", ":")).encode())
+        if url == REST_BASE_URL + "/repos/swiftstream/skills/issues/7":
             return HttpResponse(200, url, json.dumps(self.rest, separators=(",", ":")).encode())
         raise AssertionError((method, url))
 
@@ -240,6 +400,61 @@ class GitHubAPITests(unittest.TestCase):
                 client.read_optional_commit_file("swiftstream/skills", "a" * 40, ".federation-request", expected_mode="100644"),
                 b"add-source\n",
             )
+
+    def test_get_tree_reads_tree_sha_without_commit_metadata_and_preserves_strict_parsing(self):
+        tree_sha = "a" * 40
+        url = REST_BASE_URL + f"/repos/swiftstream/skills/git/trees/{tree_sha}?recursive=1"
+        payload = {
+            "sha": tree_sha,
+            "truncated": False,
+            "tree": [
+                {"path": "z-file", "mode": "100644", "type": "blob", "sha": "b" * 40},
+                {"path": "a-dir", "mode": "040000", "type": "tree", "sha": "c" * 40},
+            ],
+        }
+        transport = FakeTransport(HttpResponse(200, url, json.dumps(payload).encode("utf-8")))
+        client = GitHubClient(None, transport)
+        with patch.object(client, "get_commit_metadata", side_effect=AssertionError("tree reads must not request commit metadata")) as metadata:
+            returned_sha, entries = client.get_tree("swiftstream/skills", tree_sha)
+        self.assertEqual(returned_sha, tree_sha)
+        self.assertEqual(entries, (
+            GitTreeEntry("a-dir", "040000", "tree", "c" * 40),
+            GitTreeEntry("z-file", "100644", "blob", "b" * 40),
+        ))
+        metadata.assert_not_called()
+        self.assertEqual([(call[0], call[1]) for call in transport.calls], [("GET", url)])
+
+        invalid_responses = (
+            dict(payload, sha="d" * 40),
+            dict(payload, truncated=True),
+            dict(payload, tree=[{"path": "../escape", "mode": "100644", "type": "blob", "sha": "b" * 40}]),
+            dict(payload, tree=[{"path": "bad-mode", "mode": "100644", "type": "tree", "sha": "b" * 40}]),
+            dict(payload, tree=[
+                {"path": "duplicate", "mode": "100644", "type": "blob", "sha": "b" * 40},
+                {"path": "duplicate", "mode": "100644", "type": "blob", "sha": "c" * 40},
+            ]),
+            dict(payload, tree=[{"path": "bad-sha", "mode": "100644", "type": "blob", "sha": "B" * 40}]),
+        )
+        for invalid in invalid_responses:
+            with self.subTest(response=invalid), self.assertRaises(InvalidResponseError):
+                client = GitHubClient(None, FakeTransport(HttpResponse(200, url, json.dumps(invalid).encode("utf-8"))))
+                client.get_tree("swiftstream/skills", tree_sha)
+
+        invalid_sha_transport = FakeTransport(HttpResponse(200, url, json.dumps(payload).encode("utf-8")))
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, invalid_sha_transport).get_tree("swiftstream/skills", "A" * 40)
+        self.assertEqual(invalid_sha_transport.calls, [])
+
+        commit_sha = "d" * 40
+        delegated = GitHubClient(None, FakeTransport(HttpResponse(200, url, json.dumps(payload).encode("utf-8"))))
+        metadata_value = GitCommitMetadata(commit_sha, tree_sha, (), "2026-10-04T00:00:00Z")
+        with (
+            patch.object(delegated, "get_commit_metadata", return_value=metadata_value) as get_metadata,
+            patch.object(delegated, "get_tree", return_value=(tree_sha, entries)) as get_tree,
+        ):
+            self.assertEqual(delegated.get_commit_tree("swiftstream/skills", commit_sha), (tree_sha, entries))
+        get_metadata.assert_called_once_with("swiftstream/skills", commit_sha)
+        get_tree.assert_called_once_with("swiftstream/skills", tree_sha)
 
     def test_graphql_error_diagnostic_preserves_only_bounded_structure(self):
         text, _ = self._graphql_error({"type": "FORBIDDEN", "path": ["repository", "pullRequest"]})
@@ -423,7 +638,7 @@ class GitHubAPITests(unittest.TestCase):
             ("wrong type id", [dict(valid, id="1")], InvalidResponseError),
             ("bad node", [dict(valid, node_id="")], InvalidResponseError),
             ("bad body", [dict(valid, body=1)], InvalidResponseError),
-            ("oversized body", [dict(valid, body="x" * 16_385)], InvalidResponseError),
+            ("oversized body", [dict(valid, body="x" * 17_409)], InvalidResponseError),
             ("bad created", [dict(valid, created_at="not-time")], InvalidResponseError),
             ("naive created", [dict(valid, created_at="2026-09-10T00:00:00")], InvalidResponseError),
             ("bad updated", [dict(valid, updated_at="not-time")], InvalidResponseError),
@@ -632,6 +847,59 @@ class GitHubAPITests(unittest.TestCase):
         self.assertIn('_ISSUE_COMMENT_COMPOSITE_RACE', body)
         self.assertIn("str(error) != _ISSUE_COMMENT_COMPOSITE_RACE", body)
 
+    def test_projection_comment_api_accepts_16402_canonical_patch_without_widening_generic_writer(self):
+        projection_body = _canonical_projection_at_max_size()
+        self.assertGreater(len(projection_body.encode("utf-8")), 16_384)
+        self.assertEqual(len(projection_body.encode("utf-8")), 16_786)
+        url = REST_BASE_URL + "/repos/swiftstream/skills/issues/8/comments"
+        response_value = {"node_id": "IC_projection", "id": 77, "body": projection_body}
+        transport = FakeTransport(HttpResponse(201, url, json.dumps(response_value).encode("utf-8")))
+        client = GitHubClient("token", transport)
+        with self.assertRaises(GitHubAPIError):
+            client.create_issue_comment("swiftstream/skills", 7, projection_body)
+        self.assertEqual(transport.calls, [])
+
+        created = client.create_issue_patch_projection_comment("swiftstream/skills", 8, projection_body)
+        self.assertEqual(created.body, projection_body)
+        self.assertEqual(len(transport.calls), 1)
+        method, request_url, _headers, body, _timeout = transport.calls[0]
+        self.assertEqual((method, request_url), ("POST", url))
+        self.assertEqual(json.loads(body), {"body": projection_body})
+
+        rest = _clean_rest_comment(1, body=projection_body)
+        node = _graphql_comment_node(rest)
+        comments_transport = CommentsTransport(
+            [_snapshot([rest]), _snapshot([rest])], [_graphql_response([node])],
+        )
+        readback = GitHubClient(None, comments_transport).list_issue_comments("swiftstream/skills", 7)
+        self.assertEqual(len(readback[0].body.encode("utf-8")), 16_786)
+        self.assertEqual(readback[0].body, projection_body)
+
+    def test_projection_comment_writer_rejects_invalid_endpoint_and_noncanonical_body_before_transport(self):
+        transport = FakeTransport(HttpResponse(
+            201,
+            REST_BASE_URL + "/repos/swiftstream/skills/issues/8/comments",
+            b'{"node_id":"IC_1","id":1,"body":"x"}',
+        ))
+        client = GitHubClient(None, transport)
+        for number, body in ((0, _canonical_projection_at_max_size()), (8, "not a projection")):
+            with self.subTest(number=number), self.assertRaises(GitHubAPIError):
+                client.create_issue_patch_projection_comment("swiftstream/skills", number, body)
+        self.assertEqual(transport.calls, [])
+
+    def test_projection_comment_writer_rejects_more_than_17408_bytes_before_transport(self):
+        transport = FakeTransport(HttpResponse(
+            201,
+            REST_BASE_URL + "/repos/swiftstream/skills/issues/8/comments",
+            b'{"node_id":"IC_1","id":1,"body":"x"}',
+        ))
+        client = GitHubClient(None, transport)
+        projection_body = _canonical_projection_at_max_size() + "x" * 623
+        self.assertEqual(len(projection_body.encode("utf-8")), 17_409)
+        with self.assertRaises(GitHubAPIError):
+            client.create_issue_patch_projection_comment("swiftstream/skills", 8, projection_body)
+        self.assertEqual(transport.calls, [])
+
     def test_cas_semantics_and_single_atomic_call(self):
         with self.assertRaises(Exception):
             RefUpdate("refs/heads/x", ZERO_OID, ZERO_OID)
@@ -735,6 +1003,252 @@ class GitHubAPITests(unittest.TestCase):
         self.assertNotIn(update.name, payload["query"])
         self.assertEqual(payload["variables"]["repositoryId"], repository_id)
 
+    def test_issue_metadata_normal_order_and_complete_contract(self):
+        before = _issue_routing_payload(
+            last_edited_at="2026-09-10T00:00:00Z", includes_created_edit=True
+        )
+        transport = IssueMetadataTransport(before=before, after=before)
+        metadata = GitHubClient("token", transport).get_issue_metadata("swiftstream/skills", 7)
+
+        self.assertEqual(_call_signature(transport.calls), [
+            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_BEFORE_QUERY),
+            ("GET", REST_BASE_URL + "/repos/swiftstream/skills/issues/7", None),
+            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_AFTER_QUERY),
+        ])
+        self.assertEqual(metadata, IssueMetadata(
+            number=7,
+            database_id=700,
+            node_id="I_node",
+            body="Issue body",
+            state="open",
+            author_id="U_author",
+            author_login="alice",
+            last_edited_at="2026-09-10T00:00:00Z",
+            includes_created_edit=True,
+            is_pull_request=False,
+        ))
+
+    def test_issue_metadata_preserves_pull_request_discriminator(self):
+        routing = _issue_routing_payload(typename="PullRequest")
+        rest = _issue_rest_payload(is_pull_request=True)
+        transport = IssueMetadataTransport(before=routing, rest=rest, after=routing)
+        metadata = GitHubClient(None, transport).get_issue_metadata("swiftstream/skills", 7)
+        self.assertTrue(metadata.is_pull_request)
+        self.assertEqual(_call_signature(transport.calls), [
+            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_BEFORE_QUERY),
+            ("GET", REST_BASE_URL + "/repos/swiftstream/skills/issues/7", None),
+            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_AFTER_QUERY),
+        ])
+
+    def test_issue_metadata_routing_drift_rejects_each_authority_field(self):
+        for field, changed in (
+            ("__typename", "PullRequest"),
+            ("id", "I_other"),
+            ("number", 8),
+            ("lastEditedAt", "2026-09-10T00:00:00Z"),
+            ("includesCreatedEdit", True),
+            ("closed", True),
+        ):
+            with self.subTest(field=field):
+                after = _issue_routing_payload()
+                after["data"]["repository"]["issueOrPullRequest"][field] = changed
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(after=after)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+        edited = "2026-09-10T00:00:00Z"
+        for before_value, after_value in ((None, edited), (edited, None)):
+            with self.subTest(before_value=before_value, after_value=after_value):
+                before = _issue_routing_payload(last_edited_at=before_value)
+                after = _issue_routing_payload(last_edited_at=after_value)
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(before=before, after=after)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+    def test_issue_metadata_rejects_malformed_or_timezone_naive_routing_timestamps(self):
+        cases = (
+            ("before malformed", "before", "bad"),
+            ("after timezone-naive", "after", "2026-09-10T00:00:00"),
+        )
+        for label, operation, timestamp in cases:
+            with self.subTest(case=label):
+                before = _issue_routing_payload()
+                after = _issue_routing_payload()
+                if operation == "before":
+                    before["data"]["repository"]["issueOrPullRequest"]["lastEditedAt"] = timestamp
+                else:
+                    after["data"]["repository"]["issueOrPullRequest"]["lastEditedAt"] = timestamp
+                transport = IssueMetadataTransport(before=before, after=after)
+
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, transport).get_issue_metadata("swiftstream/skills", 7)
+
+                expected_calls = 1 if operation == "before" else 3
+                self.assertEqual(len(transport.calls), expected_calls)
+                if operation == "after":
+                    self.assertEqual(
+                        _call_signature(transport.calls),
+                        [
+                            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_BEFORE_QUERY),
+                            ("GET", REST_BASE_URL + "/repos/swiftstream/skills/issues/7", None),
+                            ("POST", GRAPHQL_ENDPOINT, ISSUE_ROUTING_AFTER_QUERY),
+                        ],
+                    )
+
+    def test_issue_metadata_lifecycle_routing_race_fails_in_both_directions(self):
+        cases = (
+            ("open_to_closed", False, True, "open"),
+            ("closed_to_open", True, False, "closed"),
+        )
+        for label, before_closed, after_closed, rest_state in cases:
+            with self.subTest(race=label):
+                before = _issue_routing_payload(closed=before_closed)
+                after = _issue_routing_payload(closed=after_closed)
+                rest = _issue_rest_payload(state=rest_state)
+                transport = IssueMetadataTransport(before=before, rest=rest, after=after)
+
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, transport).get_issue_metadata("swiftstream/skills", 7)
+
+                self.assertEqual(
+                    [call[0:2] for call in transport.calls],
+                    [
+                        ("POST", GRAPHQL_ENDPOINT),
+                        ("GET", REST_BASE_URL + "/repos/swiftstream/skills/issues/7"),
+                        ("POST", GRAPHQL_ENDPOINT),
+                    ],
+                )
+
+    def test_issue_metadata_routing_snapshots_require_known_exact_union(self):
+        malformed = (
+            {"data": {"repository": {"nameWithOwner": "swiftstream/skills", "issueOrPullRequest": None}}},
+            _issue_routing_payload(typename="Unknown"),
+            _issue_routing_payload(typename=[]),
+            _issue_routing_payload(repository="other/skills"),
+            _issue_routing_payload(number=8),
+            _issue_routing_payload(includes_created_edit=1),
+            _issue_routing_payload(closed=0),
+        )
+        for before in malformed:
+            with self.subTest(before=before), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, IssueMetadataTransport(before=before)).get_issue_metadata(
+                    "swiftstream/skills", 7
+                )
+
+    def test_issue_metadata_rest_identity_type_and_state_must_match_graphql(self):
+        cases = (
+            ("number", 8),
+            ("node_id", "I_other"),
+            ("state", "OPEN"),
+            ("state", "merged"),
+            ("pull_request", None),
+        )
+        for field, changed in cases:
+            with self.subTest(field=field, changed=changed):
+                rest = _issue_rest_payload()
+                rest[field] = changed
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(rest=rest)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+        for typename, is_pull_request in (("Issue", True), ("PullRequest", False)):
+            with self.subTest(typename=typename, is_pull_request=is_pull_request):
+                routing = _issue_routing_payload(typename=typename)
+                rest = _issue_rest_payload(is_pull_request=is_pull_request)
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(before=routing, after=routing, rest=rest)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+        for state, closed in (("closed", False), ("open", True)):
+            with self.subTest(state=state, closed=closed):
+                routing = _issue_routing_payload(closed=closed)
+                rest = _issue_rest_payload(state=state)
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(before=routing, after=routing, rest=rest)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+    def test_issue_metadata_rejects_missing_or_malformed_rest_author_and_identity(self):
+        cases = (
+            ("id", None),
+            ("id", True),
+            ("id", 0),
+            ("node_id", None),
+            ("user", None),
+        )
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                rest = _issue_rest_payload()
+                rest[field] = value
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(rest=rest)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+        for field, value in (("node_id", ""), ("login", 1)):
+            with self.subTest(author_field=field, value=value):
+                rest = _issue_rest_payload()
+                rest["user"][field] = value
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, IssueMetadataTransport(rest=rest)).get_issue_metadata(
+                        "swiftstream/skills", 7
+                    )
+
+    def test_issue_metadata_requires_non_null_valid_bounded_utf8_body(self):
+        for label, body in (
+            ("missing", None),
+            ("int", 1),
+            ("list", []),
+            ("object", {}),
+            ("oversized", "x" * 16_385),
+            ("invalid-utf8", "\ud800"),
+        ):
+            with self.subTest(body=label), self.assertRaises(InvalidResponseError):
+                rest = _issue_rest_payload(body=body)
+                if label == "missing":
+                    rest.pop("body")
+                GitHubClient(None, IssueMetadataTransport(rest=rest)).get_issue_metadata(
+                    "swiftstream/skills", 7
+                )
+
+        accepted = "é" * 8_192
+        metadata = GitHubClient(None, IssueMetadataTransport(rest=_issue_rest_payload(body=accepted))).get_issue_metadata(
+            "swiftstream/skills", 7
+        )
+        self.assertEqual(metadata.body, accepted)
+
+    def test_issue_routing_documents_are_fixed_queries_in_explicit_allowlist(self):
+        for document in (ISSUE_ROUTING_BEFORE_QUERY, ISSUE_ROUTING_AFTER_QUERY):
+            self.assertTrue(document.startswith("query FederationIssueRouting"))
+            self.assertNotIn("mutation", document)
+            for field in ("nameWithOwner", "issueOrPullRequest(number: $number)", "__typename",
+                          "... on Issue", "... on PullRequest", "lastEditedAt", "includesCreatedEdit", "closed"):
+                self.assertIn(field, document)
+        transport = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, b'{"data":{"repository":{}}}'))
+        client = GitHubClient(None, transport)
+        variables = {"owner": 'swiftstream"} mutation { deleteRepository(id: "x") {',
+                     "name": "skills", "number": 7}
+        for document in (ISSUE_ROUTING_BEFORE_QUERY, ISSUE_ROUTING_AFTER_QUERY):
+            client._graphql(document, variables)
+        self.assertEqual(len(transport.calls), 2)
+        for call, document in zip(transport.calls, (ISSUE_ROUTING_BEFORE_QUERY, ISSUE_ROUTING_AFTER_QUERY)):
+            payload = json.loads(call[3])
+            self.assertEqual(payload, {"query": document, "variables": variables})
+            self.assertNotIn(variables["owner"], payload["query"])
+        with self.assertRaises(GitHubAPIError):
+            client._graphql("query Untrusted { repository { nameWithOwner } }", {})
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_issue_metadata_rejects_invalid_request_before_network(self):
+        transport = IssueMetadataTransport()
+        for number in (0, -1, True, "7"):
+            with self.subTest(number=number), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).get_issue_metadata("swiftstream/skills", number)
+        self.assertEqual(transport.calls, [])
+
     def test_pull_metadata_normal_order_and_complete_contract(self):
         transport = PullMetadataTransport()
         metadata = GitHubClient("token", transport).get_pull_request_metadata("swiftstream/skills", 7)
@@ -757,6 +1271,41 @@ class GitHubAPITests(unittest.TestCase):
         self.assertEqual(metadata.base_repository, "swiftstream/skills")
         self.assertIsNone(metadata.last_edited_at)
         self.assertFalse(metadata.includes_created_edit)
+        self.assertFalse(metadata.draft)
+
+    def test_pull_draft_is_required_consistent_and_part_of_routing_race_snapshot(self):
+        for value in (True, False):
+            with self.subTest(draft=value):
+                transport = PullMetadataTransport(
+                    before=_routing_payload(draft=value),
+                    rest=_rest_payload(draft=value),
+                    after=_routing_payload(draft=value),
+                )
+                metadata = GitHubClient(None, transport).get_pull_request_metadata("swiftstream/skills", 7)
+                self.assertIs(metadata.draft, value)
+
+        for operation in ("before", "after"):
+            for invalid in (None, 1, "false"):
+                with self.subTest(operation=operation, invalid=invalid):
+                    payload = _routing_payload(draft=invalid)
+                    with self.assertRaises(InvalidResponseError):
+                        GitHubClient(None, PullMetadataTransport(**{operation: payload})).get_pull_request_metadata("swiftstream/skills", 7)
+
+        for invalid in (None, 1, "false"):
+            with self.subTest(rest_draft=invalid):
+                with self.assertRaises(InvalidResponseError):
+                    GitHubClient(None, PullMetadataTransport(rest=_rest_payload(draft=invalid))).get_pull_request_metadata("swiftstream/skills", 7)
+        missing = _rest_payload()
+        missing.pop("draft")
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, PullMetadataTransport(rest=missing)).get_pull_request_metadata("swiftstream/skills", 7)
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, PullMetadataTransport(rest=_rest_payload(draft=True))).get_pull_request_metadata("swiftstream/skills", 7)
+
+        before = _routing_payload(draft=False)
+        after = _routing_payload(draft=True)
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, PullMetadataTransport(before=before, after=after)).get_pull_request_metadata("swiftstream/skills", 7)
 
     def test_pull_metadata_null_body_uses_one_exact_fallback_and_preserves_body(self):
         for body in ("", "body from fallback"):
@@ -777,6 +1326,7 @@ class GitHubAPITests(unittest.TestCase):
         for document in (PULL_REQUEST_ROUTING_BEFORE_QUERY, PULL_REQUEST_ROUTING_AFTER_QUERY):
             self.assertNotIn("body", document)
             self.assertNotIn("author", document)
+            self.assertIn("isDraft", document)
         self.assertIn("body", PULL_REQUEST_BODY_FALLBACK_QUERY)
         self.assertNotIn("author", PULL_REQUEST_BODY_FALLBACK_QUERY)
         old_document = "query FederationPullRequest($owner: String!, $name: String!, $number: Int!) { repository { pullRequest { body author { id } } } }"
@@ -793,6 +1343,7 @@ class GitHubAPITests(unittest.TestCase):
             ("baseRefName", "other-base"),
             ("lastEditedAt", "2026-09-10T00:00:00Z"),
             ("includesCreatedEdit", True),
+            ("isDraft", True),
         )
         for field, changed in variants:
             with self.subTest(field=field):
@@ -961,6 +1512,1014 @@ class GitHubAPITests(unittest.TestCase):
         with self.assertRaises(InvalidResponseError):
             GitHubClient(None, transport).get_pull_request_metadata("swiftstream/skills", 7)
         self.assertEqual(_call_signature(transport.calls)[1][0:2], ("GET", REST_BASE_URL + "/repos/swiftstream/skills/pulls/7"))
+
+    def test_all_state_pull_request_enumeration_validates_bounds_orders_and_terminates(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, headers, body, timeout))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        for state in ("open", "closed", "all"):
+            transport = PageTransport({1: [{"number": 2}, {"number": 1}]})
+            result = GitHubClient(None, transport).list_pull_requests("swiftstream/skills", state=state)
+            self.assertEqual([item["number"] for item in result], [1, 2])
+            self.assertEqual(
+                transport.calls[0][1],
+                f"{REST_BASE_URL}/repos/swiftstream/skills/pulls?state={state}&per_page=100&page=1",
+            )
+
+        transport = PageTransport({1: [{"number": 2}, {"number": 1}]})
+        self.assertEqual(
+            [item["number"] for item in GitHubClient(None, transport).list_open_pull_requests("swiftstream/skills")],
+            [1, 2],
+        )
+        self.assertIn("?state=open&per_page=100&page=1", transport.calls[0][1])
+
+        for state, pages in (("unknown", 100), ("open", 0), ("open", True), ("open", 101)):
+            transport = PageTransport({1: []})
+            with self.subTest(state=state, max_pages=pages), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).list_pull_requests("swiftstream/skills", state=state, max_pages=pages)
+            self.assertEqual(transport.calls, [])
+
+        full_page = [{"number": number} for number in range(100, 0, -1)]
+        transport = PageTransport({1: full_page})
+        with self.assertRaisesRegex(InvalidResponseError, "bounded pagination exhaustion"):
+            GitHubClient(None, transport).list_pull_requests("swiftstream/skills", state="all", max_pages=1)
+        self.assertEqual(len(transport.calls), 1)
+
+        pages = {1: full_page, 2: [{"number": 102}, {"number": 101}]}
+        transport = PageTransport(pages)
+        result = GitHubClient(None, transport).list_pull_requests("swiftstream/skills", state="closed", max_pages=2)
+        self.assertEqual([item["number"] for item in result], list(range(1, 101)) + [101, 102])
+        self.assertEqual(len(transport.calls), 2)
+        self.assertIn("state=closed&per_page=100&page=2", transport.calls[1][1])
+
+    def test_all_state_pull_request_enumeration_rejects_duplicates_and_malformed_items(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, headers, body, timeout))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        full_page = [{"number": number} for number in range(1, 101)]
+        transport = PageTransport({1: full_page, 2: [{"number": 100}]})
+        with self.assertRaisesRegex(InvalidResponseError, "duplicate"):
+            GitHubClient(None, transport).list_pull_requests("swiftstream/skills", max_pages=2)
+        self.assertEqual(len(transport.calls), 2)
+
+        for malformed in (None, {}, [{"number": True}], [{"number": 0}], [{"number": "7"}], [None]):
+            transport = PageTransport({1: malformed})
+            with self.subTest(malformed=malformed), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).list_pull_requests("swiftstream/skills", max_pages=1)
+
+    def test_bounded_repository_issue_inventory_filters_pull_requests_and_uses_fixed_pages(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, body))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        for state in ("open", "closed", "all"):
+            transport = PageTransport({1: [
+                {"number": 9, "pull_request": {"url": "ignored"}},
+                {"number": 8, "title": "discovery only"},
+                {"number": 2, "body": "not returned"},
+            ]})
+            result = GitHubClient(None, transport).list_repository_issues(
+                "swiftstream/skills", state=state,
+            )
+            self.assertEqual(result, ({"number": 2}, {"number": 8}))
+            self.assertEqual(transport.calls, [(
+                "GET",
+                f"{REST_BASE_URL}/repos/swiftstream/skills/issues?state={state}&per_page=100&page=1",
+                None,
+            )])
+
+        first = [{"number": number} for number in range(100, 0, -1)]
+        transport = PageTransport({1: first, 2: [{"number": 102}, {"number": 101}]})
+        result = GitHubClient(None, transport).list_repository_issues(
+            "swiftstream/skills", state="closed", max_pages=2,
+        )
+        self.assertEqual([item["number"] for item in result], list(range(1, 103)))
+        self.assertEqual(len(transport.calls), 2)
+        self.assertIn("state=closed&per_page=100&page=2", transport.calls[1][1])
+        self.assertTrue(all(call[0] == "GET" and call[2] is None for call in transport.calls))
+
+    def test_bounded_repository_issue_inventory_rejects_invalid_pages_duplicates_and_exhaustion(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, body))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        for state, max_pages, repository in (
+            ("unknown", 1, "swiftstream/skills"),
+            ("open", 0, "swiftstream/skills"),
+            ("open", True, "swiftstream/skills"),
+            ("open", 101, "swiftstream/skills"),
+        ):
+            transport = PageTransport({1: []})
+            with self.subTest(state=state, max_pages=max_pages, repository=repository), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).list_repository_issues(repository, state=state, max_pages=max_pages)
+            self.assertEqual(transport.calls, [])
+
+        transport = PageTransport({1: []})
+        GitHubClient(None, transport).list_repository_issues("swiftstream/skills?state=all", state="open")
+        self.assertEqual(
+            transport.calls[0][1].split("/issues?", 1)[1],
+            "state=open&per_page=100&page=1",
+        )
+        self.assertIn("/repos/swiftstream/skills%253Fstate%253Dall/issues?", transport.calls[0][1])
+        self.assertEqual((transport.calls[0][0], transport.calls[0][2]), ("GET", None))
+
+        for malformed in (None, {}, [None], [{"number": True}], [{"number": 0}], [{"number": "7"}], [{}], [{"number": 2}, {"number": 2}], [
+            {"number": number} for number in range(101)
+        ]):
+            transport = PageTransport({1: malformed})
+            with self.subTest(malformed=malformed), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, transport).list_repository_issues(
+                    "swiftstream/skills", max_pages=1,
+                )
+
+        transport = PageTransport({1: [{"number": number} for number in range(1, 101)]})
+        with self.assertRaisesRegex(InvalidResponseError, "bounded pagination exhaustion"):
+            GitHubClient(None, transport).list_repository_issues("swiftstream/skills", max_pages=1)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_bounded_machine_ref_inventory_is_exact_paginated_and_keeps_orphans(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, body))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        prefix = "refs/heads/bot/federation/"
+        def row(source_id, sha, *, ref=None, target_type="commit"):
+            return {
+                "ref": ref or prefix + source_id,
+                "object": {"sha": sha, "type": target_type},
+            }
+
+        transport = PageTransport({
+            1: [
+                row("zeta", "b" * 40),
+                row("request", "c" * 40, ref=prefix + "request/issue-7"),
+                row("alpha-one", "a" * 40),
+            ],
+        })
+        result = GitHubClient(None, transport).list_machine_refs("swiftstream/skills")
+        self.assertEqual(result, (
+            {"ref": prefix + "alpha-one", "source_id": "alpha-one", "sha": "a" * 40},
+            {"ref": prefix + "zeta", "source_id": "zeta", "sha": "b" * 40},
+        ))
+        self.assertEqual(transport.calls, [(
+            "GET",
+            f"{REST_BASE_URL}/repos/swiftstream/skills/git/matching-refs/heads/bot/federation?per_page=100&page=1",
+            None,
+        )])
+        # An orphaned ref remains visible even when there is no registry input.
+        self.assertEqual(result[1]["source_id"], "zeta")
+
+        full = [row(f"source-{number:03d}", f"{number:040x}") for number in range(100)]
+        transport = PageTransport({1: full, 2: [row("orphan", "f" * 40)]})
+        paged = GitHubClient(None, transport).list_machine_refs("swiftstream/skills", max_pages=2)
+        self.assertEqual(len(paged), 101)
+        self.assertIn("orphan", {item["source_id"] for item in paged})
+        self.assertEqual(len(transport.calls), 2)
+        self.assertIn("page=2", transport.calls[1][1])
+        self.assertTrue(all(call[0] == "GET" and call[2] is None for call in transport.calls))
+
+    def test_bounded_machine_ref_inventory_rejects_malformed_rows_duplicates_and_exhaustion(self):
+        class PageTransport:
+            def __init__(self, pages):
+                self.pages = pages
+                self.calls = []
+
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, body))
+                page = int(url.rsplit("&page=", 1)[1])
+                return HttpResponse(200, url, json.dumps(self.pages[page]).encode())
+
+        prefix = "refs/heads/bot/federation/"
+        good = {"ref": prefix + "source", "object": {"sha": "a" * 40, "type": "commit"}}
+        for max_pages, repository in (
+            (0, "swiftstream/skills"), (True, "swiftstream/skills"),
+            (101, "swiftstream/skills"),
+        ):
+            transport = PageTransport({1: []})
+            with self.subTest(max_pages=max_pages, repository=repository), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).list_machine_refs(repository, max_pages=max_pages)
+            self.assertEqual(transport.calls, [])
+
+        transport = PageTransport({1: []})
+        GitHubClient(None, transport).list_machine_refs("swiftstream/skills?x=y")
+        self.assertEqual(
+            transport.calls[0][1].split("/git/matching-refs/", 1)[1],
+            "heads/bot/federation?per_page=100&page=1",
+        )
+        self.assertIn("/repos/swiftstream/skills%253Fx%253Dy/git/", transport.calls[0][1])
+        self.assertEqual((transport.calls[0][0], transport.calls[0][2]), ("GET", None))
+
+        malformed_pages = (
+            None, {}, [None], [{"ref": "refs/heads/bot/other/source", "object": {"sha": "a" * 40}}],
+            [{"ref": prefix + "request/issue-7", "object": None}],
+            [{"ref": 4, "object": {"sha": "a" * 40}}],
+            [{"ref": prefix + "Bad", "object": {"sha": "a" * 40}}],
+            [{"ref": prefix + "source", "object": None}],
+            [{"ref": prefix + "source", "object": {"type": "commit"}}],
+            [{"ref": prefix + "source", "object": {"sha": "A" * 40}}],
+            [{"ref": prefix + "source", "object": {"sha": "a" * 40, "type": "tree"}}],
+            [good, good],
+            [{"ref": prefix + "source", "object": {"sha": "a" * 40}},
+             {"ref": prefix + "source", "object": {"sha": "b" * 40}}],
+            [{"ref": prefix + f"source-{number:03d}", "object": {"sha": f"{number:040x}"}} for number in range(101)],
+        )
+        for malformed in malformed_pages:
+            transport = PageTransport({1: malformed})
+            with self.subTest(malformed=malformed), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, transport).list_machine_refs("swiftstream/skills", max_pages=1)
+
+        transport = PageTransport({1: [
+            {"ref": prefix + f"source-{number:03d}", "object": {"sha": f"{number:040x}"}}
+            for number in range(100)
+        ]})
+        with self.assertRaisesRegex(InvalidResponseError, "bounded pagination exhaustion"):
+            GitHubClient(None, transport).list_machine_refs("swiftstream/skills", max_pages=1)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_issue_pull_request_creation_preserves_canonical_multiline_body_and_draft_false(self):
+        request = parse_request_body(
+            RequestClass.ADD,
+            "Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\nA source\n"
+            "Branch:\nmain\nSkills root:\nskills\nSkill prefixes:\ndemo\n",
+        )
+        body = render_request_body(request)
+        response_url = f"{REST_BASE_URL}/repos/swiftstream/skills/pulls"
+        transport = FakeTransport(HttpResponse(201, response_url, b'{"number":9}'))
+        number = GitHubClient("token", transport).create_issue_pull_request(
+            "swiftstream/skills", head="bot/federation/request/issue-7", base="main", title="Issue request", body=body,
+        )
+        self.assertEqual(number, 9)
+        self.assertEqual(len(transport.calls), 1)
+        method, url, _headers, request_body, _timeout = transport.calls[0]
+        self.assertEqual((method, url), ("POST", response_url))
+        self.assertEqual(json.loads(request_body), {
+            "title": "Issue request",
+            "head": "bot/federation/request/issue-7",
+            "base": "main",
+            "body": body,
+            "draft": False,
+        })
+        self.assertEqual(json.loads(request_body)["body"], body)
+
+    def test_issue_pull_request_creation_rejects_invalid_data_before_transport(self):
+        good = dict(head="bot/federation/request/issue-7", base="main", title="Issue request", body="line one\nline two\n")
+        invalid_heads = (
+            "bot/federation/demo", "owner:bot/federation/request/issue-7",
+            "refs/heads/bot/federation/request/issue-7", "bot/federation/request/issue-01",
+        )
+        for head in invalid_heads:
+            transport = FakeTransport(HttpResponse(201, REST_BASE_URL, b'{"number":9}'))
+            with self.subTest(head=head), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).create_issue_pull_request("swiftstream/skills", **dict(good, head=head))
+            self.assertEqual(transport.calls, [])
+        for base in ("master", "refs/heads/main", "main "):
+            transport = FakeTransport(HttpResponse(201, REST_BASE_URL, b'{"number":9}'))
+            with self.subTest(base=base), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).create_issue_pull_request("swiftstream/skills", **dict(good, base=base))
+            self.assertEqual(transport.calls, [])
+        for body in ("", "x\r\ny", "x\x00y", "x\x7fy", "x\x01y", None):
+            transport = FakeTransport(HttpResponse(201, REST_BASE_URL, b'{"number":9}'))
+            with self.subTest(body=repr(body)), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).create_issue_pull_request("swiftstream/skills", **dict(good, body=body))
+            self.assertEqual(transport.calls, [])
+        for title in ("", "bad\ntitle", "x" * 257, "é" * 129, None):
+            transport = FakeTransport(HttpResponse(201, REST_BASE_URL, b'{"number":9}'))
+            with self.subTest(title=repr(title)[:20]), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).create_issue_pull_request("swiftstream/skills", **dict(good, title=title))
+            self.assertEqual(transport.calls, [])
+
+    def test_issue_pull_request_creation_rejects_oversized_utf8_body_before_transport(self):
+        transport = FakeTransport(HttpResponse(201, REST_BASE_URL, b'{"number":9}'))
+        with self.assertRaises(GitHubAPIError):
+            GitHubClient(None, transport).create_issue_pull_request(
+                "swiftstream/skills", head="bot/federation/request/issue-7", base="main",
+                title="Issue request", body="é" * 8_193,
+            )
+        self.assertEqual(transport.calls, [])
+
+    def test_issue_pull_request_creation_validates_response_number(self):
+        response_url = f"{REST_BASE_URL}/repos/swiftstream/skills/pulls"
+        for value in (None, {}, {"number": 0}, {"number": True}, {"number": "9"}):
+            body = json.dumps(value).encode() if value is not None else b"null"
+            transport = FakeTransport(HttpResponse(201, response_url, body))
+            with self.subTest(value=value), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, transport).create_issue_pull_request(
+                    "swiftstream/skills", head="bot/federation/request/issue-7", base="main",
+                    title="Issue request", body="canonical\nbody\n",
+                )
+
+
+class Wave05CommitStatusAPITests(unittest.TestCase):
+    repository = "swiftstream/skills"
+    sha = "a" * 40
+    context = "federation/trusted-validation"
+    description = "ssf:v1 external ev=" + "b" * 64
+    bot = {
+        "id": 9001,
+        "node_id": "BOT_NODE",
+        "login": "swift-stream-bot[bot]",
+        "type": "Bot",
+    }
+
+    @classmethod
+    def status_payload(cls, *, status_id=1, state="success", context=None, description=None,
+                       target_url=None, creator=None, created_at="2026-10-05T12:00:00Z",
+                       updated_at="2026-10-05T12:00:01Z", node_id="STATUS_NODE"):
+        return {
+            "id": status_id,
+            "node_id": node_id,
+            "state": state,
+            "context": cls.context if context is None else context,
+            "description": cls.description if description is None else description,
+            "target_url": target_url,
+            "creator": dict(cls.bot if creator is None else creator),
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+
+    @staticmethod
+    def response(status, route, body=None):
+        if body is None:
+            raw = b""
+        elif isinstance(body, bytes):
+            raw = body
+        else:
+            raw = json.dumps(body, separators=(",", ":")).encode()
+        return HttpResponse(status, REST_BASE_URL + route, raw)
+
+    def test_git_commit_object_reads_exact_sha_and_defensively_parses_metadata(self):
+        route = f"/repos/{self.repository}/git/commits/{self.sha}"
+        payload = {
+            "sha": self.sha,
+            "message": "subject\n\nswiftstream-federation-head:v2\n",
+            "tree": {"sha": "c" * 40},
+            "parents": [{"sha": "d" * 40}],
+            "author": {"name": "Author", "email": "author@example.test", "date": "2026-10-05T11:00:00Z"},
+            "committer": {"name": "Committer", "email": "bot@example.test", "date": "2026-10-05T11:01:00Z"},
+        }
+        transport = SequenceTransport([self.response(200, route, json.dumps(payload).encode())])
+        commit = GitHubClient(None, transport).get_git_commit_object(self.repository, self.sha)
+        self.assertEqual(
+            commit,
+            GitCommitObject(
+                self.sha,
+                payload["message"],
+                "c" * 40,
+                ("d" * 40,),
+                GitCommitIdentity("Author", "author@example.test", "2026-10-05T11:00:00Z"),
+                GitCommitIdentity("Committer", "bot@example.test", "2026-10-05T11:01:00Z"),
+            ),
+        )
+        self.assertEqual(transport.calls[0][0:2], ("GET", REST_BASE_URL + route))
+
+        invalid_payloads = (
+            {**payload, "sha": "e" * 40},
+            {**payload, "message": None},
+            {**payload, "tree": {"sha": "C" * 40}},
+            {**payload, "parents": [{"sha": "bad"}]},
+            {**payload, "author": {"name": "Author", "email": "author@example.test"}},
+            {**payload, "committer": {"name": "Committer", "email": "bot@example.test", "date": "2026-10-05T11:01:00+00:00"}},
+        )
+        for invalid in invalid_payloads:
+            with self.subTest(invalid=invalid), self.assertRaises(InvalidResponseError):
+                transport = SequenceTransport([self.response(200, route, json.dumps(invalid).encode())])
+                GitHubClient(None, transport).get_git_commit_object(self.repository, self.sha)
+
+    def test_create_status_requires_same_response_201_and_returns_exact_receipt(self):
+        route = f"/repos/{self.repository}/statuses/{self.sha}"
+        status = self.status_payload(target_url=None)
+        transport = SequenceTransport([self.response(201, route, status)])
+        receipt = GitHubClient(None, transport).create_commit_status(
+            self.repository, self.sha, "success", self.context, self.description, None,
+        )
+        self.assertEqual(receipt, StatusWriteReceipt(
+            self.repository, self.sha, "POST", route, "success", self.context,
+            self.description, None,
+            CommitStatus(1, "STATUS_NODE", "success", self.context, self.description, None,
+                         9001, "BOT_NODE", "swift-stream-bot[bot]", "Bot",
+                         "2026-10-05T12:00:00Z", "2026-10-05T12:00:01Z"),
+        ))
+        method, url, _headers, body, _timeout = transport.calls[0]
+        self.assertEqual((method, url), ("POST", REST_BASE_URL + route))
+        self.assertEqual(json.loads(body), {
+            "state": "success", "context": self.context,
+            "description": self.description, "target_url": None,
+        })
+        self.assertNotIn("sha", status)
+
+        for code in (200, 202, 204):
+            with self.subTest(status=code), self.assertRaises(UnexpectedStatusError):
+                transport = SequenceTransport([self.response(code, route, status)])
+                GitHubClient(None, transport).create_commit_status(
+                    self.repository, self.sha, "success", self.context, self.description,
+                )
+                self.assertEqual(len(transport.calls), 1)
+
+    def test_create_status_rejects_mismatched_or_malformed_same_response(self):
+        route = f"/repos/{self.repository}/statuses/{self.sha}"
+        invalid = (
+            self.status_payload(context="other/context"),
+            self.status_payload(state="failure"),
+            self.status_payload(description="different"),
+            self.status_payload(target_url="https://example.test"),
+            {key: value for key, value in self.status_payload().items() if key != "creator"},
+            {**self.status_payload(), "created_at": "not-a-date"},
+            {**self.status_payload(), "state": "queued"},
+        )
+        for response_body in invalid:
+            with self.subTest(response_body=response_body), self.assertRaises(InvalidResponseError):
+                transport = SequenceTransport([self.response(201, route, response_body)])
+                GitHubClient(None, transport).create_commit_status(
+                    self.repository, self.sha, "success", self.context, self.description,
+                )
+
+        for invalid_request in (
+            ("success", "", self.description, None),
+            ("neutral", self.context, self.description, None),
+            ("success", self.context, "ssf:v1 external ev=BAD", None),
+        ):
+            transport = SequenceTransport([])
+            with self.subTest(invalid_request=invalid_request), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).create_commit_status(self.repository, self.sha, *invalid_request)
+            self.assertEqual(transport.calls, [])
+
+    def test_status_write_errors_are_ambiguous_or_fail_closed_without_fallback(self):
+        route = f"/repos/{self.repository}/statuses/{self.sha}"
+        error_transport = SequenceTransport([self.response(422, route, {"message": "invalid status"})])
+        with self.assertRaises(UnprocessableError):
+            GitHubClient(None, error_transport).create_commit_status(
+                self.repository, self.sha, "success", self.context, self.description,
+            )
+        self.assertEqual(len(error_transport.calls), 1)
+        self.assertEqual(error_transport.calls[0][0:2], ("POST", REST_BASE_URL + route))
+
+        timeout_transport = SequenceTransport([TransportError("connection timed out")])
+        with self.assertRaises(TransportError):
+            GitHubClient(None, timeout_transport).create_commit_status(
+                self.repository, self.sha, "success", self.context, self.description,
+            )
+        self.assertEqual(len(timeout_transport.calls), 1)
+        self.assertEqual(timeout_transport.calls[0][0], "POST")
+
+        repeated = SequenceTransport([
+            self.response(201, route, self.status_payload()),
+            self.response(201, route, self.status_payload(status_id=2)),
+        ])
+        client = GitHubClient(None, repeated)
+        client.create_commit_status(self.repository, self.sha, "success", self.context, self.description)
+        client.create_commit_status(self.repository, self.sha, "success", self.context, self.description)
+        self.assertEqual(len(repeated.calls), 2)
+        self.assertTrue(all(call[0] == "POST" and call[1] == REST_BASE_URL + route for call in repeated.calls))
+
+    def test_status_reads_paginate_in_api_order_and_select_exact_bot_context(self):
+        wrong_context = self.status_payload(status_id=1, context="other/context")
+        wrong_database = self.status_payload(status_id=2, creator={**self.bot, "id": 9002})
+        wrong_node = self.status_payload(status_id=3, creator={**self.bot, "node_id": "OTHER_NODE"})
+        wrong_login = self.status_payload(status_id=4, creator={**self.bot, "login": "other[bot]"})
+        wrong_type = self.status_payload(status_id=5, creator={**self.bot, "type": "User"})
+        newest_exact = self.status_payload(status_id=6, created_at="2026-10-05T12:00:00Z")
+        older_exact = self.status_payload(status_id=7, created_at="2026-10-05T11:00:00Z")
+        first_page = [wrong_context, wrong_database, wrong_node, wrong_login, wrong_type, newest_exact, older_exact]
+        first_page.extend(self.status_payload(status_id=index, context="old/context") for index in range(8, 101))
+        second_page = [self.status_payload(status_id=101, created_at="2026-10-04T10:00:00Z")]
+
+        class StatusPages:
+            def __init__(self):
+                self.calls = []
+
+            def request(inner_self, method, url, headers, body, timeout):
+                inner_self.calls.append((method, url, headers, body, timeout))
+                page = int(url.rsplit("&page=", 1)[1])
+                payload = first_page if page == 1 else second_page
+                return HttpResponse(200, url, json.dumps(payload).encode())
+
+        transport = StatusPages()
+        statuses = GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=2)
+        self.assertEqual([status.id for status in statuses], list(range(1, 101)) + [101])
+        self.assertEqual(len(transport.calls), 2)
+        expected_prefix = f"{REST_BASE_URL}/repos/{self.repository}/commits/{self.sha}/statuses?per_page=100&page="
+        self.assertEqual([call[0] for call in transport.calls], ["GET", "GET"])
+        self.assertEqual([call[1] for call in transport.calls], [expected_prefix + "1", expected_prefix + "2"])
+        self.assertTrue(all(call[3] is None for call in transport.calls))
+
+        self.assertIs(
+            latest_exact_app_status(
+                statuses, self.context, bot_database_id=9001, bot_node_id="BOT_NODE",
+                bot_login="swift-stream-bot[bot]",
+            ),
+            statuses[5],
+        )
+        self.assertIsNone(latest_exact_app_status(
+            statuses, "absent/context", bot_database_id=9001, bot_node_id="BOT_NODE",
+            bot_login="swift-stream-bot[bot]",
+        ))
+        self.assertEqual([status.id for status in statuses[:7]], [1, 2, 3, 4, 5, 6, 7])
+
+    def test_status_reads_reject_bad_pages_and_bounded_history_exhaustion(self):
+        route_prefix = f"/repos/{self.repository}/commits/{self.sha}/statuses?per_page=100&page="
+        for payload in (None, {}, {"statuses": []}):
+            url = REST_BASE_URL + route_prefix + "1"
+            transport = SequenceTransport([HttpResponse(200, url, json.dumps(payload).encode())])
+            with self.subTest(payload=payload), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=1)
+
+        malformed = self.status_payload(status_id=1)
+        malformed["creator"] = {"id": True, "node_id": "BOT_NODE", "login": "bot", "type": "Bot"}
+        url = REST_BASE_URL + route_prefix + "1"
+        transport = SequenceTransport([HttpResponse(200, url, json.dumps([self.status_payload(), malformed]).encode())])
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=1)
+
+        full_page = [self.status_payload(status_id=index) for index in range(1, 101)]
+        bad_second_page = dict(self.status_payload(status_id=101))
+        bad_second_page["updated_at"] = "2026-10-05T12:00:01+00:00"
+        second_url = REST_BASE_URL + route_prefix + "2"
+        transport = SequenceTransport([
+            HttpResponse(200, url, json.dumps(full_page).encode()),
+            HttpResponse(200, second_url, json.dumps([bad_second_page]).encode()),
+        ])
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=2)
+        self.assertEqual(len(transport.calls), 2)
+
+        full_page = [self.status_payload(status_id=index) for index in range(1, 101)]
+        transport = SequenceTransport([HttpResponse(200, url, json.dumps(full_page).encode())])
+        with self.assertRaisesRegex(InvalidResponseError, "pagination exceeds"):
+            GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=1)
+        self.assertEqual(len(transport.calls), 1)
+
+        for max_pages in (0, True, 101):
+            transport = SequenceTransport([])
+            with self.subTest(max_pages=max_pages), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).list_commit_statuses(self.repository, self.sha, max_pages=max_pages)
+            self.assertEqual(transport.calls, [])
+
+
+class Wave07PullRequestStageMutationTests(unittest.TestCase):
+    operations = {
+        "REOPEN": (REOPEN_PULL_REQUEST_MUTATION, "reopenPullRequest", "reopen_pull_request"),
+        "READY_FOR_REVIEW": (MARK_PULL_REQUEST_READY_FOR_REVIEW_MUTATION, "markPullRequestReadyForReview", "mark_pull_request_ready_for_review"),
+        "CONVERT_TO_DRAFT": (CONVERT_PULL_REQUEST_TO_DRAFT_MUTATION, "convertPullRequestToDraft", "convert_pull_request_to_draft"),
+        "CLOSE": (CLOSE_PULL_REQUEST_MUTATION, "closePullRequest", "close_pull_request"),
+    }
+
+    @staticmethod
+    def pull(**changes):
+        value = {
+            "id": "PR_kwDOPull",
+            "fullDatabaseId": "800",
+            "number": 8,
+            "state": "OPEN",
+            "isDraft": False,
+            "merged": False,
+            "mergedAt": None,
+            "headRefOid": "a" * 40,
+            "baseRefOid": "b" * 40,
+            "headRefName": "bot/federation/request/issue-7",
+            "baseRefName": "main",
+            "headRepository": {"id": "R_central"},
+            "baseRepository": {"id": "R_central"},
+        }
+        value.update(changes)
+        return value
+
+    @classmethod
+    def response(cls, operation, *, client_mutation_id="mutation-123", pull=None, payload_changes=None, data_changes=None):
+        _, mutation_field, _ = cls.operations[operation]
+        payload = {"clientMutationId": client_mutation_id, "pullRequest": cls.pull() if pull is None else pull}
+        payload.update(payload_changes or {})
+        data = {mutation_field: payload}
+        data.update(data_changes or {})
+        return HttpResponse(200, GRAPHQL_ENDPOINT, json.dumps({"data": data}).encode())
+
+    def invoke(self, operation, response, *, node_id="PR_kwDOPull", client_mutation_id="mutation-123"):
+        _, _, method_name = self.operations[operation]
+        client = GitHubClient("token", FakeTransport(response))
+        return getattr(client, method_name)(node_id, client_mutation_id)
+
+    def test_all_four_static_documents_are_allowlisted_and_select_only_full_database_id(self):
+        documents = [item[0] for item in self.operations.values()]
+        self.assertEqual(len(documents), 4)
+        self.assertEqual(len(set(documents)), 4)
+        for document in documents:
+            with self.subTest(document=document.splitlines()[0]):
+                self.assertIn("$pullRequestId: ID!", document)
+                self.assertIn("$clientMutationId: String!", document)
+                self.assertIn("pullRequestId: $pullRequestId", document)
+                self.assertIn("clientMutationId: $clientMutationId", document)
+                self.assertIn("fullDatabaseId", document)
+                self.assertNotRegex(document, r"(?<!full)databaseId")
+                self.assertNotIn("PR_kwDOPull", document)
+                client = GitHubClient(None, FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, b'{"data":{}}')))
+                client._graphql(document, {"pullRequestId": "PR_kwDOPull", "clientMutationId": "mutation-123"})
+
+        transport = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, b'{"data":{}}'))
+        client = GitHubClient(None, transport)
+        for document in documents:
+            with self.assertRaises(GitHubAPIError):
+                client._graphql(document + "\n# caller suffix", {})
+        self.assertEqual(len(transport.calls), 0)
+
+    def test_public_methods_send_only_variables_and_return_exact_receipts(self):
+        for operation in self.operations:
+            with self.subTest(operation=operation):
+                pull = self.pull()
+                node_id = 'PR_" } mutation { deleteRepository(id: "x") { id } #'
+                pull["id"] = node_id
+                if operation == "CONVERT_TO_DRAFT":
+                    pull["isDraft"] = True
+                elif operation == "CLOSE":
+                    pull["state"] = "CLOSED"
+                response = self.response(operation, client_mutation_id="exact-mutation-id", pull=pull)
+                transport = FakeTransport(response)
+                _, document, method_name = self.operations[operation]
+                receipt = getattr(GitHubClient(None, transport), method_name)(node_id, "exact-mutation-id")
+                self.assertIsInstance(receipt, PullRequestStageMutationReceipt)
+                self.assertEqual(receipt.operation, operation)
+                self.assertEqual(receipt.requested_pull_request_node_id, node_id)
+                self.assertEqual(receipt.pull_request_database_id, 800)
+                self.assertEqual(receipt.returned_client_mutation_id, "exact-mutation-id")
+                self.assertEqual(len(transport.calls), 1)
+                call = transport.calls[0]
+                payload = json.loads(call[3])
+                self.assertEqual(payload["query"], self.operations[operation][0])
+                self.assertEqual(payload["variables"], {"pullRequestId": node_id, "clientMutationId": "exact-mutation-id"})
+                self.assertNotIn(node_id, payload["query"])
+
+    def test_full_database_id_parser_is_ascii_canonical_and_lossless(self):
+        self.assertEqual(github_api_module._positive_graphql_bigint("1"), 1)
+        self.assertEqual(github_api_module._positive_graphql_bigint("2147483648"), 2_147_483_648)
+        huge = "9" * 100
+        self.assertEqual(github_api_module._positive_graphql_bigint(huge), int(huge))
+        for invalid in ("0", "-1", "+1", "01", " 1", "1 ", "1.0", "1e3", "", "١", 1, True, 1.0, None, "1_0"):
+            with self.subTest(invalid=repr(invalid)), self.assertRaises(InvalidResponseError):
+                github_api_module._positive_graphql_bigint(invalid)
+
+    def test_exact_receipt_shapes_reject_identity_and_database_id_failures(self):
+        for operation in self.operations:
+            pull = self.pull()
+            if operation == "CONVERT_TO_DRAFT":
+                pull["isDraft"] = True
+            elif operation == "CLOSE":
+                pull["state"] = "CLOSED"
+            good = self.response(operation, pull=pull)
+            with self.subTest(operation=operation):
+                self.assertEqual(self.invoke(operation, good).pull_request_node_id, "PR_kwDOPull")
+
+        bad_cases = (
+            ("missing fullDatabaseId", {key: value for key, value in self.pull().items() if key != "fullDatabaseId"}),
+            ("deprecated only", {**{key: value for key, value in self.pull().items() if key != "fullDatabaseId"}, "databaseId": "800"}),
+            ("null PR node", self.pull(id=None)),
+            ("bad PR number", self.pull(number=True)),
+            ("bad head OID", self.pull(headRefOid=None)),
+            ("bad base OID", self.pull(baseRefOid="A" * 40)),
+            ("null head repository", self.pull(headRepository=None)),
+            ("extra repository key", self.pull(headRepository={"id": "R_central", "name": "repo"})),
+        )
+        for label, pull in bad_cases:
+            with self.subTest(label=label), self.assertRaises(InvalidResponseError):
+                self.invoke("REOPEN", self.response("REOPEN", pull=pull))
+
+        for database_value in ("0", "-1", "+1", "01", " 1", "1 ", "1.0", "1e3", "", "١", 1, True, 1.0, None):
+            with self.subTest(database_value=repr(database_value)), self.assertRaises(InvalidResponseError):
+                self.invoke("REOPEN", self.response("REOPEN", pull=self.pull(fullDatabaseId=database_value)))
+        for payload_changes, data_changes in (
+            ({"unexpected": "x"}, None),
+            ({"pullRequest": None}, None),
+            (None, {"anotherMutation": {}}),
+        ):
+            with self.subTest(payload_changes=payload_changes, data_changes=data_changes), self.assertRaises(InvalidResponseError):
+                self.invoke("REOPEN", self.response("REOPEN", payload_changes=payload_changes, data_changes=data_changes))
+
+    def test_client_mutation_id_and_requested_pr_node_must_match_exactly(self):
+        for response, node_id, mutation_id in (
+            (self.response("REOPEN", client_mutation_id="other"), "PR_kwDOPull", "mutation-123"),
+            (self.response("REOPEN", pull=self.pull(id="PR_other")), "PR_kwDOPull", "mutation-123"),
+        ):
+            with self.assertRaises(InvalidResponseError):
+                self.invoke("REOPEN", response, node_id=node_id, client_mutation_id=mutation_id)
+        for node_id, mutation_id in (("", "ok"), ("PR_ok", ""), ("PR_ok", "x" * 257), ("PR_ok", "bad\nvalue")):
+            transport = FakeTransport(self.response("REOPEN"))
+            with self.subTest(node_id=node_id, mutation_id=mutation_id), self.assertRaises(GitHubAPIError):
+                GitHubClient(None, transport).reopen_pull_request(node_id, mutation_id)
+            self.assertEqual(transport.calls, [])
+
+    def test_operation_state_predicates_fail_closed(self):
+        cases = (
+            ("REOPEN", self.pull(state="CLOSED")),
+            ("REOPEN", self.pull(merged=True, mergedAt="2026-10-05T10:11:12Z")),
+            ("READY_FOR_REVIEW", self.pull(isDraft=True)),
+            ("CONVERT_TO_DRAFT", self.pull(isDraft=False)),
+            ("CLOSE", self.pull(state="OPEN")),
+            ("REOPEN", self.pull(mergedAt="2026-10-05T10:11:12Z")),
+        )
+        for operation, pull in cases:
+            with self.subTest(operation=operation, pull=pull), self.assertRaises(InvalidResponseError):
+                self.invoke(operation, self.response(operation, pull=pull))
+
+    def test_graphql_errors_nulls_and_transport_errors_do_not_retry_or_fallback(self):
+        for body in (b'{"errors":[{"type":"FORBIDDEN"}]}', b'{"data":{"reopenPullRequest":null}}', b'{}'):
+            transport = FakeTransport(HttpResponse(200, GRAPHQL_ENDPOINT, body))
+            with self.subTest(body=body), self.assertRaises((GraphQLError, InvalidResponseError)):
+                GitHubClient(None, transport).reopen_pull_request("PR_kwDOPull", "mutation-123")
+            self.assertEqual(len(transport.calls), 1)
+        class TimeoutTransport:
+            def __init__(self):
+                self.calls = []
+            def request(self, *args):
+                self.calls.append(args)
+                raise TimeoutError("secret")
+        transport = TimeoutTransport()
+        with self.assertRaises(TransportError):
+            GitHubClient(None, transport).close_pull_request("PR_kwDOPull", "mutation-123")
+        self.assertEqual(len(transport.calls), 1)
+
+
+class Wave11MergedPullRequestReadTests(unittest.TestCase):
+    def payload(self, **pull_overrides):
+        pull = {
+            "id": "PR_kwDOUId1T88AAAABHO6OqA", "databaseId": 4780363432, "number": 27,
+            "state": "CLOSED", "isDraft": False, "merged": True,
+            "mergedAt": "2026-10-08T10:11:12Z", "mergeCommit": {"oid": "a" * 40},
+            "headRefOid": "b" * 40, "baseRefOid": "c" * 40,
+            "headRefName": "g8/issue-first-federation-implementation", "baseRefName": "main",
+            "headRepository": {"id": "R_kgDOUId1Tw", "databaseId": 1351054671, "nameWithOwner": "swiftstream/skills"},
+            "baseRepository": {"id": "R_kgDOUId1Tw", "databaseId": 1351054671, "nameWithOwner": "swiftstream/skills"},
+        }
+        pull.update(pull_overrides)
+        return {"data": {"repository": {"id": "R_kgDOUId1Tw", "databaseId": 1351054671, "nameWithOwner": "swiftstream/skills", "pullRequest": pull}}}
+
+    def read(self, payload):
+        class EchoURLTransport:
+            def __init__(self): self.calls = []
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, headers, body, timeout))
+                return HttpResponse(200, url, json.dumps(payload).encode("utf-8"))
+        transport = EchoURLTransport()
+        client = GitHubClient(None, transport)
+        return client.get_merged_pull_request_metadata("swiftstream/skills", 27), transport
+
+    def test_exact_read_only_merged_pr_model(self):
+        result, transport = self.read(self.payload())
+        self.assertIs(type(result), MergedPullRequestMetadata)
+        self.assertEqual(result.repository_full_name, "swiftstream/skills")
+        self.assertEqual(result.pull_request_database_id, 4780363432)
+        self.assertEqual(result.merge_commit_oid, "a" * 40)
+        self.assertEqual(result.head_repository_node_id, "R_kgDOUId1Tw")
+        self.assertEqual(len(transport.calls), 1)
+        method, url, _headers, body, _timeout = transport.calls[0]
+        self.assertEqual(method, "POST")
+        request = json.loads(body)
+        self.assertEqual(request["query"], MERGED_PULL_REQUEST_QUERY)
+        self.assertEqual(request["variables"], {"owner": "swiftstream", "name": "skills", "number": 27})
+
+    def test_rejects_wrong_shape_types_and_noncanonical_metadata(self):
+        cases = (
+            {"number": True}, {"databaseId": True}, {"isDraft": 0}, {"merged": "true"},
+            {"mergeCommit": {"oid": "A" * 40}}, {"mergedAt": "2026-10-08T10:11:12+00:00"},
+            {"unexpected": "field"},
+        )
+        for override in cases:
+            with self.subTest(override=override), self.assertRaises(InvalidResponseError):
+                self.read(self.payload(**override))
+
+    def test_compare_commits_requires_exact_identity_and_merge_base(self):
+        base, head = "a" * 40, "b" * 40
+        response = {"base_commit": {"sha": base}, "merge_base_commit": {"sha": base}, "status": "ahead", "commits": [{"sha": head}]}
+        class CompareTransport:
+            def __init__(self, value): self.value, self.calls = value, []
+            def request(self, method, url, headers, body, timeout):
+                self.calls.append((method, url, headers, body, timeout))
+                return HttpResponse(200, url, json.dumps(self.value).encode("utf-8"))
+        transport = CompareTransport(response)
+        self.assertEqual(GitHubClient(None, transport).compare_commits("swiftstream/skills", base, head), ("ahead", base, base))
+        for invalid in (
+            {**response, "base_commit": {"sha": "c" * 40}},
+            {**response, "merge_base_commit": {"sha": "c" * 40}},
+            {**response, "status": "diverged"},
+            {**response, "commits": []},
+        ):
+            transport = CompareTransport(invalid)
+            with self.subTest(invalid=invalid), self.assertRaises(InvalidResponseError):
+                GitHubClient(None, transport).compare_commits("swiftstream/skills", base, head)
+
+
+class Wave12WorkflowReadSubstrateTests(unittest.TestCase):
+    repository = "swiftstream/skills"
+    workflow_id = 412345678
+
+    @staticmethod
+    def workflow_payload(**changes):
+        value = {
+            "id": Wave12WorkflowReadSubstrateTests.workflow_id,
+            "node_id": "W_kwDOExactWorkflow",
+            "name": "G8 Issue Intake",
+            "path": ".github/workflows/federation-g8-issue-intake.yml",
+            "state": "active",
+            "created_at": "2026-10-08T10:11:12Z",
+            "updated_at": "2026-10-09T10:11:12Z",
+            "url": "https://api.github.com/repos/swiftstream/skills/actions/workflows/412345678",
+            "html_url": "https://github.com/swiftstream/skills/actions/workflows/federation-g8-issue-intake.yml",
+            "badge_url": "https://github.com/swiftstream/skills/actions/workflows/federation-g8-issue-intake.yml/badge.svg",
+        }
+        value.update(changes)
+        return value
+
+    @staticmethod
+    def run_payload(run_id, *, workflow_id=None, status="completed", conclusion="success", attempt=1):
+        return {
+            "id": run_id,
+            "run_attempt": attempt,
+            "status": status,
+            "conclusion": conclusion,
+            "workflow_id": workflow_id if workflow_id is not None else Wave12WorkflowReadSubstrateTests.workflow_id,
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "head_sha": f"{run_id:040x}"[-40:],
+            "name": "ignored non-authority presentation field",
+        }
+
+    def test_workflow_metadata_exact_path_and_numeric_id_reads(self):
+        payload = self.workflow_payload()
+        response_body = json.dumps(payload).encode()
+        path_transport = FakeTransport(HttpResponse(
+            200,
+            REST_BASE_URL + "/repos/swiftstream/skills/actions/workflows/federation-g8-issue-intake.yml",
+            response_body,
+        ))
+        by_path = GitHubClient(None, path_transport).get_workflow_metadata_by_path(
+            self.repository,
+            ".github/workflows/federation-g8-issue-intake.yml",
+        )
+        self.assertIs(type(by_path), github_api_module.WorkflowMetadata)
+        self.assertEqual(by_path.id, self.workflow_id)
+        self.assertEqual(by_path.path, ".github/workflows/federation-g8-issue-intake.yml")
+        self.assertEqual(by_path.state, "active")
+        self.assertEqual(path_transport.calls[0][0], "GET")
+
+        id_transport = FakeTransport(HttpResponse(
+            200,
+            REST_BASE_URL + f"/repos/swiftstream/skills/actions/workflows/{self.workflow_id}",
+            response_body,
+        ))
+        by_id = GitHubClient(None, id_transport).get_workflow_metadata_by_id(self.repository, self.workflow_id)
+        self.assertEqual(by_id, by_path)
+
+    def test_workflow_metadata_rejects_shape_identity_state_and_path_ambiguity(self):
+        cases = (
+            {**self.workflow_payload(), "unexpected": 1},
+            {key: value for key, value in self.workflow_payload().items() if key != "badge_url"},
+            self.workflow_payload(id=True),
+            self.workflow_payload(state="unknown"),
+            self.workflow_payload(path=".github/workflows/nested/workflow.yml"),
+        )
+        for payload in cases:
+            with self.subTest(payload=payload), self.assertRaises((InvalidResponseError, GitHubAPIError)):
+                transport = FakeTransport(HttpResponse(
+                    200,
+                    REST_BASE_URL + "/repos/swiftstream/skills/actions/workflows/federation-g8-issue-intake.yml",
+                    json.dumps(payload).encode(),
+                ))
+                GitHubClient(None, transport).get_workflow_metadata_by_path(
+                    self.repository,
+                    ".github/workflows/federation-g8-issue-intake.yml",
+                )
+        with self.assertRaises(GitHubAPIError):
+            GitHubClient(None, FakeTransport(None)).get_workflow_metadata_by_path(
+                self.repository,
+                ".github/workflows/nested/workflow.yml",
+            )
+
+    def test_workflow_run_inventory_is_bounded_typed_and_preserves_nonterminal_status(self):
+        payload = {
+            "total_count": 2,
+            "workflow_runs": [
+                self.run_payload(101),
+                self.run_payload(102, status="in_progress", conclusion=None, attempt=2),
+            ],
+        }
+        url = REST_BASE_URL + f"/repos/swiftstream/skills/actions/workflows/{self.workflow_id}/runs?per_page=100&page=1"
+        transport = FakeTransport(HttpResponse(200, url, json.dumps(payload).encode()))
+        runs = GitHubClient(None, transport).list_workflow_runs(self.repository, self.workflow_id)
+        self.assertEqual([run.id for run in runs], [101, 102])
+        self.assertEqual(runs[1].run_attempt, 2)
+        self.assertEqual(runs[1].status, "in_progress")
+        self.assertIsNone(runs[1].conclusion)
+        self.assertTrue(any(run.status != "completed" for run in runs))
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_workflow_run_inventory_paginates_and_requires_declared_total(self):
+        first = [self.run_payload(index + 1) for index in range(100)]
+        second = [self.run_payload(101)]
+        base = REST_BASE_URL + f"/repos/swiftstream/skills/actions/workflows/{self.workflow_id}/runs?per_page=100&page="
+        transport = SequenceTransport([
+            HttpResponse(200, base + "1", json.dumps({"total_count": 101, "workflow_runs": first}).encode()),
+            HttpResponse(200, base + "2", json.dumps({"total_count": 101, "workflow_runs": second}).encode()),
+        ])
+        runs = GitHubClient(None, transport).list_workflow_runs(self.repository, self.workflow_id, max_pages=2)
+        self.assertEqual(len(runs), 101)
+        self.assertEqual(len(transport.calls), 2)
+
+        exhausted = FakeTransport(HttpResponse(
+            200,
+            base + "1",
+            json.dumps({"total_count": 101, "workflow_runs": first}).encode(),
+        ))
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, exhausted).list_workflow_runs(self.repository, self.workflow_id, max_pages=1)
+
+        short = FakeTransport(HttpResponse(
+            200,
+            base + "1",
+            json.dumps({"total_count": 3, "workflow_runs": first[:2]}).encode(),
+        ))
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, short).list_workflow_runs(self.repository, self.workflow_id)
+
+    def test_workflow_run_inventory_rejects_malformed_unknown_and_mismatched_runs(self):
+        url = REST_BASE_URL + f"/repos/swiftstream/skills/actions/workflows/{self.workflow_id}/runs?per_page=100&page=1"
+        cases = (
+            {"total_count": True, "workflow_runs": []},
+            {"total_count": 1, "workflow_runs": [self.run_payload(1, workflow_id=self.workflow_id + 1)]},
+            {"total_count": 1, "workflow_runs": [self.run_payload(1, status="mystery")]},
+            {"total_count": 1, "workflow_runs": [self.run_payload(1, conclusion="mystery")]},
+            {"total_count": 1, "workflow_runs": [{key: value for key, value in self.run_payload(1).items() if key != "run_attempt"}]},
+        )
+        for payload in cases:
+            with self.subTest(payload=payload), self.assertRaises(InvalidResponseError):
+                transport = FakeTransport(HttpResponse(200, url, json.dumps(payload).encode()))
+                GitHubClient(None, transport).list_workflow_runs(self.repository, self.workflow_id)
+        duplicate = {
+            "total_count": 2,
+            "workflow_runs": [self.run_payload(1), self.run_payload(1, attempt=2)],
+        }
+        with self.assertRaises(InvalidResponseError):
+            transport = FakeTransport(HttpResponse(200, url, json.dumps(duplicate).encode()))
+            GitHubClient(None, transport).list_workflow_runs(self.repository, self.workflow_id)
+
+    def test_deleted_workflow_id_not_found_remains_typed_not_found(self):
+        url = REST_BASE_URL + f"/repos/swiftstream/skills/actions/workflows/{self.workflow_id}/runs?per_page=100&page=1"
+        transport = FakeTransport(HttpResponse(404, url, b'{"message":"Not Found"}'))
+        with self.assertRaises(NotFoundError):
+            GitHubClient(None, transport).list_workflow_runs(self.repository, self.workflow_id)
+
+    def test_optional_ref_maps_only_exact_404_to_absence(self):
+        branch = "bot/federation-g8-activation"
+        url = REST_BASE_URL + "/repos/swiftstream/skills/git/ref/heads/bot/federation-g8-activation"
+        missing = FakeTransport(HttpResponse(404, url, b'{"message":"Not Found"}'))
+        self.assertIsNone(GitHubClient(None, missing).get_optional_ref_oid(self.repository, branch))
+
+        forbidden = FakeTransport(HttpResponse(403, url, b'{"message":"Forbidden"}'))
+        with self.assertRaises(ForbiddenError):
+            GitHubClient(None, forbidden).get_optional_ref_oid(self.repository, branch)
+
+        server = FakeTransport(HttpResponse(503, url, b'{"message":"Unavailable"}'))
+        with self.assertRaises(ServerError):
+            GitHubClient(None, server).get_optional_ref_oid(self.repository, branch)
+
+        present = FakeTransport(HttpResponse(
+            200, url, json.dumps({"object": {"sha": "a" * 40}}).encode(),
+        ))
+        self.assertEqual(
+            GitHubClient(None, present).get_optional_ref_oid(self.repository, branch),
+            "a" * 40,
+        )
+
+        malformed = FakeTransport(HttpResponse(200, url, b'{"object":{}}'))
+        with self.assertRaises(InvalidResponseError):
+            GitHubClient(None, malformed).get_optional_ref_oid(self.repository, branch)
 
 
 if __name__ == "__main__":

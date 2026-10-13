@@ -5,12 +5,15 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from automation.federation.controller import (
+    AppMetadata,
+    BotMetadata,
     AppIdentity,
     MachinePRAuthority,
     MachineReconcileResult,
     ProposalCandidate,
     R02Controller,
     R02Error,
+    IssueManagedRouteResult,
     parse_repository_id_hint,
     validate_machine_generated_scope,
     TrustedValidationResult,
@@ -18,8 +21,8 @@ from automation.federation.controller import (
     render_check_run_output,
     verify_machine_check_identity,
 )
-from automation.federation.github_api import CheckRun, GitHubClient, GitTreeEntry, HttpResponse, IssueComment, NotFoundError, PullRequestMetadata, RepositoryMetadata, RefCASConflict
-from automation.federation.request_model import ANCHOR_MARKER, RequestClass, RequestAnchor, body_sha256, parse_request_body
+from automation.federation.github_api import CheckRun, CommitStatus, GitCommitIdentity, GitCommitObject, GitHubAPIError, GitHubClient, GitTreeEntry, HttpResponse, IssueComment, NotFoundError, PullRequestMetadata, RepositoryMetadata, RefCASConflict
+from automation.federation.request_model import ANCHOR_MARKER, ActivationBoundaryEvidence, CarrierRole, ClaimedHeadMarker, IssuePRBinding, LegacyClassificationOutcome, LegacyClassificationResult, LegacyQuarantineClass, LegacyQuarantineEvidence, RequestClass, RequestAnchor, activation_boundary_id_digest, body_sha256, claim_generation_id, machine_ref_claim_authority_digest, parse_request_body
 from scripts import federate as c02
 import automation.federation.controller as controller_module
 
@@ -29,6 +32,10 @@ class ReconcileClient:
         self.main = "a" * 40
         self.refs = []
         self.dispatches = []
+        self.ref_values = {}
+        self.commit_objects = {}
+        self.pull_requests = {}
+        self.identity = GitCommitIdentity("Bot", "bot@example.test", "2026-10-08T00:00:00Z")
 
     def get_repository_metadata(self, repository):
         return RepositoryMetadata(7, "R_central", repository, "main")
@@ -36,23 +43,99 @@ class ReconcileClient:
     def get_ref_oid(self, repository, branch):
         if branch == "main":
             return self.main
+        if branch in self.ref_values:
+            return self.ref_values[branch]
         raise NotFoundError("missing ref")
 
+    def get_app_metadata(self, slug):
+        return AppMetadata(1, slug, "A")
+
+    def get_bot_metadata(self, slug):
+        return BotMetadata(2, "app[bot]", getattr(self, "bot_node_id", "U"), "Bot")
+
+    def get_git_commit_object(self, repository, sha):
+        if sha in self.commit_objects:
+            return self.commit_objects[sha]
+        if sha == self.main:
+            return GitCommitObject(sha, "base\n", "b" * 40, (), self.identity, self.identity)
+        raise NotFoundError("unknown commit")
+
     def list_open_pull_requests(self, repository):
-        return ()
+        return tuple({"number": number} for number in sorted(self.pull_requests))
+
+    def get_pull_request_metadata(self, repository, number):
+        return self.pull_requests[number]
 
     def update_refs(self, repository_id, updates):
         self.refs.extend(updates)
+        for update in updates:
+            branch = update.name.removeprefix("refs/heads/")
+            self.ref_values[branch] = update.after_oid
+            self.pull_requests = {
+                number: replace(pr, head_oid=update.after_oid)
+                if pr.head_ref == branch else pr
+                for number, pr in self.pull_requests.items()
+            }
 
     def create_machine_pull_request(self, repository, **kwargs):
         self.created_pr = kwargs
-        return 41
+        number = 41
+        self.pull_requests[number] = PullRequestMetadata(
+            number, "PR_node", "U", "app[bot]", self.ref_values[kwargs["head"]], self.main,
+            kwargs["head"], kwargs["base"], "R_central", repository, "R_central", repository,
+            None, False, False,
+        )
+        return number
 
     def dispatch_workflow(self, repository, workflow, ref, inputs=None):
         self.dispatches.append((workflow, ref, inputs))
 
 
 class ReconcileTests(unittest.TestCase):
+    def setUp(self):
+        self._public_source_patch = patch.object(
+            controller_module, "read_public_source_metadata",
+            return_value=controller_module.PublicSourceMetadata(99, "Owner/Repo", "main", None),
+        )
+        self._scope_patch = patch.object(
+            controller_module, "validate_machine_generated_scope",
+            side_effect=lambda client, _repository, _base, head: getattr(client, "machine_changed_paths", {}).get(head, ("skills/demo/SKILL.md",)),
+        )
+        self._public_source_patch.start()
+        self._scope_patch.start()
+
+    def tearDown(self):
+        self._scope_patch.stop()
+        self._public_source_patch.stop()
+
+    def _candidate(self, client, source, commit_sha, changed_paths, *, tree_sha="e" * 40, nonce="4" * 64):
+        central = client.get_repository_metadata("swiftstream/skills").node_id
+        owner = f"{central}:{source.source_id}"
+        paths = tuple(sorted(changed_paths, key=lambda item: item.encode("utf-8")))
+        scope = __import__("hashlib").sha256(
+            b"swiftstream-federation-machine-ref-claim-scope:v1\n"
+            + json.dumps({"schemaVersion": 1, "candidateTreeSha": tree_sha, "changedPaths": list(paths)}, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        authority = machine_ref_claim_authority_digest(
+            central_repository_node_id=central, owner_key=owner, source_id=source.source_id,
+            source_repository_id=source.repository_id,
+            machine_ref=f"refs/heads/bot/federation/{source.source_id}",
+            accepted_base_sha=client.main, accepted_base_tree_sha="b" * 40,
+            candidate_tree_sha=tree_sha, candidate_scope_digest=scope,
+        )
+        generation = claim_generation_id(
+            authority_preimage_digest=authority, carrier_nonce=nonce,
+            central_repository_node_id=central, owner_key=owner,
+            from_head_sha=client.main, from_tree_sha="b" * 40,
+            claim_kind="MACHINE_REF_CLAIM", role="MACHINE_PUBLICATION",
+            owner_kind="MACHINE_SOURCE", transition_kind="MACHINE_PUBLICATION",
+        )
+        marker = ClaimedHeadMarker("MACHINE_REF_CLAIM", CarrierRole.MACHINE_PUBLICATION.value, "MACHINE_SOURCE", owner, generation, nonce, "MACHINE_PUBLICATION")
+        client.commit_objects[commit_sha] = GitCommitObject(commit_sha, marker.render(), tree_sha, (client.main,), client.identity, client.identity)
+        client.machine_changed_paths = getattr(client, "machine_changed_paths", {})
+        client.machine_changed_paths[commit_sha] = paths
+        return ProposalCandidate(commit_sha, client.main, paths, RequestClass.MACHINE_PUBLICATION, source.source_id, source.repository_id, True, marker, tree_sha)
+
     def _manual_reconcile_fixture(self, *, accepted=True, edited=False, fork=False):
         body = "Repository URL:\nhttps://github.com/Owner/Repo\n"
         current = "a" * 40
@@ -63,7 +146,7 @@ class ReconcileTests(unittest.TestCase):
         class ManualClient(ReconcileClient):
             def __init__(self):
                 super().__init__()
-                self.pr = PullRequestMetadata(7, body, "U_author", "alice", "d" * 40, current, "request", "main", "R_central" if not fork else "R_fork", "swiftstream/skills" if not fork else "someone/fork", "R_central", "swiftstream/skills", "2026-01-01" if edited else None, edited)
+                self.pr = PullRequestMetadata(7, body, "U_author", "alice", "d" * 40, current, "request", "main", "R_central" if not fork else "R_fork", "swiftstream/skills" if not fork else "someone/fork", "R_central", "swiftstream/skills", "2026-01-01" if edited else None, edited, False)
                 self.comments = [] if edited else [anchor_comment]
                 self.states = []
 
@@ -82,6 +165,7 @@ class ReconcileTests(unittest.TestCase):
                 self.states.append((number, state))
 
         client = ManualClient()
+        client.bot_node_id = "U_bot"
         source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U_bot", "app[bot]"))
         controller._accepted_sources = lambda _main=None: (source,) if accepted else ()
@@ -106,7 +190,7 @@ class ReconcileTests(unittest.TestCase):
     def test_changed_source_uses_zero_before_oid_and_global_finalizer_wake(self):
         client = ReconcileClient()
         source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
-        candidate = ProposalCandidate("d" * 40, client.main, ("README.md", "federation.lock.json"), RequestClass.MACHINE_PUBLICATION, "demo", 99)
+        candidate = self._candidate(client, source, "d" * 40, ("README.md", "federation.lock.json"))
         builder = type("Builder", (), {"machine_candidate": lambda _self, base, source_id: candidate})()
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U", "app[bot]"), candidate_builder=builder)
         controller._accepted_sources = lambda _main=None: (source,)
@@ -114,7 +198,563 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(result.outcome, "CHANGED")
         self.assertEqual(client.refs[0].before_oid, "0" * 40)
         self.assertFalse(client.refs[0].force)
-        self.assertEqual(client.dispatches[-1][0], "federation-state-finalize.yml")
+        self.assertEqual(client.dispatches[-1][0], "federation-g8-state-finalize.yml")
+
+    def test_response_lost_after_persisted_h_and_full_restart_reuses_same_generation(self):
+        class LostResponse(ReconcileClient):
+            def __init__(self):
+                super().__init__()
+                self.updates = []
+            def update_refs(self, repository_id, updates):
+                self.updates.extend(updates)
+                super().update_refs(repository_id, updates)
+                raise GitHubAPIError("accepted CAS response lost")
+
+        client = LostResponse()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
+        builds = []
+        class Builder:
+            def machine_candidate(_self, base, source_id):
+                builds.append((base, source_id))
+                return candidate
+            def validate_machine_head(_self, _base, _source_id, _head):
+                return True, "MATCHES"
+        controller, _ = self._controller_with_source(client, source, Builder())
+        first = controller.reconcile(99)
+        self.assertEqual(first.outcome, "CHANGED")
+        self.assertEqual(len(client.updates), 1)
+        self.assertEqual(client.updates[0].after_oid, candidate.commit_sha)
+        generation = candidate.claimed_head_marker.claim_generation_id
+        nonce = candidate.claimed_head_marker.carrier_nonce
+
+        # New invocation has no prior B or generation memory; the current H
+        # and its exact marker are sufficient to recover/create the PR.
+        second = controller.reconcile(99)
+        self.assertEqual(second.outcome, "NOOP")
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(client.ref_values["bot/federation/demo"], candidate.commit_sha)
+        self.assertEqual(candidate.claimed_head_marker.claim_generation_id, generation)
+        self.assertEqual(candidate.claimed_head_marker.carrier_nonce, nonce)
+
+    def test_restart_after_cas_before_pr_creation_recovers_existing_h_without_generation(self):
+        client = ReconcileClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
+        client.ref_values["bot/federation/demo"] = candidate.commit_sha
+        class RecoveryOnlyBuilder:
+            def machine_candidate(_self, *_args):
+                self.fail("persisted H must be recovered without generating H3")
+            def validate_machine_head(_self, _base, _source_id, head_sha):
+                self.assertEqual(head_sha, candidate.commit_sha)
+                return True, "MATCHES"
+        controller, _ = self._controller_with_source(client, source, RecoveryOnlyBuilder())
+        result = controller.reconcile(99)
+        self.assertEqual(result.outcome, "CHANGED")
+        self.assertEqual(client.refs, [])
+        self.assertEqual(client.pull_requests[41].head_oid, candidate.commit_sha)
+        self.assertEqual(client.ref_values["bot/federation/demo"], candidate.commit_sha)
+
+    def test_ambiguous_unchanged_ref_retries_exact_same_cas_once(self):
+        class RetryClient(ReconcileClient):
+            def __init__(self):
+                super().__init__()
+                self.updates = []
+            def update_refs(self, repository_id, updates):
+                self.updates.extend(updates)
+                if len(self.updates) == 1:
+                    raise GitHubAPIError("CAS outcome ambiguous")
+                super().update_refs(repository_id, updates)
+
+        client = RetryClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
+        builds = []
+        class Builder:
+            def machine_candidate(_self, base, source_id):
+                builds.append((base, source_id))
+                return candidate
+        controller, _ = self._controller_with_source(client, source, Builder())
+        result = controller.reconcile(99)
+        self.assertEqual(result.outcome, "CHANGED")
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(client.updates, [client.updates[0], client.updates[0]])
+        self.assertEqual(client.updates[0].before_oid, "0" * 40)
+        self.assertEqual(client.updates[0].after_oid, candidate.commit_sha)
+
+    def test_ambiguous_retry_guard_rejection_stops_before_second_cas(self):
+        class AmbiguousClient(ReconcileClient):
+            def __init__(self):
+                super().__init__()
+                self.updates = []
+            def update_refs(self, _repository_id, updates):
+                self.updates.extend(updates)
+                raise GitHubAPIError("CAS outcome ambiguous")
+
+        client = AmbiguousClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
+        builder = type("Builder", (), {"machine_candidate": lambda _self, _base, _source_id: candidate})()
+        controller, _ = self._controller_with_source(client, source, builder)
+        guard_calls = []
+
+        def guard():
+            guard_calls.append(None)
+            if len(guard_calls) == 2:
+                raise R02Error("Task02 mutation authority became stale")
+
+        result = controller.reconcile(99, pre_mutation_guard=guard, dispatch_finalizer=False)
+
+        self.assertEqual(result.outcome, "FAIL")
+        self.assertEqual(len(guard_calls), 2)
+        self.assertEqual(len(client.updates), 1)
+        self.assertEqual(client.updates[0].before_oid, "0" * 40)
+        self.assertEqual(client.updates[0].after_oid, candidate.commit_sha)
+        self.assertEqual(client.ref_values, {})
+        self.assertEqual(client.refs, [])
+        self.assertFalse(hasattr(client, "created_pr"))
+        self.assertEqual(client.dispatches, [])
+
+    def test_ambiguous_retry_exhaustion_does_not_create_h3_or_new_nonce(self):
+        class StuckClient(ReconcileClient):
+            def __init__(self):
+                super().__init__()
+                self.updates = []
+            def update_refs(self, _repository_id, updates):
+                self.updates.extend(updates)
+                raise GitHubAPIError("CAS outcome unresolved")
+
+        client = StuckClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
+        builds = []
+        class Builder:
+            def machine_candidate(_self, base, source_id):
+                builds.append((base, source_id))
+                return candidate
+        controller, _ = self._controller_with_source(client, source, Builder())
+        result = controller.reconcile(99)
+        self.assertEqual((result.outcome, result.reason), ("FAIL", "MACHINE_AMBIGUOUS_RETRY_EXHAUSTED"))
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(len(client.updates), 2)
+        self.assertEqual(client.updates[0], client.updates[1])
+        self.assertFalse(hasattr(client, "created_pr"))
+
+    def test_reported_cas_success_with_third_ref_is_contradiction(self):
+        class ContradictorySuccessClient(ReconcileClient):
+            def __init__(self):
+                super().__init__()
+                self.updates = []
+            def update_refs(self, _repository_id, updates):
+                self.updates.extend(updates)
+                # Simulate a successful API response while a distinct valid
+                # generation owns the ref, proving this H did not win.
+                self.ref_values[updates[0].name.removeprefix("refs/heads/")] = "e" * 40
+
+        client = ContradictorySuccessClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
+        self._candidate(client, source, "e" * 40, ("README.md",), nonce="5" * 64)
+        builds = []
+        class Builder:
+            def machine_candidate(_self, base, source_id):
+                builds.append((base, source_id))
+                return candidate
+        controller, _ = self._controller_with_source(client, source, Builder())
+        result = controller.reconcile(99)
+        self.assertEqual((result.outcome, result.reason), ("FAIL", "MACHINE_CAS_SUCCESS_REF_CONTRADICTION"))
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(len(client.updates), 1)
+        self.assertEqual(client.updates[0].before_oid, "0" * 40)
+        self.assertFalse(hasattr(client, "created_pr"))
+
+    def test_ambiguous_unchanged_ref_with_changed_main_stops_without_retry(self):
+        class ChangedMainClient(ReconcileClient):
+            def __init__(self):
+                super().__init__()
+                self.updates = []
+            def update_refs(self, _repository_id, updates):
+                self.updates.extend(updates)
+                self.main = "f" * 40
+                raise GitHubAPIError("CAS response ambiguous; main advanced")
+
+        client = ChangedMainClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
+        builds = []
+        class Builder:
+            def machine_candidate(_self, base, source_id):
+                builds.append((base, source_id))
+                return candidate
+        controller, _ = self._controller_with_source(client, source, Builder())
+        result = controller.reconcile(99)
+        self.assertEqual((result.outcome, result.reason), ("FAIL", "MACHINE_AMBIGUOUS_AUTHORITY_CHANGED"))
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(len(client.updates), 1)
+        self.assertEqual(client.updates[0].after_oid, candidate.commit_sha)
+        self.assertFalse(hasattr(client, "created_pr"))
+
+    def test_persisted_h_with_changed_accepted_main_is_not_replaced(self):
+        class AdvancingMainClient(ReconcileClient):
+            def __init__(self):
+                super().__init__()
+                self.updates = []
+            def update_refs(self, repository_id, updates):
+                self.updates.extend(updates)
+                super().update_refs(repository_id, updates)
+                self.main = "f" * 40
+
+        client = AdvancingMainClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
+        builds = []
+        class Builder:
+            def machine_candidate(_self, base, source_id):
+                builds.append((base, source_id))
+                return candidate
+        controller, _ = self._controller_with_source(client, source, Builder())
+        result = controller.reconcile(99)
+        self.assertEqual((result.outcome, result.reason), ("FAIL", "MACHINE_PERSISTED_GENERATION_AUTHORITY_STALE"))
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(len(client.updates), 1)
+        self.assertEqual(client.ref_values["bot/federation/demo"], candidate.commit_sha)
+        self.assertFalse(hasattr(client, "created_pr"))
+
+    def test_ref_b_changed_after_generation_prevents_stale_cas(self):
+        client = ReconcileClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        losing = self._candidate(client, source, "c" * 40, ("README.md",), nonce="4" * 64)
+        competitor = self._candidate(client, source, "d" * 40, ("README.md",), nonce="5" * 64)
+        successor = self._candidate(client, source, "e" * 40, ("README.md",), nonce="6" * 64)
+        candidates = [losing, successor]
+        builds = []
+        class Builder:
+            def machine_candidate(_self, base, source_id):
+                builds.append((base, source_id))
+                if len(builds) == 1:
+                    # A competing valid generation lands after B was read but
+                    # before the first candidate's exact CAS.
+                    client.ref_values["bot/federation/demo"] = competitor.commit_sha
+                return candidates[len(builds) - 1]
+            def validate_machine_head(_self, _base, _source_id, _head):
+                return False, "NEW_SUCCESSOR_REQUIRED"
+        controller, _ = self._controller_with_source(client, source, Builder())
+        result = controller.reconcile(99)
+        self.assertEqual(result.outcome, "CHANGED")
+        self.assertEqual(len(builds), 2)
+        self.assertEqual(len(client.refs), 1)
+        self.assertEqual(client.refs[0].before_oid, competitor.commit_sha)
+        self.assertEqual(client.refs[0].after_oid, successor.commit_sha)
+        self.assertNotEqual(client.refs[0].after_oid, losing.commit_sha)
+
+    def test_legacy_machine_h_migrates_to_fresh_h2_with_exact_before_cas(self):
+        client = ReconcileClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        legacy_head = "c" * 40
+        client.ref_values["bot/federation/demo"] = legacy_head
+        client.commit_objects[legacy_head] = GitCommitObject(
+            legacy_head, "Swift Stream federation machine publication\n", "d" * 40,
+            (client.main,), client.identity, client.identity,
+        )
+        client.pull_requests[40] = PullRequestMetadata(
+            40, "PR_node", "U", "app[bot]", legacy_head, client.main,
+            "bot/federation/demo", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+        candidate = self._candidate(client, source, "e" * 40, ("README.md",), nonce="5" * 64)
+        builder = type("Builder", (), {
+            "machine_candidate": lambda _self, _base, _source_id: candidate,
+            "validate_machine_head": lambda _self, _base, _source_id, _head: (True, "MATCHES"),
+        })()
+        controller, _ = self._controller_with_source(client, source, builder)
+        boundary_id = activation_boundary_id_digest("R_central", 27, 100, "PR_node", "f" * 40, "1" * 64, "2" * 64)
+        boundary = ActivationBoundaryEvidence(1, "R_central", 27, 100, "PR_node", "f" * 40, "f" * 40, "1" * 64, "2" * 64, boundary_id)
+        legacy_evidence = LegacyQuarantineEvidence(1, LegacyQuarantineClass.MACHINE, 7, "R_central", "swiftstream/skills", legacy_head, "f" * 64)
+        classification = LegacyClassificationResult(LegacyClassificationOutcome.QUARANTINE, legacy_evidence, "EXACT_LEGACY_MACHINE")
+        original_resolver = controller.resolve_current_sha_carrier_role
+        controller.resolve_current_sha_carrier_role = lambda sha: (
+            controller_module.ShaCarrierResolution(controller_module.CarrierActivation.LEGACY_CUTOVER_QUARANTINE)
+            if sha == legacy_head else original_resolver(sha)
+        )
+        controller.derive_activation_boundary_evidence = lambda: boundary
+        controller.classify_legacy_head = lambda _sha, *, implementation_reviewed_head_sha: classification
+        failures = []
+        controller.publish_legacy_failure = lambda head, activation_id, *, implementation_reviewed_head_sha: failures.append((head, activation_id, implementation_reviewed_head_sha))
+
+        result = controller.reconcile(99)
+        self.assertEqual(result.outcome, "CHANGED")
+        self.assertEqual(failures, [(legacy_head, boundary_id, "f" * 40)])
+        self.assertEqual(client.refs[0].before_oid, legacy_head)
+        self.assertEqual(client.refs[0].after_oid, candidate.commit_sha)
+        self.assertTrue(client.refs[0].force)
+        self.assertEqual(client.commit_objects[legacy_head].message, "Swift Stream federation machine publication\n")
+        self.assertNotEqual(candidate.claimed_head_marker.carrier_nonce, "4" * 64)
+        self.assertEqual(client.pull_requests[40].head_oid, candidate.commit_sha)
+
+    def test_machine_claim_candidate_mints_fresh_v2_head_for_empty_file_diff(self):
+        source = c02.SourceDeclaration(
+            "demo", "Owner/Repo", 99, "skills", "Demo",
+            (c02.LineDeclaration("refs/heads/main", ("demo",)),),
+        )
+
+        class ClaimClient:
+            def __init__(self):
+                self.tree_calls = 0
+                self.commit_calls = []
+
+            def get_commit_tree(self, repository, sha):
+                self.assertion = (repository, sha)
+                return "b" * 40, ()
+
+            def bot_commit_timestamp_after(self, repository, sha):
+                return "2026-10-10T00:00:01Z"
+
+            def create_tree(self, *_args, **_kwargs):
+                self.tree_calls += 1
+                raise AssertionError("empty-diff claim migration must reuse the exact base tree")
+
+            def create_commit(self, repository, message, tree, parents, *, timestamp=None):
+                self.commit_calls.append((repository, message, tree, tuple(parents), timestamp))
+                return type("GitObject", (), {"sha": "e" * 40})()
+
+        client = ClaimClient()
+        builder = controller_module.C02CandidateBuilder(
+            client,
+            "swiftstream/skills",
+            trusted_checkout_sha="a" * 40,
+        )
+        builder._machine_plan = lambda base, source_id: (
+            {},
+            {},
+            source,
+            RepositoryMetadata(7, "R_central", "swiftstream/skills", "main"),
+        )
+        with patch.object(controller_module, "new_carrier_nonce", return_value="5" * 64):
+            candidate = builder.machine_claim_candidate("a" * 40, "demo")
+
+        self.assertEqual(candidate.changed_paths, ())
+        self.assertTrue(candidate.marker_present)
+        self.assertEqual(candidate.commit_sha, "e" * 40)
+        self.assertEqual(candidate.candidate_tree_sha, "b" * 40)
+        self.assertEqual(candidate.claimed_head_marker.carrier_nonce, "5" * 64)
+        self.assertEqual(candidate.claimed_head_marker.claim_kind, "MACHINE_REF_CLAIM")
+        self.assertEqual(candidate.claimed_head_marker.role, "MACHINE_PUBLICATION")
+        self.assertEqual(client.tree_calls, 0)
+        self.assertEqual(client.commit_calls[0][2], "b" * 40)
+        self.assertEqual(client.commit_calls[0][3], ("a" * 40,))
+
+    def test_legacy_machine_byte_identical_tree_still_migrates_to_fresh_claimed_h2(self):
+        client = ReconcileClient()
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        legacy_head = "c" * 40
+        client.ref_values["bot/federation/demo"] = legacy_head
+        client.commit_objects[legacy_head] = GitCommitObject(
+            legacy_head, "Swift Stream federation machine publication\n", "b" * 40,
+            (client.main,), client.identity, client.identity,
+        )
+        client.pull_requests[40] = PullRequestMetadata(
+            40, "PR_node", "U", "app[bot]", legacy_head, client.main,
+            "bot/federation/demo", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+        claimed = self._candidate(
+            client,
+            source,
+            "e" * 40,
+            (),
+            tree_sha="b" * 40,
+            nonce="5" * 64,
+        )
+        ordinary_noop = ProposalCandidate(
+            client.main,
+            client.main,
+            (),
+            RequestClass.MACHINE_PUBLICATION,
+            source.source_id,
+            source.repository_id,
+            False,
+        )
+        builder = type("Builder", (), {
+            "machine_candidate": lambda _self, _base, _source_id: ordinary_noop,
+            "machine_claim_candidate": lambda _self, _base, _source_id: claimed,
+            "validate_machine_head": lambda _self, _base, _source_id, _head: (True, "MATCHES"),
+        })()
+        controller, _ = self._controller_with_source(client, source, builder)
+        boundary_id = activation_boundary_id_digest("R_central", 27, 100, "PR_node", "f" * 40, "1" * 64, "2" * 64)
+        boundary = ActivationBoundaryEvidence(1, "R_central", 27, 100, "PR_node", "f" * 40, "f" * 40, "1" * 64, "2" * 64, boundary_id)
+        legacy_evidence = LegacyQuarantineEvidence(
+            1, LegacyQuarantineClass.MACHINE, 7, "R_central",
+            "swiftstream/skills", legacy_head, "f" * 64,
+        )
+        classification = LegacyClassificationResult(
+            LegacyClassificationOutcome.QUARANTINE,
+            legacy_evidence,
+            "EXACT_LEGACY_MACHINE",
+        )
+        original_resolver = controller.resolve_current_sha_carrier_role
+        controller.resolve_current_sha_carrier_role = lambda sha: (
+            controller_module.ShaCarrierResolution(controller_module.CarrierActivation.LEGACY_CUTOVER_QUARANTINE)
+            if sha == legacy_head else original_resolver(sha)
+        )
+        controller.derive_activation_boundary_evidence = lambda: boundary
+        controller.classify_legacy_head = lambda _sha, *, implementation_reviewed_head_sha: classification
+        controller.publish_legacy_failure = lambda *_args, **_kwargs: None
+
+        result = controller.reconcile(99)
+
+        self.assertEqual(result.outcome, "CHANGED")
+        self.assertEqual(len(client.refs), 1)
+        self.assertEqual(client.refs[0].before_oid, legacy_head)
+        self.assertEqual(client.refs[0].after_oid, claimed.commit_sha)
+        self.assertNotEqual(client.refs[0].after_oid, legacy_head)
+        self.assertEqual(claimed.changed_paths, ())
+        self.assertTrue(claimed.marker_present)
+        self.assertIsNotNone(claimed.claimed_head_marker)
+        self.assertEqual(client.pull_requests[40].head_oid, claimed.commit_sha)
+
+    def test_legacy_machine_reconcile_accepts_exact_preconfirmed_failure_receipt_without_duplicate_post(self):
+        client = ReconcileClient()
+        source = c02.SourceDeclaration(
+            "demo", "Owner/Repo", 99, "skills", "Demo",
+            (c02.LineDeclaration("refs/heads/main", ("demo",)),),
+        )
+        legacy_head = "c" * 40
+        client.ref_values["bot/federation/demo"] = legacy_head
+        client.commit_objects[legacy_head] = GitCommitObject(
+            legacy_head, "Swift Stream federation machine publication\n", "d" * 40,
+            (client.main,), client.identity, client.identity,
+        )
+        client.pull_requests[40] = PullRequestMetadata(
+            40, "PR_node", "U", "app[bot]", legacy_head, client.main,
+            "bot/federation/demo", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+        candidate = self._candidate(client, source, "e" * 40, ("README.md",), nonce="5" * 64)
+        builder = type("Builder", (), {
+            "machine_candidate": lambda _self, _base, _source_id: candidate,
+            "machine_claim_candidate": lambda _self, _base, _source_id: candidate,
+            "validate_machine_head": lambda _self, _base, _source_id, _head: (True, "MATCHES"),
+        })()
+        controller, _ = self._controller_with_source(client, source, builder)
+        boundary_id = activation_boundary_id_digest(
+            "R_central", 27, 100, "PR_node",
+            "f" * 40, "1" * 64, "2" * 64,
+        )
+        boundary = ActivationBoundaryEvidence(
+            1, "R_central", 27, 100, "PR_node",
+            "f" * 40, "f" * 40, "1" * 64, "2" * 64, boundary_id,
+        )
+        legacy_evidence = LegacyQuarantineEvidence(
+            1, LegacyQuarantineClass.MACHINE, 7, "R_central",
+            "swiftstream/skills", legacy_head, "f" * 64,
+        )
+        classification = LegacyClassificationResult(
+            LegacyClassificationOutcome.QUARANTINE,
+            legacy_evidence,
+            "EXACT_LEGACY_MACHINE",
+        )
+        original_resolver = controller.resolve_current_sha_carrier_role
+        controller.resolve_current_sha_carrier_role = lambda sha: (
+            controller_module.ShaCarrierResolution(
+                controller_module.CarrierActivation.LEGACY_CUTOVER_QUARANTINE,
+            )
+            if sha == legacy_head else original_resolver(sha)
+        )
+        controller.derive_activation_boundary_evidence = lambda: boundary
+        controller.classify_legacy_head = lambda _sha, *, implementation_reviewed_head_sha: classification
+
+        digest = controller_module.legacy_status_evidence_digest(
+            legacy_evidence,
+            boundary_id,
+        )
+        description = controller_module.render_status_description(
+            controller_module.StatusClass.LEGACY,
+            digest,
+        )
+        status = CommitStatus(
+            77,
+            "CS_77",
+            "failure",
+            "federation/trusted-validation",
+            description,
+            None,
+            controller.app.bot_id,
+            controller.app.bot_node_id,
+            controller.app.bot_login,
+            "Bot",
+            "2026-10-10T00:00:00Z",
+            "2026-10-10T00:00:00Z",
+        )
+        receipt = controller_module.StatusWriteReceipt(
+            "swiftstream/skills",
+            legacy_head,
+            "POST",
+            f"/repos/swiftstream/skills/statuses/{legacy_head}",
+            "failure",
+            "federation/trusted-validation",
+            description,
+            None,
+            status,
+        )
+        controller.publish_legacy_failure = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("preconfirmed receipt must suppress duplicate legacy failure POST")
+        )
+
+        result = controller.reconcile(
+            99,
+            legacy_failure_receipt=receipt,
+        )
+        self.assertEqual(result.outcome, "CHANGED")
+        self.assertEqual(client.refs[0].before_oid, legacy_head)
+        self.assertEqual(client.refs[0].after_oid, candidate.commit_sha)
+
+    def test_third_ref_makes_old_h_lose_and_successor_uses_fresh_nonce_and_head(self):
+        class ThirdValueClient(ReconcileClient):
+            def __init__(self, third):
+                super().__init__()
+                self.third = third
+                self.update_payloads = []
+            def update_refs(self, repository_id, updates):
+                self.update_payloads.extend(updates)
+                if len(self.update_payloads) == 1:
+                    update = updates[0]
+                    self.ref_values[update.name.removeprefix("refs/heads/")] = self.third
+                    self.pull_requests = {number: replace(pr, head_oid=self.third) for number, pr in self.pull_requests.items()}
+                    raise GitHubAPIError("ambiguous CAS with third value")
+                super().update_refs(repository_id, updates)
+
+        third_sha = "d" * 40
+        client = ThirdValueClient(third_sha)
+        source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
+        old = self._candidate(client, source, "c" * 40, ("README.md",), nonce="4" * 64)
+        third = self._candidate(client, source, third_sha, ("README.md",), nonce="5" * 64)
+        first_successor = self._candidate(client, source, "e" * 40, ("README.md",), nonce="6" * 64)
+        fresh_successor = self._candidate(client, source, "f" * 40, ("README.md",), nonce="7" * 64)
+        client.ref_values["bot/federation/demo"] = old.commit_sha
+        client.pull_requests[40] = PullRequestMetadata(
+            40, "PR_node", "U", "app[bot]", old.commit_sha, client.main,
+            "bot/federation/demo", "main", "R_central", "swiftstream/skills",
+            "R_central", "swiftstream/skills", None, False, False,
+        )
+        candidates = [first_successor, fresh_successor]
+        builds = []
+        class Builder:
+            def machine_candidate(_self, base, source_id):
+                builds.append((base, source_id))
+                return candidates[len(builds) - 1]
+            def validate_machine_head(_self, _base, _source_id, _head):
+                return False, "SUCCESSOR_REQUIRED"
+        controller, _ = self._controller_with_source(client, source, Builder())
+        result = controller.reconcile(99)
+        self.assertEqual(result.outcome, "CHANGED")
+        self.assertEqual(len(builds), 2)
+        self.assertEqual(client.update_payloads[0].before_oid, old.commit_sha)
+        self.assertEqual(client.update_payloads[0].after_oid, first_successor.commit_sha)
+        self.assertEqual(client.update_payloads[1].before_oid, third.commit_sha)
+        self.assertEqual(client.update_payloads[1].after_oid, fresh_successor.commit_sha)
+        self.assertNotEqual(first_successor.claimed_head_marker.carrier_nonce, fresh_successor.claimed_head_marker.carrier_nonce)
+        self.assertNotEqual(first_successor.commit_sha, fresh_successor.commit_sha)
+        self.assertEqual(controller.resolve_current_sha_carrier_role(first_successor.commit_sha).activation, controller_module.CarrierActivation.CONFLICTING)
 
     def test_machine_scope_rejects_non_generated_paths(self):
         class Trees:
@@ -151,7 +791,7 @@ class ReconcileTests(unittest.TestCase):
     def test_reconcile_never_uses_wake_hint_as_source_authority(self):
         client = ReconcileClient()
         source = c02.SourceDeclaration("real", "Owner/Repo", 99, "skills", "Real", (c02.LineDeclaration("refs/heads/main", ("real",)),))
-        candidate = ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "real", 99)
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
         builder = type("Builder", (), {"machine_candidate": lambda _self, base, source_id: candidate})()
         controller, _ = self._controller_with_source(client, source, builder)
         self.assertEqual(controller.reconcile("99").source_id, "real")
@@ -170,24 +810,23 @@ class ReconcileTests(unittest.TestCase):
         class CASClient(ReconcileClient):
             def __init__(self):
                 super().__init__()
-                self.branch_reads = 0
                 self.updates = 0
 
             def get_ref_oid(self, repository, branch):
-                if branch == "main":
-                    return self.main
-                self.branch_reads += 1
-                return "b" * 40 if self.branch_reads == 1 else "c" * 40
+                return super().get_ref_oid(repository, branch)
 
             def update_refs(self, repository_id, updates):
                 self.updates += 1
                 if self.updates == 1:
                     raise RefCASConflict("competitor won")
-                self.refs.extend(updates)
+                super().update_refs(repository_id, updates)
 
         client = CASClient()
         source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
-        candidates = [ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99), ProposalCandidate("e" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)]
+        candidates = [
+            self._candidate(client, source, "d" * 40, ("README.md",), nonce="4" * 64),
+            self._candidate(client, source, "e" * 40, ("README.md",), nonce="5" * 64),
+        ]
         seen = []
         class Builder:
             def machine_candidate(self, base, source_id):
@@ -197,21 +836,21 @@ class ReconcileTests(unittest.TestCase):
         result = controller.reconcile(99)
         self.assertEqual(result.outcome, "CHANGED")
         self.assertEqual(len(seen), 2)
-        self.assertEqual(client.refs[0].before_oid, "c" * 40)
-        self.assertTrue(client.refs[0].force)
+        self.assertEqual(client.refs[0].before_oid, "0" * 40)
+        self.assertFalse(client.refs[0].force)
+        self.assertNotEqual(candidates[0].claimed_head_marker.carrier_nonce, candidates[1].claimed_head_marker.carrier_nonce)
+        self.assertNotEqual(candidates[0].commit_sha, candidates[1].commit_sha)
 
     def test_repeated_cas_loss_exhausts_without_stale_overwrite(self):
         class AlwaysCAS(ReconcileClient):
             def __init__(self):
                 super().__init__()
-                self.reads = 0
                 self.updates = 0
 
             def get_ref_oid(self, repository, branch):
-                if branch == "main":
-                    return self.main
-                self.reads += 1
-                return ("b" if self.reads == 1 else "c") * 40
+                if branch != "main" and branch not in self.ref_values:
+                    return "b" * 40
+                return super().get_ref_oid(repository, branch)
 
             def update_refs(self, repository_id, updates):
                 self.updates += 1
@@ -219,8 +858,12 @@ class ReconcileTests(unittest.TestCase):
 
         client = AlwaysCAS()
         source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
-        candidate = ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)
-        controller, _ = self._controller_with_source(client, source, type("Builder", (), {"machine_candidate": lambda _self, base, source_id: candidate})())
+        candidates = [self._candidate(client, source, chr(ord("d") + i) * 40, ("README.md",), nonce=f"{i + 1:064x}") for i in range(3)]
+        calls = []
+        def build(_self, base, source_id):
+            calls.append((base, source_id))
+            return candidates[len(calls) - 1]
+        controller, _ = self._controller_with_source(client, source, type("Builder", (), {"machine_candidate": build})())
         result = controller.reconcile(99)
         self.assertEqual(result.reason, "MACHINE_BRANCH_CAS_CONFLICT_RECOMPUTE_EXHAUSTED")
         self.assertEqual(client.updates, 3)
@@ -229,13 +872,14 @@ class ReconcileTests(unittest.TestCase):
     def test_existing_matching_branch_has_no_cas_churn(self):
         class Matching(ReconcileClient):
             def get_ref_oid(self, repository, branch):
-                return self.main if branch == "main" else "d" * 40
+                return self.main if branch == "main" else self.ref_values.get(branch, "d" * 40)
         client = Matching()
         source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
-        candidate = ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)
+        candidate = self._candidate(client, source, "e" * 40, ("README.md",))
         controller, _ = self._controller_with_source(client, source, type("Builder", (), {"machine_candidate": lambda _self, base, source_id: candidate})())
         self.assertEqual(controller.reconcile(99).outcome, "CHANGED")
-        self.assertEqual(client.refs, [])
+        self.assertEqual(client.refs[0].before_oid, "d" * 40)
+        self.assertTrue(client.refs[0].force)
 
     def test_rendered_machine_evidence_binds_class_head_base_source_and_repository(self):
         result = TrustedValidationResult("failure", bounded_check_output(RequestClass.MACHINE_PUBLICATION, "a" * 40, "b" * 40, "demo", 99, "BLOCKED"))
@@ -326,7 +970,7 @@ class ReconcileTests(unittest.TestCase):
         class OwnedInvalid(ReconcileClient):
             def __init__(self):
                 super().__init__()
-                self.pr = PullRequestMetadata(7, "", "U", "app[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False)
+                self.pr = PullRequestMetadata(7, "", "U", "app[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False)
                 self.comments = []
                 self.states = []
             def list_open_pull_requests(self, repository):
@@ -348,7 +992,8 @@ class ReconcileTests(unittest.TestCase):
         source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         candidate = ProposalCandidate("e" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)
         controller, _ = self._controller_with_source(client, source, type("Builder", (), {"machine_candidate": lambda _self, base, source_id: candidate})())
-        result = controller.reconcile(99)
+        with patch.object(controller_module, "validate_machine_generated_scope", side_effect=controller_module.CandidateScopeError("forbidden")):
+            result = controller.reconcile(99)
         self.assertEqual(result.outcome, "FAIL")
         self.assertEqual(client.states, [(7, "closed")])
         self.assertIn("MACHINE_RECONCILE_FAILED", client.comments[0].body)
@@ -357,7 +1002,7 @@ class ReconcileTests(unittest.TestCase):
         class WrongApp(ReconcileClient):
             def __init__(self):
                 super().__init__()
-                self.pr = PullRequestMetadata(7, "", "wrong", "other[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False)
+                self.pr = PullRequestMetadata(7, "", "wrong", "other[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False)
                 self.states = []
             def list_open_pull_requests(self, repository):
                 return ({"number": 7},)
@@ -430,7 +1075,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_machine_validation_rejects_stale_base_before_candidate_validation(self):
         client = ReconcileClient()
-        client.pr = PullRequestMetadata(7, "", "U", "app[bot]", "d" * 40, "b" * 40, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False)
+        client.pr = PullRequestMetadata(7, "", "U", "app[bot]", "d" * 40, "b" * 40, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False)
         source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         called = []
         builder = type("Builder", (), {"validate_machine_head": lambda _self, *args: called.append(args) or (True, "ok")})()
@@ -459,7 +1104,7 @@ class ReconcileTests(unittest.TestCase):
 
     def test_manual_reconcile_guard_blocks_request_race_before_first_machine_mutation(self):
         client, controller, source = self._manual_reconcile_fixture()
-        candidate = ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
         controller.candidate_builder = type("Builder", (), {"machine_candidate": lambda _self, _base, _source_id: candidate})()
         reads = 0
         original = client.pr
@@ -482,8 +1127,8 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(len(client.comments), 1)
 
     def test_manual_reconcile_guard_blocks_request_race_before_finalizer_dispatch(self):
-        client, controller, _source = self._manual_reconcile_fixture()
-        candidate = ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)
+        client, controller, source = self._manual_reconcile_fixture()
+        candidate = self._candidate(client, source, "d" * 40, ("README.md",))
         controller.candidate_builder = type("Builder", (), {"machine_candidate": lambda _self, _base, _source_id: candidate})()
         controller._machine_prs = lambda _main, _repository, _sources: {"demo": [MachinePRAuthority(41, "demo", 99, "c" * 40)]}
         reads = 0
@@ -510,7 +1155,7 @@ class ReconcileTests(unittest.TestCase):
         client = ReconcileClient()
         source = c02.SourceDeclaration("demo", "Owner/Repo", 99, "skills", "Demo", (c02.LineDeclaration("refs/heads/main", ("demo",)),))
         controller, _ = self._controller_with_source(client, source, None)
-        controller.candidate_builder = type("Builder", (), {"machine_candidate": lambda _self, _base, _source_id: ProposalCandidate("d" * 40, client.main, ("README.md",), RequestClass.MACHINE_PUBLICATION, "demo", 99)})()
+        controller.candidate_builder = type("Builder", (), {"machine_candidate": lambda _self, _base, _source_id: self._candidate(client, source, "d" * 40, ("README.md",))})()
         controller._machine_prs = lambda _main, _repository, _sources: {"demo": [MachinePRAuthority(7, "demo", 99, "d" * 40, False, "bad") ]}
         guard_calls = []
 
@@ -557,6 +1202,7 @@ class ReconcileTests(unittest.TestCase):
             "base_repository": "swiftstream/skills",
             "last_edited_at": None,
             "includes_created_edit": False,
+            "draft": False,
         }
         values.update(overrides)
         return PullRequestMetadata(**values), comment
@@ -567,6 +1213,7 @@ class ReconcileTests(unittest.TestCase):
                 super().__init__()
                 self.prs = prs
                 self.updated_branches = []
+                self.comment_reads = 0
 
             def list_open_pull_requests(self, _repository):
                 return tuple({"number": number} for number in self.prs)
@@ -575,6 +1222,7 @@ class ReconcileTests(unittest.TestCase):
                 return self.prs[number]
 
             def list_issue_comments(self, _repository, number):
+                self.comment_reads += 1
                 return tuple(comments_by_pr.get(number, ()))
 
             def update_pull_request_branch(self, _repository, number, *, expected_head_sha):
@@ -594,8 +1242,8 @@ class ReconcileTests(unittest.TestCase):
         result = controller.main_advance()
         self.assertEqual(result, "MAIN_ADVANCE_DISPATCHED:1")
         self.assertEqual(client.dispatches, [
-            ("federation-reconcile.yml", "refs/heads/main", {"repository_id": "123"}),
-            ("federation-state-finalize.yml", "refs/heads/main", {}),
+            ("federation-g8-reconcile.yml", "refs/heads/main", {"repository_id": "123"}),
+            ("federation-g8-state-finalize.yml", "refs/heads/main", {}),
         ])
 
     def test_main_advance_multiple_sources_is_deterministic_and_finalizer_is_coalesced(self):
@@ -605,9 +1253,9 @@ class ReconcileTests(unittest.TestCase):
         client, controller = self._main_advance_controller((source_b, source_a), machine)
         controller.main_advance()
         self.assertEqual([item[2]["repository_id"] for item in client.dispatches[:2]], ["1", "2"])
-        self.assertEqual(sum(item[0] == "federation-state-finalize.yml" for item in client.dispatches), 1)
+        self.assertEqual(sum(item[0] == "federation-g8-state-finalize.yml" for item in client.dispatches), 1)
 
-    def test_main_advance_owned_manual_pr_wakes_only_shared_finalizer(self):
+    def test_main_advance_owned_standalone_manual_pr_is_inert(self):
         body = "Repository URL:\nhttps://github.com/Owner/Repo\nDescription:\nDemo\nBranch:\nmain\nSkills root:\nskills\nSkill prefixes:\ndemo\n"
         request = parse_request_body(RequestClass.ADD, body)
         anchor = RequestAnchor(8, RequestClass.ADD, "U_author", "alice", body_sha256(body), request)
@@ -616,8 +1264,9 @@ class ReconcileTests(unittest.TestCase):
         class ManualAdvanceClient(ReconcileClient):
             def __init__(self):
                 super().__init__()
-                self.pr = PullRequestMetadata(8, body, "U_author", "alice", "d" * 40, self.main, "request", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False)
+                self.pr = PullRequestMetadata(8, body, "U_author", "alice", "d" * 40, self.main, "request", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False)
                 self.comments = [comment]
+                self.comment_reads = 0
 
             def list_open_pull_requests(self, _repository):
                 return ({"number": 8},)
@@ -626,6 +1275,7 @@ class ReconcileTests(unittest.TestCase):
                 return self.pr
 
             def list_issue_comments(self, _repository, _number):
+                self.comment_reads += 1
                 return tuple(self.comments)
 
         client = ManualAdvanceClient()
@@ -633,18 +1283,21 @@ class ReconcileTests(unittest.TestCase):
         controller = R02Controller(client, "swiftstream/skills", AppIdentity("app", 1, "A", 2, "U_bot", "app[bot]"))
         controller._accepted_sources = lambda _main=None: (source,)
         controller._machine_prs = lambda _main, _repository, _sources: {"demo": []}
-        self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
-        self.assertEqual(client.dispatches, [("federation-state-finalize.yml", "refs/heads/main", {})])
+        self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        self.assertEqual(client.comment_reads, 0)
+        self.assertEqual(client.dispatches, [])
 
-    def test_main_advance_valid_central_manual_add_update_remove_each_wakes_one_shared_finalizer(self):
+    def test_main_advance_valid_standalone_manual_add_update_remove_are_inert(self):
         for request_class in (RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE):
             with self.subTest(request_class=request_class):
                 pr, comment = self._manual_main_advance_pr(request_class)
                 client, controller = self._main_advance_with_prs({pr.number: pr}, {pr.number: (comment,)})
-                self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
-                self.assertEqual(client.dispatches, [("federation-state-finalize.yml", "refs/heads/main", {})])
+                self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+                self.assertEqual(client.comment_reads, 0)
+                self.assertEqual(client.updated_branches, [])
+                self.assertEqual(client.dispatches, [])
 
-    def test_main_advance_manual_requires_central_trusted_head_and_exact_head_identity(self):
+    def test_main_advance_standalone_manual_is_inert_before_head_or_comment_authority(self):
         cases = (
             {"head_repository_id": "R_fork", "head_repository": "attacker/fork"},
             {"head_ref": "request..invalid"},
@@ -655,9 +1308,11 @@ class ReconcileTests(unittest.TestCase):
                 pr, comment = self._manual_main_advance_pr(**overrides)
                 client, controller = self._main_advance_with_prs({pr.number: pr}, {pr.number: (comment,)})
                 self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+                self.assertEqual(client.comment_reads, 0)
+                self.assertEqual(client.updated_branches, [])
                 self.assertEqual(client.dispatches, [])
 
-    def test_main_advance_manual_invalid_anchor_forms_do_not_wake(self):
+    def test_main_advance_does_not_inspect_standalone_anchor_forms(self):
         pr, valid_comment = self._manual_main_advance_pr()
         cases = (
             ("malformed", (replace(valid_comment, body=f"{ANCHOR_MARKER}\nnot-json\n"),)),
@@ -668,6 +1323,8 @@ class ReconcileTests(unittest.TestCase):
             with self.subTest(anchor=label):
                 client, controller = self._main_advance_with_prs({pr.number: pr}, {pr.number: comments})
                 self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+                self.assertEqual(client.comment_reads, 0)
+                self.assertEqual(client.updated_branches, [])
                 self.assertEqual(client.dispatches, [])
 
     def test_main_advance_machine_pr_stays_under_machine_authority(self):
@@ -679,11 +1336,11 @@ class ReconcileTests(unittest.TestCase):
         )
         self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:1")
         self.assertEqual(client.dispatches, [
-            ("federation-reconcile.yml", "refs/heads/main", {"repository_id": "99"}),
-            ("federation-state-finalize.yml", "refs/heads/main", {}),
+            ("federation-g8-reconcile.yml", "refs/heads/main", {"repository_id": "99"}),
+            ("federation-g8-state-finalize.yml", "refs/heads/main", {}),
         ])
 
-    def test_main_advance_valid_machine_and_manual_work_coalesce_to_one_shared_finalizer_wake(self):
+    def test_main_advance_manual_pr_does_not_change_machine_dispatch_or_finalizer_wake(self):
         machine_pr, _ = self._manual_main_advance_pr(number=41, head_ref="bot/federation/demo", author_id="U_bot", author_login="app[bot]")
         manual_pr, manual_comment = self._manual_main_advance_pr(number=8, request_class=RequestClass.UPDATE)
         client, controller = self._main_advance_with_prs(
@@ -692,8 +1349,10 @@ class ReconcileTests(unittest.TestCase):
             {"demo": [MachinePRAuthority(41, "demo", 99, machine_pr.head_oid)]},
         )
         self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:1")
-        self.assertEqual(sum(item[0] == "federation-state-finalize.yml" for item in client.dispatches), 1)
+        self.assertEqual(sum(item[0] == "federation-g8-state-finalize.yml" for item in client.dispatches), 1)
         self.assertEqual(len(client.dispatches), 2)
+        self.assertEqual(client.comment_reads, 0)
+        self.assertEqual(client.updated_branches, [])
 
     def test_main_advance_stale_base_and_unrelated_prs_remain_no_wake(self):
         stale_pr, stale_comment = self._manual_main_advance_pr(base_oid="b" * 40)
@@ -703,20 +1362,107 @@ class ReconcileTests(unittest.TestCase):
             {stale_pr.number: (stale_comment,), unrelated_pr.number: ()},
         )
         self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        self.assertEqual(client.comment_reads, 0)
         self.assertEqual(client.dispatches, [])
         self.assertEqual(client.updated_branches, [])
 
-    def test_main_advance_stale_initial_marker_request_is_cloud_normalized_with_head_cas(self):
+    def test_main_advance_stale_marker_only_manual_pr_is_not_normalized(self):
         stale_pr, _ = self._manual_main_advance_pr(base_oid="b" * 40)
         client, controller = self._main_advance_with_prs({stale_pr.number: stale_pr}, {stale_pr.number: ()})
         with patch.object(controller_module, "read_request_marker", return_value=RequestClass.ADD) as read_marker, patch.object(controller_module, "validate_existing_request_head") as validate_head:
-            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
-        read_marker.assert_called_once_with(client, "swiftstream/skills", stale_pr.head_oid)
-        validate_head.assert_called_once_with(client, "swiftstream/skills", stale_pr, RequestClass.ADD, stale_pr.base_oid)
-        self.assertEqual(client.updated_branches, [(stale_pr.number, stale_pr.head_oid)])
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        read_marker.assert_not_called()
+        validate_head.assert_not_called()
+        self.assertEqual(client.comment_reads, 0)
+        self.assertEqual(client.updated_branches, [])
         self.assertEqual(client.dispatches, [])
 
-    def test_main_advance_stale_initial_request_ignores_ordinary_non_request_anchor_comment(self):
+    def test_main_advance_reserved_issue_pr_is_quarantined_at_current_and_stale_bases(self):
+        binding = IssuePRBinding.create(
+            issue_number=7,
+            issue_database_id=700,
+            issue_node_id="I_7",
+            issue_request_anchor_comment_database_id=701,
+            issue_request_anchor_sha256="1" * 64,
+            issue_branch_lease_comment_database_id=702,
+            issue_branch_lease_sha256="2" * 64,
+            source_id="demo",
+            source_repository_id=99,
+            branch_ref="refs/heads/bot/federation/request/issue-7",
+            pull_request_number=8,
+            pull_request_database_id=800,
+            pull_request_node_id="PR_8",
+            initial_head_sha="d" * 40,
+            base_ref="main",
+            central_repository_node_id="R_central",
+        )
+        issue_binding = IssueComment(
+            "IC_binding", 300, binding.render_issue_binding(), "U_bot", "app[bot]", "Bot",
+            None, None, None, None, False,
+        )
+        pr_binding = IssueComment(
+            "IC_origin", 301, binding.render_pr_origin_binding(), "U_bot", "app[bot]", "Bot",
+            None, None, None, None, False,
+        )
+        comment_states = {
+            "missing": (),
+            "half-issue-side": (issue_binding,),
+            "half-pr-side": (pr_binding,),
+            "complete": (issue_binding, pr_binding),
+        }
+        for base_oid in ("a" * 40, "b" * 40):
+            for binding_state, comments in comment_states.items():
+                with self.subTest(base_oid=base_oid, binding_state=binding_state):
+                    pr_value, _ = self._manual_main_advance_pr(base_oid=base_oid)
+                    reserved_pr = replace(pr_value, head_ref="bot/federation/request/issue-7")
+                    client, controller = self._main_advance_with_prs(
+                        {reserved_pr.number: reserved_pr}, {reserved_pr.number: comments}
+                    )
+                    with patch.object(controller_module, "read_request_marker") as read_marker:
+                        self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+                    read_marker.assert_not_called()
+                    self.assertEqual(client.updated_branches, [])
+                    self.assertEqual(client.dispatches, [])
+
+    def test_main_advance_routes_reserved_issue_head_through_claim_path_without_branch_update(self):
+        pr_value, _ = self._manual_main_advance_pr()
+        reserved_pr = replace(pr_value, head_ref="bot/federation/request/issue-7")
+        client, controller = self._main_advance_with_prs(
+            {reserved_pr.number: reserved_pr}, {reserved_pr.number: ()},
+        )
+        result = IssueManagedRouteResult("CLAIM_READY", "PROPOSAL", RequestClass.ADD)
+        with patch.object(controller, "interactive_issue_managed_route", return_value=result) as route:
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        route.assert_called_once()
+        self.assertEqual(route.call_args.args[0], 7)
+        self.assertIs(route.call_args.args[1].__self__, controller)
+        self.assertEqual(client.updated_branches, [])
+        self.assertEqual(client.dispatches, [])
+
+    def test_main_advance_preserves_exact_managed_noop_result(self):
+        pr_value, _ = self._manual_main_advance_pr()
+        reserved_pr = replace(pr_value, head_ref="bot/federation/request/issue-7")
+        client, controller = self._main_advance_with_prs(
+            {reserved_pr.number: reserved_pr}, {reserved_pr.number: ()},
+        )
+        expected = IssueManagedRouteResult("NOOP", "NO_SEMANTIC_CHANGE", RequestClass.ADD)
+        with patch.object(controller, "interactive_issue_managed_route", return_value=expected):
+            self.assertIs(controller.main_advance(), expected)
+        self.assertEqual(client.updated_branches, [])
+        self.assertEqual(client.dispatches, [])
+
+    def test_main_advance_malformed_reserved_issue_prefix_fails_closed(self):
+        pr_value, _ = self._manual_main_advance_pr(base_oid="b" * 40)
+        malformed_pr = replace(pr_value, head_ref="bot/federation/request/issue-01")
+        client, controller = self._main_advance_with_prs({malformed_pr.number: malformed_pr}, {malformed_pr.number: ()})
+        with patch.object(controller_module, "read_request_marker") as read_marker:
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        read_marker.assert_not_called()
+        self.assertEqual(client.comment_reads, 0)
+        self.assertEqual(client.updated_branches, [])
+        self.assertEqual(client.dispatches, [])
+
+    def test_main_advance_stale_marker_only_pr_ignores_all_comments_and_stays_inert(self):
         stale_pr, _ = self._manual_main_advance_pr(base_oid="b" * 40)
         compatibility_comment = IssueComment(
             "IC_compat",
@@ -736,15 +1482,21 @@ class ReconcileTests(unittest.TestCase):
             {stale_pr.number: (compatibility_comment,)},
         )
         with patch.object(controller_module, "read_request_marker", return_value=RequestClass.ADD), patch.object(controller_module, "validate_existing_request_head"):
-            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_DISPATCHED:0")
-        self.assertEqual(client.updated_branches, [(stale_pr.number, stale_pr.head_oid)])
+            self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        self.assertEqual(client.comment_reads, 0)
+        self.assertEqual(client.updated_branches, [])
         self.assertEqual(client.dispatches, [])
 
-    def test_main_advance_stale_initial_request_fails_closed_before_update_on_scope_error(self):
+    def test_main_advance_stale_marker_only_pr_does_not_validate_or_update_branch(self):
         stale_pr, _ = self._manual_main_advance_pr(base_oid="b" * 40)
         client, controller = self._main_advance_with_prs({stale_pr.number: stale_pr}, {stale_pr.number: ()})
-        with patch.object(controller_module, "read_request_marker", return_value=RequestClass.ADD), patch.object(controller_module, "validate_existing_request_head", side_effect=R02Error("unsafe stale request")):
+        with patch.object(controller_module, "read_request_marker") as read_marker, patch.object(
+            controller_module, "validate_existing_request_head", side_effect=R02Error("unsafe stale request")
+        ) as validate_head:
             self.assertEqual(controller.main_advance(), "MAIN_ADVANCE_NOOP")
+        read_marker.assert_not_called()
+        validate_head.assert_not_called()
+        self.assertEqual(client.comment_reads, 0)
         self.assertEqual(client.updated_branches, [])
         self.assertEqual(client.dispatches, [])
 
@@ -758,8 +1510,8 @@ class ReconcileTests(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.prs = {
-                    8: PullRequestMetadata(8, body, "U_author", "alice", "d" * 40, "b" * 40, "request", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False),
-                    9: PullRequestMetadata(9, "", "U", "other[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False),
+                    8: PullRequestMetadata(8, body, "U_author", "alice", "d" * 40, "b" * 40, "request", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False),
+                    9: PullRequestMetadata(9, "", "U", "other[bot]", "d" * 40, self.main, "bot/federation/demo", "main", "R_central", "swiftstream/skills", "R_central", "swiftstream/skills", None, False, False),
                 }
                 self.comments_by_pr = {8: (comment,), 9: ()}
 
@@ -781,7 +1533,7 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(client.dispatches, [])
 
     def test_main_advance_workflow_has_push_main_static_boundaries(self):
-        workflow = (controller_module.Path(__file__).resolve().parents[2] / ".github/workflows/federation-main-advance.yml").read_text()
+        workflow = (controller_module.Path(__file__).resolve().parents[2] / ".github/workflows/federation-g8-main-advance.yml").read_text()
         self.assertIn("branches: [main]", workflow)
         self.assertIn("contents: read", workflow)
         self.assertIn("permission-contents: write", workflow)
@@ -794,8 +1546,8 @@ class ReconcileTests(unittest.TestCase):
 
     def test_main_advance_and_interactive_share_request_anchor_authority_concurrency(self):
         workflows = controller_module.Path(__file__).resolve().parents[2] / ".github/workflows"
-        main_advance = (workflows / "federation-main-advance.yml").read_text()
-        interactive = (workflows / "federation-interactive.yml").read_text()
+        main_advance = (workflows / "federation-g8-main-advance.yml").read_text()
+        interactive = (workflows / "federation-g8-interactive.yml").read_text()
         group = "group: swiftstream-skills-federation-manual-authority"
         self.assertEqual(main_advance.count(group), 1)
         self.assertEqual(interactive.count(group), 1)

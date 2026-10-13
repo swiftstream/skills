@@ -10,6 +10,8 @@ import re
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
@@ -19,36 +21,159 @@ from .github_api import (
     AppMetadata,
     BotMetadata,
     CheckRun,
+    CommitStatus,
+    GitCommitObject,
+    GitTreeEntry,
     GitHubAPIError,
     GitHubClient,
     GraphQLError,
     IssueComment,
+    IssueMetadata,
     InvalidResponseError,
     MergeResult,
+    MergedPullRequestMetadata,
     NotFoundError,
     PullRequestMetadata,
+    PullRequestStageMutationReceipt,
     RefCASConflict,
     RefUpdate,
     RepositoryMetadata,
+    StatusWriteReceipt,
+    WorkflowMetadata,
+    WorkflowRunMetadata,
     ZERO_OID,
 )
 from .request_model import (
     ANCHOR_MARKER,
+    ISSUE_REQUEST_ANCHOR_MARKER,
+    ISSUE_PATCH_PROJECTION_MARKER,
+    ISSUE_HEAD_CLAIM_MARKER,
+    REQUIRED_STATUS_EPOCH_MARKER,
+    ISSUE_FINALIZATION_EPOCH_MARKER,
+    ISSUE_CANCELLATION_FENCE_MARKER,
+    ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+    ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
+    ISSUE_NO_PR_CANCELLED_RESULT_MARKER,
+    ISSUE_INTERNAL_PR_BINDING_MARKER,
+    PR_ISSUE_ORIGIN_BINDING_MARKER,
     PATCH_SENTINEL,
     REQUEST_MARKER,
     CommentEvent,
+    FoldEvidence,
+    IssuePatchEvent,
+    IssueBranchLease,
+    IssueRequestAnchor,
+    IssuePRBinding,
+    IssueHeadClaim,
+    RequiredStatusEpoch,
+    RequiredStatusEpochReason,
+    IssueFinalizationEpoch,
+    IssueCancellationFence,
+    IssueCancellationDraftWitness,
+    IssueTerminalCancelledResult,
+    IssueTerminalCancelledProofKind,
+    IssueNoPRCancelledResult,
+    IssueNoPRCancelledProofKind,
+    ExactPullRequestStageMutationEvidence,
+    PullRequestStageMutationOperation,
+    ExactAppRequiredStatusSnapshot,
+    ExactAppRequiredStatusEvidence,
+    IssuePatchProjection,
+    ClaimedHeadMarker,
+    CLAIMED_HEAD_MARKER_HEADER,
+    CarrierActivation,
+    CarrierRole,
+    ActivationBoundaryEvidence,
+    ActivationEpochRecord,
+    ActivationWorkflowIdentity,
+    HistoricWorkflowIdentity,
+    ActivationRecoveryAction,
+    ActivationRecoveryActionClass,
+    ActivationRecoveryEvidence,
+    ActivationRecoveryResultClass,
+    ActivationRecoveryWitness,
+    G8_ACTIVATION_RECOVERY_EVIDENCE_MARKER,
+    G8_ACTIVATION_RECORD_PATH,
+    G8_ACTIVATION_REF,
+    G8_ACTIVATION_STATUS_CONTEXT,
+    G8_CENTRAL_REPOSITORY_NODE_ID,
+    G8_IMPLEMENTATION_PR_NUMBER,
+    G8_IMPLEMENTATION_PR_DATABASE_ID,
+    G8_IMPLEMENTATION_PR_NODE_ID,
+    G8_NEW_WRITER_PATHS,
+    G8_OLD_WRITERS,
+    parse_activation_epoch_record,
+    parse_activation_recovery_evidence,
+    activation_recovery_inventory_digest,
+    activation_recovery_result_digest,
+    activation_recovery_witness_id,
+    activation_record_digest,
+    old_path_absence_proof_digest,
+    old_run_terminal_proof_digest,
+    ordered_recovery_actions_digest,
+    six_workflow_identity_digest,
+    activation_status_description,
+    LegacyEvidenceDisposition,
+    LegacyQuarantineClass,
+    LegacyClassificationOutcome,
+    LegacyQuarantineEvidence,
+    LegacyClassificationResult,
+    ShaCarrierResolution,
+    StatusClass,
     PatchFoldResult,
     Request,
     RequestAnchor,
     RequestClass,
     RequestModelError,
     body_sha256,
+    classify_issue_head_claim_progression,
+    effective_request_digest,
     fold_patch_events,
+    fold_issue_patch_events,
+    issue_branch_lease_authority_digest,
+    issue_head_claim_authority_digest,
+    issue_final_status_evidence_digest,
+    issue_patch_projection_evidence_digest,
+    normalize_target_evidence_digest,
+    proposal_target_evidence_digest,
+    issue_branch_ref,
+    issue_owner_key,
+    parse_issue_owner_key,
+    external_status_evidence_digest,
+    legacy_status_evidence_digest,
+    legacy_recovery_decision,
+    cancel_status_evidence_digest,
+    claim_generation_id,
+    machine_ref_claim_authority_digest,
+    authority_surface_digest,
+    new_writer_topology_digest,
+    activation_boundary_id_digest,
+    new_carrier_nonce,
     parse_anchor,
+    parse_issue_request_anchor,
+    parse_issue_internal_pr_binding,
+    parse_pr_issue_origin_binding,
+    parse_issue_branch_lease,
+    parse_issue_head_claim,
+    parse_required_status_epoch,
+    parse_issue_finalization_epoch,
+    parse_issue_cancellation_fence,
+    parse_issue_cancellation_draft_witness,
+    parse_issue_terminal_cancelled_result,
+    parse_issue_no_pr_cancelled_result,
+    parse_issue_patch_projection,
+    parse_claimed_head_marker,
+    render_status_description,
+    parse_status_description,
+    parse_issue_request_body,
     parse_request_body,
+    render_request_body,
+    render_patch,
     parse_patch,
     proposed_line_refs,
+    reserved_issue_branch_number,
     resolve_publication_lines,
+    ISSUE_BRANCH_LEASE_MARKER,
     validate_drop_set,
     verify_anchor_integrity,
 )
@@ -92,6 +217,400 @@ class PhaseNotImplementedError(ControllerError):
     """The requested operation belongs to a later frozen phase."""
 
 
+class G8RuntimeState(Enum):
+    ACTIVE_G8 = "ACTIVE_G8"
+    MERGED_UNPROVEN = "MERGED_UNPROVEN"
+    BLOCKED_POST_MERGE = "BLOCKED_POST_MERGE"
+    PRE_G8_NOT_APPLICABLE = "PRE_G8_NOT_APPLICABLE"
+
+
+@dataclass(frozen=True)
+class G8ActivationGuardResult:
+    runtime_state: G8RuntimeState
+    ordinary_write_allowed: bool
+    activation_write_allowed: bool
+    reason: str
+
+    def __post_init__(self) -> None:
+        if type(self.runtime_state) is not G8RuntimeState:
+            raise ValueError("G8 runtime state must be an exact G8RuntimeState")
+        if type(self.ordinary_write_allowed) is not bool or type(self.activation_write_allowed) is not bool:
+            raise ValueError("G8 write permissions must be exact booleans")
+        expected = {
+            G8RuntimeState.ACTIVE_G8: (True, False, "ACTIVE_G8_EPOCH_PROVEN"),
+            G8RuntimeState.MERGED_UNPROVEN: (False, True, "MERGED_UNPROVEN_NO_VALID_EPOCH"),
+            G8RuntimeState.BLOCKED_POST_MERGE: (False, False, "BLOCKED_POST_MERGE_CONFLICT"),
+            G8RuntimeState.PRE_G8_NOT_APPLICABLE: (False, False, "PRE_G8_NOT_APPLICABLE"),
+        }[self.runtime_state]
+        if (self.ordinary_write_allowed, self.activation_write_allowed, self.reason) != expected:
+            raise ValueError("G8 activation guard tuple does not match the closed runtime-state matrix")
+
+
+def _g8_activation_guard_result(state: G8RuntimeState) -> G8ActivationGuardResult:
+    matrix = {
+        G8RuntimeState.ACTIVE_G8: (True, False, "ACTIVE_G8_EPOCH_PROVEN"),
+        G8RuntimeState.MERGED_UNPROVEN: (False, True, "MERGED_UNPROVEN_NO_VALID_EPOCH"),
+        G8RuntimeState.BLOCKED_POST_MERGE: (False, False, "BLOCKED_POST_MERGE_CONFLICT"),
+        G8RuntimeState.PRE_G8_NOT_APPLICABLE: (False, False, "PRE_G8_NOT_APPLICABLE"),
+    }
+    ordinary, activation, reason = matrix[state]
+    return G8ActivationGuardResult(state, ordinary, activation, reason)
+
+
+_G8_RECOVERY_SUBJECT_PREFIX = "swiftstream-federation-g8-activation-recovery-subject:v1\n"
+_G8_RECOVERY_EFFECT_PREFIX = "swiftstream-federation-g8-activation-recovery-effect:v1\n"
+_G8_LEGACY_RECOVERY_PREFIX = "swiftstream-federation-g8-legacy-quarantine-migration:v1\n"
+
+
+def _g8_recovery_material_digest(prefix: str, material: Mapping[str, Any]) -> str:
+    if prefix not in {
+        _G8_RECOVERY_SUBJECT_PREFIX,
+        _G8_RECOVERY_EFFECT_PREFIX,
+        _G8_LEGACY_RECOVERY_PREFIX,
+    }:
+        raise ValueError("G8 recovery digest domain is not a closed value")
+    if type(material) is not dict:
+        raise ValueError("G8 recovery digest material must be an exact mapping")
+    try:
+        encoded = json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        raise ValueError("G8 recovery digest material is not canonical JSON") from error
+    return hashlib.sha256(prefix.encode("utf-8") + encoded).hexdigest()
+
+
+def _g8_validate_recovery_action_material(
+    action_class: ActivationRecoveryActionClass,
+    subject: Mapping[str, Any],
+    effect: Mapping[str, Any],
+    result_class: ActivationRecoveryResultClass,
+) -> None:
+    if (
+        type(action_class) is not ActivationRecoveryActionClass
+        or type(result_class) is not ActivationRecoveryResultClass
+        or type(subject) is not dict
+        or type(effect) is not dict
+    ):
+        raise ValueError("G8 recovery action material must use exact closed types")
+
+    def exact_keys(value: Mapping[str, Any], expected: set[str], label: str) -> None:
+        if set(value) != expected:
+            raise ValueError(f"G8 {label} has an invalid exact key set")
+
+    def sha40(value: Any, label: str) -> None:
+        if type(value) is not str or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+            raise ValueError(f"G8 {label} must be exact lowercase 40-hex")
+
+    def positive(value: Any, label: str) -> None:
+        if type(value) is not int or not 1 <= value <= 9_223_372_036_854_775_807:
+            raise ValueError(f"G8 {label} must be an exact positive signed-64 integer")
+
+    def deferred(reason_values: set[str] | None = None) -> None:
+        exact_keys(effect, {"deferredUntil", "reason"}, "deferred recovery effect")
+        if effect["deferredUntil"] != "ACTIVE_G8":
+            raise ValueError("G8 deferred recovery effect must target exact ACTIVE_G8")
+        reason = effect["reason"]
+        if type(reason) is not str or re.fullmatch(r"[A-Z][A-Z0-9_]{0,255}", reason) is None:
+            raise ValueError("G8 deferred recovery reason must be a bounded code token")
+        if reason_values is not None and reason not in reason_values:
+            raise ValueError("G8 deferred recovery reason is outside the exact action policy")
+
+    if action_class is ActivationRecoveryActionClass.LEGACY_FAILURE_STATUS:
+        exact_keys(subject, {"headSha", "legacyEvidence"}, "legacy-failure subject")
+        sha40(subject["headSha"], "legacy-failure headSha")
+        legacy = subject["legacyEvidence"]
+        exact_keys(
+            legacy if type(legacy) is dict else {},
+            {
+                "schemaVersion", "evidenceClass", "centralRepositoryDatabaseId",
+                "centralRepositoryNodeId", "centralRepositoryFullName", "headSha",
+                "evidencePayloadDigest",
+            },
+            "legacy-failure evidence",
+        )
+        if legacy["schemaVersion"] != 1 or legacy["headSha"] != subject["headSha"]:
+            raise ValueError("G8 legacy-failure evidence does not bind its subject head")
+        exact_keys(effect, {
+            "repository", "requestedSha", "method", "route", "state", "context",
+            "description", "targetUrl", "returnedStatusId", "returnedStatusNodeId",
+            "returnedCreatorDatabaseId", "returnedCreatorNodeId", "returnedCreatorLogin",
+            "returnedCreatorType", "returnedCreatedAt", "returnedUpdatedAt",
+        }, "legacy-failure effect")
+        if (
+            result_class is not ActivationRecoveryResultClass.APPLIED
+            or effect["requestedSha"] != subject["headSha"]
+            or effect["method"] != "POST"
+            or effect["state"] != "failure"
+            or effect["context"] != "federation/trusted-validation"
+            or effect["targetUrl"] is not None
+            or effect["returnedCreatorType"] != "Bot"
+        ):
+            raise ValueError("G8 legacy-failure effect is not the exact fail-closed status receipt")
+        positive(effect["returnedStatusId"], "legacy-failure returnedStatusId")
+        positive(effect["returnedCreatorDatabaseId"], "legacy-failure returnedCreatorDatabaseId")
+        return
+
+    if action_class is ActivationRecoveryActionClass.CANCEL_FAILURE_STATUS:
+        exact_keys(
+            subject,
+            {"issueNumber", "fenceId", "cancellationHeadSha", "pullRequestNumber"},
+            "cancel-failure subject",
+        )
+        positive(subject["issueNumber"], "cancel-failure issueNumber")
+        positive(subject["pullRequestNumber"], "cancel-failure pullRequestNumber")
+        sha40(subject["cancellationHeadSha"], "cancel-failure cancellationHeadSha")
+        snapshot = ExactAppRequiredStatusSnapshot.from_value(dict(effect))
+        if (
+            snapshot.disposition != "PRESENT"
+            or snapshot.queried_sha != subject["cancellationHeadSha"]
+            or snapshot.state != "failure"
+            or snapshot.context != "federation/trusted-validation"
+            or snapshot.status_class is not StatusClass.CANCEL
+            or result_class not in {
+                ActivationRecoveryResultClass.APPLIED,
+                ActivationRecoveryResultClass.ALREADY_CONVERGED,
+            }
+        ):
+            raise ValueError("G8 cancel-failure effect is not the exact fail-closed App status snapshot")
+        return
+
+    if action_class is ActivationRecoveryActionClass.LEGACY_MACHINE_MIGRATION:
+        exact_keys(
+            subject,
+            {"headSha", "legacyEvidence", "machineRef", "sourceId", "repositoryId"},
+            "legacy-machine subject",
+        )
+        sha40(subject["headSha"], "legacy-machine before head")
+        legacy = subject["legacyEvidence"]
+        exact_keys(
+            legacy if type(legacy) is dict else {},
+            {
+                "schemaVersion", "evidenceClass", "centralRepositoryDatabaseId",
+                "centralRepositoryNodeId", "centralRepositoryFullName", "headSha",
+                "evidencePayloadDigest",
+            },
+            "legacy-machine evidence",
+        )
+        if (
+            legacy["schemaVersion"] != 1
+            or legacy["evidenceClass"] != LegacyQuarantineClass.MACHINE.value
+            or legacy["headSha"] != subject["headSha"]
+            or subject["machineRef"] != f"refs/heads/bot/federation/{subject['sourceId']}"
+        ):
+            raise ValueError("G8 legacy-machine subject does not bind exact machine quarantine authority")
+        positive(subject["repositoryId"], "legacy-machine repositoryId")
+        exact_keys(effect, {
+            "beforeHeadSha", "afterHeadSha", "afterActivation", "afterRole", "afterMarker",
+            "outcome", "sourceId", "repositoryId", "reason",
+        }, "legacy-machine effect")
+        sha40(effect["beforeHeadSha"], "legacy-machine effect beforeHeadSha")
+        sha40(effect["afterHeadSha"], "legacy-machine effect afterHeadSha")
+        if (
+            effect["beforeHeadSha"] != subject["headSha"]
+            or effect["afterHeadSha"] == subject["headSha"]
+            or effect["afterActivation"] != CarrierActivation.ACTIVE.value
+            or effect["afterRole"] != CarrierRole.MACHINE_PUBLICATION.value
+            or effect["sourceId"] != subject["sourceId"]
+            or effect["repositoryId"] != subject["repositoryId"]
+            or effect["outcome"] not in {"CHANGED", "NOOP"}
+            or type(effect["afterMarker"]) is not str
+            or not effect["afterMarker"]
+            or type(effect["reason"]) is not str
+            or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", effect["reason"]) is None
+            or result_class not in {
+                ActivationRecoveryResultClass.APPLIED,
+                ActivationRecoveryResultClass.ALREADY_CONVERGED,
+            }
+        ):
+            raise ValueError("G8 legacy-machine effect does not bind exact fresh ACTIVE v2 H2 authority")
+        return
+
+    if action_class is ActivationRecoveryActionClass.ISSUE_TERMINAL_CLEANUP:
+        exact_keys(
+            subject,
+            {"issueNumber", "fenceId", "cancellationHeadSha"},
+            "Issue terminal-cleanup subject",
+        )
+        positive(subject["issueNumber"], "Issue terminal-cleanup issueNumber")
+        sha40(subject["cancellationHeadSha"], "Issue terminal-cleanup cancellationHeadSha")
+        if result_class is not ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE:
+            raise ValueError("G8 Issue terminal cleanup is pre-epoch deferred only")
+        deferred({"CANCELLATION_CLEANUP_POST_ACTIVE"})
+        return
+
+    if action_class is ActivationRecoveryActionClass.RESERVED_TRANSITION_RECOVERY:
+        owner_keys = {"headSha", "role", "owningPrNumber"}
+        machine_keys = {"headSha", "role", "machineRef", "sourceId", "repositoryId", "marker"}
+        if set(subject) == owner_keys:
+            sha40(subject["headSha"], "reserved-transition headSha")
+            positive(subject["owningPrNumber"], "reserved-transition owningPrNumber")
+            if subject["role"] not in {
+                CarrierRole.ISSUE_ACTIVE.value,
+                CarrierRole.ISSUE_FINALIZING.value,
+                CarrierRole.ISSUE_CANCEL.value,
+            }:
+                raise ValueError("G8 owner reserved transition must use an exact Issue role")
+            if result_class is not ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE:
+                raise ValueError("G8 owner reserved transition recovery is pre-epoch deferred only")
+            deferred({"RESERVED_ISSUE_TRANSITION_POST_ACTIVE"})
+            return
+        if set(subject) == machine_keys:
+            sha40(subject["headSha"], "reserved-machine headSha")
+            positive(subject["repositoryId"], "reserved-machine repositoryId")
+            if (
+                subject["role"] != CarrierRole.MACHINE_PUBLICATION.value
+                or subject["machineRef"] != f"refs/heads/bot/federation/{subject['sourceId']}"
+                or type(subject["marker"]) is not str
+                or not subject["marker"]
+            ):
+                raise ValueError("G8 reserved-machine subject does not bind exact machine authority")
+            exact_keys(effect, {
+                "afterHeadSha", "afterActivation", "afterRole", "afterMarker",
+                "outcome", "sourceId", "repositoryId", "reason",
+            }, "reserved-machine effect")
+            sha40(effect["afterHeadSha"], "reserved-machine afterHeadSha")
+            if (
+                effect["afterActivation"] != CarrierActivation.ACTIVE.value
+                or effect["afterRole"] != CarrierRole.MACHINE_PUBLICATION.value
+                or effect["sourceId"] != subject["sourceId"]
+                or effect["repositoryId"] != subject["repositoryId"]
+                or effect["outcome"] not in {"CHANGED", "NOOP"}
+                or type(effect["afterMarker"]) is not str
+                or not effect["afterMarker"]
+                or type(effect["reason"]) is not str
+                or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", effect["reason"]) is None
+                or result_class not in {
+                    ActivationRecoveryResultClass.APPLIED,
+                    ActivationRecoveryResultClass.ALREADY_CONVERGED,
+                }
+            ):
+                raise ValueError("G8 reserved-machine effect does not prove exact ACTIVE machine recovery")
+            return
+        raise ValueError("G8 reserved-transition subject has an invalid exact shape")
+
+    if action_class is ActivationRecoveryActionClass.ISSUE_REQUEST_RECOVERY:
+        finalizer_keys = {"headSha", "role", "owningPrNumber"}
+        intent_keys = {"centralRepositoryNodeId", "issueNumber", "target"}
+        if set(subject) == finalizer_keys:
+            sha40(subject["headSha"], "Issue recovery headSha")
+            positive(subject["owningPrNumber"], "Issue recovery owningPrNumber")
+            if subject["role"] not in {
+                CarrierRole.ISSUE_ACTIVE.value,
+                CarrierRole.ISSUE_FINALIZING.value,
+            }:
+                raise ValueError("G8 deferred finalizer subject has an invalid role")
+            deferred({"PASSING_FINALIZER_FORBIDDEN_PRE_EPOCH"})
+        elif set(subject) == intent_keys:
+            if subject["centralRepositoryNodeId"] != G8_CENTRAL_REPOSITORY_NODE_ID:
+                raise ValueError("G8 Issue recovery intent repository identity is not frozen")
+            positive(subject["issueNumber"], "Issue recovery intent issueNumber")
+            if subject["target"] not in {
+                Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY.value,
+                Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY.value,
+            }:
+                raise ValueError("G8 Issue recovery intent target is not a closed Wg1 semantic")
+            deferred()
+        else:
+            raise ValueError("G8 Issue recovery subject has an invalid exact shape")
+        if result_class is not ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE:
+            raise ValueError("G8 Issue request recovery is pre-epoch deferred only")
+        return
+
+    raise ValueError("G8 recovery action class has no exact material schema")
+
+
+@dataclass(frozen=True)
+class G8ActivationWorkflowProof:
+    path: str
+    reviewed_blob_oid: str
+    reviewed_blob_sha256: str
+    workflow_id: int
+    workflow_state: str
+
+    def __post_init__(self) -> None:
+        if self.path not in G8_NEW_WRITER_PATHS:
+            raise ValueError("G8 activation workflow proof path is outside the exact six-writer set")
+        if type(self.reviewed_blob_oid) is not str or re.fullmatch(r"[0-9a-f]{40}", self.reviewed_blob_oid) is None:
+            raise ValueError("G8 activation workflow reviewed blob OID must be lowercase 40-hex")
+        if type(self.reviewed_blob_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", self.reviewed_blob_sha256) is None:
+            raise ValueError("G8 activation workflow reviewed blob digest must be lowercase 64-hex")
+        if type(self.workflow_id) is not int or not 1 <= self.workflow_id <= 9_223_372_036_854_775_807:
+            raise ValueError("G8 activation workflow ID must be a positive signed-64 integer")
+        if self.workflow_state != "active":
+            raise ValueError("G8 activation workflow state must be exact active")
+
+    def as_value(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "reviewedBlobOid": self.reviewed_blob_oid,
+            "reviewedBlobSha256": self.reviewed_blob_sha256,
+            "workflowId": self.workflow_id,
+            "workflowState": self.workflow_state,
+        }
+
+
+@dataclass(frozen=True)
+class G8ActivationPreflightResult:
+    boundary: ActivationBoundaryEvidence
+    current_main_oid: str
+    new_workflows: tuple[G8ActivationWorkflowProof, ...]
+    old_path_absence_proof_digest: str
+    old_run_terminal_digest: str
+    six_workflow_identity_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.boundary) is not ActivationBoundaryEvidence:
+            raise ValueError("G8 activation preflight requires exact boundary evidence")
+        if self.current_main_oid != self.boundary.merged_result_oid:
+            raise ValueError("G8 activation preflight current main must equal the exact merged result")
+        if type(self.new_workflows) is not tuple or tuple(item.path for item in self.new_workflows) != G8_NEW_WRITER_PATHS:
+            raise ValueError("G8 activation preflight requires the exact six workflow proofs in contract order")
+        if len({item.workflow_id for item in self.new_workflows}) != len(self.new_workflows):
+            raise ValueError("G8 activation preflight workflow IDs must be unique")
+        for value, label in (
+            (self.old_path_absence_proof_digest, "old path absence proof digest"),
+            (self.old_run_terminal_digest, "old run terminal digest"),
+            (self.six_workflow_identity_digest, "six workflow identity digest"),
+        ):
+            if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"G8 activation preflight {label} must be lowercase 64-hex")
+
+
+@dataclass(frozen=True)
+class G8ActivationRecoveryExecution:
+    preflight: G8ActivationPreflightResult
+    actions: tuple[ActivationRecoveryAction, ...]
+    witness: ActivationRecoveryWitness
+    evidence: ActivationRecoveryEvidence
+    result_digest: str
+    persisted_comment_database_id: int
+
+    def __post_init__(self) -> None:
+        if type(self.preflight) is not G8ActivationPreflightResult:
+            raise ValueError("G8 activation recovery execution requires exact preflight proof")
+        if type(self.actions) is not tuple or any(type(item) is not ActivationRecoveryAction for item in self.actions):
+            raise ValueError("G8 activation recovery execution actions must be exact immutable actions")
+        if type(self.witness) is not ActivationRecoveryWitness or type(self.evidence) is not ActivationRecoveryEvidence:
+            raise ValueError("G8 activation recovery execution requires exact witness/evidence")
+        if tuple(item.sequence for item in self.actions) != tuple(range(len(self.actions))):
+            raise ValueError("G8 activation recovery execution actions must be contiguous and zero-based")
+        if self.evidence.to_witness() != self.witness:
+            raise ValueError("G8 activation recovery execution evidence does not reconstruct the witness")
+        if self.evidence.recovery_action_count != len(self.actions):
+            raise ValueError("G8 activation recovery action count differs from persisted evidence")
+        if self.evidence.ordered_recovery_actions_digest != ordered_recovery_actions_digest(self.actions):
+            raise ValueError("G8 activation recovery action digest differs from persisted evidence")
+        if self.evidence.result_digest() != self.result_digest:
+            raise ValueError("G8 activation recovery result digest differs from canonical evidence")
+        if type(self.persisted_comment_database_id) is not int or not 1 <= self.persisted_comment_database_id <= 9_223_372_036_854_775_807:
+            raise ValueError("G8 activation recovery persistence requires a positive comment database ID")
+
+
 @dataclass(frozen=True)
 class CandidateDiff:
     paths: tuple[str, ...]
@@ -103,12 +622,43 @@ class R02Error(ControllerError):
     """Bounded, secret-free rejection of an R02 state transition."""
 
 
+class PreG8NotApplicableError(R02Error):
+    """The fixed implementation PR exists but has not yet formed a merged G8 boundary."""
+
+
 class StaleAuthorityError(R02Error):
     pass
 
 
 class StaleTrustedCheckoutError(StaleAuthorityError):
     """The trusted code checkout cannot safely evaluate the current main."""
+
+
+class IssueManagedNoSemanticChange(R02Error):
+    """A valid Issue request produces no trust/configuration semantic change."""
+
+    reason = "NO_SEMANTIC_CHANGE"
+
+    def __init__(self, request_class: RequestClass):
+        if type(request_class) is not RequestClass or request_class not in {
+            RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE,
+        }:
+            raise ValueError("Issue-managed no-change requires an exact manual RequestClass")
+        self.request_class = request_class
+        super().__init__(self.reason)
+
+
+@dataclass(frozen=True)
+class IssueManagedRouteResult:
+    outcome: str
+    reason: str
+    request_class: RequestClass
+
+    def __post_init__(self) -> None:
+        if type(self.request_class) is not RequestClass or self.request_class not in {
+            RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE,
+        }:
+            raise ValueError("Issue-managed route result requires an exact manual RequestClass")
 
 
 class DuplicateAnchorError(R02Error):
@@ -131,6 +681,299 @@ class CandidateScopeError(R02Error):
     pass
 
 
+class ReservedIssuePRPendingManagedAuthority(R02Error):
+    """A reserved Issue PR is quarantined until its Wave 04 managed path exists."""
+
+
+_RESERVED_ISSUE_PR_BRANCH_PREFIX = "bot/federation/request/"
+_RESERVED_ISSUE_PR_FULL_REF_PREFIX = f"refs/heads/{_RESERVED_ISSUE_PR_BRANCH_PREFIX}"
+
+
+def _is_reserved_issue_pr_head(head_ref: str) -> bool:
+    """Fail closed for the reserved namespace, including malformed attempts."""
+    try:
+        return reserved_issue_branch_number(head_ref) is not None
+    except RequestModelError:
+        if head_ref.startswith((_RESERVED_ISSUE_PR_BRANCH_PREFIX, _RESERVED_ISSUE_PR_FULL_REF_PREFIX)):
+            return True
+        raise
+
+
+def _raise_if_reserved_issue_pr(pr: PullRequestMetadata) -> None:
+    if _is_reserved_issue_pr_head(pr.head_ref):
+        raise ReservedIssuePRPendingManagedAuthority("reserved Issue PR is quarantined pending Wave 04 managed authority")
+
+
+class Wave08DecisionKind(Enum):
+    NO_MUTATION = "NO_MUTATION"
+    RESERVED_OWNER_RECOVERY = "RESERVED_OWNER_RECOVERY"
+    MACHINE_RECOVERY_DEFERRED = "MACHINE_RECOVERY_DEFERRED"
+    ISSUE_OWNER_FINALIZER_RECOVERY = "ISSUE_OWNER_FINALIZER_RECOVERY"
+    ISSUE_OWNER_CANCELLATION_RECOVERY = "ISSUE_OWNER_CANCELLATION_RECOVERY"
+    MACHINE_VALIDATION_DISPATCH = "MACHINE_VALIDATION_DISPATCH"
+    MACHINE_FINALIZER_DISPATCH = "MACHINE_FINALIZER_DISPATCH"
+    EXTERNAL_STATUS = "EXTERNAL_STATUS"
+    LEGACY_QUARANTINE_DEFERRED = "LEGACY_QUARANTINE_DEFERRED"
+    CONFLICTING_BLOCKED = "CONFLICTING_BLOCKED"
+
+
+class Wave08DispatchTarget(Enum):
+    ISSUE_FINALIZER = "ISSUE_FINALIZER"
+    ISSUE_CANCELLATION_RECOVERY = "ISSUE_CANCELLATION_RECOVERY"
+    ISSUE_INTAKE_TERMINAL_RECOVERY = "ISSUE_INTAKE_TERMINAL_RECOVERY"
+    MACHINE_VALIDATION = "MACHINE_VALIDATION"
+    MACHINE_FINALIZER = "MACHINE_FINALIZER"
+
+
+class Wave08DecisionReason(Enum):
+    OWNER_NOT_PRESENT = "OWNER_NOT_PRESENT"
+    ROLE_REQUIRES_NO_ACTION = "ROLE_REQUIRES_NO_ACTION"
+    RESERVED_ROLE = "RESERVED_ROLE"
+    ISSUE_FINALIZER_REQUIRED = "ISSUE_FINALIZER_REQUIRED"
+    ISSUE_CANCELLATION_REQUIRED = "ISSUE_CANCELLATION_REQUIRED"
+    MACHINE_VALIDATION_REQUIRED = "MACHINE_VALIDATION_REQUIRED"
+    MACHINE_FINALIZER_REQUIRED = "MACHINE_FINALIZER_REQUIRED"
+    EXPLICITLY_UNCLAIMED = "EXPLICITLY_UNCLAIMED"
+    LEGACY_CLASSIFIER_DEFERRED = "LEGACY_CLASSIFIER_DEFERRED"
+    CONFLICTING_EVIDENCE = "CONFLICTING_EVIDENCE"
+    MACHINE_AUTHORITY_PENDING = "MACHINE_AUTHORITY_PENDING"
+    FRESH_AUTHORITY_FAILED = "FRESH_AUTHORITY_FAILED"
+    DISPATCH_FAILED = "DISPATCH_FAILED"
+
+
+class Wave08PermissionLevel(Enum):
+    NONE = "none"
+    READ = "read"
+    WRITE = "write"
+
+
+class Wave08PermissionLane(Enum):
+    WG3_MANUAL_STATUS = "WG3_MANUAL_STATUS"
+    WG3_MACHINE_VALIDATION = "WG3_MACHINE_VALIDATION"
+    WG4_ISSUE_MANUAL_FINALIZER = "WG4_ISSUE_MANUAL_FINALIZER"
+    WG4_MACHINE_FINALIZER = "WG4_MACHINE_FINALIZER"
+    WG6_ORDINARY_RECOVERY = "WG6_ORDINARY_RECOVERY"
+
+
+_WAVE08_PERMISSION_KEYS = ("actions", "statuses", "contents", "pull_requests", "issues", "checks")
+_WAVE08_PERMISSION_VALUES = {
+    Wave08PermissionLane.WG3_MANUAL_STATUS: ("write", "write", "read", "read", "read", "none"),
+    Wave08PermissionLane.WG3_MACHINE_VALIDATION: ("write", "none", "read", "read", "read", "write"),
+    Wave08PermissionLane.WG4_ISSUE_MANUAL_FINALIZER: ("write", "write", "write", "write", "read", "none"),
+    Wave08PermissionLane.WG4_MACHINE_FINALIZER: ("write", "none", "write", "write", "read", "write"),
+    Wave08PermissionLane.WG6_ORDINARY_RECOVERY: ("write", "write", "write", "write", "read", "none"),
+}
+
+
+@dataclass(frozen=True)
+class Wave08PermissionProfile:
+    lane: Wave08PermissionLane
+    actions: Wave08PermissionLevel
+    statuses: Wave08PermissionLevel
+    contents: Wave08PermissionLevel
+    pull_requests: Wave08PermissionLevel
+    issues: Wave08PermissionLevel
+    checks: Wave08PermissionLevel
+
+    def __post_init__(self) -> None:
+        if type(self.lane) is not Wave08PermissionLane:
+            raise ValueError("Wave 08 permission lane must be closed")
+        values = tuple(getattr(self, key) for key in _WAVE08_PERMISSION_KEYS)
+        if any(type(value) is not Wave08PermissionLevel for value in values):
+            raise ValueError("Wave 08 permission values must use the closed permission enum")
+        expected = _WAVE08_PERMISSION_VALUES[self.lane]
+        if tuple(value.value for value in values) != expected:
+            raise ValueError("Wave 08 permission profile differs from its exact lane contract")
+
+    def as_pairs(self) -> tuple[tuple[str, str], ...]:
+        return tuple((key, getattr(self, key).value) for key in _WAVE08_PERMISSION_KEYS)
+
+
+WAVE08_PERMISSION_PROFILES = tuple(
+    Wave08PermissionProfile(lane, *(Wave08PermissionLevel(value) for value in values))
+    for lane, values in _WAVE08_PERMISSION_VALUES.items()
+)
+
+
+@dataclass(frozen=True)
+class Wave08Decision:
+    head_sha: str
+    resolution: ShaCarrierResolution
+    pull_request_numbers: tuple[int, ...]
+    owning_pr_number: int | None
+    kind: Wave08DecisionKind
+    reason: Wave08DecisionReason
+    dispatch_target: Wave08DispatchTarget | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", self.head_sha) is None:
+            raise ValueError("Wave 08 decision head must be exact lowercase 40-hex")
+        if type(self.resolution) is not ShaCarrierResolution:
+            raise ValueError("Wave 08 decision requires an exact SHA carrier resolution")
+        if type(self.pull_request_numbers) is not tuple:
+            raise ValueError("Wave 08 PR numbers must be a canonical tuple")
+        if any(type(number) is not int or not 1 <= number <= 9_223_372_036_854_775_807 for number in self.pull_request_numbers):
+            raise ValueError("Wave 08 PR numbers must be positive exact integers")
+        if tuple(sorted(set(self.pull_request_numbers))) != self.pull_request_numbers:
+            raise ValueError("Wave 08 PR numbers must be unique and deterministically sorted")
+        if self.owning_pr_number is not None:
+            if type(self.owning_pr_number) is not int or not 1 <= self.owning_pr_number <= 9_223_372_036_854_775_807:
+                raise ValueError("Wave 08 owner PR number must be a positive exact integer")
+            if self.owning_pr_number not in self.pull_request_numbers:
+                raise ValueError("Wave 08 owner PR must belong to the shared-head group")
+        if type(self.kind) is not Wave08DecisionKind or type(self.reason) is not Wave08DecisionReason:
+            raise ValueError("Wave 08 decision kind/reason must use closed enums")
+        if self.dispatch_target is not None and type(self.dispatch_target) is not Wave08DispatchTarget:
+            raise ValueError("Wave 08 dispatch target must use a closed semantic enum")
+
+        activation, role = self.resolution.activation, self.resolution.role
+        marker = self.resolution.marker
+        expected: dict[Wave08DecisionKind, tuple[set[tuple[CarrierActivation, CarrierRole | None]], Wave08DispatchTarget | None]] = {
+            Wave08DecisionKind.NO_MUTATION: ({(item, role_value) for item in CarrierActivation for role_value in (None, *tuple(CarrierRole))}, None),
+            Wave08DecisionKind.RESERVED_OWNER_RECOVERY: ({(CarrierActivation.RESERVED_INACTIVE, item) for item in CarrierRole if item is not CarrierRole.MACHINE_PUBLICATION}, None),
+            Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY: ({(CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE), (CarrierActivation.ACTIVE, CarrierRole.ISSUE_FINALIZING)}, Wave08DispatchTarget.ISSUE_FINALIZER),
+            Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY: ({(CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL)}, Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY),
+            Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH: ({(CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION)}, Wave08DispatchTarget.MACHINE_VALIDATION),
+            Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH: ({(CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION)}, Wave08DispatchTarget.MACHINE_FINALIZER),
+            Wave08DecisionKind.EXTERNAL_STATUS: ({(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION, None)}, None),
+            Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED: ({(CarrierActivation.LEGACY_CUTOVER_QUARANTINE, None)}, None),
+            Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED: ({(CarrierActivation.RESERVED_INACTIVE, CarrierRole.MACHINE_PUBLICATION)}, None),
+            Wave08DecisionKind.CONFLICTING_BLOCKED: (
+                {(item, role_value) for item in CarrierActivation for role_value in (None, *tuple(CarrierRole))}, None,
+            ),
+        }
+        allowed_pairs, target = expected[self.kind]
+        if (activation, role) not in allowed_pairs or self.dispatch_target is not target:
+            raise ValueError("Wave 08 decision kind/target is incompatible with its SHA role")
+        owner_actions = {
+            Wave08DecisionKind.RESERVED_OWNER_RECOVERY,
+            Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY,
+            Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY,
+            Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH,
+            Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH,
+        }
+        if self.kind in owner_actions and self.owning_pr_number is None:
+            raise ValueError("owner action requires the exact owner PR in the shared-head group")
+        if self.kind not in owner_actions and self.owning_pr_number is not None:
+            raise ValueError("non-owner action cannot claim an owning PR")
+        if self.kind is Wave08DecisionKind.RESERVED_OWNER_RECOVERY and (
+            marker is None or marker.owner_kind != "ISSUE"
+        ):
+            raise ValueError("reserved owner recovery requires an exact Issue claim marker")
+        if self.kind is Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED and (
+            marker is None or marker.owner_kind != "MACHINE_SOURCE" or marker.claim_kind != "MACHINE_REF_CLAIM"
+        ):
+            raise ValueError("machine recovery deferral requires the exact reserved machine claim marker")
+        if self.kind in {
+            Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY,
+            Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY,
+        } and (marker is None or marker.owner_kind != "ISSUE"):
+            raise ValueError("Issue action requires an exact Issue claim marker")
+        if self.kind is Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY and (
+            (role is CarrierRole.ISSUE_ACTIVE and marker.claim_kind not in {
+                "ISSUE_BRANCH_LEASE", "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH",
+            })
+            or (role is CarrierRole.ISSUE_FINALIZING and marker.claim_kind != "ISSUE_FINALIZATION_EPOCH")
+        ):
+            raise ValueError("Issue finalizer action requires the exact role-specific marker kind")
+        if self.kind is Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY and (
+            role is not CarrierRole.ISSUE_CANCEL or marker.claim_kind != "ISSUE_CANCELLATION_FENCE"
+        ):
+            raise ValueError("Issue cancellation action requires an exact cancellation-fence marker")
+        if self.kind in {
+            Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH,
+            Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH,
+        } and (
+            marker is None or marker.owner_kind != "MACHINE_SOURCE" or marker.claim_kind != "MACHINE_REF_CLAIM"
+        ):
+            raise ValueError("machine action requires an exact supplied machine-claim marker")
+        if self.kind is Wave08DecisionKind.EXTERNAL_STATUS and not self.pull_request_numbers:
+            raise ValueError("external status action requires an OPEN-PR head group")
+
+
+@dataclass(frozen=True)
+class IssueOwnerPR:
+    issue_number: int
+    pull_request_number: int
+    owner_key: str
+    binding_authority: str
+
+    def __post_init__(self) -> None:
+        if type(self.issue_number) is not int or not 1 <= self.issue_number <= 9_223_372_036_854_775_807:
+            raise ValueError("Issue owner number must be a positive exact integer")
+        if type(self.pull_request_number) is not int or not 1 <= self.pull_request_number <= 9_223_372_036_854_775_807:
+            raise ValueError("owner PR number must be a positive exact integer")
+        if type(self.owner_key) is not str or not self.owner_key:
+            raise ValueError("Issue owner key is required")
+        if type(self.binding_authority) is not str or self.binding_authority not in {"FULL_BINDING", "PRE_BINDING"}:
+            raise ValueError("Issue owner binding authority is unknown")
+
+
+@dataclass(frozen=True)
+class Wave08IssueRecoveryIntent:
+    """Bounded Wg6-to-Wg1 semantic dispatch; it carries no mutation authority."""
+
+    target: Wave08DispatchTarget
+    central_repository_node_id: str
+    issue_number: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.target not in {
+            Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY,
+            Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY,
+        }:
+            raise ValueError("Issue recovery intent requires a closed Wg1 semantic target")
+        if type(self.central_repository_node_id) is not str or not self.central_repository_node_id:
+            raise ValueError("Issue recovery intent requires the exact central repository identity")
+        if type(self.issue_number) is not int or not 1 <= self.issue_number <= 9_223_372_036_854_775_807:
+            raise ValueError("Issue recovery intent requires a positive exact Issue number")
+        if type(self.reason) is not str or not self.reason or len(self.reason.encode("utf-8")) > 256:
+            raise ValueError("Issue recovery intent reason must be bounded text")
+
+
+@dataclass(frozen=True)
+class Wave08IssueRecoveryRecord:
+    issue_number: int
+    issue_database_id: int | None
+    issue_node_id: str | None
+    outcome: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class Wave08MachineRefRecord:
+    ref: str
+    source_id: str
+    head_sha: str
+    outcome: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class Wave08UniversalRecoveryResult:
+    """Immutable bounded evidence from one complete or fail-closed recovery sweep."""
+
+    complete: bool
+    open_pr_inventory_count: int
+    fresh_pr_count: int
+    distinct_pr_head_count: int
+    issue_inventory_count: int
+    relevant_issue_count: int
+    machine_ref_inventory_count: int
+    decisions: tuple[Wave08Decision, ...]
+    issue_recoveries: tuple[Wave08IssueRecoveryRecord, ...]
+    machine_refs: tuple[Wave08MachineRefRecord, ...]
+    dispatch_intents: tuple[Wave08IssueRecoveryIntent, ...]
+    status_actions: tuple[tuple[str, str], ...]
+    blocked_reasons: tuple[str, ...]
+    deferred_count: int
+
+    @property
+    def blocked_count(self) -> int:
+        return len(self.blocked_reasons)
+
+
 @dataclass(frozen=True)
 class AppIdentity:
     slug: str
@@ -148,11 +991,46 @@ class AnchorComment:
 
 
 @dataclass(frozen=True)
+class IssueAnchorComment:
+    anchor: IssueRequestAnchor
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
 class PublicSourceMetadata:
     repository_id: int
     full_name: str
     default_branch: str
     description: str | None
+
+
+class IssueSourceIdentityKind(Enum):
+    PROPOSED = "proposed"
+    ACCEPTED = "accepted"
+
+
+@dataclass(frozen=True)
+class IssueSourceAuthority:
+    request_class: RequestClass
+    source_id: str
+    source_repository_id: int
+    source_canonical_full_name: str
+    source_identity_kind: IssueSourceIdentityKind
+    source_default_branch: str
+    source_description: str | None
+
+    def __post_init__(self) -> None:
+        if self.request_class not in MANUAL_CLASSES:
+            raise R02Error("Issue source authority requires ADD, UPDATE, or REMOVE")
+        if type(self.source_identity_kind) is not IssueSourceIdentityKind:
+            raise R02Error("Issue source identity kind must use the closed authority enum")
+        expected_kind = (
+            IssueSourceIdentityKind.PROPOSED
+            if self.request_class is RequestClass.ADD
+            else IssueSourceIdentityKind.ACCEPTED
+        )
+        if self.source_identity_kind is not expected_kind:
+            raise R02Error("Issue source identity kind does not match request class")
 
 
 @dataclass(frozen=True)
@@ -175,6 +1053,16 @@ class ProposalCandidate:
     source_id: str | None = None
     repository_id: int | None = None
     marker_present: bool = False
+    claimed_head_marker: ClaimedHeadMarker | None = None
+    candidate_tree_sha: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.marker_present) is not bool:
+            raise R02Error("candidate marker_present must be an exact bool")
+        if self.claimed_head_marker is not None and (
+            type(self.claimed_head_marker) is not ClaimedHeadMarker or not self.marker_present
+        ):
+            raise R02Error("typed claimed-head evidence must be present and exact")
 
 
 @dataclass(frozen=True)
@@ -212,6 +1100,7 @@ RESULT_IDEMPOTENCY_PREFIX = "<!-- swiftstream-federation-result:"
 TRUSTED_VALIDATION_NAME = "federation/trusted-validation"
 FINALIZER_CONCURRENCY_GROUP = "swiftstream-skills-federation-state-finalizer"
 MANUAL_CLASSES = frozenset({RequestClass.ADD, RequestClass.UPDATE, RequestClass.REMOVE})
+_LEGACY_UPDATE_REMOVE_NO_FEDERATION_ERROR = "UPDATE/REMOVE requires an actual federation.json trust/configuration change"
 GENERATED_PREFIXES = ("skills/",)
 MACHINE_GENERATED_FILES = frozenset({"federation.lock.json", "README.md"})
 MACHINE_WORK_LIMIT = 8
@@ -357,6 +1246,1061 @@ def resolve_app_identity(client: GitHubClient, token_action_app_slug: str) -> Ap
     return AppIdentity(token_action_app_slug, app.id, app.node_id, bot.id, bot.node_id, bot.login)
 
 
+_CLAIMED_HEAD_FAMILY = "swiftstream-federation-head:"
+_EXTERNAL_STATUS_CONTEXT = "federation/trusted-validation"
+
+
+def _is_canonical_wave08_source_id(value: Any) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        return c02.validate_source_id(value) == value
+    except c02.FederationError:
+        return False
+
+
+def _conflicting_sha_carrier(marker: ClaimedHeadMarker | None = None) -> ShaCarrierResolution:
+    return ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=marker)
+
+
+def wave08_legacy_disposition(
+    head_sha: str,
+    resolver: Callable[[str], LegacyEvidenceDisposition] | None,
+) -> LegacyEvidenceDisposition:
+    """Call the explicit trusted legacy classifier for exactly H; never infer ABSENT."""
+    if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None or not callable(resolver):
+        return LegacyEvidenceDisposition.CONFLICTING
+    try:
+        disposition = resolver(head_sha)
+    except Exception:
+        return LegacyEvidenceDisposition.CONFLICTING
+    return disposition if type(disposition) is LegacyEvidenceDisposition else LegacyEvidenceDisposition.CONFLICTING
+
+
+def legacy_classification_disposition(result: LegacyClassificationResult) -> LegacyEvidenceDisposition:
+    if type(result) is not LegacyClassificationResult:
+        raise R02Error("legacy classification result has an invalid type")
+    return {
+        LegacyClassificationOutcome.ABSENT: LegacyEvidenceDisposition.ABSENT,
+        LegacyClassificationOutcome.QUARANTINE: LegacyEvidenceDisposition.QUARANTINE,
+        LegacyClassificationOutcome.CONFLICTING: LegacyEvidenceDisposition.CONFLICTING,
+    }[result.outcome]
+
+
+def _legacy_payload_digest(prefix: str, value: Mapping[str, Any]) -> str:
+    try:
+        canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256((prefix + canonical).encode("utf-8")).hexdigest()
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise R02Error("legacy evidence payload cannot be encoded canonically") from None
+
+
+def wave08_decision_for_resolution(
+    head_sha: str,
+    resolution: ShaCarrierResolution,
+    pull_request_numbers: Iterable[int],
+    *,
+    owner_pr_number: int | None = None,
+    machine_target: Wave08DispatchTarget = Wave08DispatchTarget.MACHINE_VALIDATION,
+) -> Wave08Decision:
+    """Pure closed SHA-role-to-action mapping for one deterministic shared-head group."""
+    if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+        raise ValueError("Wave 08 decision head must be exact lowercase 40-hex")
+    if type(resolution) is not ShaCarrierResolution:
+        raise ValueError("Wave 08 decision requires an exact SHA carrier resolution")
+    if type(machine_target) is not Wave08DispatchTarget or machine_target not in {
+        Wave08DispatchTarget.MACHINE_VALIDATION, Wave08DispatchTarget.MACHINE_FINALIZER,
+    }:
+        raise ValueError("machine action requires a closed machine semantic target")
+    if isinstance(pull_request_numbers, (str, bytes)):
+        raise ValueError("Wave 08 PR group must be an integer sequence")
+    try:
+        raw_numbers = tuple(pull_request_numbers)
+    except TypeError:
+        raise ValueError("Wave 08 PR group must be an integer sequence") from None
+    if any(type(number) is not int or not 1 <= number <= 9_223_372_036_854_775_807 for number in raw_numbers):
+        raise ValueError("Wave 08 PR group numbers must be positive exact integers")
+    if len(set(raw_numbers)) != len(raw_numbers):
+        raise ValueError("Wave 08 PR group contains duplicate PR numbers")
+    numbers = tuple(sorted(raw_numbers))
+    if owner_pr_number is not None and (
+        type(owner_pr_number) is not int
+        or not 1 <= owner_pr_number <= 9_223_372_036_854_775_807
+    ):
+        raise ValueError("Wave 08 owner PR number must be a positive exact integer")
+    owner = owner_pr_number
+    if owner is not None and owner not in numbers:
+        raise ValueError("Wave 08 owner PR must belong to the shared-head group")
+    owner_is_member = owner is not None and owner in numbers
+    activation, role, marker = resolution.activation, resolution.role, resolution.marker
+    if role is not CarrierRole.MACHINE_PUBLICATION and machine_target is not Wave08DispatchTarget.MACHINE_VALIDATION:
+        raise ValueError("Issue and non-machine roles cannot select a machine dispatch lane")
+    if activation in {
+        CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION,
+        CarrierActivation.LEGACY_CUTOVER_QUARANTINE,
+        CarrierActivation.CONFLICTING,
+    } and owner is not None:
+        raise ValueError("unclaimed, quarantined, and conflicting heads cannot have an owner PR")
+
+    def make(kind: Wave08DecisionKind, reason: Wave08DecisionReason, target: Wave08DispatchTarget | None = None, *, chosen_owner: int | None = None) -> Wave08Decision:
+        return Wave08Decision(head_sha, resolution, numbers, chosen_owner, kind, reason, target)
+
+    if activation is CarrierActivation.CONFLICTING:
+        return make(Wave08DecisionKind.CONFLICTING_BLOCKED, Wave08DecisionReason.CONFLICTING_EVIDENCE)
+    if activation is CarrierActivation.LEGACY_CUTOVER_QUARANTINE:
+        return make(Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED, Wave08DecisionReason.LEGACY_CLASSIFIER_DEFERRED)
+    if activation is CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION:
+        if numbers:
+            return make(Wave08DecisionKind.EXTERNAL_STATUS, Wave08DecisionReason.EXPLICITLY_UNCLAIMED)
+        return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.ROLE_REQUIRES_NO_ACTION)
+    if activation is CarrierActivation.RESERVED_INACTIVE:
+        if role is CarrierRole.MACHINE_PUBLICATION:
+            if marker is not None and marker.owner_kind == "MACHINE_SOURCE" and marker.claim_kind == "MACHINE_REF_CLAIM":
+                return make(Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED, Wave08DecisionReason.MACHINE_AUTHORITY_PENDING)
+            return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.OWNER_NOT_PRESENT)
+        if owner_is_member and marker is not None and marker.owner_kind == "ISSUE":
+            return make(
+                Wave08DecisionKind.RESERVED_OWNER_RECOVERY,
+                Wave08DecisionReason.RESERVED_ROLE,
+                chosen_owner=owner,
+            )
+        return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.OWNER_NOT_PRESENT)
+
+    if activation is not CarrierActivation.ACTIVE or type(role) is not CarrierRole:
+        return make(Wave08DecisionKind.CONFLICTING_BLOCKED, Wave08DecisionReason.CONFLICTING_EVIDENCE)
+    if role in {CarrierRole.ISSUE_ACTIVE, CarrierRole.ISSUE_FINALIZING}:
+        if not owner_is_member or marker is None or marker.owner_kind != "ISSUE":
+            return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.OWNER_NOT_PRESENT)
+        return make(
+            Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY,
+            Wave08DecisionReason.ISSUE_FINALIZER_REQUIRED,
+            Wave08DispatchTarget.ISSUE_FINALIZER,
+            chosen_owner=owner,
+        )
+    if role is CarrierRole.ISSUE_CANCEL:
+        if not owner_is_member or marker is None or marker.owner_kind != "ISSUE":
+            return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.OWNER_NOT_PRESENT)
+        return make(
+            Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY,
+            Wave08DecisionReason.ISSUE_CANCELLATION_REQUIRED,
+            Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY,
+            chosen_owner=owner,
+        )
+    if role is CarrierRole.MACHINE_PUBLICATION:
+        if not owner_is_member or marker is None or marker.owner_kind != "MACHINE_SOURCE" or marker.claim_kind != "MACHINE_REF_CLAIM":
+            return make(Wave08DecisionKind.NO_MUTATION, Wave08DecisionReason.OWNER_NOT_PRESENT)
+        if machine_target is Wave08DispatchTarget.MACHINE_VALIDATION:
+            return make(
+                Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH,
+                Wave08DecisionReason.MACHINE_VALIDATION_REQUIRED,
+                machine_target,
+                chosen_owner=owner,
+            )
+        return make(
+            Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH,
+            Wave08DecisionReason.MACHINE_FINALIZER_REQUIRED,
+            machine_target,
+            chosen_owner=owner,
+        )
+    return make(Wave08DecisionKind.CONFLICTING_BLOCKED, Wave08DecisionReason.CONFLICTING_EVIDENCE)
+
+
+def _issue_pr_binding_matches_cancellation_identity(
+    binding: IssuePRBinding,
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment,
+    pr_number: int,
+    pr_issue: IssueMetadata,
+    central_repository_node_id: str,
+) -> bool:
+    actual = (
+        binding.issue_number,
+        binding.issue_database_id,
+        binding.issue_node_id,
+        binding.issue_request_anchor_comment_database_id,
+        binding.issue_request_anchor_sha256,
+        binding.issue_branch_lease_comment_database_id,
+        binding.issue_branch_lease_sha256,
+        binding.source_id,
+        binding.source_repository_id,
+        binding.branch_ref,
+        binding.pull_request_number,
+        binding.pull_request_database_id,
+        binding.pull_request_node_id,
+        binding.initial_head_sha,
+        binding.base_ref,
+        binding.central_repository_node_id,
+    )
+    expected = (
+        anchor.anchor.issue_number,
+        anchor.anchor.issue_database_id,
+        anchor.anchor.issue_node_id,
+        anchor.comment.database_id,
+        anchor.anchor.canonical_sha256(),
+        lease.comment.database_id,
+        _binding_comment_sha256(lease.comment),
+        anchor.anchor.source_id,
+        anchor.anchor.source_repository_id,
+        lease.lease.branch_ref,
+        pr_number,
+        pr_issue.database_id,
+        pr_issue.node_id,
+        lease.lease.initial_head_sha,
+        "main",
+        central_repository_node_id,
+    )
+    return actual == expected
+
+
+def _fresh_issue_cancellation_authority(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    *,
+    require_prebinding_lease_root: bool = False,
+    allow_pr_stage_state: bool = False,
+) -> _IssueCancellationAuthority:
+    cancellation_allows_closed_lifecycle = False
+    central = client.get_repository_metadata(repository)
+    if (
+        type(central) is not RepositoryMetadata
+        or central.full_name != repository
+        or central.default_branch != "main"
+        or not central.node_id
+    ):
+        raise R02Error("cancellation requires exact central repository identity and main default branch")
+    intake = _read_issue_pr_intake(
+        client, repository, issue_number, app, central.node_id,
+        lambda _request, _request_class: None,
+        validate_fresh_source_authority=False,
+        require_open_lifecycle=cancellation_allows_closed_lifecycle,
+    )
+    owning_issue, _issue_comments, anchor, lease, _repo, issue_bindings = intake
+    short_ref = lease.lease.branch_ref.removeprefix("refs/heads/")
+    candidates = _enumerate_issue_pr_candidates(
+        client, repository, short_ref, app, anchor, lease, central.node_id,
+    )
+    if len(candidates) != 1:
+        raise R02Error("cancellation requires exactly one central App-created reserved-head PR")
+    candidate = candidates[0]
+    pr = candidate.pr
+    try:
+        pr_issue = client.get_issue_metadata(repository, pr.number)
+        all_prs = tuple(client.list_pull_requests(repository, state="all"))
+    except Exception as error:
+        raise StaleAuthorityError(f"cancellation PR-as-Issue authority is unavailable: {_bounded_reason(error)}") from None
+    raw_matches = [item for item in all_prs if type(item) is dict and item.get("number") == pr.number]
+    if len(raw_matches) != 1:
+        raise R02Error("cancellation PR enumeration did not uniquely identify the exact PR")
+    raw = raw_matches[0]
+    raw_state = raw.get("state")
+    raw_merged = raw.get("merged")
+    if type(raw_merged) is not bool and "merged_at" in raw:
+        merged_at = raw.get("merged_at")
+        if merged_at is None:
+            raw_merged = False
+        elif type(merged_at) is str and merged_at:
+            raw_merged = True
+        else:
+            raw_merged = None
+    if type(raw_state) is not str or raw_state not in {"open", "closed"} or type(raw_merged) is not bool:
+        raise R02Error("cancellation PR enumeration omitted exact state/merged evidence")
+    expected_body = render_request_body(anchor.anchor.initial_request)
+    if (
+        type(pr) is not PullRequestMetadata
+        or pr.number != candidate.pr.number
+        or pr.author_id != app.bot_node_id
+        or pr.author_login != app.bot_login
+        or pr.head_ref != short_ref
+        or pr.head_repository_id != central.node_id
+        or pr.head_repository != repository
+        or pr.base_repository_id != central.node_id
+        or pr.base_repository != repository
+        or pr.base_ref != "main"
+        or type(pr.draft) is not bool
+        or (not allow_pr_stage_state and pr.draft is not False)
+        or pr.body != expected_body
+        or pr.last_edited_at is not None
+        or pr.includes_created_edit is not False
+        or type(pr_issue) is not IssueMetadata
+        or pr_issue.is_pull_request is not True
+        or pr_issue.number != pr.number
+        or type(pr_issue.database_id) is not int
+        or pr_issue.database_id <= 0
+        or type(pr_issue.node_id) is not str
+        or not pr_issue.node_id
+        or pr_issue.author_id != app.bot_node_id
+        or pr_issue.author_login != app.bot_login
+        or pr_issue.body != pr.body
+        or pr_issue.state != raw_state
+    ):
+        raise R02Error("cancellation PR is not the exact immutable central PR-as-Issue")
+    pr_comments = tuple(client.list_issue_comments(repository, pr.number))
+    _issue_pr_authority_fence(pr_comments, app, allow_cancellation_fence=True)
+    pr_bindings = _binding_comment_candidates(
+        pr_comments, app, PR_ISSUE_ORIGIN_BINDING_MARKER,
+        parse_pr_issue_origin_binding, "PRIssueOriginBinding",
+    )
+    issue_binding = issue_bindings[0] if issue_bindings else None
+    pr_binding = pr_bindings[0] if pr_bindings else None
+    for item in (issue_binding, pr_binding):
+        if item is not None and not _issue_pr_binding_matches_cancellation_identity(
+            item.binding, anchor, lease, pr.number, pr_issue, central.node_id,
+        ):
+            raise R02Error("partial IssuePRBinding does not match the exact PR-as-Issue identity triple")
+    if issue_binding is not None and pr_binding is not None:
+        if issue_binding.binding != pr_binding.binding:
+            raise R02Error("two-sided IssuePRBinding disagrees across Issue and PR comments")
+        binding_state = _read_managed_issue_pr_binding_state(
+            client, repository, issue_number, app, central.node_id,
+            lambda _request, _request_class: None,
+            validate_fresh_source_authority=False,
+            require_open_lifecycle=cancellation_allows_closed_lifecycle,
+            allow_cancellation_fence=True,
+            allow_pr_stage_state=allow_pr_stage_state,
+        )
+        binding = binding_state.binding
+        if (
+            binding != issue_binding.binding
+            or binding.pull_request_node_id != pr_issue.node_id
+            or binding.pull_request_database_id != pr_issue.database_id
+            or binding.pull_request_number != pr_issue.number
+        ):
+            raise R02Error("complete IssuePRBinding does not match central PR-as-Issue identity")
+        binding_authority = "FULL_BINDING"
+    else:
+        binding = None
+        binding_state = None
+        binding_authority = "PRE_BINDING"
+    authority = _IssueCancellationAuthority(
+        issue_anchor=anchor,
+        lease=lease,
+        binding_authority=binding_authority,
+        pull_request_number=pr.number,
+        pull_request_database_id=pr_issue.database_id,
+        pull_request_node_id=pr_issue.node_id,
+        central_repository_node_id=central.node_id,
+        base_repository_node_id=central.node_id,
+        pr=pr,
+        pr_issue=pr_issue,
+        owning_issue=owning_issue,
+        pr_comments=pr_comments,
+        binding=binding,
+        binding_state=binding_state,
+        raw_pr_state=raw_state.upper(),
+        raw_pr_merged=raw_merged,
+    )
+    if authority.binding_authority == "PRE_BINDING" and require_prebinding_lease_root:
+        current_ref = _read_issue_branch_ref(client, repository, short_ref)
+        if current_ref != lease.lease.initial_head_sha or pr.head_oid != lease.lease.initial_head_sha:
+            raise R02Error("PRE_BINDING cancellation requires the exact lease-root PR/ref before fence activation")
+    return authority
+
+
+def resolve_sha_carrier_role(
+    client: GitHubClient,
+    repository: str,
+    head_sha: str,
+    app_slug: str,
+    legacy_evidence_disposition: LegacyEvidenceDisposition | Callable[[], LegacyEvidenceDisposition],
+) -> ShaCarrierResolution:
+    """Resolve the role of exact commit H without consulting PR topology first."""
+    try:
+        commit = client.get_git_commit_object(repository, head_sha)
+    except Exception:
+        return _conflicting_sha_carrier()
+    if type(commit) is not GitCommitObject or commit.sha != head_sha or type(commit.message) is not str:
+        return _conflicting_sha_carrier()
+
+    marker_count = commit.message.count(_CLAIMED_HEAD_FAMILY)
+    if marker_count == 0:
+        if type(legacy_evidence_disposition) is LegacyEvidenceDisposition:
+            disposition = legacy_evidence_disposition
+        elif callable(legacy_evidence_disposition):
+            try:
+                disposition = legacy_evidence_disposition()
+            except Exception:
+                return _conflicting_sha_carrier()
+        else:
+            raise R02Error("explicit trusted legacy evidence disposition is required")
+        if type(disposition) is not LegacyEvidenceDisposition:
+            return _conflicting_sha_carrier()
+        if disposition is LegacyEvidenceDisposition.QUARANTINE:
+            return ShaCarrierResolution(CarrierActivation.LEGACY_CUTOVER_QUARANTINE)
+        if disposition is LegacyEvidenceDisposition.CONFLICTING:
+            return _conflicting_sha_carrier()
+        if disposition is LegacyEvidenceDisposition.ABSENT:
+            return ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+        return _conflicting_sha_carrier()
+
+    # The whole literal namespace is reserved before any fallback. Only one exact
+    # supported v2 marker occupying the entire commit message reaches provenance.
+    if marker_count != 1 or not commit.message.startswith(CLAIMED_HEAD_MARKER_HEADER + "\n"):
+        return _conflicting_sha_carrier()
+    try:
+        marker = parse_claimed_head_marker(commit.message)
+    except RequestModelError:
+        return _conflicting_sha_carrier()
+
+    supported_roles = {
+        "ISSUE_BRANCH_LEASE": CarrierRole.ISSUE_ACTIVE.value,
+        "ISSUE_HEAD_CLAIM": CarrierRole.ISSUE_ACTIVE.value,
+        "REQUIRED_STATUS_EPOCH": CarrierRole.ISSUE_ACTIVE.value,
+        "ISSUE_FINALIZATION_EPOCH": CarrierRole.ISSUE_FINALIZING.value,
+        "ISSUE_CANCELLATION_FENCE": CarrierRole.ISSUE_CANCEL.value,
+    }
+    if (
+        marker.owner_kind != "ISSUE"
+        or marker.claim_kind not in supported_roles
+        or marker.role != supported_roles.get(marker.claim_kind)
+    ):
+        return _conflicting_sha_carrier(marker)
+
+    try:
+        central = client.get_repository_metadata(repository)
+        if (
+            type(central) is not RepositoryMetadata
+            or central.full_name != repository
+            or not central.node_id
+        ):
+            return _conflicting_sha_carrier(marker)
+        owner_central_node_id, issue_database_id, issue_node_id, issue_number = parse_issue_owner_key(marker.owner_key)
+        if owner_central_node_id != central.node_id:
+            return _conflicting_sha_carrier(marker)
+        app = resolve_app_identity(client, app_slug)
+        issue = client.get_issue_metadata(repository, issue_number)
+        if (
+            type(issue) is not IssueMetadata
+            or issue.number != issue_number
+            or issue.database_id != issue_database_id
+            or issue.node_id != issue_node_id
+            or issue.is_pull_request
+        ):
+            return _conflicting_sha_carrier(marker)
+        comments = tuple(client.list_issue_comments(repository, issue_number))
+        anchor = validate_unique_issue_anchor(comments, issue, app)
+        if issue_owner_key(
+            central.node_id, anchor.anchor.issue_database_id,
+            anchor.anchor.issue_node_id, anchor.anchor.issue_number,
+        ) != marker.owner_key:
+            return _conflicting_sha_carrier(marker)
+        lease = _resolve_issue_branch_lease_class(
+            client, repository, comments, app, anchor.anchor,
+            anchor.comment.database_id, central.node_id,
+        )
+        if lease is None:
+            return _conflicting_sha_carrier(marker)
+
+        if marker.claim_kind == "ISSUE_BRANCH_LEASE":
+            if lease.lease.initial_head_sha != head_sha or _lease_marker_for(lease.lease) != marker:
+                return _conflicting_sha_carrier(marker)
+            current_ref = _read_issue_branch_ref(
+                client, repository, lease.lease.branch_ref.removeprefix("refs/heads/"),
+            )
+            activation = CarrierActivation.ACTIVE if current_ref == head_sha else CarrierActivation.RESERVED_INACTIVE
+            return ShaCarrierResolution(activation, CarrierRole.ISSUE_ACTIVE, marker)
+
+        if marker.claim_kind == "ISSUE_CANCELLATION_FENCE":
+            return _resolve_issue_cancellation_carrier(
+                client, repository, head_sha, app, marker,
+            )
+
+        state = _read_managed_issue_pr_binding_state(
+            client,
+            repository,
+            issue_number,
+            app,
+            central.node_id,
+            lambda _request, _request_class: None,
+            validate_fresh_source_authority=False,
+            require_open_lifecycle=False,
+        )
+        current_ref = _read_issue_branch_ref(
+            client, repository, state.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        pr_comments = tuple(client.list_issue_comments(repository, state.binding.pull_request_number))
+        history = _issue_authority_history(
+            client, repository, pr_comments, app, state, current_ref or ZERO_OID,
+        )
+        matches = [
+            item for item in history
+            if item.target_head_sha == head_sha
+            and (
+                (_issue_head_claim_marker(item.artifact) if item.claim_kind == "ISSUE_HEAD_CLAIM"
+                 else _required_status_epoch_marker(item.artifact) if item.claim_kind == "REQUIRED_STATUS_EPOCH"
+                 else _issue_finalization_epoch_marker(item.artifact) if item.claim_kind == "ISSUE_FINALIZATION_EPOCH"
+                 else _lease_marker_for(item.artifact)) == marker
+            )
+        ]
+        if len(matches) != 1:
+            return _conflicting_sha_carrier(marker)
+        activation_state = _read_managed_issue_pr_binding_state(
+            client,
+            repository,
+            issue_number,
+            app,
+            central.node_id,
+            lambda _request, _request_class: None,
+            validate_fresh_source_authority=False,
+            require_open_lifecycle=False,
+        )
+        _require_same_managed_issue_pr_binding(state, activation_state)
+        activation_ref = _read_issue_branch_ref(
+            client, repository, activation_state.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        active = (
+            activation_state.owning_issue.state == "open"
+            and activation_state.pr_issue.state == "open"
+            and activation_ref == head_sha
+            and activation_state.pr.head_oid == head_sha
+        )
+        activation = CarrierActivation.ACTIVE if active else CarrierActivation.RESERVED_INACTIVE
+        result_role = CarrierRole(supported_roles[marker.claim_kind])
+        return ShaCarrierResolution(activation, result_role, marker)
+    except Exception:
+        return _conflicting_sha_carrier(marker)
+
+
+def _resolve_issue_cancellation_carrier(
+    client: GitHubClient,
+    repository: str,
+    head_sha: str,
+    app: AppIdentity,
+    marker: ClaimedHeadMarker,
+) -> ShaCarrierResolution:
+    try:
+        owner_central_node_id, _issue_database_id, _issue_node_id, issue_number = parse_issue_owner_key(marker.owner_key)
+        authority = _fresh_issue_cancellation_authority(
+            client, repository, issue_number, app, allow_pr_stage_state=True,
+        )
+        if authority.central_repository_node_id != owner_central_node_id:
+            return _conflicting_sha_carrier(marker)
+        if authority.binding_authority == "PRE_BINDING" and (
+            authority.pr.head_oid != authority.lease.lease.initial_head_sha
+            and authority.pr.head_oid != head_sha
+        ):
+            return _conflicting_sha_carrier(marker)
+        current_ref = _read_issue_branch_ref(
+            client, repository, authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        fences = _issue_cancellation_fence_comments(
+            client, repository, authority.pr_comments, app, authority, current_ref or ZERO_OID,
+        )
+        if len(fences) != 1 or fences[0].fence.cancellation_head_sha != head_sha:
+            return _conflicting_sha_carrier(marker)
+        fence_item = fences[0]
+        if _issue_cancellation_fence_marker(fence_item.fence) != marker:
+            return _conflicting_sha_carrier(marker)
+        if authority.binding_authority == "FULL_BINDING":
+            assert authority.binding_state is not None
+            history = _issue_authority_history(
+                client, repository, authority.pr_comments, app,
+                authority.binding_state, current_ref or ZERO_OID,
+            )
+            exact_nodes = tuple(
+                node for node in history
+                if node.target_head_sha == head_sha
+                and node.claim_kind == "ISSUE_CANCELLATION_FENCE"
+                and node.artifact == fence_item.fence
+                and node.comment.database_id == fence_item.comment.database_id
+            )
+            if len(exact_nodes) != 1:
+                return _conflicting_sha_carrier(marker)
+        elif (
+            fence_item.fence.binding_authority != "PRE_BINDING"
+            or fence_item.fence.original_head_claim_kind != "ISSUE_BRANCH_LEASE"
+            or fence_item.fence.original_head_claim_role != CarrierRole.ISSUE_ACTIVE.value
+            or fence_item.fence.original_head_sha != authority.lease.lease.initial_head_sha
+        ):
+            return _conflicting_sha_carrier(marker)
+
+        # Re-read every identity input after provenance. The resolver never uses
+        # graph reachability alone as ACTIVE evidence.
+        final_authority = _fresh_issue_cancellation_authority(
+            client, repository, issue_number, app, allow_pr_stage_state=True,
+        )
+        if (
+            final_authority.binding_authority != authority.binding_authority
+            or final_authority.issue_anchor.anchor != authority.issue_anchor.anchor
+            or final_authority.issue_anchor.comment.database_id != authority.issue_anchor.comment.database_id
+            or final_authority.lease.lease != authority.lease.lease
+            or final_authority.lease.comment.database_id != authority.lease.comment.database_id
+            or final_authority.pull_request_number != authority.pull_request_number
+            or final_authority.pull_request_database_id != authority.pull_request_database_id
+            or final_authority.pull_request_node_id != authority.pull_request_node_id
+            or final_authority.binding != authority.binding
+        ):
+            return _conflicting_sha_carrier(marker)
+        final_ref = _read_issue_branch_ref(
+            client, repository, final_authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        active = (
+            final_ref == head_sha
+            and final_authority.pr.head_oid == head_sha
+            and final_authority.raw_pr_state in {"OPEN", "CLOSED"}
+            and final_authority.raw_pr_merged is False
+            and final_authority.pr_issue.state == final_authority.raw_pr_state.lower()
+        )
+        activation = CarrierActivation.ACTIVE if active else CarrierActivation.RESERVED_INACTIVE
+        return ShaCarrierResolution(activation, CarrierRole.ISSUE_CANCEL, marker)
+    except Exception:
+        return _conflicting_sha_carrier(marker)
+
+
+def derive_issue_owner_pr(
+    client: GitHubClient,
+    repository: str,
+    head_sha: str,
+    resolution: ShaCarrierResolution,
+    app_slug: str,
+    *,
+    role_already_resolved: bool = False,
+    canonical_role_resolver: Callable[[str], ShaCarrierResolution] | None = None,
+) -> IssueOwnerPR:
+    """Derive an Issue owner from validated claim history and exact current binding."""
+    if (
+        type(head_sha) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        or type(resolution) is not ShaCarrierResolution
+        or resolution.activation not in {CarrierActivation.ACTIVE, CarrierActivation.RESERVED_INACTIVE}
+        or type(resolution.marker) is not ClaimedHeadMarker
+        or resolution.marker.owner_kind != "ISSUE"
+    ):
+        raise R02Error("exact Issue claimed-head resolution is required to derive its owner")
+    if type(role_already_resolved) is not bool:
+        raise R02Error("role_already_resolved must be an exact bool")
+    if canonical_role_resolver is not None and not callable(canonical_role_resolver):
+        raise R02Error("canonical role resolver must be a semantic callable")
+    if not role_already_resolved:
+        fresh_resolution = (
+            canonical_role_resolver(head_sha)
+            if canonical_role_resolver is not None
+            else resolve_sha_carrier_role(
+                client, repository, head_sha, app_slug, LegacyEvidenceDisposition.CONFLICTING,
+            )
+        )
+        if fresh_resolution != resolution:
+            raise StaleAuthorityError("Issue SHA role changed during owner derivation")
+    try:
+        central = client.get_repository_metadata(repository)
+        central_node_id, issue_database_id, issue_node_id, issue_number = parse_issue_owner_key(
+            resolution.marker.owner_key,
+        )
+        if (
+            type(central) is not RepositoryMetadata
+            or central.full_name != repository
+            or central.default_branch != "main"
+            or central.node_id != central_node_id
+        ):
+            raise R02Error("Issue owner key does not bind the exact central repository")
+        app = resolve_app_identity(client, app_slug)
+        issue = client.get_issue_metadata(repository, issue_number)
+        comments = tuple(client.list_issue_comments(repository, issue_number))
+        if (
+            type(issue) is not IssueMetadata
+            or issue.number != issue_number
+            or issue.database_id != issue_database_id
+            or issue.node_id != issue_node_id
+            or issue.is_pull_request
+        ):
+            raise R02Error("claimed Issue owner does not match fresh Issue identity")
+        anchor = validate_unique_issue_anchor(comments, issue, app)
+        if issue_owner_key(
+            central.node_id, anchor.anchor.issue_database_id,
+            anchor.anchor.issue_node_id, anchor.anchor.issue_number,
+        ) != resolution.marker.owner_key:
+            raise R02Error("IssueRequestAnchor does not match the claimed owner key")
+        lease = _resolve_issue_branch_lease_class(
+            client, repository, comments, app, anchor.anchor,
+            anchor.comment.database_id, central.node_id,
+        )
+        if lease is None:
+            raise R02Error("exact IssueBranchLease is required to derive an Issue owner")
+        if resolution.marker.claim_kind == "ISSUE_BRANCH_LEASE" and (
+            lease.lease.initial_head_sha != head_sha or _lease_marker_for(lease.lease) != resolution.marker
+        ):
+            raise R02Error("Issue lease does not bind the exact claimed head")
+        if resolution.marker.claim_kind == "ISSUE_CANCELLATION_FENCE":
+            authority = _fresh_issue_cancellation_authority(
+                client, repository, issue_number, app, allow_pr_stage_state=True,
+            )
+            current_ref = _read_issue_branch_ref(
+                client, repository, authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+            )
+            fences = _issue_cancellation_fence_comments(
+                client, repository, authority.pr_comments, app, authority, current_ref or ZERO_OID,
+            )
+            exact = tuple(
+                item for item in fences
+                if item.fence.cancellation_head_sha == head_sha
+                and _issue_cancellation_fence_marker(item.fence) == resolution.marker
+            )
+            if len(exact) != 1 or (
+                resolution.activation is CarrierActivation.ACTIVE
+                and (current_ref != head_sha or authority.pr.head_oid != head_sha)
+            ):
+                raise R02Error("cancellation owner does not match the exact active fence/PR head")
+            return IssueOwnerPR(
+                issue_number, authority.pull_request_number, resolution.marker.owner_key,
+                "PRE_BINDING" if authority.binding_authority == "PRE_BINDING" else "FULL_BINDING",
+            )
+        state = _read_managed_issue_pr_binding_state(
+            client, repository, issue_number, app, central.node_id,
+            lambda _request, _request_class: None,
+            validate_fresh_source_authority=False,
+            require_open_lifecycle=False,
+        )
+        current_ref = _read_issue_branch_ref(
+            client, repository, state.binding.branch_ref.removeprefix("refs/heads/"),
+        )
+        pr_comments = tuple(client.list_issue_comments(repository, state.binding.pull_request_number))
+        history = _issue_authority_history(
+            client, repository, pr_comments, app, state, current_ref or ZERO_OID,
+        )
+        if not any(
+            item.target_head_sha == head_sha
+            and item.claim_kind == resolution.marker.claim_kind
+            and (
+                (_issue_head_claim_marker(item.artifact) if item.claim_kind == "ISSUE_HEAD_CLAIM"
+                 else _required_status_epoch_marker(item.artifact) if item.claim_kind == "REQUIRED_STATUS_EPOCH"
+                 else _issue_finalization_epoch_marker(item.artifact) if item.claim_kind == "ISSUE_FINALIZATION_EPOCH"
+                 else _lease_marker_for(item.artifact)) == resolution.marker
+            )
+            for item in history
+        ):
+            raise R02Error("Issue authority history does not bind the claimed owner PR")
+        if resolution.activation is CarrierActivation.ACTIVE and (
+            current_ref != head_sha or state.pr.head_oid != head_sha
+        ):
+            raise R02Error("active Issue owner PR/ref no longer points at the exact resolved head")
+        return IssueOwnerPR(issue_number, state.binding.pull_request_number, resolution.marker.owner_key, "FULL_BINDING")
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"exact Issue owner derivation failed: {_bounded_reason(error)}") from None
+
+
+def publish_unclaimed_external_success(
+    client: GitHubClient,
+    repository: RepositoryMetadata,
+    head_sha: str,
+    resolution: ShaCarrierResolution,
+    app: AppIdentity,
+) -> StatusWriteReceipt:
+    """Publish only the PR-independent external success tuple for proven-unclaimed H."""
+    if type(repository) is not RepositoryMetadata:
+        raise R02Error("exact central repository metadata is required for external status")
+    if type(resolution) is not ShaCarrierResolution or resolution != ShaCarrierResolution(
+        CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION,
+    ):
+        raise R02Error("external success requires exact UNCLAIMED_OUT_OF_FEDERATION resolution")
+    if type(app) is not AppIdentity:
+        raise R02Error("exact trusted App identity is required for external status")
+    if (
+        type(repository.id) is not int or repository.id <= 0
+        or type(repository.node_id) is not str or not repository.node_id
+        or type(repository.full_name) is not str or repository.full_name.count("/") != 1
+        or not re.fullmatch(r"[0-9a-f]{40}", head_sha if type(head_sha) is str else "")
+        or type(app.bot_id) is not int or app.bot_id <= 0
+        or type(app.bot_node_id) is not str or not app.bot_node_id
+        or type(app.bot_login) is not str or not app.bot_login
+    ):
+        raise R02Error("external status repository, SHA, or Bot identity is malformed")
+    digest = external_status_evidence_digest(
+        repository.id, repository.node_id, repository.full_name, head_sha,
+    )
+    description = render_status_description(StatusClass.EXTERNAL, digest)
+    receipt = client.create_commit_status(
+        repository.full_name,
+        head_sha,
+        "success",
+        _EXTERNAL_STATUS_CONTEXT,
+        description,
+        None,
+    )
+    expected_route = f"/repos/{repository.full_name}/statuses/{head_sha}"
+    if type(receipt) is not StatusWriteReceipt or (
+        receipt.repository != repository.full_name
+        or receipt.requested_sha != head_sha
+        or receipt.method != "POST"
+        or receipt.route != expected_route
+        or receipt.requested_state != "success"
+        or receipt.requested_context != _EXTERNAL_STATUS_CONTEXT
+        or receipt.requested_description != description
+        or receipt.requested_target_url is not None
+    ):
+        raise R02Error("external status write receipt does not match the exact requested tuple")
+    status = receipt.returned_status
+    if type(status) is not CommitStatus or (
+        status.context != _EXTERNAL_STATUS_CONTEXT
+        or status.state != "success"
+        or status.description != description
+        or status.target_url is not None
+        or status.creator_database_id != app.bot_id
+        or status.creator_node_id != app.bot_node_id
+        or status.creator_login != app.bot_login
+        or status.creator_type != "Bot"
+    ):
+        raise R02Error("external status response does not match the exact App Bot tuple")
+    return receipt
+
+
+def _latest_exact_issue_final_status_evidence(
+    client: GitHubClient,
+    repository: str,
+    head_sha: str,
+    app: AppIdentity,
+) -> ExactAppRequiredStatusEvidence | None:
+    """Select corroborating evidence only from the exact App's issue-final success rows."""
+    try:
+        statuses = tuple(client.list_commit_statuses(repository, head_sha))
+    except Exception:
+        # This evidence is corroborating only. Its absence or temporary
+        # unavailability never suppresses a RequiredStatusEpoch transition.
+        return None
+    matching: list[CommitStatus] = []
+    for status in statuses:
+        if type(status) is not CommitStatus or (
+            status.creator_database_id != app.bot_id
+            or status.creator_node_id != app.bot_node_id
+            or status.creator_login != app.bot_login
+            or status.creator_type != "Bot"
+            or status.state != "success"
+            or status.context != "federation/trusted-validation"
+            or status.target_url is not None
+            or status.description is None
+        ):
+            continue
+        try:
+            description = parse_status_description(status.description)
+        except RequestModelError:
+            continue
+        if description.status_class is StatusClass.ISSUE_FINAL:
+            matching.append(status)
+    if not matching:
+        return None
+    latest = max(matching, key=lambda item: (item.updated_at, item.created_at, item.id))
+    try:
+        return ExactAppRequiredStatusEvidence(
+            latest.id, latest.node_id, latest.state, latest.context, latest.description or "",
+            latest.target_url, latest.creator_database_id, latest.creator_node_id,
+            latest.creator_login, latest.creator_type, latest.created_at, latest.updated_at,
+        )
+    except RequestModelError:
+        return None
+
+
+def _read_latest_exact_app_required_status_snapshot(
+    client: GitHubClient,
+    repository: str,
+    head_sha: str,
+    app: AppIdentity,
+) -> tuple[ExactAppRequiredStatusSnapshot, bool, bool, CommitStatus | None]:
+    try:
+        statuses = tuple(client.list_commit_statuses(repository, head_sha))
+    except Exception as error:
+        raise StaleAuthorityError(f"exact-App status snapshot is unavailable: {_bounded_reason(error)}") from None
+    matching = [
+        status for status in statuses
+        if type(status) is CommitStatus
+        and status.creator_database_id == app.bot_id
+        and status.creator_node_id == app.bot_node_id
+        and status.creator_login == app.bot_login
+        and status.creator_type == "Bot"
+        and status.context == "federation/trusted-validation"
+    ]
+    issue_final_success = False
+    exact_app_success = False
+    for status in matching:
+        if status.state != "success":
+            continue
+        exact_app_success = True
+        if status.description is None:
+            continue
+        try:
+            issue_final_success = issue_final_success or (
+                parse_status_description(status.description).status_class is StatusClass.ISSUE_FINAL
+            )
+        except RequestModelError:
+            continue
+    if not matching:
+        return ExactAppRequiredStatusSnapshot.absent(head_sha), issue_final_success, exact_app_success, None
+    latest = max(matching, key=lambda item: (item.updated_at, item.created_at, item.id))
+    if latest.description is None:
+        raise R02Error("latest exact-App required status has no canonical description")
+    try:
+        parsed = parse_status_description(latest.description)
+        snapshot = ExactAppRequiredStatusSnapshot.present_status(
+            queried_sha=head_sha,
+            status_id=latest.id,
+            status_node_id=latest.node_id,
+            creator_database_id=latest.creator_database_id,
+            creator_node_id=latest.creator_node_id,
+            creator_login=latest.creator_login,
+            creator_type=latest.creator_type,
+            context=latest.context,
+            state=latest.state,
+            description=latest.description,
+            target_url=latest.target_url,
+            created_at=latest.created_at,
+            updated_at=latest.updated_at,
+            parsed_status_class=parsed.status_class,
+            parsed_evidence_digest=parsed.evidence_digest,
+        )
+    except RequestModelError as error:
+        raise R02Error(f"latest exact-App required status is not snapshot-safe: {_bounded_reason(error)}") from None
+    return snapshot, issue_final_success, exact_app_success, latest
+
+
+def _latest_exact_cancel_status_evidence(
+    client: GitHubClient,
+    repository: str,
+    fence: IssueCancellationFence,
+    app: AppIdentity,
+) -> ExactAppRequiredStatusSnapshot | None:
+    snapshot, _issue_final_success, any_exact_app_success, latest = _read_latest_exact_app_required_status_snapshot(
+        client, repository, fence.cancellation_head_sha, app,
+    )
+    if any_exact_app_success:
+        raise StaleAuthorityError("any exact-App success on ISSUE_CANCEL blocks cancellation continuation")
+    if not snapshot.is_present:
+        return None
+    desired_digest = cancel_status_evidence_digest(
+        central_repository_node_id=fence.central_repository_node_id,
+        issue_number=fence.issue_number,
+        issue_database_id=fence.issue_database_id,
+        issue_node_id=fence.issue_node_id,
+        fence_id=fence.fence_id,
+        cancellation_head_sha=fence.cancellation_head_sha,
+        binding_authority=fence.binding_authority,
+        pull_request_number=fence.pull_request_number,
+        pull_request_database_id=fence.pull_request_database_id,
+        pull_request_node_id=fence.pull_request_node_id,
+    )
+    if snapshot.state == "success":
+        raise StaleAuthorityError("exact-App success on ISSUE_CANCEL blocks cancellation failure continuation")
+    if snapshot.status_class is StatusClass.CANCEL:
+        if (
+            snapshot.state != "failure"
+            or snapshot.evidence_digest != desired_digest
+            or snapshot.target_url is not None
+        ):
+            raise StaleAuthorityError("latest exact-App cancel status does not match this fence")
+        return snapshot
+    return None
+
+
+def _snapshot_required_status_row(
+    status: CommitStatus,
+    queried_sha: str,
+) -> ExactAppRequiredStatusSnapshot:
+    if type(status) is not CommitStatus or status.description is None:
+        raise R02Error("exact required status row is missing or malformed")
+    try:
+        parsed = parse_status_description(status.description)
+        return ExactAppRequiredStatusSnapshot.present_status(
+            queried_sha=queried_sha,
+            status_id=status.id,
+            status_node_id=status.node_id,
+            creator_database_id=status.creator_database_id,
+            creator_node_id=status.creator_node_id,
+            creator_login=status.creator_login,
+            creator_type=status.creator_type,
+            context=status.context,
+            state=status.state,
+            description=status.description,
+            target_url=status.target_url,
+            created_at=status.created_at,
+            updated_at=status.updated_at,
+            parsed_status_class=parsed.status_class,
+            parsed_evidence_digest=parsed.evidence_digest,
+        )
+    except RequestModelError as error:
+        raise R02Error(f"exact required status row cannot be snapshotted: {_bounded_reason(error)}") from None
+
+
+def _validate_issue_cancel_status_receipt(
+    receipt: StatusWriteReceipt,
+    repository: RepositoryMetadata,
+    fence: IssueCancellationFence,
+    app: AppIdentity,
+) -> CommitStatus:
+    digest = cancel_status_evidence_digest(
+        central_repository_node_id=repository.node_id,
+        issue_number=fence.issue_number,
+        issue_database_id=fence.issue_database_id,
+        issue_node_id=fence.issue_node_id,
+        fence_id=fence.fence_id,
+        cancellation_head_sha=fence.cancellation_head_sha,
+        binding_authority=fence.binding_authority,
+        pull_request_number=fence.pull_request_number,
+        pull_request_database_id=fence.pull_request_database_id,
+        pull_request_node_id=fence.pull_request_node_id,
+    )
+    description = render_status_description(StatusClass.CANCEL, digest)
+    if len(description.encode("ascii")) != 81:
+        raise R02Error("canonical cancellation status description must be exactly 81 ASCII bytes")
+    expected_route = f"/repos/{repository.full_name}/statuses/{fence.cancellation_head_sha}"
+    if type(receipt) is not StatusWriteReceipt or (
+        receipt.repository != repository.full_name
+        or receipt.requested_sha != fence.cancellation_head_sha
+        or receipt.method != "POST"
+        or receipt.route != expected_route
+        or receipt.requested_state != "failure"
+        or receipt.requested_context != "federation/trusted-validation"
+        or receipt.requested_description != description
+        or receipt.requested_target_url is not None
+    ):
+        raise R02Error("cancel status receipt does not match the exact requested tuple")
+    status = receipt.returned_status
+    if type(status) is not CommitStatus or (
+        status.state != "failure"
+        or status.context != "federation/trusted-validation"
+        or status.description != description
+        or status.target_url is not None
+        or status.creator_database_id != app.bot_id
+        or status.creator_node_id != app.bot_node_id
+        or status.creator_login != app.bot_login
+        or status.creator_type != "Bot"
+    ):
+        raise R02Error("cancel status response does not match the exact App Bot failure tuple")
+    return status
+
+
+def _validate_issue_final_status_receipt(
+    receipt: StatusWriteReceipt,
+    repository: RepositoryMetadata,
+    epoch: IssueFinalizationEpoch,
+    app: AppIdentity,
+) -> StatusWriteReceipt:
+    expected_route = f"/repos/{repository.full_name}/statuses/{epoch.final_head_sha}"
+    if type(receipt) is not StatusWriteReceipt or (
+        receipt.repository != repository.full_name
+        or receipt.requested_sha != epoch.final_head_sha
+        or receipt.method != "POST"
+        or receipt.route != expected_route
+        or receipt.requested_state != "success"
+        or receipt.requested_context != epoch.required_status_context
+        or receipt.requested_description != epoch.required_status_description
+        or receipt.requested_target_url is not None
+    ):
+        raise R02Error("issue-final status receipt does not match the exact epoch tuple")
+    status = receipt.returned_status
+    if type(status) is not CommitStatus or (
+        status.context != epoch.required_status_context
+        or status.state != "success"
+        or status.description != epoch.required_status_description
+        or status.target_url is not None
+        or status.creator_database_id != app.bot_id
+        or status.creator_node_id != app.bot_node_id
+        or status.creator_login != app.bot_login
+        or status.creator_type != "Bot"
+    ):
+        raise R02Error("issue-final response does not match the exact App Bot status tuple")
+    return receipt
+
+
 def marker_classes(marker_path: str, marker_value: str) -> RequestClass:
     if marker_path != REQUEST_MARKER or type(marker_value) is not str:
         raise R02Error("request marker path/value is not exact")
@@ -467,6 +2411,3144 @@ def reconstruct_from_github(client: GitHubClient, repository: str, pr: PullReque
     if not verify_anchor_integrity(anchor_comment.anchor, pr.body):
         raise R02Error("PR body hash no longer matches immutable RequestAnchor")
     return fold_patch_events(anchor_comment.anchor, authorized_patch_events(client, repository, anchor_comment, comments), semantic_validator)
+
+
+def _issue_anchor_candidates(comments: Iterable[IssueComment]) -> list[IssueAnchorComment]:
+    found: list[IssueAnchorComment] = []
+    for comment in comments:
+        if not comment.body.startswith("<!-- swiftstream-federation-issue-request-anchor:v1 -->"):
+            continue
+        try:
+            anchor = parse_issue_request_anchor(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueRequestAnchor: {_bounded_reason(error)}") from None
+        found.append(IssueAnchorComment(anchor, comment))
+    return found
+
+
+def _validate_issue_source_authority(anchor: IssueRequestAnchor, authority: IssueSourceAuthority) -> None:
+    if type(authority) is not IssueSourceAuthority:
+        raise R02Error("fresh Issue source authority is required")
+    if (
+        authority.request_class is not anchor.request_class
+        or authority.source_id != anchor.source_id
+        or authority.source_repository_id != anchor.source_repository_id
+        or authority.source_canonical_full_name != anchor.source_canonical_full_name
+        or authority.source_identity_kind.value != anchor.source_identity_kind
+    ):
+        raise StaleAuthorityError("Issue source authority changed from immutable IssueRequestAnchor")
+
+
+def validate_unique_issue_anchor(
+    comments: Iterable[IssueComment],
+    issue: IssueMetadata,
+    app: AppIdentity,
+) -> IssueAnchorComment:
+    if type(issue) is not IssueMetadata or issue.is_pull_request:
+        raise R02Error("IssueRequestAnchor requires an Issue metadata snapshot")
+    found = _issue_anchor_candidates(comments)
+    if len(found) != 1:
+        raise DuplicateAnchorError("exactly one immutable IssueRequestAnchor comment is required")
+    item = found[0]
+    anchor, comment = item.anchor, item.comment
+    if (
+        anchor.issue_number != issue.number
+        or anchor.issue_database_id != issue.database_id
+        or anchor.issue_node_id != issue.node_id
+        or anchor.original_author_id != issue.author_id
+    ):
+        raise R02Error("IssueRequestAnchor Issue/requester identity mismatch")
+    if (
+        comment.author_id != app.bot_node_id
+        or comment.author_login != app.bot_login
+        or comment.author_type not in {None, "Bot"}
+    ):
+        raise R02Error("IssueRequestAnchor is not authored by the designated App Bot")
+    if (
+        comment.editor_id is not None
+        or comment.editor_login is not None
+        or comment.editor_type is not None
+        or comment.last_edited_at is not None
+        or comment.includes_created_edit
+    ):
+        raise R02Error("IssueRequestAnchor comment edit-integrity metadata is not immutable")
+    return item
+
+
+def create_or_validate_issue_anchor(
+    client: GitHubClient,
+    repository: str,
+    issue: IssueMetadata,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    source_authority: IssueSourceAuthority | None,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+) -> IssueAnchorComment:
+    """Establish one immutable Issue anchor or validate its exact persisted evidence."""
+    if type(issue) is not IssueMetadata or issue.is_pull_request:
+        raise R02Error("Issue intake requires one Issue metadata snapshot")
+    if not callable(source_authority_resolver):
+        raise R02Error("a fresh Issue source-authority resolver is required")
+    comment_list = list(comments)
+    existing = _issue_anchor_candidates(comment_list)
+    if existing:
+        persisted = validate_unique_issue_anchor(comment_list, issue, app)
+        try:
+            fresh = source_authority_resolver(persisted.anchor.initial_request, persisted.anchor.request_class)
+        except Exception as error:
+            raise StaleAuthorityError(f"fresh Issue source authority is unavailable: {_bounded_reason(error)}") from None
+        _validate_issue_source_authority(persisted.anchor, fresh)
+        return persisted
+
+    if type(source_authority) is not IssueSourceAuthority:
+        raise R02Error("new IssueRequestAnchor requires a validated IssueSourceAuthority")
+    try:
+        initial_request = parse_issue_request_body(issue.body)
+        initial_body_sha256 = body_sha256(issue.body)
+    except RequestModelError as error:
+        raise R02Error(f"Issue request body is invalid: {_bounded_reason(error)}") from None
+    if initial_request.request_class is not source_authority.request_class:
+        raise R02Error("Issue body request class does not match IssueSourceAuthority")
+    _validate_issue_source_authority(
+        IssueRequestAnchor(
+            1,
+            issue.number,
+            issue.database_id,
+            issue.node_id,
+            initial_request.request_class,
+            issue.author_id,
+            issue.author_login,
+            initial_body_sha256,
+            initial_request,
+            source_authority.source_id,
+            source_authority.source_repository_id,
+            source_authority.source_canonical_full_name,
+            source_authority.source_identity_kind.value,
+            issue.last_edited_at,
+            issue.includes_created_edit,
+        ),
+        source_authority,
+    )
+    intended = IssueRequestAnchor(
+        1,
+        issue.number,
+        issue.database_id,
+        issue.node_id,
+        initial_request.request_class,
+        issue.author_id,
+        issue.author_login,
+        initial_body_sha256,
+        initial_request,
+        source_authority.source_id,
+        source_authority.source_repository_id,
+        source_authority.source_canonical_full_name,
+        source_authority.source_identity_kind.value,
+        issue.last_edited_at,
+        issue.includes_created_edit,
+    )
+    client.create_issue_comment(repository, issue.number, intended.render())
+    try:
+        reread_issue = client.get_issue_metadata(repository, issue.number)
+        reread_comments = client.list_issue_comments(repository, issue.number)
+    except Exception as error:
+        raise StaleAuthorityError(f"Issue anchor write could not be re-read: {_bounded_reason(error)}") from None
+    if (
+        reread_issue.number != issue.number
+        or reread_issue.database_id != issue.database_id
+        or reread_issue.node_id != issue.node_id
+        or reread_issue.is_pull_request
+        or reread_issue.author_id != issue.author_id
+    ):
+        raise StaleAuthorityError("Issue identity changed while creating IssueRequestAnchor")
+    try:
+        fresh_source_authority = source_authority_resolver(initial_request, initial_request.request_class)
+    except Exception as error:
+        raise StaleAuthorityError(f"fresh Issue source authority is unavailable after anchoring: {_bounded_reason(error)}") from None
+    _validate_issue_source_authority(intended, fresh_source_authority)
+    persisted = validate_unique_issue_anchor(reread_comments, reread_issue, app)
+    if persisted.anchor != intended:
+        raise StaleAuthorityError("persisted IssueRequestAnchor differs from intended authority")
+    if (
+        reread_issue.body != issue.body
+        or reread_issue.last_edited_at != issue.last_edited_at
+        or reread_issue.includes_created_edit != issue.includes_created_edit
+    ):
+        raise StaleAuthorityError("Issue body/edit metadata changed after the immutable anchor was created")
+    return persisted
+
+
+def _issue_comment_edited(comment: IssueComment) -> bool:
+    return any((
+        comment.editor_id is not None,
+        comment.editor_login is not None,
+        comment.editor_type is not None,
+        comment.last_edited_at is not None,
+        comment.includes_created_edit,
+    ))
+
+
+def _issue_patch_candidate(body: str) -> bool:
+    normalized = body.replace("\r\n", "\n")
+    return next((line for line in normalized.split("\n") if line != ""), None) == PATCH_SENTINEL
+
+
+def authorized_issue_patch_events(
+    client: GitHubClient,
+    repository: str,
+    anchor_comment: IssueAnchorComment,
+    comments: Iterable[IssueComment],
+) -> tuple[IssuePatchEvent, ...]:
+    events: list[IssuePatchEvent] = []
+    anchor_id = anchor_comment.comment.database_id
+    for comment in comments:
+        if comment.database_id <= anchor_id:
+            continue
+        if type(comment.body) is str and comment.body.startswith(ISSUE_PATCH_PROJECTION_MARKER):
+            continue
+        try:
+            if len(comment.body.encode("utf-8")) > 16_384:
+                # The Issue PATCH authority remains capped at 16 KiB. The only
+                # wider machine comment is a projection and is skipped above.
+                continue
+        except (AttributeError, UnicodeEncodeError):
+            raise R02Error("Issue comment body is not valid UTF-8 text") from None
+        authorized = False
+        if comment.author_type == "User" and comment.author_id is not None and _issue_patch_candidate(comment.body):
+            if comment.author_id == anchor_comment.anchor.original_author_id:
+                authorized = True
+            elif comment.author_login is not None:
+                try:
+                    authorized = client.get_collaborator_permission(repository, comment.author_login) in {"admin", "maintain"}
+                except Exception:
+                    authorized = False
+        try:
+            events.append(IssuePatchEvent(comment.database_id, authorized, _issue_comment_edited(comment), comment.body))
+        except RequestModelError as error:
+            raise R02Error(f"Issue PATCH event is invalid: {_bounded_reason(error)}") from None
+    return tuple(sorted(events, key=lambda item: item.comment_id))
+
+
+def reconstruct_issue_from_github(
+    client: GitHubClient,
+    repository: str,
+    anchor_comment: IssueAnchorComment,
+    comments: Iterable[IssueComment],
+    semantic_validator: Callable[[Request], bool] | None = None,
+) -> PatchFoldResult:
+    """Rebuild effective Issue request from its immutable anchor and later Issue comments."""
+    events = authorized_issue_patch_events(client, repository, anchor_comment, comments)
+    try:
+        return fold_issue_patch_events(anchor_comment.anchor, events, semantic_validator)
+    except RequestModelError as error:
+        raise R02Error(f"Issue PATCH fold failed closed: {_bounded_reason(error)}") from None
+
+
+@dataclass(frozen=True)
+class IssueBranchLeaseComment:
+    lease: IssueBranchLease
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
+class IssuePRBindingState:
+    issue_anchor: IssueAnchorComment
+    lease: IssueBranchLeaseComment
+    binding: IssuePRBinding
+    issue_binding_comment: IssueComment
+    pr_binding_comment: IssueComment
+    pr: PullRequestMetadata
+    pr_issue: IssueMetadata
+    owning_issue: IssueMetadata
+
+
+@dataclass(frozen=True)
+class IssueHeadClaimComment:
+    claim: IssueHeadClaim
+    comment: IssueComment
+    active: bool
+
+
+@dataclass(frozen=True)
+class RequiredStatusEpochComment:
+    epoch: RequiredStatusEpoch
+    comment: IssueComment
+    active: bool
+
+
+@dataclass(frozen=True)
+class IssueFinalizationEpochComment:
+    epoch: IssueFinalizationEpoch
+    comment: IssueComment
+    active: bool
+
+
+@dataclass(frozen=True)
+class IssueCancellationFenceComment:
+    fence: IssueCancellationFence
+    comment: IssueComment
+    active: bool
+
+
+@dataclass(frozen=True)
+class IssueCancellationDraftWitnessComment:
+    witness: IssueCancellationDraftWitness
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
+class IssueTerminalCancelledResultComment:
+    result: IssueTerminalCancelledResult
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
+class IssueNoPRCancelledResultComment:
+    result: IssueNoPRCancelledResult
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
+class _IssueCancellationAuthority:
+    """Fresh central ownership inputs; binding stays absent for PRE_BINDING."""
+
+    issue_anchor: IssueAnchorComment
+    lease: IssueBranchLeaseComment
+    binding_authority: str
+    pull_request_number: int
+    pull_request_database_id: int
+    pull_request_node_id: str
+    central_repository_node_id: str
+    base_repository_node_id: str
+    pr: PullRequestMetadata
+    pr_issue: IssueMetadata
+    owning_issue: IssueMetadata
+    pr_comments: tuple[IssueComment, ...]
+    binding: IssuePRBinding | None
+    binding_state: IssuePRBindingState | None
+    raw_pr_state: str
+    raw_pr_merged: bool
+
+
+class IssueCancellationClass(Enum):
+    A_ANCHOR_ONLY = "A_ANCHOR_ONLY"
+    B_LEASE_REF_ABSENT = "B_LEASE_REF_ABSENT"
+    C_LEASE_ZERO_PR = "C_LEASE_ZERO_PR"
+    D_PRE_BINDING_ONE_PR = "D_PRE_BINDING_ONE_PR"
+    E_FULL_BINDING = "E_FULL_BINDING"
+    F_CONFLICTING = "F_CONFLICTING"
+
+
+@dataclass(frozen=True)
+class _IssueCancellationPRCandidate:
+    pr: PullRequestMetadata
+    pr_issue: IssueMetadata
+    comments: tuple[IssueComment, ...]
+    raw_state: str
+    raw_merged: bool
+    raw_merged_at: str | None
+    issue_binding: _IssuePRBindingComment | None
+    pr_binding: _IssuePRBindingComment | None
+
+
+@dataclass(frozen=True)
+class IssueCancellationState:
+    """Fresh central-only classification and immutable cancellation evidence."""
+
+    classification: IssueCancellationClass
+    repository: RepositoryMetadata
+    issue: IssueMetadata
+    issue_comments: tuple[IssueComment, ...]
+    issue_anchor: IssueAnchorComment
+    lease: IssueBranchLeaseComment | None
+    branch_ref_oid: str | None
+    all_state_pr_enumeration_digest: str
+    pr_candidates: tuple[_IssueCancellationPRCandidate, ...]
+    cancellation_authority: _IssueCancellationAuthority | None
+    fence_items: tuple[IssueCancellationFenceComment, ...]
+    witness_items: tuple[IssueCancellationDraftWitnessComment, ...]
+    terminal_result_items: tuple[IssueTerminalCancelledResultComment, ...]
+    no_pr_results: tuple[IssueNoPRCancelledResult, ...]
+    merge_observed: bool
+
+
+def _cancellation_binding_authority_id(authority: _IssueCancellationAuthority) -> str:
+    if authority.binding_authority == "PRE_BINDING":
+        if authority.binding is not None or authority.binding_state is not None:
+            raise R02Error("PRE_BINDING cancellation authority must not carry a fabricated IssuePRBinding")
+        return "PRE_BINDING"
+    if authority.binding_authority == "FULL_BINDING":
+        if authority.binding is None or authority.binding_state is None or authority.binding_state.binding != authority.binding:
+            raise R02Error("FULL_BINDING cancellation authority requires the exact persisted IssuePRBinding")
+        return authority.binding.binding_id
+    raise R02Error("IssueCancellationFence binding authority is unsupported")
+
+
+@dataclass(frozen=True)
+class _IssueAuthorityNode:
+    claim_kind: str
+    role: CarrierRole
+    target_head_sha: str
+    from_head_sha: str | None
+    tree_sha: str
+    transition_kind: str
+    artifact_id: str
+    artifact_sha256: str
+    comment: IssueComment
+    artifact: Any
+    active: bool = False
+    proposal_origin: Any | None = None
+
+
+@dataclass(frozen=True)
+class _IssueEpochSnapshot:
+    state: IssuePRBindingState
+    repository: RepositoryMetadata
+    accepted_main_sha: str
+    accepted_main_tree_sha: str
+    accepted_main_entries: tuple[Any, ...]
+    current_ref: str
+    issue: IssueMetadata
+    issue_comments: tuple[IssueComment, ...]
+    pr_comments: tuple[IssueComment, ...]
+    fold: PatchFoldResult
+    projections: tuple[IssuePatchProjection, ...]
+    fresh_source: IssueSourceAuthority | None
+    source_error: str | None
+    history: tuple[_IssueAuthorityNode, ...]
+    current_authority: _IssueAuthorityNode
+    resolution: ShaCarrierResolution
+
+
+@dataclass(frozen=True)
+class _IssuePRBindingComment:
+    binding: IssuePRBinding
+    comment: IssueComment
+
+
+@dataclass(frozen=True)
+class _IssuePRCandidate:
+    pr: PullRequestMetadata
+    comments: tuple[IssueComment, ...]
+    binding: _IssuePRBindingComment | None
+
+
+def _lease_sha40(value: Any, label: str) -> str:
+    if type(value) is not str or not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise R02Error(f"{label} is not a canonical Git object SHA")
+    return value
+
+
+def _fresh_issue_source_authority(
+    resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+    anchor: IssueRequestAnchor,
+) -> IssueSourceAuthority:
+    try:
+        authority = resolver(anchor.initial_request, anchor.request_class)
+    except Exception as error:
+        raise StaleAuthorityError(f"fresh Issue source authority is unavailable: {_bounded_reason(error)}") from None
+    _validate_issue_source_authority(anchor, authority)
+    return authority
+
+
+def _lease_repo_snapshot(
+    client: GitHubClient,
+    repository: str,
+    expected_node_id: str,
+) -> tuple[RepositoryMetadata, str]:
+    try:
+        metadata = client.get_repository_metadata(repository)
+        if metadata.node_id != expected_node_id or not metadata.default_branch:
+            raise StaleAuthorityError("central repository identity/default branch changed")
+        branch_sha = _lease_sha40(client.get_ref_oid(repository, metadata.default_branch), "central default-branch head")
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"central repository snapshot is unavailable: {_bounded_reason(error)}") from None
+    return metadata, branch_sha
+
+
+def _lease_tree_snapshot(
+    client: GitHubClient,
+    repository: str,
+    commit_sha: str,
+) -> tuple[Any, str, tuple[Any, ...]]:
+    try:
+        metadata = client.get_commit_metadata(repository, commit_sha)
+        if metadata.sha != commit_sha:
+            raise R02Error("commit metadata identity does not match requested SHA")
+        tree_sha, entries = client.get_commit_tree(repository, commit_sha)
+        if tree_sha != metadata.tree_sha:
+            raise R02Error("commit tree response identity does not match commit metadata")
+        _lease_sha40(tree_sha, "commit tree SHA")
+        return metadata, tree_sha, entries
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"Git commit/tree provenance is unavailable: {_bounded_reason(error)}") from None
+
+
+def _lease_leaf_map(entries: Iterable[Any]) -> dict[str, tuple[str, str, str]]:
+    leaves: dict[str, tuple[str, str, str]] = {}
+    for entry in entries:
+        if entry.object_type == "tree":
+            continue
+        if entry.path in leaves:
+            raise R02Error("Git tree contains duplicate leaf paths")
+        leaves[entry.path] = (entry.mode, entry.object_type, entry.sha)
+    return leaves
+
+
+def _validate_marker_only_tree_delta(
+    base_entries: Iterable[Any],
+    head_entries: Iterable[Any],
+    expected_blob_sha: str,
+) -> None:
+    base = _lease_leaf_map(base_entries)
+    head = _lease_leaf_map(head_entries)
+    changed = {path for path in set(base) | set(head) if base.get(path) != head.get(path)}
+    if changed != {REQUEST_MARKER}:
+        raise R02Error("initial claimed tree must change only .federation-request")
+    if head.get(REQUEST_MARKER) != ("100644", "blob", expected_blob_sha):
+        raise R02Error("initial claimed tree .federation-request entry is not the exact regular blob")
+
+
+def _lease_marker_for(lease: IssueBranchLease) -> ClaimedHeadMarker:
+    return ClaimedHeadMarker(
+        lease.claim_kind,
+        lease.carrier_role,
+        "ISSUE",
+        issue_owner_key(
+            lease.central_repository_node_id,
+            lease.issue_database_id,
+            lease.issue_node_id,
+            lease.issue_number,
+        ),
+        lease.claim_generation_id,
+        lease.carrier_nonce,
+        "INITIAL",
+    )
+
+
+def _expected_deterministic_commit_sha(tree_sha: str, parent_sha: str, message: str, author_date: str) -> str:
+    if type(author_date) is not str or not author_date.endswith("Z"):
+        raise R02Error("claimed commit author date is not deterministic UTC")
+    try:
+        instant = datetime.fromisoformat(author_date[:-1] + "+00:00")
+    except ValueError:
+        raise R02Error("claimed commit author date is malformed") from None
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise R02Error("claimed commit author date lacks a timezone")
+    git_timestamp = f"{int(instant.timestamp())} +0000"
+    body = (
+        f"tree {tree_sha}\nparent {parent_sha}\n"
+        f"author Swift Stream Federation <automation@swiftstream.invalid> {git_timestamp}\n"
+        f"committer Swift Stream Federation <automation@swiftstream.invalid> {git_timestamp}\n\n"
+    ).encode("utf-8") + message.encode("utf-8")
+    return hashlib.sha1(b"commit " + str(len(body)).encode("ascii") + b"\0" + body).hexdigest()
+
+
+def _validate_issue_branch_lease_history(
+    client: GitHubClient,
+    repository: str,
+    anchor: IssueRequestAnchor,
+    lease: IssueBranchLease,
+) -> None:
+    if (
+        lease.issue_number != anchor.issue_number
+        or lease.issue_database_id != anchor.issue_database_id
+        or lease.issue_node_id != anchor.issue_node_id
+        or lease.issue_request_anchor_sha256 != anchor.canonical_sha256()
+        or lease.source_id != anchor.source_id
+        or lease.source_repository_id != anchor.source_repository_id
+        or lease.request_class is not anchor.request_class
+        or lease.branch_ref != issue_branch_ref(anchor.issue_number)
+    ):
+        raise R02Error("IssueBranchLease does not match its immutable IssueRequestAnchor")
+    try:
+        _base, base_tree_sha, base_entries = _lease_tree_snapshot(client, repository, lease.accepted_base_sha)
+        authority_digest = issue_branch_lease_authority_digest(
+            accepted_base_sha=lease.accepted_base_sha,
+            accepted_base_tree_sha=base_tree_sha,
+            branch_ref=lease.branch_ref,
+            central_repository_node_id=lease.central_repository_node_id,
+            owner_key=issue_owner_key(lease.central_repository_node_id, anchor.issue_database_id, anchor.issue_node_id, anchor.issue_number),
+            issue_request_anchor_sha256=anchor.canonical_sha256(),
+            request_class=anchor.request_class,
+            source_canonical_full_name=anchor.source_canonical_full_name,
+            source_id=anchor.source_id,
+            source_identity_kind=anchor.source_identity_kind,
+            source_repository_id=anchor.source_repository_id,
+        )
+        if authority_digest != lease.authority_preimage_digest:
+            raise R02Error("IssueBranchLease authority preimage digest does not recompute")
+        owner_key = issue_owner_key(lease.central_repository_node_id, anchor.issue_database_id, anchor.issue_node_id, anchor.issue_number)
+        generation = claim_generation_id(
+            authority_preimage_digest=authority_digest,
+            carrier_nonce=lease.carrier_nonce,
+            central_repository_node_id=lease.central_repository_node_id,
+            owner_key=owner_key,
+            from_head_sha=lease.accepted_base_sha,
+            from_tree_sha=base_tree_sha,
+        )
+        marker = _lease_marker_for(lease)
+        if generation != lease.claim_generation_id or marker.claim_generation_id != generation:
+            raise R02Error("IssueBranchLease claimed-head generation does not recompute")
+        marker_text = marker.render()
+        if hashlib.sha256(marker_text.encode("utf-8")).hexdigest() != lease.initial_head_marker_digest:
+            raise R02Error("IssueBranchLease marker digest does not match canonical marker")
+        head, head_tree_sha, head_entries = _lease_tree_snapshot(client, repository, lease.initial_head_sha)
+        if head.parents != (lease.accepted_base_sha,) or head.tree_sha != lease.initial_head_tree_sha or head_tree_sha != lease.initial_head_tree_sha:
+            raise R02Error("IssueBranchLease initial commit parent/tree provenance does not match")
+        expected_sha = _expected_deterministic_commit_sha(head.tree_sha, lease.accepted_base_sha, marker_text, head.author_date)
+        if expected_sha != lease.initial_head_sha:
+            raise R02Error("IssueBranchLease commit SHA does not bind the exact claimed-head marker")
+        expected_bytes = (anchor.request_class.value + "\n").encode("utf-8")
+        expected_blob_sha = hashlib.sha1(b"blob " + str(len(expected_bytes)).encode("ascii") + b"\0" + expected_bytes).hexdigest()
+        _validate_marker_only_tree_delta(base_entries, head_entries, expected_blob_sha)
+        readback = client.read_commit_file(repository, lease.initial_head_sha, REQUEST_MARKER, expected_mode="100644")
+        if readback != expected_bytes:
+            raise R02Error("IssueBranchLease .federation-request readback differs from the exact request class bytes")
+        if parse_claimed_head_marker(marker_text) != marker:
+            raise R02Error("IssueBranchLease marker does not parse canonically")
+    except R02Error:
+        raise
+    except Exception as error:
+        raise R02Error(f"IssueBranchLease historical provenance is invalid: {_bounded_reason(error)}") from None
+
+
+def _lease_comment_candidates(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    anchor: IssueRequestAnchor,
+    anchor_comment_database_id: int,
+    central_repository_node_id: str,
+) -> list[IssueBranchLeaseComment]:
+    found: list[IssueBranchLeaseComment] = []
+    for comment in comments:
+        if not comment.body.startswith(ISSUE_BRANCH_LEASE_MARKER):
+            continue
+        try:
+            lease = parse_issue_branch_lease(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueBranchLease comment: {_bounded_reason(error)}") from None
+        if (
+            comment.author_id != app.bot_node_id
+            or comment.author_login != app.bot_login
+            or comment.author_type not in {None, "Bot"}
+            or comment.editor_id is not None
+            or comment.editor_login is not None
+            or comment.editor_type is not None
+            or comment.last_edited_at is not None
+            or comment.includes_created_edit
+        ):
+            raise R02Error("IssueBranchLease comment authorship/edit integrity is invalid")
+        if (
+            lease.issue_number != anchor.issue_number
+            or lease.issue_database_id != anchor.issue_database_id
+            or lease.issue_node_id != anchor.issue_node_id
+            or lease.issue_request_anchor_sha256 != anchor.canonical_sha256()
+            or lease.source_id != anchor.source_id
+            or lease.source_repository_id != anchor.source_repository_id
+            or lease.request_class is not anchor.request_class
+            or lease.branch_ref != issue_branch_ref(anchor.issue_number)
+            or lease.issue_request_anchor_comment_database_id != anchor_comment_database_id
+            or lease.central_repository_node_id != central_repository_node_id
+        ):
+            raise R02Error("IssueBranchLease does not match its immutable IssueRequestAnchor")
+        found.append(IssueBranchLeaseComment(lease, comment))
+    return found
+
+
+def _resolve_issue_branch_lease_class(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    anchor: IssueRequestAnchor,
+    anchor_comment_database_id: int,
+    central_repository_node_id: str,
+) -> IssueBranchLeaseComment | None:
+    candidates = _lease_comment_candidates(comments, app, anchor, anchor_comment_database_id, central_repository_node_id)
+    if not candidates:
+        return None
+    by_payload: dict[str, list[IssueBranchLeaseComment]] = {}
+    for item in candidates:
+        _validate_issue_branch_lease_history(client, repository, anchor, item.lease)
+        by_payload.setdefault(item.lease.render(), []).append(item)
+    if len(by_payload) != 1:
+        raise R02Error("conflicting immutable IssueBranchLease payloads block progression")
+    equivalent = next(iter(by_payload.values()))
+    return min(equivalent, key=lambda item: item.comment.database_id)
+
+
+def _read_issue_anchor_for_lease(
+    client: GitHubClient,
+    repository: str,
+    anchor_comment: IssueAnchorComment,
+    app: AppIdentity,
+) -> tuple[IssueMetadata, tuple[IssueComment, ...], IssueAnchorComment]:
+    try:
+        issue = client.get_issue_metadata(repository, anchor_comment.anchor.issue_number)
+        comments = client.list_issue_comments(repository, anchor_comment.anchor.issue_number)
+    except Exception as error:
+        raise StaleAuthorityError(f"Issue anchor/comment state is unavailable: {_bounded_reason(error)}") from None
+    persisted = validate_unique_issue_anchor(comments, issue, app)
+    if (
+        persisted.anchor != anchor_comment.anchor
+        or persisted.comment.database_id != anchor_comment.comment.database_id
+        or persisted.comment.body != anchor_comment.comment.body
+    ):
+        raise StaleAuthorityError("the supplied IssueRequestAnchor is not the current canonical anchor")
+    return issue, comments, persisted
+
+
+def _validate_new_claimed_commit(
+    client: GitHubClient,
+    repository: str,
+    accepted_base_sha: str,
+    accepted_base_entries: Iterable[Any],
+    created_head_sha: str,
+    created_tree_sha: str,
+    created_blob_sha: str,
+    marker: ClaimedHeadMarker,
+    expected_bytes: bytes,
+    timestamp: str,
+) -> None:
+    metadata, head_tree_sha, head_entries = _lease_tree_snapshot(client, repository, created_head_sha)
+    if metadata.parents != (accepted_base_sha,) or metadata.tree_sha != created_tree_sha or head_tree_sha != created_tree_sha:
+        raise R02Error("created claimed commit parent/tree readback is not exact")
+    if metadata.author_date != timestamp:
+        raise R02Error("created claimed commit timestamp readback is not exact")
+    if _expected_deterministic_commit_sha(created_tree_sha, accepted_base_sha, marker.render(), timestamp) != created_head_sha:
+        raise R02Error("created claimed commit SHA does not bind its exact marker")
+    expected_blob_sha = hashlib.sha1(b"blob " + str(len(expected_bytes)).encode("ascii") + b"\0" + expected_bytes).hexdigest()
+    if created_blob_sha != expected_blob_sha:
+        raise R02Error("created request blob SHA does not bind exact request bytes")
+    _validate_marker_only_tree_delta(accepted_base_entries, head_entries, created_blob_sha)
+    try:
+        file_bytes = client.read_commit_file(repository, created_head_sha, REQUEST_MARKER, expected_mode="100644")
+    except Exception as error:
+        raise R02Error(f"created request blob could not be read back as mode 100644: {_bounded_reason(error)}") from None
+    if file_bytes != expected_bytes:
+        raise R02Error("created request blob readback is not the exact RequestClass line")
+    if parse_claimed_head_marker(marker.render()) != marker:
+        raise R02Error("locally generated claimed-head marker failed exact parser roundtrip")
+
+
+def create_or_validate_issue_branch_lease(
+    client: GitHubClient,
+    repository: str,
+    anchor_comment: IssueAnchorComment,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+    *,
+    nonce_factory: Callable[[], str] | None = None,
+) -> IssueBranchLeaseComment:
+    """Create one unreachable marker-only claim or reuse its immutable historical lease."""
+    if type(anchor_comment) is not IssueAnchorComment:
+        raise R02Error("IssueBranchLease requires one validated IssueRequestAnchor comment")
+    if not callable(source_authority_resolver):
+        raise R02Error("a fresh Issue source-authority resolver is required")
+    try:
+        issue, comments, persisted_anchor = _read_issue_anchor_for_lease(client, repository, anchor_comment, app)
+    except RequestModelError as error:
+        raise R02Error(f"IssueRequestAnchor is invalid: {_bounded_reason(error)}") from None
+    try:
+        canonical = _resolve_issue_branch_lease_class(
+            client, repository, comments, app, persisted_anchor.anchor,
+            persisted_anchor.comment.database_id, central_repository_node_id,
+        )
+    except RequestModelError as error:
+        raise R02Error(f"IssueBranchLease evidence is invalid: {_bounded_reason(error)}") from None
+    try:
+        repo_snapshot, current_main = _lease_repo_snapshot(client, repository, central_repository_node_id)
+    except R02Error:
+        raise
+
+    if canonical is not None:
+        _fresh_issue_source_authority(source_authority_resolver, persisted_anchor.anchor)
+        # A later central-main advance does not rewrite historical lease provenance.
+        return canonical
+
+    _fresh_issue_source_authority(source_authority_resolver, persisted_anchor.anchor)
+    accepted_base_sha = current_main
+    try:
+        base_metadata, accepted_base_tree_sha, accepted_base_entries = _lease_tree_snapshot(client, repository, accepted_base_sha)
+        if base_metadata.sha != accepted_base_sha:
+            raise R02Error("accepted central base commit identity changed")
+        branch_ref = issue_branch_ref(persisted_anchor.anchor.issue_number)
+        owner_key = issue_owner_key(
+            central_repository_node_id,
+            persisted_anchor.anchor.issue_database_id,
+            persisted_anchor.anchor.issue_node_id,
+            persisted_anchor.anchor.issue_number,
+        )
+        nonce = (nonce_factory or new_carrier_nonce)()
+        if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{64}", nonce):
+            raise R02Error("trusted carrier nonce factory did not return 64 lowercase hex")
+        authority_digest = issue_branch_lease_authority_digest(
+            accepted_base_sha=accepted_base_sha,
+            accepted_base_tree_sha=accepted_base_tree_sha,
+            branch_ref=branch_ref,
+            central_repository_node_id=central_repository_node_id,
+            owner_key=owner_key,
+            issue_request_anchor_sha256=persisted_anchor.anchor.canonical_sha256(),
+            request_class=persisted_anchor.anchor.request_class,
+            source_canonical_full_name=persisted_anchor.anchor.source_canonical_full_name,
+            source_id=persisted_anchor.anchor.source_id,
+            source_identity_kind=persisted_anchor.anchor.source_identity_kind,
+            source_repository_id=persisted_anchor.anchor.source_repository_id,
+        )
+        generation = claim_generation_id(
+            authority_preimage_digest=authority_digest,
+            carrier_nonce=nonce,
+            central_repository_node_id=central_repository_node_id,
+            owner_key=owner_key,
+            from_head_sha=accepted_base_sha,
+            from_tree_sha=accepted_base_tree_sha,
+        )
+        marker = ClaimedHeadMarker("ISSUE_BRANCH_LEASE", "ISSUE_ACTIVE", "ISSUE", owner_key, generation, nonce, "INITIAL")
+        expected_bytes = (persisted_anchor.anchor.request_class.value + "\n").encode("utf-8")
+        blob_content = base64.b64encode(expected_bytes).decode("ascii")
+        blob = client.create_blob(repository, blob_content, encoding="base64")
+        blob_sha = _lease_sha40(blob.sha, "created blob SHA")
+        entry = {"path": REQUEST_MARKER, "mode": "100644", "type": "blob", "sha": blob_sha}
+        tree = client.create_tree(repository, accepted_base_tree_sha, [entry])
+        tree_sha = _lease_sha40(tree.sha, "created tree SHA")
+        timestamp = client.bot_commit_timestamp_after(repository, accepted_base_sha)
+        created_head = client.create_commit(repository, marker.render(), tree_sha, [accepted_base_sha], timestamp=timestamp)
+        head_sha = _lease_sha40(created_head.sha, "created commit SHA")
+        _validate_new_claimed_commit(
+            client,
+            repository,
+            accepted_base_sha,
+            accepted_base_entries,
+            head_sha,
+            tree_sha,
+            blob_sha,
+            marker,
+            expected_bytes,
+            timestamp,
+        )
+        lease = IssueBranchLease.create(
+            schema_version=1,
+            issue_number=persisted_anchor.anchor.issue_number,
+            issue_database_id=persisted_anchor.anchor.issue_database_id,
+            issue_node_id=persisted_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=persisted_anchor.comment.database_id,
+            issue_request_anchor_sha256=persisted_anchor.anchor.canonical_sha256(),
+            source_id=persisted_anchor.anchor.source_id,
+            source_repository_id=persisted_anchor.anchor.source_repository_id,
+            central_repository_node_id=central_repository_node_id,
+            branch_ref=branch_ref,
+            accepted_base_sha=accepted_base_sha,
+            carrier_role="ISSUE_ACTIVE",
+            claim_kind="ISSUE_BRANCH_LEASE",
+            claim_generation_id=generation,
+            carrier_nonce=nonce,
+            authority_preimage_digest=authority_digest,
+            initial_head_sha=head_sha,
+            initial_head_tree_sha=tree_sha,
+            initial_head_parent_sha=accepted_base_sha,
+            initial_head_marker_digest=hashlib.sha256(marker.render().encode("utf-8")).hexdigest(),
+            request_class=persisted_anchor.anchor.request_class,
+        )
+        client.create_issue_comment(repository, issue.number, lease.render())
+        try:
+            reread_issue, reread_comments, reread_anchor = _read_issue_anchor_for_lease(client, repository, persisted_anchor, app)
+            persisted_lease = _resolve_issue_branch_lease_class(
+                client, repository, reread_comments, app, reread_anchor.anchor,
+                reread_anchor.comment.database_id, central_repository_node_id,
+            )
+        except (RequestModelError, R02Error) as error:
+            raise StaleAuthorityError(f"persisted IssueBranchLease could not be validated: {_bounded_reason(error)}") from None
+        if persisted_lease is None or persisted_lease.lease != lease:
+            raise StaleAuthorityError("persisted IssueBranchLease differs from the intended immutable lease")
+        _fresh_issue_source_authority(source_authority_resolver, reread_anchor.anchor)
+        final_repo, final_main = _lease_repo_snapshot(client, repository, central_repository_node_id)
+        if final_repo.full_name != repo_snapshot.full_name or final_repo.default_branch != repo_snapshot.default_branch:
+            raise StaleAuthorityError("central repository identity/default branch changed during lease creation")
+        if final_main != accepted_base_sha:
+            raise StaleAuthorityError("central default branch advanced during new IssueBranchLease creation")
+        return persisted_lease
+    except (RequestModelError, R02Error):
+        raise
+    except Exception as error:
+        raise R02Error(f"IssueBranchLease creation failed closed: {_bounded_reason(error)}") from None
+
+
+def _issue_pr_authority_fence(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    *,
+    allow_cancellation_fence: bool = False,
+) -> None:
+    allowed = (
+        ISSUE_REQUEST_ANCHOR_MARKER,
+        ISSUE_BRANCH_LEASE_MARKER,
+        ISSUE_INTERNAL_PR_BINDING_MARKER,
+        ISSUE_PATCH_PROJECTION_MARKER,
+        ISSUE_HEAD_CLAIM_MARKER,
+        REQUIRED_STATUS_EPOCH_MARKER,
+        ISSUE_FINALIZATION_EPOCH_MARKER,
+    ) + ((
+        ISSUE_CANCELLATION_FENCE_MARKER,
+        ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+        ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
+        ISSUE_NO_PR_CANCELLED_RESULT_MARKER,
+    ) if allow_cancellation_fence else ())
+    cancellation_markers = (
+        ISSUE_CANCELLATION_FENCE_MARKER,
+        ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+        ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
+        ISSUE_NO_PR_CANCELLED_RESULT_MARKER,
+    )
+    reserved_prefix = "<!-- swiftstream-federation-issue-"
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(reserved_prefix):
+            continue
+        if any(comment.body.startswith(marker) for marker in cancellation_markers) and not allow_cancellation_fence:
+            raise StaleAuthorityError(
+                "persisted cancellation authority is a one-way gate for non-cancellation progression"
+            )
+        if (
+            comment.author_id != app.bot_node_id
+            or comment.author_login != app.bot_login
+            or comment.author_type not in {None, "Bot"}
+            or _issue_comment_edited(comment)
+        ):
+            continue
+        permitted = allowed + (
+            (
+                ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+                ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
+                ISSUE_NO_PR_CANCELLED_RESULT_MARKER,
+            )
+            if allow_cancellation_fence else ()
+        )
+        if not any(comment.body.startswith(marker) for marker in permitted):
+            raise R02Error("unrecognized reserved Issue authority marker blocks Wave 03 progression")
+
+
+def _binding_comment_candidates(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    marker: str,
+    parser: Callable[[str], IssuePRBinding],
+    label: str,
+) -> tuple[_IssuePRBindingComment, ...]:
+    found: list[_IssuePRBindingComment] = []
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(marker):
+            continue
+        try:
+            binding = parser(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed {label}: {_bounded_reason(error)}") from None
+        if (
+            comment.author_id != app.bot_node_id
+            or comment.author_login != app.bot_login
+            or comment.author_type not in {None, "Bot"}
+            or _issue_comment_edited(comment)
+        ):
+            raise R02Error(f"{label} authorship/edit integrity is invalid")
+        found.append(_IssuePRBindingComment(binding, comment))
+    if len(found) > 1:
+        raise R02Error(f"duplicate {label} comments block progression")
+    return tuple(found)
+
+
+def _binding_comment_sha256(comment: IssueComment) -> str:
+    try:
+        return hashlib.sha256(comment.body.encode("utf-8")).hexdigest()
+    except (AttributeError, UnicodeEncodeError):
+        raise R02Error("binding provenance comment body is not valid UTF-8 text") from None
+
+
+def _issue_head_claim_marker(claim: IssueHeadClaim) -> ClaimedHeadMarker:
+    return ClaimedHeadMarker(
+        claim.claim_kind,
+        claim.carrier_role,
+        "ISSUE",
+        issue_owner_key(
+            claim.central_repository_node_id,
+            claim.issue_database_id,
+            claim.issue_node_id,
+            claim.issue_number,
+        ),
+        claim.claim_generation_id,
+        claim.carrier_nonce,
+        claim.transition_kind,
+    )
+
+
+def _required_status_epoch_marker(epoch: RequiredStatusEpoch) -> ClaimedHeadMarker:
+    if type(epoch) is not RequiredStatusEpoch:
+        raise R02Error("RequiredStatusEpoch marker requires its exact parsed artifact")
+    return ClaimedHeadMarker(
+        epoch.claim_kind,
+        epoch.carrier_role,
+        "ISSUE",
+        issue_owner_key(
+            epoch.central_repository_node_id,
+            epoch.issue_database_id,
+            epoch.issue_node_id,
+            epoch.issue_number,
+        ),
+        epoch.claim_generation_id,
+        epoch.carrier_nonce,
+        epoch.transition_kind,
+    )
+
+
+def _issue_finalization_epoch_marker(epoch: IssueFinalizationEpoch) -> ClaimedHeadMarker:
+    if type(epoch) is not IssueFinalizationEpoch:
+        raise R02Error("IssueFinalizationEpoch marker requires its exact parsed artifact")
+    return ClaimedHeadMarker(
+        epoch.claim_kind,
+        epoch.carrier_role,
+        "ISSUE",
+        issue_owner_key(
+            epoch.central_repository_node_id,
+            epoch.issue_database_id,
+            epoch.issue_node_id,
+            epoch.issue_number,
+        ),
+        epoch.claim_generation_id,
+        epoch.carrier_nonce,
+        epoch.transition_kind,
+    )
+
+
+def _issue_head_claim_matches_binding(claim: IssueHeadClaim, state: IssuePRBindingState) -> None:
+    anchor = state.issue_anchor
+    lease = state.lease
+    binding = state.binding
+    expected = (
+        anchor.anchor.issue_number,
+        anchor.anchor.issue_database_id,
+        anchor.anchor.issue_node_id,
+        anchor.comment.database_id,
+        anchor.anchor.canonical_sha256(),
+        lease.comment.database_id,
+        _binding_comment_sha256(lease.comment),
+        binding.binding_id,
+        anchor.anchor.source_id,
+        anchor.anchor.source_repository_id,
+        binding.pull_request_number,
+        binding.pull_request_database_id,
+        binding.pull_request_node_id,
+        binding.central_repository_node_id,
+        binding.branch_ref,
+        anchor.anchor.request_class,
+    )
+    actual = (
+        claim.issue_number,
+        claim.issue_database_id,
+        claim.issue_node_id,
+        claim.issue_request_anchor_comment_database_id,
+        claim.issue_request_anchor_sha256,
+        claim.issue_branch_lease_comment_database_id,
+        claim.issue_branch_lease_sha256,
+        claim.binding_id,
+        claim.source_id,
+        claim.source_repository_id,
+        claim.pull_request_number,
+        claim.pull_request_database_id,
+        claim.pull_request_node_id,
+        claim.central_repository_node_id,
+        claim.branch_ref,
+        claim.request_class,
+    )
+    if actual != expected:
+        raise R02Error("IssueHeadClaim does not bind the immutable Issue/lease/binding identities")
+
+
+def _proposal_tree_evidence(
+    client: GitHubClient,
+    repository: str,
+    base_entries: Iterable[Any],
+    target_entries: Iterable[Any],
+) -> tuple[tuple[str, ...], tuple[dict[str, Any], ...]]:
+    _validate_claimed_regular_tree(base_entries, "accepted proposal base")
+    _validate_claimed_regular_tree(target_entries, "proposal target")
+    base = _lease_leaf_map(base_entries)
+    target = _lease_leaf_map(target_entries)
+    changed_paths = tuple(sorted(path for path in set(base) | set(target) if base.get(path) != target.get(path)))
+    evidence: list[dict[str, Any]] = []
+    for path in changed_paths:
+        present = target.get(path)
+        if present is None:
+            evidence.append({
+                "path": path, "state": "ABSENT", "mode": None, "objectType": None,
+                "blobSha": None, "contentSha256": None,
+            })
+            continue
+        mode, object_type, blob_sha = present
+        if mode not in {"100644", "100755"} or object_type != "blob":
+            raise R02Error("claimed proposal target contains a nonregular tree object")
+        content = client.get_blob(repository, blob_sha)
+        evidence.append({
+            "path": path,
+            "state": "PRESENT",
+            "mode": mode,
+            "objectType": object_type,
+            "blobSha": blob_sha,
+            "contentSha256": hashlib.sha256(content).hexdigest(),
+        })
+    return changed_paths, tuple(evidence)
+
+
+def _validate_claimed_regular_tree(entries: Iterable[Any], label: str) -> None:
+    leaves: set[str] = set()
+    directories: set[str] = set()
+    for item in entries:
+        if item.object_type == "tree" and item.mode == "040000":
+            directories.add(item.path)
+        elif item.object_type == "blob" and item.mode in {"100644", "100755"}:
+            leaves.add(item.path)
+        else:
+            raise R02Error(f"{label} contains a nonregular Git object")
+    expected_directories = {
+        "/".join(path.split("/")[:index])
+        for path in leaves
+        for index in range(1, len(path.split("/")))
+    }
+    if directories != expected_directories:
+        raise R02Error(f"{label} directory structure does not match its regular file paths")
+
+
+def _validate_issue_head_claim_target(
+    client: GitHubClient,
+    repository: str,
+    claim: IssueHeadClaim,
+    lease: IssueBranchLease,
+) -> None:
+    marker = _issue_head_claim_marker(claim)
+    marker_text = marker.render()
+    if parse_claimed_head_marker(marker_text) != marker:
+        raise R02Error("IssueHeadClaim marker does not parse canonically")
+    if hashlib.sha256(marker_text.encode("utf-8")).hexdigest() != claim.marker_digest:
+        raise R02Error("IssueHeadClaim marker digest does not match its stored claim")
+    from_meta, from_tree_sha, _from_entries = _lease_tree_snapshot(client, repository, claim.from_head_sha)
+    if from_meta.sha != claim.from_head_sha or from_tree_sha != claim.from_tree_sha:
+        raise R02Error("IssueHeadClaim from-head tree provenance does not match stored evidence")
+    base_meta, accepted_tree_sha, accepted_entries = _lease_tree_snapshot(client, repository, claim.accepted_base_sha)
+    if base_meta.sha != claim.accepted_base_sha or accepted_tree_sha != claim.accepted_base_tree_sha:
+        raise R02Error("IssueHeadClaim accepted-base tree provenance does not match stored evidence")
+    target_meta, target_tree_sha, target_entries = _lease_tree_snapshot(client, repository, claim.to_head_sha)
+    if (
+        target_meta.sha != claim.to_head_sha
+        or target_meta.parents != (claim.from_head_sha,)
+        or target_meta.tree_sha != claim.to_tree_sha
+        or target_tree_sha != claim.to_tree_sha
+    ):
+        raise R02Error("IssueHeadClaim target commit parent/tree provenance does not match")
+    expected_sha = _expected_deterministic_commit_sha(
+        target_tree_sha, claim.from_head_sha, marker_text, target_meta.author_date,
+    )
+    if expected_sha != claim.to_head_sha:
+        raise R02Error("IssueHeadClaim target SHA does not bind its exact deterministic marker")
+    if claim.transition_kind == "NORMALIZE":
+        if claim.from_head_sha != lease.initial_head_sha:
+            raise R02Error("NORMALIZE IssueHeadClaim must wrap the exact leased initial head")
+        _validate_claimed_regular_tree(accepted_entries, "NORMALIZE accepted base")
+        _validate_claimed_regular_tree(target_entries, "NORMALIZE target")
+        request_bytes = (claim.request_class.value + "\n").encode("utf-8")
+        expected_blob_sha = hashlib.sha1(
+            b"blob " + str(len(request_bytes)).encode("ascii") + b"\0" + request_bytes
+        ).hexdigest()
+        _validate_marker_only_tree_delta(accepted_entries, target_entries, expected_blob_sha)
+        actual_tree = _lease_leaf_map(target_entries)
+        expected = _lease_leaf_map(accepted_entries)
+        expected[REQUEST_MARKER] = ("100644", "blob", expected_blob_sha)
+        if actual_tree != expected:
+            raise R02Error("NORMALIZE target tree is not the exact accepted-base marker shell")
+        marker_file = client.read_commit_file(repository, claim.to_head_sha, REQUEST_MARKER, expected_mode="100644")
+        if marker_file != request_bytes:
+            raise R02Error("NORMALIZE .federation-request readback differs from exact request class bytes")
+        expected_target = normalize_target_evidence_digest(
+            request_class=claim.request_class,
+            request_marker_blob_sha=expected_blob_sha,
+            target_tree_sha=target_tree_sha,
+        )
+    else:
+        _validate_claimed_regular_tree(target_entries, "IssueHeadClaim proposal target")
+        _changed, evidence = _proposal_tree_evidence(client, repository, accepted_entries, target_entries)
+        expected_target = proposal_target_evidence_digest(
+            candidate_tree_sha=target_tree_sha,
+            changed=evidence,
+            candidate_changed_paths=_changed,
+        )
+        if claim.transition_kind in {"PROPOSAL", "PATCH_REGENERATION", "MAIN_ADVANCE"}:
+            if REQUEST_MARKER in _lease_leaf_map(target_entries):
+                raise R02Error("proposal target must remove the transient request marker")
+    if expected_target != claim.target_evidence_digest:
+        raise R02Error("IssueHeadClaim target evidence digest does not match the stored target tree")
+
+
+def _validate_required_status_epoch_binding(
+    epoch: RequiredStatusEpoch,
+    state: IssuePRBindingState,
+) -> None:
+    anchor = state.issue_anchor
+    lease = state.lease
+    binding = state.binding
+    expected = (
+        anchor.anchor.issue_number, anchor.anchor.issue_database_id, anchor.anchor.issue_node_id,
+        anchor.comment.database_id, anchor.anchor.canonical_sha256(),
+        lease.comment.database_id, _binding_comment_sha256(lease.comment), binding.binding_id,
+        anchor.anchor.source_id, anchor.anchor.source_repository_id,
+        binding.pull_request_number, binding.pull_request_database_id, binding.pull_request_node_id,
+        binding.central_repository_node_id, binding.branch_ref, anchor.anchor.request_class,
+    )
+    actual = (
+        epoch.issue_number, epoch.issue_database_id, epoch.issue_node_id,
+        epoch.issue_request_anchor_comment_database_id, epoch.issue_request_anchor_sha256,
+        epoch.issue_branch_lease_comment_database_id, epoch.issue_branch_lease_sha256, epoch.binding_id,
+        epoch.source_id, epoch.source_repository_id,
+        epoch.pull_request_number, epoch.pull_request_database_id, epoch.pull_request_node_id,
+        epoch.central_repository_node_id, epoch.branch_ref, epoch.request_class,
+    )
+    if actual != expected:
+        raise R02Error("RequiredStatusEpoch does not bind immutable Issue/lease/binding identities")
+
+
+def _validate_issue_finalization_epoch_binding(
+    epoch: IssueFinalizationEpoch,
+    state: IssuePRBindingState,
+) -> None:
+    anchor = state.issue_anchor
+    lease = state.lease
+    binding = state.binding
+    expected = (
+        anchor.anchor.issue_number, anchor.anchor.issue_database_id, anchor.anchor.issue_node_id,
+        anchor.comment.database_id, anchor.anchor.canonical_sha256(),
+        lease.comment.database_id, _binding_comment_sha256(lease.comment), binding.binding_id,
+        anchor.anchor.source_id, anchor.anchor.source_repository_id,
+        binding.pull_request_number, binding.pull_request_database_id, binding.pull_request_node_id,
+        binding.central_repository_node_id, binding.branch_ref, anchor.anchor.request_class,
+    )
+    actual = (
+        epoch.issue_number, epoch.issue_database_id, epoch.issue_node_id,
+        epoch.issue_request_anchor_comment_database_id, epoch.issue_request_anchor_sha256,
+        epoch.issue_branch_lease_comment_database_id, epoch.issue_branch_lease_sha256, epoch.binding_id,
+        epoch.source_id, epoch.source_repository_id,
+        epoch.pull_request_number, epoch.pull_request_database_id, epoch.pull_request_node_id,
+        epoch.central_repository_node_id, epoch.branch_ref, epoch.request_class,
+    )
+    if actual != expected:
+        raise R02Error("IssueFinalizationEpoch does not bind immutable Issue/lease/binding identities")
+
+
+def _validate_epoch_target_commit(
+    client: GitHubClient,
+    repository: str,
+    *,
+    target_sha: str,
+    from_head_sha: str,
+    from_tree_sha: str,
+    target_tree_sha: str,
+    accepted_base_sha: str,
+    accepted_base_tree_sha: str,
+    marker: ClaimedHeadMarker,
+    marker_digest: str,
+    label: str,
+) -> None:
+    marker_text = marker.render()
+    if parse_claimed_head_marker(marker_text) != marker:
+        raise R02Error(f"{label} marker does not parse canonically")
+    if hashlib.sha256(marker_text.encode("utf-8")).hexdigest() != marker_digest:
+        raise R02Error(f"{label} marker digest does not match immutable artifact")
+    from_meta, actual_from_tree, _from_entries = _lease_tree_snapshot(client, repository, from_head_sha)
+    if from_meta.sha != from_head_sha or actual_from_tree != from_tree_sha:
+        raise R02Error(f"{label} from-head tree provenance does not match")
+    base_meta, actual_base_tree, _base_entries = _lease_tree_snapshot(client, repository, accepted_base_sha)
+    if base_meta.sha != accepted_base_sha or actual_base_tree != accepted_base_tree_sha:
+        raise R02Error(f"{label} accepted-base tree provenance does not match")
+    target_meta, actual_target_tree, _target_entries = _lease_tree_snapshot(client, repository, target_sha)
+    if (
+        target_meta.sha != target_sha
+        or target_meta.parents != (from_head_sha,)
+        or target_meta.tree_sha != target_tree_sha
+        or actual_target_tree != target_tree_sha
+        or actual_target_tree != from_tree_sha
+    ):
+        raise R02Error(f"{label} target is not an exact no-tree-change direct child")
+    try:
+        target_object = client.get_git_commit_object(repository, target_sha)
+    except Exception as error:
+        raise R02Error(f"{label} exact target commit object is unavailable: {_bounded_reason(error)}") from None
+    if type(target_object) is not GitCommitObject or type(target_object.message) is not str:
+        raise R02Error(f"{label} exact target commit object is malformed")
+    try:
+        parsed_target_marker = parse_claimed_head_marker(target_object.message)
+    except RequestModelError as error:
+        raise R02Error(f"{label} target marker is malformed: {_bounded_reason(error)}") from None
+    if (
+        type(target_object) is not GitCommitObject
+        or target_object.sha != target_sha
+        or target_object.message != marker_text
+        or target_object.parents != (from_head_sha,)
+        or target_object.tree_sha != target_tree_sha
+        or parsed_target_marker != marker
+    ):
+        raise R02Error(f"{label} exact target commit message/parent/tree is invalid")
+    expected_sha = _expected_deterministic_commit_sha(
+        target_tree_sha, from_head_sha, marker_text, target_meta.author_date,
+    )
+    if expected_sha != target_sha:
+        raise R02Error(f"{label} target SHA does not bind its canonical marker")
+
+
+def _validate_required_status_epoch_target(
+    client: GitHubClient,
+    repository: str,
+    epoch: RequiredStatusEpoch,
+    state: IssuePRBindingState,
+) -> None:
+    _validate_required_status_epoch_binding(epoch, state)
+    _validate_epoch_target_commit(
+        client,
+        repository,
+        target_sha=epoch.to_head_sha,
+        from_head_sha=epoch.from_head_sha,
+        from_tree_sha=epoch.from_tree_sha,
+        target_tree_sha=epoch.to_tree_sha,
+        accepted_base_sha=epoch.accepted_base_sha,
+        accepted_base_tree_sha=epoch.accepted_base_tree_sha,
+        marker=_required_status_epoch_marker(epoch),
+        marker_digest=epoch.marker_digest,
+        label="RequiredStatusEpoch",
+    )
+
+
+def _validate_issue_finalization_epoch_target(
+    client: GitHubClient,
+    repository: str,
+    epoch: IssueFinalizationEpoch,
+    state: IssuePRBindingState,
+) -> None:
+    _validate_issue_finalization_epoch_binding(epoch, state)
+    if issue_final_status_evidence_digest(epoch) != epoch.required_status_evidence_digest:
+        raise R02Error("IssueFinalizationEpoch issue-final evidence digest does not recompute")
+    _validate_epoch_target_commit(
+        client,
+        repository,
+        target_sha=epoch.final_head_sha,
+        from_head_sha=epoch.from_head_sha,
+        from_tree_sha=epoch.from_tree_sha,
+        target_tree_sha=epoch.final_tree_sha,
+        accepted_base_sha=epoch.accepted_base_sha,
+        accepted_base_tree_sha=epoch.accepted_base_tree_sha,
+        marker=_issue_finalization_epoch_marker(epoch),
+        marker_digest=epoch.marker_digest,
+        label="IssueFinalizationEpoch",
+    )
+
+
+def _epoch_comment_authority(comment: IssueComment, app: AppIdentity, label: str) -> None:
+    if (
+        comment.author_id != app.bot_node_id
+        or comment.author_login != app.bot_login
+        or comment.author_type not in {None, "Bot"}
+        or _issue_comment_edited(comment)
+    ):
+        raise R02Error(f"{label} comment authorship/edit integrity is invalid")
+
+
+def _required_status_epoch_comments(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    state: IssuePRBindingState,
+    current_ref: str,
+) -> tuple[RequiredStatusEpochComment, ...]:
+    grouped: dict[str, dict[str, list[tuple[RequiredStatusEpoch, IssueComment]]]] = {}
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(REQUIRED_STATUS_EPOCH_MARKER):
+            continue
+        try:
+            epoch = parse_required_status_epoch(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed RequiredStatusEpoch comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "RequiredStatusEpoch")
+        if epoch.prior_required_status is not None and (
+            epoch.prior_required_status.creator_database_id != app.bot_id
+            or epoch.prior_required_status.creator_node_id != app.bot_node_id
+            or epoch.prior_required_status.creator_login != app.bot_login
+            or epoch.prior_required_status.creator_type != "Bot"
+        ):
+            raise R02Error("RequiredStatusEpoch prior status evidence is not from the exact current App Bot")
+        _validate_required_status_epoch_target(client, repository, epoch, state)
+        grouped.setdefault(epoch.claim_generation_id, {}).setdefault(epoch.render(), []).append((epoch, comment))
+    result: list[RequiredStatusEpochComment] = []
+    for payloads in grouped.values():
+        if len(payloads) != 1:
+            raise R02Error("conflicting RequiredStatusEpoch payloads for one generation block resolution")
+        equivalent = next(iter(payloads.values()))
+        epoch, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result.append(RequiredStatusEpochComment(epoch, comment, current_ref == epoch.to_head_sha))
+    return tuple(sorted(result, key=lambda item: (item.comment.database_id, item.epoch.claim_generation_id)))
+
+
+def _issue_finalization_epoch_comments(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    state: IssuePRBindingState,
+    current_ref: str,
+) -> tuple[IssueFinalizationEpochComment, ...]:
+    grouped: dict[str, dict[str, list[tuple[IssueFinalizationEpoch, IssueComment]]]] = {}
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_FINALIZATION_EPOCH_MARKER):
+            continue
+        try:
+            epoch = parse_issue_finalization_epoch(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueFinalizationEpoch comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueFinalizationEpoch")
+        _validate_issue_finalization_epoch_target(client, repository, epoch, state)
+        grouped.setdefault(epoch.claim_generation_id, {}).setdefault(epoch.render(), []).append((epoch, comment))
+    result: list[IssueFinalizationEpochComment] = []
+    for payloads in grouped.values():
+        if len(payloads) != 1:
+            raise R02Error("conflicting IssueFinalizationEpoch payloads for one generation block resolution")
+        equivalent = next(iter(payloads.values()))
+        epoch, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result.append(IssueFinalizationEpochComment(epoch, comment, current_ref == epoch.final_head_sha))
+    return tuple(sorted(result, key=lambda item: (item.comment.database_id, item.epoch.claim_generation_id)))
+
+
+def _issue_cancellation_fence_marker(fence: IssueCancellationFence) -> ClaimedHeadMarker:
+    if type(fence) is not IssueCancellationFence:
+        raise R02Error("IssueCancellationFence marker requires its exact parsed artifact")
+    return ClaimedHeadMarker(
+        "ISSUE_CANCELLATION_FENCE",
+        "ISSUE_CANCEL",
+        "ISSUE",
+        issue_owner_key(
+            fence.central_repository_node_id,
+            fence.issue_database_id,
+            fence.issue_node_id,
+            fence.issue_number,
+        ),
+        fence.claim_generation_id,
+        fence.cancellation_carrier_nonce,
+        "TERMINAL_CANCELLATION",
+    )
+
+
+def _validate_issue_cancellation_fence_target(
+    client: GitHubClient,
+    repository: str,
+    fence: IssueCancellationFence,
+) -> None:
+    marker = _issue_cancellation_fence_marker(fence)
+    marker_text = marker.render()
+    if parse_claimed_head_marker(marker_text) != marker:
+        raise R02Error("IssueCancellationFence marker does not parse canonically")
+    if hashlib.sha256(marker_text.encode("utf-8")).hexdigest() != fence.marker_digest:
+        raise R02Error("IssueCancellationFence marker digest does not match")
+    original, original_tree, _original_entries = _lease_tree_snapshot(
+        client, repository, fence.original_head_sha,
+    )
+    if original.sha != fence.original_head_sha or original_tree != fence.original_head_tree_sha:
+        raise R02Error("IssueCancellationFence original head/tree identity is invalid")
+    target, target_tree, _target_entries = _lease_tree_snapshot(
+        client, repository, fence.cancellation_head_sha,
+    )
+    if (
+        target.sha != fence.cancellation_head_sha
+        or target.parents != (fence.original_head_sha,)
+        or target.tree_sha != fence.original_head_tree_sha
+        or target_tree != fence.original_head_tree_sha
+        or fence.cancellation_head_tree_sha != fence.original_head_tree_sha
+    ):
+        raise R02Error("IssueCancellationFence target is not an exact direct no-tree-change child")
+    try:
+        commit = client.get_git_commit_object(repository, fence.cancellation_head_sha)
+    except Exception as error:
+        raise R02Error(f"IssueCancellationFence exact target commit is unavailable: {_bounded_reason(error)}") from None
+    if type(commit) is not GitCommitObject or (
+        commit.sha != fence.cancellation_head_sha
+        or commit.message != marker_text
+        or commit.tree_sha != fence.original_head_tree_sha
+        or commit.parents != (fence.original_head_sha,)
+        or commit.author.name != "Swift Stream Federation"
+        or commit.author.email != "automation@swiftstream.invalid"
+        or commit.committer.name != "Swift Stream Federation"
+        or commit.committer.email != "automation@swiftstream.invalid"
+        or commit.author.date != commit.committer.date
+    ):
+        raise R02Error("IssueCancellationFence exact target marker/identity is invalid")
+    try:
+        parsed_marker = parse_claimed_head_marker(commit.message)
+    except RequestModelError as error:
+        raise R02Error(f"IssueCancellationFence target marker is malformed: {_bounded_reason(error)}") from None
+    if parsed_marker != marker or _expected_deterministic_commit_sha(
+        commit.tree_sha, fence.original_head_sha, marker_text, commit.author.date,
+    ) != fence.cancellation_head_sha:
+        raise R02Error("IssueCancellationFence target SHA does not bind its exact marker and Bot identity")
+
+
+def _validate_issue_cancellation_fence_context(
+    fence: IssueCancellationFence,
+    authority: _IssueCancellationAuthority,
+) -> None:
+    anchor = authority.issue_anchor
+    lease = authority.lease
+    expected = (
+        anchor.anchor.issue_number,
+        anchor.anchor.issue_database_id,
+        anchor.anchor.issue_node_id,
+        anchor.comment.database_id,
+        anchor.anchor.canonical_sha256(),
+        lease.comment.database_id,
+        _binding_comment_sha256(lease.comment),
+        _cancellation_binding_authority_id(authority),
+        anchor.anchor.source_id,
+        anchor.anchor.source_repository_id,
+        lease.lease.branch_ref,
+        authority.pull_request_number,
+        authority.pull_request_database_id,
+        authority.pull_request_node_id,
+        authority.central_repository_node_id,
+        authority.base_repository_node_id,
+        "main",
+    )
+    actual = (
+        fence.issue_number,
+        fence.issue_database_id,
+        fence.issue_node_id,
+        fence.issue_request_anchor_comment_database_id,
+        fence.issue_request_anchor_sha256,
+        fence.issue_branch_lease_comment_database_id,
+        fence.issue_branch_lease_sha256,
+        fence.binding_authority,
+        fence.source_id,
+        fence.source_repository_id,
+        fence.branch_ref,
+        fence.pull_request_number,
+        fence.pull_request_database_id,
+        fence.pull_request_node_id,
+        fence.central_repository_node_id,
+        fence.base_repository_node_id,
+        fence.base_ref,
+    )
+    if actual != expected:
+        raise R02Error("IssueCancellationFence does not match exact central Issue/lease/PR-as-Issue identity")
+    if (
+        authority.pr.number != authority.pull_request_number
+        or authority.pr_issue.number != authority.pull_request_number
+        or authority.pr_issue.database_id != authority.pull_request_database_id
+        or authority.pr_issue.node_id != authority.pull_request_node_id
+    ):
+        raise R02Error("IssueCancellationFence PR node/database/number cross-check failed")
+    if authority.binding_authority == "FULL_BINDING":
+        binding = authority.binding
+        state = authority.binding_state
+        if binding is None or state is None or state.binding != binding:
+            raise R02Error("FULL_BINDING cancellation authority requires the exact persisted two-sided binding")
+        if (
+            binding.pull_request_number != authority.pull_request_number
+            or binding.pull_request_database_id != authority.pull_request_database_id
+            or binding.pull_request_node_id != authority.pull_request_node_id
+        ):
+            raise R02Error("FULL_BINDING does not cross-check the exact PR-as-Issue identity triple")
+    elif authority.binding_authority == "PRE_BINDING":
+        if authority.binding is not None or authority.binding_state is not None:
+            raise R02Error("PRE_BINDING cancellation authority must not fabricate an IssuePRBinding")
+    else:
+        raise R02Error("IssueCancellationFence binding authority is unsupported")
+
+
+def _require_exact_cancellation_stage_receipt_identity(
+    receipt: PullRequestStageMutationReceipt,
+    authority: _IssueCancellationAuthority,
+    fence: IssueCancellationFence,
+) -> PullRequestStageMutationReceipt:
+    if type(receipt) is not PullRequestStageMutationReceipt:
+        raise R02Error("cancellation stage authority requires an exact PR-stage mutation receipt")
+    expected = (
+        authority.pull_request_node_id,
+        authority.pull_request_database_id,
+        authority.pull_request_number,
+    )
+    actual = (
+        receipt.pull_request_node_id,
+        receipt.pull_request_database_id,
+        receipt.pull_request_number,
+    )
+    fence_identity = (
+        fence.pull_request_node_id,
+        fence.pull_request_database_id,
+        fence.pull_request_number,
+    )
+    if actual != expected or expected != fence_identity:
+        raise R02Error("stage mutation receipt PR node/database/number differs from exact PR-as-Issue and fence")
+    return receipt
+
+
+def _issue_cancellation_fence_comments(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    authority: _IssueCancellationAuthority,
+    current_ref: str,
+) -> tuple[IssueCancellationFenceComment, ...]:
+    grouped: dict[str, list[tuple[IssueCancellationFence, IssueComment]]] = {}
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_CANCELLATION_FENCE_MARKER):
+            continue
+        try:
+            fence = parse_issue_cancellation_fence(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueCancellationFence comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueCancellationFence")
+        _validate_issue_cancellation_fence_context(fence, authority)
+        if fence.binding_authority == "PRE_BINDING":
+            lease = authority.lease.lease
+            if (
+                fence.original_head_claim_kind != "ISSUE_BRANCH_LEASE"
+                or fence.original_head_claim_role != CarrierRole.ISSUE_ACTIVE.value
+                or fence.original_head_sha != lease.initial_head_sha
+                or fence.original_head_tree_sha != lease.initial_head_tree_sha
+                or fence.original_head_artifact_comment_database_id != authority.lease.comment.database_id
+                or fence.original_head_artifact_id != lease.lease_id
+                or fence.original_head_artifact_sha256 != _binding_comment_sha256(authority.lease.comment)
+            ):
+                raise R02Error("PRE_BINDING IssueCancellationFence must use the exact active lease-root predecessor")
+        _validate_issue_cancellation_fence_target(client, repository, fence)
+        grouped.setdefault(fence.fence_id, []).append((fence, comment))
+    if len(grouped) > 1:
+        raise R02Error("conflicting IssueCancellationFence payloads exist for one request attempt")
+    result: list[IssueCancellationFenceComment] = []
+    for equivalent in grouped.values():
+        renders = {item.render() for item, _comment in equivalent}
+        if len(renders) != 1:
+            raise R02Error("IssueCancellationFence ID collision has non-identical payloads")
+        fence, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result.append(IssueCancellationFenceComment(
+            fence, comment, current_ref == fence.cancellation_head_sha,
+        ))
+    return tuple(result)
+
+
+_CANCELLATION_STAGE_SPECS: Mapping[str, tuple[str, PullRequestStageMutationOperation]] = {
+    "DRAFT_REOPEN": ("reopen_pull_request", PullRequestStageMutationOperation.REOPEN),
+    "DRAFT_READY": ("mark_pull_request_ready_for_review", PullRequestStageMutationOperation.READY_FOR_REVIEW),
+    "DRAFT_CONVERT": ("convert_pull_request_to_draft", PullRequestStageMutationOperation.CONVERT_TO_DRAFT),
+    "CLOSE_REOPEN": ("reopen_pull_request", PullRequestStageMutationOperation.REOPEN),
+    "TERMINAL_CLOSE": ("close_pull_request", PullRequestStageMutationOperation.CLOSE),
+}
+
+
+def _cancellation_stage_client_mutation_id(fence: IssueCancellationFence, stage: str) -> str:
+    if stage not in _CANCELLATION_STAGE_SPECS:
+        raise R02Error("cancellation PR mutation stage is unsupported")
+    operation = _CANCELLATION_STAGE_SPECS[stage][1].value
+    payload = {
+        "cancellationHeadSha": fence.cancellation_head_sha,
+        "fenceId": fence.fence_id,
+        "operation": operation,
+        "pullRequestNodeId": fence.pull_request_node_id,
+        "stage": stage,
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    digest = hashlib.sha256(
+        ("swiftstream-federation:cancellation-pr-stage-mutation:v1\n" + encoded).encode("ascii"),
+    ).hexdigest()
+    client_mutation_id = f"g8w07-{digest}"
+    if len(client_mutation_id.encode("ascii")) > 256:
+        raise R02Error("deterministic cancellation clientMutationId exceeds the bounded transport limit")
+    return client_mutation_id
+
+
+def _exact_cancellation_stage_evidence(
+    receipt: PullRequestStageMutationReceipt,
+    authority: _IssueCancellationAuthority,
+    fence: IssueCancellationFence,
+    stage: str,
+) -> ExactPullRequestStageMutationEvidence:
+    try:
+        _method_name, operation = _CANCELLATION_STAGE_SPECS[stage]
+    except KeyError:
+        raise R02Error("cancellation PR mutation stage is unsupported") from None
+    _require_exact_cancellation_stage_receipt_identity(receipt, authority, fence)
+    expected_id = _cancellation_stage_client_mutation_id(fence, stage)
+    if (
+        receipt.operation != operation.value
+        or receipt.requested_pull_request_node_id != fence.pull_request_node_id
+        or receipt.requested_client_mutation_id != expected_id
+        or receipt.returned_client_mutation_id != expected_id
+    ):
+        raise R02Error("same-response PR-stage receipt operation or clientMutationId differs from the exact logical stage")
+    try:
+        evidence = ExactPullRequestStageMutationEvidence(
+            operation=operation,
+            client_mutation_id=receipt.returned_client_mutation_id,
+            pull_request_node_id=receipt.pull_request_node_id,
+            pull_request_database_id=receipt.pull_request_database_id,
+            pull_request_number=receipt.pull_request_number,
+            state=receipt.state,
+            is_draft=receipt.is_draft,
+            merged=receipt.merged,
+            merged_at=receipt.merged_at,
+            head_ref_oid=receipt.head_oid,
+            base_ref_oid=receipt.base_oid,
+            head_ref_name=receipt.head_ref,
+            base_ref_name=receipt.base_ref,
+            head_repository_node_id=receipt.head_repository_node_id,
+            base_repository_node_id=receipt.base_repository_node_id,
+        )
+    except RequestModelError as error:
+        raise R02Error(f"same-response PR-stage evidence is invalid: {_bounded_reason(error)}") from None
+    expected_state = "CLOSED" if operation is PullRequestStageMutationOperation.CLOSE else "OPEN"
+    expected_draft = {
+        "DRAFT_READY": False,
+        "DRAFT_CONVERT": True,
+    }.get(stage)
+    if (
+        evidence.pull_request_node_id != authority.pull_request_node_id
+        or evidence.pull_request_database_id != authority.pull_request_database_id
+        or evidence.pull_request_number != authority.pull_request_number
+        or evidence.pull_request_node_id != fence.pull_request_node_id
+        or evidence.pull_request_database_id != fence.pull_request_database_id
+        or evidence.pull_request_number != fence.pull_request_number
+        or evidence.head_ref_oid != fence.cancellation_head_sha
+        or evidence.head_ref_name != fence.branch_ref.removeprefix("refs/heads/")
+        or evidence.base_ref_name != "main"
+        or evidence.head_repository_node_id != fence.central_repository_node_id
+        or evidence.base_repository_node_id != fence.base_repository_node_id
+        or evidence.state != expected_state
+        or (expected_draft is not None and evidence.is_draft is not expected_draft)
+        or evidence.merged
+        or evidence.merged_at is not None
+    ):
+        raise R02Error("same-response PR-stage evidence differs from exact cancellation PR/HC/base authority")
+    return evidence
+
+
+def _cancellation_witness_expected_fields(
+    authority: _IssueCancellationAuthority,
+    fence_item: IssueCancellationFenceComment,
+    status: ExactAppRequiredStatusSnapshot,
+) -> dict[str, Any]:
+    anchor = authority.issue_anchor
+    lease = authority.lease
+    fence = fence_item.fence
+    return {
+        "issue_number": anchor.anchor.issue_number,
+        "issue_database_id": anchor.anchor.issue_database_id,
+        "issue_node_id": anchor.anchor.issue_node_id,
+        "issue_request_anchor_comment_database_id": anchor.comment.database_id,
+        "issue_request_anchor_sha256": anchor.anchor.canonical_sha256(),
+        "issue_branch_lease_comment_database_id": lease.comment.database_id,
+        "issue_branch_lease_sha256": _binding_comment_sha256(lease.comment),
+        "fence_comment_database_id": fence_item.comment.database_id,
+        "fence_sha256": _binding_comment_sha256(fence_item.comment),
+        "fence_id": fence.fence_id,
+        "binding_authority": _cancellation_binding_authority_id(authority),
+        "source_id": anchor.anchor.source_id,
+        "source_repository_id": anchor.anchor.source_repository_id,
+        "branch_ref": lease.lease.branch_ref,
+        "pull_request_number": authority.pull_request_number,
+        "pull_request_database_id": authority.pull_request_database_id,
+        "pull_request_node_id": authority.pull_request_node_id,
+        "original_head_sha": fence.original_head_sha,
+        "cancellation_head_sha": fence.cancellation_head_sha,
+        "anchored_accepted_base_sha": lease.lease.accepted_base_sha,
+        "base_repository_node_id": fence.base_repository_node_id,
+        "base_ref": "main",
+        "head_repository_node_id": fence.central_repository_node_id,
+        "current_required_status": status,
+    }
+
+
+def _validate_cancellation_witness_stage_ids(
+    witness: IssueCancellationDraftWitness,
+    fence: IssueCancellationFence,
+) -> None:
+    stages = (
+        (witness.reopen_evidence, "DRAFT_REOPEN"),
+        (witness.ready_evidence, "DRAFT_READY"),
+        (witness.draft_evidence, "DRAFT_CONVERT"),
+    )
+    for evidence, stage in stages:
+        if evidence is not None and evidence.client_mutation_id != _cancellation_stage_client_mutation_id(fence, stage):
+            raise R02Error("draft witness contains a noncanonical cancellation clientMutationId")
+
+
+def _issue_cancellation_draft_witness_comments(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    authority: _IssueCancellationAuthority,
+    fence_item: IssueCancellationFenceComment,
+    status: ExactAppRequiredStatusSnapshot,
+) -> tuple[IssueCancellationDraftWitnessComment, ...]:
+    grouped: dict[str, list[tuple[IssueCancellationDraftWitness, IssueComment]]] = {}
+    expected = _cancellation_witness_expected_fields(authority, fence_item, status)
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER):
+            continue
+        try:
+            witness = parse_issue_cancellation_draft_witness(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueCancellationDraftWitness comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueCancellationDraftWitness")
+        if any(getattr(witness, name) != value for name, value in expected.items()):
+            raise R02Error("IssueCancellationDraftWitness does not match exact anchor/lease/fence/PR/status authority")
+        _validate_cancellation_witness_stage_ids(witness, fence_item.fence)
+        grouped.setdefault(witness.witness_id, []).append((witness, comment))
+    if len(grouped) > 1:
+        raise R02Error("conflicting IssueCancellationDraftWitness payloads exist")
+    result: list[IssueCancellationDraftWitnessComment] = []
+    for equivalent in grouped.values():
+        if len({item.render() for item, _comment in equivalent}) != 1:
+            raise R02Error("IssueCancellationDraftWitness ID collision has non-identical payloads")
+        witness, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result.append(IssueCancellationDraftWitnessComment(witness, comment))
+    return tuple(result)
+
+
+def _cancellation_terminal_result_expected_fields(
+    authority: _IssueCancellationAuthority,
+    fence_item: IssueCancellationFenceComment,
+    witness_item: IssueCancellationDraftWitnessComment,
+    status: ExactAppRequiredStatusSnapshot,
+) -> dict[str, Any]:
+    anchor = authority.issue_anchor
+    lease = authority.lease
+    fence = fence_item.fence
+    return {
+        "issue_number": anchor.anchor.issue_number,
+        "issue_database_id": anchor.anchor.issue_database_id,
+        "issue_node_id": anchor.anchor.issue_node_id,
+        "issue_request_anchor_comment_database_id": anchor.comment.database_id,
+        "issue_request_anchor_sha256": anchor.anchor.canonical_sha256(),
+        "issue_branch_lease_comment_database_id": lease.comment.database_id,
+        "issue_branch_lease_sha256": _binding_comment_sha256(lease.comment),
+        "binding_authority": _cancellation_binding_authority_id(authority),
+        "source_id": anchor.anchor.source_id,
+        "source_repository_id": anchor.anchor.source_repository_id,
+        "branch_ref": lease.lease.branch_ref,
+        "pull_request_number": authority.pull_request_number,
+        "pull_request_database_id": authority.pull_request_database_id,
+        "pull_request_node_id": authority.pull_request_node_id,
+        "original_head_sha": fence.original_head_sha,
+        "cancellation_head_sha": fence.cancellation_head_sha,
+        "base_repository_node_id": fence.base_repository_node_id,
+        "base_ref": "main",
+        "fence_comment_database_id": fence_item.comment.database_id,
+        "fence_sha256": _binding_comment_sha256(fence_item.comment),
+        "fence_id": fence.fence_id,
+        "draft_witness_comment_database_id": witness_item.comment.database_id,
+        "draft_witness_sha256": _binding_comment_sha256(witness_item.comment),
+        "witness_id": witness_item.witness.witness_id,
+        "current_failure_status": status,
+    }
+
+
+def _issue_terminal_cancelled_result_comments(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    authority: _IssueCancellationAuthority,
+    fence_item: IssueCancellationFenceComment,
+    witness_item: IssueCancellationDraftWitnessComment,
+    status: ExactAppRequiredStatusSnapshot,
+) -> tuple[IssueTerminalCancelledResultComment, ...]:
+    grouped: dict[str, list[tuple[IssueTerminalCancelledResult, IssueComment]]] = {}
+    expected = _cancellation_terminal_result_expected_fields(authority, fence_item, witness_item, status)
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_TERMINAL_CANCELLED_RESULT_MARKER):
+            continue
+        try:
+            result = parse_issue_terminal_cancelled_result(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueTerminalCancelledResult comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueTerminalCancelledResult")
+        if any(getattr(result, name) != value for name, value in expected.items()):
+            raise R02Error("IssueTerminalCancelledResult does not match exact fence/witness/status/PR authority")
+        if (
+            result.close_evidence.head_repository_node_id != fence_item.fence.central_repository_node_id
+            or result.close_evidence.base_repository_node_id != fence_item.fence.base_repository_node_id
+            or result.close_evidence.head_ref_name != fence_item.fence.branch_ref.removeprefix("refs/heads/")
+            or result.close_evidence.base_ref_name != "main"
+            or result.close_evidence.client_mutation_id != _cancellation_stage_client_mutation_id(
+                fence_item.fence, "TERMINAL_CLOSE",
+            )
+        ):
+            raise R02Error("terminal close evidence does not bind exact same-response PR stage authority")
+        grouped.setdefault(result.terminal_result_id, []).append((result, comment))
+    if len(grouped) > 1:
+        raise R02Error("conflicting IssueTerminalCancelledResult payloads exist")
+    result_items: list[IssueTerminalCancelledResultComment] = []
+    for equivalent in grouped.values():
+        if len({item.render() for item, _comment in equivalent}) != 1:
+            raise R02Error("IssueTerminalCancelledResult ID collision has non-identical payloads")
+        result, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result_items.append(IssueTerminalCancelledResultComment(result, comment))
+    return tuple(result_items)
+
+
+def _issue_no_pr_cancelled_result_comments(
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment | None,
+) -> tuple[IssueNoPRCancelledResultComment, ...]:
+    grouped: dict[str, list[tuple[IssueNoPRCancelledResult, IssueComment]]] = {}
+    for comment in comments:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_NO_PR_CANCELLED_RESULT_MARKER):
+            continue
+        try:
+            result = parse_issue_no_pr_cancelled_result(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueNoPRCancelledResult comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueNoPRCancelledResult")
+        identity_matches = (
+            result.issue_number == anchor.anchor.issue_number
+            and result.issue_database_id == anchor.anchor.issue_database_id
+            and result.issue_node_id == anchor.anchor.issue_node_id
+            and result.issue_request_anchor_comment_database_id == anchor.comment.database_id
+            and result.issue_request_anchor_sha256 == anchor.anchor.canonical_sha256()
+            and result.source_id == anchor.anchor.source_id
+            and result.source_repository_id == anchor.anchor.source_repository_id
+        )
+        if not identity_matches:
+            raise R02Error("IssueNoPRCancelledResult does not match exact immutable IssueRequestAnchor")
+        if lease is None:
+            if result.proof_kind is not IssueNoPRCancelledProofKind.ANCHOR_ONLY:
+                raise R02Error("lease-backed no-PR result exists without its exact IssueBranchLease")
+        else:
+            if (
+                result.proof_kind is IssueNoPRCancelledProofKind.ANCHOR_ONLY
+                or result.lease_comment_database_id != lease.comment.database_id
+                or result.lease_sha256 != _binding_comment_sha256(lease.comment)
+                or result.lease_id != lease.lease.lease_id
+                or result.branch_ref != lease.lease.branch_ref
+                or result.lease_initial_head_sha != lease.lease.initial_head_sha
+            ):
+                raise R02Error("lease-backed no-PR result does not match exact immutable IssueBranchLease")
+        grouped.setdefault(result.no_pr_result_id, []).append((result, comment))
+    if len(grouped) > 1:
+        raise R02Error("conflicting immutable IssueNoPRCancelledResult payloads exist")
+    result_items: list[IssueNoPRCancelledResultComment] = []
+    for equivalent in grouped.values():
+        if len({item.render() for item, _comment in equivalent}) != 1:
+            raise R02Error("IssueNoPRCancelledResult ID collision has non-identical payloads")
+        result, comment = min(equivalent, key=lambda item: item[1].database_id)
+        result_items.append(IssueNoPRCancelledResultComment(result, comment))
+    return tuple(result_items)
+
+
+def _issue_cancellation_fence_predecessor_matches(
+    node: _IssueAuthorityNode,
+    fence: IssueCancellationFence,
+) -> bool:
+    return (
+        fence.original_head_claim_kind == node.claim_kind
+        and fence.original_head_claim_role == node.role.value
+        and fence.original_head_sha == node.target_head_sha
+        and fence.original_head_tree_sha == node.tree_sha
+        and fence.original_head_artifact_comment_database_id == node.comment.database_id
+        and fence.original_head_artifact_id == node.artifact_id
+        and fence.original_head_artifact_sha256 == node.artifact_sha256
+    )
+
+
+def _resolve_issue_cancellation_original_node(
+    client: GitHubClient,
+    repository: str,
+    authority: _IssueCancellationAuthority,
+    app: AppIdentity,
+    original_head_sha: str,
+    canonical_role_resolver: Callable[[str], ShaCarrierResolution] | None = None,
+) -> _IssueAuthorityNode:
+    if authority.binding_authority == "PRE_BINDING":
+        lease = authority.lease.lease
+        if original_head_sha != lease.initial_head_sha:
+            raise R02Error("PRE_BINDING cancellation predecessor must be the exact lease root")
+        marker = _lease_marker_for(lease)
+        resolution = (
+            canonical_role_resolver(original_head_sha)
+            if canonical_role_resolver is not None
+            else resolve_sha_carrier_role(
+                client, repository, original_head_sha, app.slug, LegacyEvidenceDisposition.CONFLICTING,
+            )
+        )
+        if (
+            resolution.role is not CarrierRole.ISSUE_ACTIVE
+            or resolution.marker != marker
+            or resolution.activation is not CarrierActivation.ACTIVE
+        ):
+            raise R02Error("PRE_BINDING lease-root predecessor is not the exact current ISSUE_ACTIVE carrier")
+        return _IssueAuthorityNode(
+            "ISSUE_BRANCH_LEASE", CarrierRole.ISSUE_ACTIVE, lease.initial_head_sha, None,
+            lease.initial_head_tree_sha, "INITIAL", lease.lease_id,
+            _binding_comment_sha256(authority.lease.comment), authority.lease.comment,
+            lease, active=True,
+        )
+    state = authority.binding_state
+    if state is None:
+        raise R02Error("FULL_BINDING cancellation predecessor requires the exact persisted IssuePRBinding")
+    comments = tuple(client.list_issue_comments(repository, authority.pull_request_number))
+    current_ref = _read_issue_branch_ref(
+        client, repository, authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+    )
+    if current_ref != original_head_sha or authority.pr.head_oid != original_head_sha:
+        raise StaleAuthorityError("FULL_BINDING cancellation predecessor is not the exact current ref/PR head")
+    history = _issue_authority_history(client, repository, comments, app, state, current_ref)
+    matches = tuple(node for node in history if node.target_head_sha == original_head_sha)
+    if len(matches) != 1:
+        raise R02Error("FULL_BINDING cancellation has no unique real unified-history predecessor")
+    node = matches[0]
+    if (node.claim_kind, node.role) not in {
+        ("ISSUE_HEAD_CLAIM", CarrierRole.ISSUE_ACTIVE),
+        ("REQUIRED_STATUS_EPOCH", CarrierRole.ISSUE_ACTIVE),
+        ("ISSUE_FINALIZATION_EPOCH", CarrierRole.ISSUE_FINALIZING),
+        ("ISSUE_BRANCH_LEASE", CarrierRole.ISSUE_ACTIVE),
+    }:
+        raise R02Error("FULL_BINDING cancellation predecessor kind/role is unsupported")
+    return node
+
+
+def _issue_authority_history(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    state: IssuePRBindingState,
+    current_ref: str,
+) -> tuple[_IssueAuthorityNode, ...]:
+    """Validate all Issue-owned claim/epoch nodes, then resolve one unified provenance graph."""
+    comment_list = tuple(comments)
+    claim_groups: dict[str, dict[str, list[tuple[IssueHeadClaim, IssueComment]]]] = {}
+    for comment in comment_list:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_HEAD_CLAIM_MARKER):
+            continue
+        try:
+            claim = parse_issue_head_claim(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssueHeadClaim comment: {_bounded_reason(error)}") from None
+        _epoch_comment_authority(comment, app, "IssueHeadClaim")
+        _issue_head_claim_matches_binding(claim, state)
+        _validate_issue_head_claim_target(client, repository, claim, state.lease.lease)
+        claim_groups.setdefault(claim.claim_generation_id, {}).setdefault(claim.render(), []).append((claim, comment))
+    claims: list[IssueHeadClaimComment] = []
+    for payloads in claim_groups.values():
+        if len(payloads) != 1:
+            raise R02Error("conflicting IssueHeadClaim payloads for one generation block progression")
+        equivalent = next(iter(payloads.values()))
+        claim, comment = min(equivalent, key=lambda item: item[1].database_id)
+        claims.append(IssueHeadClaimComment(claim, comment, current_ref == claim.to_head_sha))
+    required_epochs = _required_status_epoch_comments(client, repository, comment_list, app, state, current_ref)
+    finalization_epochs = _issue_finalization_epoch_comments(client, repository, comment_list, app, state, current_ref)
+    cancellation_authority = _IssueCancellationAuthority(
+        issue_anchor=state.issue_anchor,
+        lease=state.lease,
+        binding_authority="FULL_BINDING",
+        pull_request_number=state.binding.pull_request_number,
+        pull_request_database_id=state.binding.pull_request_database_id,
+        pull_request_node_id=state.binding.pull_request_node_id,
+        central_repository_node_id=state.binding.central_repository_node_id,
+        base_repository_node_id=state.binding.central_repository_node_id,
+        pr=state.pr,
+        pr_issue=state.pr_issue,
+        owning_issue=state.owning_issue,
+        pr_comments=comment_list,
+        binding=state.binding,
+        binding_state=state,
+        raw_pr_state="OPEN",
+        raw_pr_merged=False,
+    )
+    cancellation_fences = _issue_cancellation_fence_comments(
+        client, repository, comment_list, app, cancellation_authority, current_ref,
+    )
+
+    lease = state.lease.lease
+    root = _IssueAuthorityNode(
+        "ISSUE_BRANCH_LEASE", CarrierRole.ISSUE_ACTIVE, lease.initial_head_sha, None,
+        lease.initial_head_tree_sha, "INITIAL", lease.lease_id,
+        _binding_comment_sha256(state.lease.comment), state.lease.comment, lease,
+        active=current_ref == lease.initial_head_sha,
+    )
+    nodes: list[_IssueAuthorityNode] = [root]
+    for item in claims:
+        claim = item.claim
+        nodes.append(_IssueAuthorityNode(
+            claim.claim_kind, CarrierRole.ISSUE_ACTIVE, claim.to_head_sha, claim.from_head_sha,
+            claim.to_tree_sha, claim.transition_kind, claim.claim_id,
+            _binding_comment_sha256(item.comment), item.comment, claim, active=item.active,
+        ))
+    for item in required_epochs:
+        epoch = item.epoch
+        nodes.append(_IssueAuthorityNode(
+            epoch.claim_kind, CarrierRole.ISSUE_ACTIVE, epoch.to_head_sha, epoch.from_head_sha,
+            epoch.to_tree_sha, epoch.transition_kind, epoch.epoch_id,
+            _binding_comment_sha256(item.comment), item.comment, epoch, active=item.active,
+        ))
+    for item in finalization_epochs:
+        epoch = item.epoch
+        nodes.append(_IssueAuthorityNode(
+            epoch.claim_kind, CarrierRole.ISSUE_FINALIZING, epoch.final_head_sha, epoch.from_head_sha,
+            epoch.final_tree_sha, epoch.transition_kind, epoch.epoch_id,
+            _binding_comment_sha256(item.comment), item.comment, epoch, active=item.active,
+        ))
+    for item in cancellation_fences:
+        fence = item.fence
+        nodes.append(_IssueAuthorityNode(
+            "ISSUE_CANCELLATION_FENCE", CarrierRole.ISSUE_CANCEL,
+            fence.cancellation_head_sha, fence.original_head_sha,
+            fence.cancellation_head_tree_sha, fence.transition_kind, fence.fence_id,
+            _binding_comment_sha256(item.comment), item.comment, fence, active=item.active,
+        ))
+
+    by_target: dict[str, _IssueAuthorityNode] = {}
+    for node in nodes:
+        old = by_target.get(node.target_head_sha)
+        if old is not None and (
+            old.claim_kind != node.claim_kind
+            or old.role is not node.role
+            or old.artifact_id != node.artifact_id
+            or old.artifact_sha256 != node.artifact_sha256
+        ):
+            raise R02Error("conflicting Issue-owned role/provenance for one claimed SHA")
+        by_target[node.target_head_sha] = node
+
+    reachable: dict[str, _IssueAuthorityNode] = {root.target_head_sha: root}
+    unresolved = [node for node in nodes if node is not root]
+    while unresolved:
+        advanced = False
+        remaining: list[_IssueAuthorityNode] = []
+        for node in unresolved:
+            parent = reachable.get(node.from_head_sha or "")
+            if parent is None:
+                remaining.append(node)
+                continue
+            if parent.claim_kind == "ISSUE_CANCELLATION_FENCE":
+                raise R02Error("IssueCancellationFence is terminal and cannot have Issue authority descendants")
+            if node.claim_kind == "ISSUE_HEAD_CLAIM":
+                claim = node.artifact
+                if parent.role is not CarrierRole.ISSUE_ACTIVE or parent.claim_kind == "ISSUE_FINALIZATION_EPOCH":
+                    raise R02Error("IssueHeadClaim cannot descend directly from ISSUE_FINALIZING")
+                if claim.transition_kind == "NORMALIZE":
+                    if parent.claim_kind != "ISSUE_BRANCH_LEASE" or claim.from_head_sha != lease.initial_head_sha:
+                        raise R02Error("NORMALIZE IssueHeadClaim must descend directly from the leased root")
+                    origin = None
+                elif claim.transition_kind in {"PROPOSAL", "PATCH_REGENERATION", "MAIN_ADVANCE"}:
+                    if parent.claim_kind not in {
+                        "ISSUE_BRANCH_LEASE", "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH",
+                    }:
+                        raise R02Error("proposal IssueHeadClaim has an unsupported ISSUE_ACTIVE predecessor")
+                    origin = node
+                else:
+                    raise R02Error("IssueHeadClaim history has an unsupported transition kind")
+            elif node.claim_kind == "REQUIRED_STATUS_EPOCH":
+                epoch = node.artifact
+                if (
+                    epoch.from_provenance_kind != parent.claim_kind
+                    or epoch.from_provenance_id != parent.artifact_id
+                    or epoch.from_provenance_sha256 != parent.artifact_sha256
+                    or epoch.from_carrier_role != parent.role.value
+                ):
+                    raise R02Error("RequiredStatusEpoch exact predecessor provenance does not match unified history")
+                if epoch.reason_class is RequiredStatusEpochReason.FINALIZATION_INVALIDATED:
+                    if parent.claim_kind != "ISSUE_FINALIZATION_EPOCH" or parent.role is not CarrierRole.ISSUE_FINALIZING:
+                        raise R02Error("FINALIZATION_INVALIDATED must descend from exact ISSUE_FINALIZING provenance")
+                elif parent.role is not CarrierRole.ISSUE_ACTIVE:
+                    raise R02Error("non-finalization RequiredStatusEpoch must descend from ISSUE_ACTIVE")
+                origin = parent.proposal_origin
+            elif node.claim_kind == "ISSUE_FINALIZATION_EPOCH":
+                epoch = node.artifact
+                if parent.role is not CarrierRole.ISSUE_ACTIVE or parent.claim_kind not in {
+                    "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH",
+                }:
+                    raise R02Error("IssueFinalizationEpoch must descend from exact ISSUE_ACTIVE claim/epoch authority")
+                if (
+                    epoch.from_authority_kind != parent.claim_kind
+                    or epoch.from_authority_comment_database_id != parent.comment.database_id
+                    or epoch.from_authority_artifact_id != parent.artifact_id
+                    or epoch.from_authority_artifact_sha256 != parent.artifact_sha256
+                    or epoch.from_authority_role != parent.role.value
+                ):
+                    raise R02Error("IssueFinalizationEpoch immediate authority identity/hash/comment mismatch")
+                if parent.claim_kind == "ISSUE_HEAD_CLAIM":
+                    origin = parent if parent.transition_kind in {"PROPOSAL", "PATCH_REGENERATION", "MAIN_ADVANCE"} else None
+                else:
+                    origin = parent.proposal_origin
+                if origin is None or type(origin.artifact) is not IssueHeadClaim:
+                    raise R02Error("IssueFinalizationEpoch ancestry has no proposal-bearing IssueHeadClaim origin")
+                if origin.artifact.transition_kind == "NORMALIZE":
+                    raise R02Error("IssueFinalizationEpoch proposal origin cannot be NORMALIZE")
+                if (
+                    epoch.proposal_origin_claim_comment_database_id != origin.comment.database_id
+                    or epoch.proposal_origin_claim_id != origin.artifact.claim_id
+                    or epoch.proposal_origin_claim_sha256 != _binding_comment_sha256(origin.comment)
+                    or epoch.claimed_target_evidence_digest != origin.artifact.target_evidence_digest
+                    or epoch.fresh_proposal_scope_evidence_digest != origin.artifact.target_evidence_digest
+                ):
+                    raise R02Error("IssueFinalizationEpoch proposal-origin/scope evidence mismatch")
+            elif node.claim_kind == "ISSUE_CANCELLATION_FENCE":
+                fence = node.artifact
+                if parent.role not in {CarrierRole.ISSUE_ACTIVE, CarrierRole.ISSUE_FINALIZING} or parent.claim_kind not in {
+                    "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH", "ISSUE_FINALIZATION_EPOCH", "ISSUE_BRANCH_LEASE",
+                }:
+                    raise R02Error("IssueCancellationFence predecessor is not an allowed active/finalizing authority")
+                if fence.binding_authority != state.binding.binding_id:
+                    raise R02Error("PRE_BINDING IssueCancellationFence cannot enter full-binding unified history")
+                if not _issue_cancellation_fence_predecessor_matches(parent, fence):
+                    raise R02Error("IssueCancellationFence does not bind the exact reachable predecessor provenance")
+                if parent.role is CarrierRole.ISSUE_FINALIZING and fence.pre_fence_success_may_exist is not True:
+                    raise R02Error("finalizing predecessor requires preFenceSuccessMayExist")
+                origin = parent.proposal_origin
+            else:
+                raise R02Error("unsupported Issue-owned history node kind")
+            if node.target_head_sha in reachable:
+                existing = reachable[node.target_head_sha]
+                if existing.claim_kind != node.claim_kind or existing.artifact_id != node.artifact_id:
+                    raise R02Error("multiple Issue authority nodes claim the same target SHA")
+            else:
+                reachable[node.target_head_sha] = _IssueAuthorityNode(
+                    node.claim_kind, node.role, node.target_head_sha, node.from_head_sha, node.tree_sha,
+                    node.transition_kind, node.artifact_id, node.artifact_sha256, node.comment, node.artifact,
+                    active=node.active, proposal_origin=origin,
+                )
+            advanced = True
+        if not advanced:
+            raise R02Error("unified Issue-owned history has missing or cyclic predecessor provenance")
+        unresolved = remaining
+    return tuple(sorted(reachable.values(), key=lambda node: (node.target_head_sha, node.claim_kind)))
+
+
+def _issue_head_claim_comments(
+    client: GitHubClient,
+    repository: str,
+    comments: Iterable[IssueComment],
+    app: AppIdentity,
+    state: IssuePRBindingState,
+    current_ref: str,
+) -> tuple[IssueHeadClaimComment, ...]:
+    history = _issue_authority_history(client, repository, comments, app, state, current_ref)
+    claims = tuple(
+        IssueHeadClaimComment(node.artifact, node.comment, node.active)
+        for node in history if node.claim_kind == "ISSUE_HEAD_CLAIM"
+    )
+    return tuple(sorted(claims, key=lambda item: (item.comment.database_id, item.claim.claim_generation_id)))
+
+
+def _fresh_issue_projection_set(
+    client: GitHubClient,
+    repository: str,
+    issue: IssueMetadata,
+    anchor: IssueAnchorComment,
+    binding: IssuePRBinding,
+    source_comments: Iterable[IssueComment],
+    pr_comments: Iterable[IssueComment],
+    app: AppIdentity,
+    semantic_validator: Callable[[Request], bool] | None,
+    *,
+    require_complete: bool = False,
+) -> tuple[PatchFoldResult, tuple[IssuePatchProjection, ...]]:
+    source_comment_list = tuple(source_comments)
+    pr_comment_list = tuple(pr_comments)
+    events = authorized_issue_patch_events(client, repository, anchor, source_comment_list)
+    try:
+        fold = fold_issue_patch_events(anchor.anchor, events, semantic_validator)
+    except RequestModelError as error:
+        raise R02Error(f"Issue PATCH fold failed closed: {_bounded_reason(error)}") from None
+    by_id = {comment.database_id: comment for comment in source_comment_list}
+    event_by_id = {event.comment_id: event for event in events}
+    expected: dict[int, IssuePatchProjection] = {}
+    for item in fold.evidence:
+        if item.kind != "applied":
+            continue
+        event = event_by_id.get(item.comment_id)
+        source = by_id.get(item.comment_id)
+        if event is None or source is None:
+            raise R02Error("accepted Issue PATCH evidence lost its exact source comment")
+        try:
+            patch = parse_patch(event.body)
+            if patch is None:
+                raise RequestModelError("accepted Issue PATCH evidence is not a PATCH")
+            expected[item.comment_id] = IssuePatchProjection(
+                1,
+                issue.database_id,
+                issue.number,
+                anchor.comment.database_id,
+                source.database_id,
+                _binding_comment_sha256(source),
+                binding.binding_id,
+                patch,
+            )
+        except RequestModelError as error:
+            raise R02Error(f"accepted Issue PATCH cannot render a canonical projection: {_bounded_reason(error)}") from None
+
+    actual: dict[int, set[str]] = {}
+    if any(
+        type(comment.body) is str and comment.body.startswith(ISSUE_PATCH_PROJECTION_MARKER)
+        for comment in source_comment_list
+    ):
+        raise R02Error("IssuePatchProjection comments must be stored on the generated Issue PR")
+    if any(
+        type(comment.body) is str and comment.body.startswith((
+            ISSUE_HEAD_CLAIM_MARKER, REQUIRED_STATUS_EPOCH_MARKER, ISSUE_FINALIZATION_EPOCH_MARKER,
+        ))
+        for comment in source_comment_list
+    ):
+        raise R02Error("Issue-owned claim/epoch comments must be stored on the generated Issue PR")
+    for comment in pr_comment_list:
+        if type(comment.body) is not str or not comment.body.startswith(ISSUE_PATCH_PROJECTION_MARKER):
+            continue
+        try:
+            projection = parse_issue_patch_projection(comment.body)
+        except RequestModelError as error:
+            raise R02Error(f"malformed IssuePatchProjection: {_bounded_reason(error)}") from None
+        if (
+            comment.author_id != app.bot_node_id
+            or comment.author_login != app.bot_login
+            or comment.author_type not in {None, "Bot"}
+            or _issue_comment_edited(comment)
+        ):
+            raise R02Error("IssuePatchProjection comment authorship/edit integrity is invalid")
+        expected_projection = expected.get(projection.issue_comment_id)
+        source = by_id.get(projection.issue_comment_id)
+        if (
+            expected_projection is None
+            or source is None
+            or projection.issue_database_id != issue.database_id
+            or projection.issue_number != issue.number
+            or projection.issue_anchor_comment_id != anchor.comment.database_id
+            or projection.issue_comment_body_sha256 != _binding_comment_sha256(source)
+            or projection.binding_id != binding.binding_id
+            or projection.render() != expected_projection.render()
+        ):
+            raise R02Error("IssuePatchProjection does not match the exact accepted Issue PATCH evidence")
+        actual.setdefault(projection.issue_comment_id, set()).add(projection.render())
+    if any(len(payloads) != 1 for payloads in actual.values()):
+        raise R02Error("conflicting IssuePatchProjection equivalence classes block progression")
+    if require_complete and set(actual) != set(expected):
+        raise StaleAuthorityError("IssuePatchProjection evidence is incomplete after persistence")
+    return fold, tuple(expected[key] for key in sorted(expected))
+
+
+def _synchronize_issue_patch_projections(
+    client: GitHubClient,
+    repository: str,
+    issue: IssueMetadata,
+    anchor: IssueAnchorComment,
+    binding: IssuePRBinding,
+    source_comments: Iterable[IssueComment],
+    pr_comments: Iterable[IssueComment],
+    app: AppIdentity,
+    semantic_validator: Callable[[Request], bool] | None,
+) -> tuple[PatchFoldResult, tuple[IssuePatchProjection, ...], tuple[IssueComment, ...], tuple[IssueComment, ...]]:
+    current_source_comments = tuple(source_comments)
+    current_pr_comments = tuple(pr_comments)
+    fold, expected = _fresh_issue_projection_set(
+        client, repository, issue, anchor, binding,
+        current_source_comments, current_pr_comments, app, semantic_validator,
+    )
+    present = {
+        parse_issue_patch_projection(comment.body).issue_comment_id
+        for comment in current_pr_comments
+        if type(comment.body) is str and comment.body.startswith(ISSUE_PATCH_PROJECTION_MARKER)
+    }
+    for projection in expected:
+        if projection.issue_comment_id in present:
+            continue
+        body = projection.render()
+        try:
+            client.create_issue_patch_projection_comment(repository, binding.pull_request_number, body)
+        except GitHubAPIError as error:
+            try:
+                reread = tuple(client.list_issue_comments(repository, binding.pull_request_number))
+                _fresh_issue_projection_set(
+                    client, repository, issue, anchor, binding,
+                    current_source_comments, reread, app, semantic_validator,
+                    require_complete=True,
+                )
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous IssuePatchProjection POST cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            raise StaleAuthorityError(
+                f"ambiguous IssuePatchProjection POST; stop and reread on a later invocation: {_bounded_reason(error)}"
+            ) from None
+        try:
+            current_pr_comments = tuple(client.list_issue_comments(repository, binding.pull_request_number))
+        except Exception as error:
+            raise StaleAuthorityError(f"IssuePatchProjection write could not be reread: {_bounded_reason(error)}") from None
+        _fresh_issue_projection_set(
+            client, repository, issue, anchor, binding,
+            current_source_comments, current_pr_comments, app, semantic_validator,
+            require_complete=True,
+        )
+    if expected:
+        # The expected set is a frozen accepted-fold snapshot. A source PATCH that
+        # races projection POST is handled by the next fresh invocation.
+        refreshed_issue = client.get_issue_metadata(repository, issue.number)
+        refreshed_source_comments = tuple(client.list_issue_comments(repository, issue.number))
+        refreshed_pr_comments = tuple(client.list_issue_comments(repository, binding.pull_request_number))
+        if (
+            refreshed_issue.number != issue.number
+            or refreshed_issue.database_id != issue.database_id
+            or refreshed_issue.node_id != issue.node_id
+            or refreshed_issue.is_pull_request
+            or refreshed_issue.state != "open"
+        ):
+            raise StaleAuthorityError("source Issue identity/lifecycle changed during projection synchronization")
+        refreshed_anchor = validate_unique_issue_anchor(refreshed_source_comments, refreshed_issue, app)
+        if refreshed_anchor.anchor != anchor.anchor or refreshed_anchor.comment.database_id != anchor.comment.database_id:
+            raise StaleAuthorityError("source Issue anchor changed during projection synchronization")
+        refreshed_fold, refreshed_expected = _fresh_issue_projection_set(
+            client, repository, refreshed_issue, anchor, binding,
+            refreshed_source_comments, refreshed_pr_comments, app, semantic_validator,
+            require_complete=True,
+        )
+        if refreshed_fold != fold or tuple(item.render() for item in refreshed_expected) != tuple(item.render() for item in expected):
+            raise StaleAuthorityError("Issue PATCH state changed during projection synchronization; fresh progression is required")
+        current_source_comments = refreshed_source_comments
+        current_pr_comments = refreshed_pr_comments
+    return fold, expected, current_source_comments, current_pr_comments
+
+
+def _require_semantic_issue_candidate(
+    candidate: ProposalCandidate,
+    request_class: RequestClass,
+    accepted_base_sha: str,
+) -> None:
+    if type(candidate) is not ProposalCandidate:
+        raise R02Error("C02 Issue candidate builder returned an invalid candidate")
+    if candidate.request_class is not request_class or candidate.accepted_base_sha != accepted_base_sha:
+        raise R02Error("C02 Issue candidate class/base does not match the fresh request snapshot")
+    if candidate.commit_sha == accepted_base_sha or not candidate.changed_paths:
+        raise IssueManagedNoSemanticChange(request_class)
+    if request_class in {RequestClass.UPDATE, RequestClass.REMOVE} and "federation.json" not in candidate.changed_paths:
+        raise IssueManagedNoSemanticChange(request_class)
+
+
+def _plan_issue_managed_candidate(
+    candidate_builder: CandidateBuilder,
+    request: Request,
+    request_class: RequestClass,
+    accepted_base_sha: str,
+    head_sha: str,
+) -> ProposalCandidate:
+    try:
+        candidate = candidate_builder(request, request_class, accepted_base_sha, head_sha)
+    except R02Error as error:
+        if (
+            type(error) is R02Error
+            and request_class in {RequestClass.UPDATE, RequestClass.REMOVE}
+            and str(error) == _LEGACY_UPDATE_REMOVE_NO_FEDERATION_ERROR
+        ):
+            raise IssueManagedNoSemanticChange(request_class) from None
+        raise
+    _require_semantic_issue_candidate(candidate, request_class, accepted_base_sha)
+    return candidate
+
+
+def _validate_issue_binding_cross_link(
+    binding: IssuePRBinding,
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment,
+    central_repository_node_id: str,
+) -> None:
+    expected = (
+        anchor.anchor.issue_number,
+        anchor.anchor.issue_database_id,
+        anchor.anchor.issue_node_id,
+        anchor.comment.database_id,
+        anchor.anchor.canonical_sha256(),
+        lease.comment.database_id,
+        _binding_comment_sha256(lease.comment),
+        anchor.anchor.source_id,
+        anchor.anchor.source_repository_id,
+        lease.lease.branch_ref,
+        lease.lease.initial_head_sha,
+        "main",
+        central_repository_node_id,
+    )
+    actual = (
+        binding.issue_number,
+        binding.issue_database_id,
+        binding.issue_node_id,
+        binding.issue_request_anchor_comment_database_id,
+        binding.issue_request_anchor_sha256,
+        binding.issue_branch_lease_comment_database_id,
+        binding.issue_branch_lease_sha256,
+        binding.source_id,
+        binding.source_repository_id,
+        binding.branch_ref,
+        binding.initial_head_sha,
+        binding.base_ref,
+        binding.central_repository_node_id,
+    )
+    if actual != expected:
+        raise R02Error("IssuePRBinding does not cross-bind the exact Issue anchor and branch lease")
+
+
+def _read_issue_pr_intake(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+    *,
+    validate_fresh_source_authority: bool = True,
+    require_open_lifecycle: bool = True,
+) -> tuple[
+    IssueMetadata,
+    tuple[IssueComment, ...],
+    IssueAnchorComment,
+    IssueBranchLeaseComment,
+    RepositoryMetadata,
+    tuple[_IssuePRBindingComment, ...],
+]:
+    try:
+        issue = client.get_issue_metadata(repository, issue_number)
+        if (
+            type(issue) is not IssueMetadata
+            or issue.number != issue_number
+            or issue.is_pull_request
+            or (require_open_lifecycle and issue.state != "open")
+        ):
+            raise R02Error("Wave 03 requires the exact open Issue, not a PullRequest")
+        comments = tuple(client.list_issue_comments(repository, issue_number))
+        anchor = validate_unique_issue_anchor(comments, issue, app)
+        leases = _resolve_issue_branch_lease_class(
+            client,
+            repository,
+            comments,
+            app,
+            anchor.anchor,
+            anchor.comment.database_id,
+            central_repository_node_id,
+        )
+        if leases is None:
+            raise R02Error("one canonical IssueBranchLease is required before Wave 03")
+        if validate_fresh_source_authority:
+            _fresh_issue_source_authority(source_authority_resolver, anchor.anchor)
+        repo = client.get_repository_metadata(repository)
+        if (
+            type(repo) is not RepositoryMetadata
+            or repo.node_id != central_repository_node_id
+            or repo.full_name != repository
+            or repo.default_branch != "main"
+        ):
+            raise StaleAuthorityError("central repository identity or default branch changed")
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"fresh Issue/lease/repository authority is unavailable: {_bounded_reason(error)}") from None
+
+    _issue_pr_authority_fence(comments, app)
+    binding_comments = _binding_comment_candidates(
+        comments, app, ISSUE_INTERNAL_PR_BINDING_MARKER,
+        parse_issue_internal_pr_binding, "IssueInternalPRBinding",
+    )
+    for item in binding_comments:
+        _validate_issue_binding_cross_link(item.binding, anchor, leases, central_repository_node_id)
+    return issue, comments, anchor, leases, repo, binding_comments
+
+
+def _same_issue_pr_intake(
+    initial: tuple[IssueMetadata, tuple[IssueComment, ...], IssueAnchorComment, IssueBranchLeaseComment, RepositoryMetadata, tuple[_IssuePRBindingComment, ...]],
+    fresh: tuple[IssueMetadata, tuple[IssueComment, ...], IssueAnchorComment, IssueBranchLeaseComment, RepositoryMetadata, tuple[_IssuePRBindingComment, ...]],
+) -> None:
+    if (
+        fresh[2].anchor != initial[2].anchor
+        or fresh[2].comment.database_id != initial[2].comment.database_id
+        or fresh[2].comment.body != initial[2].comment.body
+        or fresh[3].lease != initial[3].lease
+        or fresh[3].comment.database_id != initial[3].comment.database_id
+        or fresh[3].comment.body != initial[3].comment.body
+        or fresh[4].node_id != initial[4].node_id
+        or fresh[4].full_name != initial[4].full_name
+        or fresh[4].default_branch != initial[4].default_branch
+    ):
+        raise StaleAuthorityError("Issue anchor, lease, or central repository changed during Wave 03")
+
+
+def _read_issue_branch_ref(client: GitHubClient, repository: str, short_ref: str) -> str | None:
+    try:
+        return _lease_sha40(client.get_ref_oid(repository, short_ref), "leased Issue branch head")
+    except NotFoundError:
+        return None
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"leased Issue branch ref is unavailable: {_bounded_reason(error)}") from None
+
+
+def _enumerate_issue_pr_candidates(
+    client: GitHubClient,
+    repository: str,
+    short_ref: str,
+    app: AppIdentity,
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment,
+    central_repository_node_id: str,
+) -> tuple[_IssuePRCandidate, ...]:
+    try:
+        raw_items = client.list_pull_requests(repository, state="all")
+        if type(raw_items) not in {tuple, list}:
+            raise R02Error("all-state PR enumeration must return a sequence")
+        seen_numbers: set[int] = set()
+        candidates: list[_IssuePRCandidate] = []
+        for raw in raw_items:
+            if type(raw) is not dict or type(raw.get("number")) is not int or not 1 <= raw["number"] <= 9_223_372_036_854_775_807:
+                raise R02Error("all-state PR enumeration contains an invalid number")
+            number = raw["number"]
+            if number in seen_numbers:
+                raise R02Error("all-state PR enumeration contains duplicate numbers")
+            seen_numbers.add(number)
+            pr = client.get_pull_request_metadata(repository, number)
+            if type(pr) is not PullRequestMetadata or pr.number != number:
+                raise R02Error("composite PR metadata does not match the enumerated PR number")
+            if pr.head_ref == short_ref and pr.head_repository_id != central_repository_node_id:
+                raise R02Error("foreign repository PR collides with the reserved Issue branch name")
+            if pr.head_ref != short_ref or pr.head_repository_id != central_repository_node_id:
+                continue
+            comments = tuple(client.list_issue_comments(repository, number))
+            binding_comments = _binding_comment_candidates(
+                comments, app, PR_ISSUE_ORIGIN_BINDING_MARKER,
+                parse_pr_issue_origin_binding, "PRIssueOriginBinding",
+            )
+            binding_item = binding_comments[0] if binding_comments else None
+            if binding_item is not None:
+                _validate_issue_binding_cross_link(binding_item.binding, anchor, lease, central_repository_node_id)
+                if binding_item.binding.pull_request_number != number:
+                    raise R02Error("PRIssueOriginBinding names a different PR number")
+            candidates.append(_IssuePRCandidate(pr, comments, binding_item))
+        return tuple(candidates)
+    except R02Error:
+        raise
+    except Exception as error:
+        raise StaleAuthorityError(f"all-state reserved-head PR inventory failed: {_bounded_reason(error)}") from None
+
+
+def _validate_generated_issue_pr(
+    client: GitHubClient,
+    repository: str,
+    number: int,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment,
+) -> tuple[PullRequestMetadata, IssueMetadata, tuple[IssueComment, ...], tuple[_IssuePRBindingComment, ...]]:
+    try:
+        pr = client.get_pull_request_metadata(repository, number)
+        pr_issue = client.get_issue_metadata(repository, number)
+        comments = tuple(client.list_issue_comments(repository, number))
+    except Exception as error:
+        raise StaleAuthorityError(f"generated Issue PR composite state is unavailable: {_bounded_reason(error)}") from None
+    expected_body = render_request_body(anchor.anchor.initial_request)
+    short_ref = lease.lease.branch_ref.removeprefix("refs/heads/")
+    if type(pr) is not PullRequestMetadata or pr.number != number:
+        raise R02Error("reserved-head candidate has invalid composite PR identity")
+    if (
+        pr.author_id != app.bot_node_id
+        or pr.author_login != app.bot_login
+        or pr.head_oid != lease.lease.initial_head_sha
+        or pr.head_ref != short_ref
+        or pr.head_repository_id != central_repository_node_id
+        or pr.head_repository != repository
+        or pr.base_repository_id != central_repository_node_id
+        or pr.base_repository != repository
+        or pr.base_ref != "main"
+        or pr.draft is not False
+        or pr.body != expected_body
+        or pr.last_edited_at is not None
+        or pr.includes_created_edit is not False
+    ):
+        raise R02Error("reserved-head PR is not the exact open nondraft App-generated Issue PR")
+    if (
+        type(pr_issue) is not IssueMetadata
+        or pr_issue.is_pull_request is not True
+        or pr_issue.number != number
+        or type(pr_issue.database_id) is not int
+        or not 1 <= pr_issue.database_id <= 9_223_372_036_854_775_807
+        or type(pr_issue.node_id) is not str
+        or not pr_issue.node_id
+        or c02.contains_control(pr_issue.node_id)
+        or pr_issue.author_id != pr.author_id
+        or pr_issue.author_login != pr.author_login
+        or pr_issue.state != "open"
+        or pr_issue.body != pr.body
+    ):
+        raise R02Error("PR-as-Issue identity/state/body does not match the generated PR")
+    binding_comments = _binding_comment_candidates(
+        comments, app, PR_ISSUE_ORIGIN_BINDING_MARKER,
+        parse_pr_issue_origin_binding, "PRIssueOriginBinding",
+    )
+    return pr, pr_issue, comments, binding_comments
+
+
+def _intended_issue_pr_binding(
+    anchor: IssueAnchorComment,
+    lease: IssueBranchLeaseComment,
+    pr: PullRequestMetadata,
+    pr_issue: IssueMetadata,
+    central_repository_node_id: str,
+) -> IssuePRBinding:
+    return IssuePRBinding.create(
+        schema_version=1,
+        issue_number=anchor.anchor.issue_number,
+        issue_database_id=anchor.anchor.issue_database_id,
+        issue_node_id=anchor.anchor.issue_node_id,
+        issue_request_anchor_comment_database_id=anchor.comment.database_id,
+        issue_request_anchor_sha256=anchor.anchor.canonical_sha256(),
+        issue_branch_lease_comment_database_id=lease.comment.database_id,
+        issue_branch_lease_sha256=_binding_comment_sha256(lease.comment),
+        source_id=anchor.anchor.source_id,
+        source_repository_id=anchor.anchor.source_repository_id,
+        branch_ref=lease.lease.branch_ref,
+        pull_request_number=pr.number,
+        pull_request_database_id=pr_issue.database_id,
+        pull_request_node_id=pr_issue.node_id,
+        initial_head_sha=lease.lease.initial_head_sha,
+        base_ref="main",
+        central_repository_node_id=central_repository_node_id,
+    )
+
+
+def _require_binding_equals(
+    candidates: tuple[_IssuePRBindingComment, ...],
+    intended: IssuePRBinding,
+    label: str,
+) -> IssueComment | None:
+    if not candidates:
+        return None
+    if candidates[0].binding != intended:
+        raise R02Error(f"existing {label} conflicts with the exact intended IssuePRBinding")
+    return candidates[0].comment
+
+
+def _fresh_issue_pr_binding_snapshot(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+    initial: tuple[IssueMetadata, tuple[IssueComment, ...], IssueAnchorComment, IssueBranchLeaseComment, RepositoryMetadata, tuple[_IssuePRBindingComment, ...]],
+    pr_number: int,
+    intended: IssuePRBinding,
+) -> tuple[IssuePRBindingState | None, tuple[IssueMetadata, tuple[IssueComment, ...], IssueAnchorComment, IssueBranchLeaseComment, RepositoryMetadata, tuple[_IssuePRBindingComment, ...]], PullRequestMetadata, IssueMetadata, tuple[IssueComment, ...], tuple[_IssuePRBindingComment, ...]]:
+    fresh = _read_issue_pr_intake(
+        client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+    )
+    _same_issue_pr_intake(initial, fresh)
+    issue_binding_candidates = fresh[5]
+    short_ref = fresh[3].lease.branch_ref.removeprefix("refs/heads/")
+    if _read_issue_branch_ref(client, repository, short_ref) != fresh[3].lease.initial_head_sha:
+        raise StaleAuthorityError("leased Issue branch ref moved during two-sided binding")
+    _validate_issue_branch_lease_history(client, repository, fresh[2].anchor, fresh[3].lease)
+    candidates = _enumerate_issue_pr_candidates(
+        client, repository, short_ref, app, fresh[2], fresh[3], central_repository_node_id,
+    )
+    if len(candidates) != 1 or candidates[0].pr.number != pr_number:
+        raise StaleAuthorityError("exact generated Issue PR is no longer the sole reserved-head candidate")
+    pr, pr_issue, comments, pr_binding_candidates = _validate_generated_issue_pr(
+        client, repository, pr_number, app, central_repository_node_id, fresh[2], fresh[3],
+    )
+    expected = _intended_issue_pr_binding(fresh[2], fresh[3], pr, pr_issue, central_repository_node_id)
+    if expected != intended:
+        raise StaleAuthorityError("intended IssuePRBinding changed during fresh revalidation")
+    issue_binding_comment = _require_binding_equals(fresh[5], intended, "IssueInternalPRBinding")
+    pr_binding_comment = _require_binding_equals(pr_binding_candidates, intended, "PRIssueOriginBinding")
+    complete = None
+    if issue_binding_comment is not None and pr_binding_comment is not None:
+        complete = IssuePRBindingState(
+            issue_anchor=fresh[2],
+            lease=fresh[3],
+            binding=intended,
+            issue_binding_comment=issue_binding_comment,
+            pr_binding_comment=pr_binding_comment,
+            pr=pr,
+            pr_issue=pr_issue,
+            owning_issue=fresh[0],
+        )
+    return complete, fresh, pr, pr_issue, comments, pr_binding_candidates
+
+
+def _write_issue_pr_binding_side(
+    client: GitHubClient,
+    repository: str,
+    number: int,
+    binding: IssuePRBinding,
+    app: AppIdentity,
+    *,
+    issue_side: bool,
+) -> IssueComment:
+    marker = ISSUE_INTERNAL_PR_BINDING_MARKER if issue_side else PR_ISSUE_ORIGIN_BINDING_MARKER
+    parser = parse_issue_internal_pr_binding if issue_side else parse_pr_issue_origin_binding
+    label = "IssueInternalPRBinding" if issue_side else "PRIssueOriginBinding"
+    body = binding.render_issue_binding() if issue_side else binding.render_pr_origin_binding()
+    try:
+        client.create_issue_comment(repository, number, body)
+    except GitHubAPIError as error:
+        try:
+            comments = tuple(client.list_issue_comments(repository, number))
+        except Exception as read_error:
+            raise StaleAuthorityError(
+                f"ambiguous {label} POST and target surface could not be diagnosed: {_bounded_reason(read_error)}"
+            ) from None
+        candidates = _binding_comment_candidates(comments, app, marker, parser, label)
+        if candidates and candidates[0].binding != binding:
+            raise R02Error(f"conflicting {label} evidence appeared after ambiguous POST") from None
+        raise StaleAuthorityError(
+            f"ambiguous {label} POST; stop this invocation and reread on a later invocation: {_bounded_reason(error)}"
+        ) from None
+    try:
+        comments = tuple(client.list_issue_comments(repository, number))
+    except Exception as error:
+        raise StaleAuthorityError(f"persisted {label} could not be reread: {_bounded_reason(error)}") from None
+    candidates = _binding_comment_candidates(comments, app, marker, parser, label)
+    if not candidates or candidates[0].binding != binding:
+        raise StaleAuthorityError(f"persisted {label} is absent or differs from the exact intended payload")
+    return candidates[0].comment
+
+
+def create_or_recover_issue_pr_binding(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+) -> IssuePRBindingState:
+    """Expose exactly the historical leased head, recover one exact PR, and persist its immutable two-sided binding."""
+    if type(issue_number) is not int or not 1 <= issue_number <= 9_223_372_036_854_775_807:
+        raise R02Error("Issue number must be a positive signed-64 integer")
+    if not callable(source_authority_resolver):
+        raise R02Error("a fresh Issue source-authority resolver is required")
+    initial = _read_issue_pr_intake(
+        client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+    )
+    issue, _comments, anchor, lease, _repo, issue_binding_candidates = initial
+    short_ref = lease.lease.branch_ref.removeprefix("refs/heads/")
+    if lease.lease.branch_ref != issue_branch_ref(issue_number):
+        raise R02Error("canonical IssueBranchLease ref does not match the requested Issue")
+
+    # Revalidate every authority input immediately before the ref ownership inventory.
+    fresh = _read_issue_pr_intake(
+        client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+    )
+    _same_issue_pr_intake(initial, fresh)
+    issue_binding_candidates = fresh[5]
+    inventory = _enumerate_issue_pr_candidates(
+        client, repository, short_ref, app, anchor, lease, central_repository_node_id,
+    )
+    if len(inventory) > 1:
+        raise R02Error("duplicate exact reserved-head PR candidates block Wave 03")
+    if issue_binding_candidates and not inventory:
+        raise R02Error("IssueInternalPRBinding points to a missing reserved-head PR")
+    if issue_binding_candidates and inventory and issue_binding_candidates[0].binding.pull_request_number != inventory[0].pr.number:
+        raise R02Error("IssueInternalPRBinding PR number disagrees with reserved-head candidate")
+
+    current_ref = _read_issue_branch_ref(client, repository, short_ref)
+    if current_ref is None:
+        if issue_binding_candidates:
+            raise R02Error("an existing IssuePRBinding cannot recreate an absent leased ref")
+        if inventory or any(candidate.binding is not None for candidate in inventory):
+            raise R02Error("an existing reserved-head PR/binding blocks recreation of an absent leased ref")
+        exact_create = RefUpdate(
+            name=lease.lease.branch_ref,
+            before_oid=ZERO_OID,
+            after_oid=lease.lease.initial_head_sha,
+            force=False,
+        )
+        try:
+            client.update_refs(central_repository_node_id, [exact_create])
+        except RefCASConflict as error:
+            if _read_issue_branch_ref(client, repository, short_ref) != lease.lease.initial_head_sha:
+                raise StaleAuthorityError(f"leased ref CAS conflicted without exact readback recovery: {_bounded_reason(error)}") from None
+        except GitHubAPIError as error:
+            if _read_issue_branch_ref(client, repository, short_ref) != lease.lease.initial_head_sha:
+                raise StaleAuthorityError(f"ambiguous leased ref CAS did not read back the exact lease head: {_bounded_reason(error)}") from None
+        if _read_issue_branch_ref(client, repository, short_ref) != lease.lease.initial_head_sha:
+            raise StaleAuthorityError("leased ref create did not read back the exact initialHeadSha")
+    elif current_ref != lease.lease.initial_head_sha:
+        raise R02Error("leased Issue branch is already owned by a different head")
+
+    # The historical lease remains valid even when current main has advanced.
+    _validate_issue_branch_lease_history(client, repository, anchor.anchor, lease.lease)
+    after_ref = _read_issue_pr_intake(
+        client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+    )
+    _same_issue_pr_intake(initial, after_ref)
+    issue_binding_candidates = after_ref[5]
+    if _read_issue_branch_ref(client, repository, short_ref) != lease.lease.initial_head_sha:
+        raise StaleAuthorityError("leased Issue ref changed after exact create/recovery")
+    inventory = _enumerate_issue_pr_candidates(
+        client, repository, short_ref, app, anchor, lease, central_repository_node_id,
+    )
+    if len(inventory) > 1:
+        raise R02Error("duplicate exact reserved-head PR candidates block Wave 03")
+    if issue_binding_candidates and not inventory:
+        raise R02Error("IssueInternalPRBinding points to a missing reserved-head PR")
+
+    created_number: int | None = None
+    create_error: GitHubAPIError | None = None
+    if not inventory:
+        before_create = _read_issue_pr_intake(
+            client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+        )
+        _same_issue_pr_intake(initial, before_create)
+        issue_binding_candidates = before_create[5]
+        if before_create[5]:
+            raise R02Error("IssueInternalPRBinding appeared before PR creation")
+        if _read_issue_branch_ref(client, repository, short_ref) != lease.lease.initial_head_sha:
+            raise StaleAuthorityError("leased ref changed before exact Issue PR creation")
+        _validate_issue_branch_lease_history(client, repository, anchor.anchor, lease.lease)
+        latest_inventory = _enumerate_issue_pr_candidates(
+            client, repository, short_ref, app, anchor, lease, central_repository_node_id,
+        )
+        if len(latest_inventory) > 1:
+            raise R02Error("duplicate exact reserved-head PR candidates block Issue PR creation")
+        if latest_inventory:
+            inventory = latest_inventory
+        else:
+            title = f"Federation request #{issue_number}: {anchor.anchor.request_class.value}"
+            body = render_request_body(anchor.anchor.initial_request)
+            try:
+                created_number = client.create_issue_pull_request(
+                    repository, head=short_ref, base="main", title=title, body=body,
+                )
+            except GitHubAPIError as error:
+                create_error = error
+            inventory = _enumerate_issue_pr_candidates(
+                client, repository, short_ref, app, anchor, lease, central_repository_node_id,
+            )
+            if len(inventory) != 1:
+                if len(inventory) > 1:
+                    raise R02Error("PR create response recovery found duplicate reserved-head candidates")
+                reason = _bounded_reason(create_error) if create_error is not None else "successful response had no exact candidate"
+                raise StaleAuthorityError(f"Issue PR create did not recover one exact candidate; no same-invocation retry: {reason}") from None
+            if created_number is not None and inventory[0].pr.number != created_number:
+                raise R02Error("created PR number does not match the sole exact reserved-head candidate")
+    if len(inventory) != 1:
+        raise R02Error("exactly one all-state reserved-head PR candidate is required")
+    pr_number = inventory[0].pr.number
+    if issue_binding_candidates and issue_binding_candidates[0].binding.pull_request_number != pr_number:
+        raise R02Error("IssueInternalPRBinding PR number disagrees with its candidate")
+
+    pr, pr_issue, _pr_comments, pr_binding_candidates = _validate_generated_issue_pr(
+        client, repository, pr_number, app, central_repository_node_id, anchor, lease,
+    )
+    intended = _intended_issue_pr_binding(anchor, lease, pr, pr_issue, central_repository_node_id)
+    issue_binding_comment = _require_binding_equals(issue_binding_candidates, intended, "IssueInternalPRBinding")
+    pr_binding_comment = _require_binding_equals(pr_binding_candidates, intended, "PRIssueOriginBinding")
+    # Ordered repair: when both are missing, persist the Issue side first.
+    for issue_side in (True, False):
+        fresh_result = _fresh_issue_pr_binding_snapshot(
+            client, repository, issue_number, app, central_repository_node_id,
+            source_authority_resolver, initial, pr_number, intended,
+        )
+        complete, fresh, fresh_pr, fresh_pr_issue, fresh_pr_comments, fresh_pr_bindings = fresh_result
+        if complete is not None:
+            return complete
+        if issue_side:
+            present = _require_binding_equals(fresh[5], intended, "IssueInternalPRBinding")
+            if present is not None:
+                continue
+            _write_issue_pr_binding_side(
+                client, repository, issue_number, intended, app, issue_side=True,
+            )
+        else:
+            present = _require_binding_equals(fresh_pr_bindings, intended, "PRIssueOriginBinding")
+            if present is not None:
+                continue
+            _write_issue_pr_binding_side(
+                client, repository, pr_number, intended, app, issue_side=False,
+            )
+
+    final = _fresh_issue_pr_binding_snapshot(
+        client, repository, issue_number, app, central_repository_node_id,
+        source_authority_resolver, initial, pr_number, intended,
+    )[0]
+    if final is None:
+        raise StaleAuthorityError("final cross-validation did not find the exact complete two-sided IssuePRBinding")
+    return final
+
+
+def _read_managed_issue_pr_binding_state(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    central_repository_node_id: str,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+    *,
+    validate_fresh_source_authority: bool = True,
+    require_open_lifecycle: bool = True,
+    allow_cancellation_fence: bool = False,
+    allow_pr_stage_state: bool = False,
+) -> IssuePRBindingState:
+    intake = _read_issue_pr_intake(
+        client, repository, issue_number, app, central_repository_node_id, source_authority_resolver,
+        validate_fresh_source_authority=validate_fresh_source_authority,
+        require_open_lifecycle=require_open_lifecycle,
+    )
+    issue, _issue_comments, anchor, lease, _repo, issue_bindings = intake
+    if not issue_bindings:
+        raise R02Error("IssueInternalPRBinding is required before managed Issue progression")
+    by_payload: dict[str, list[_IssuePRBindingComment]] = {}
+    for item in issue_bindings:
+        by_payload.setdefault(item.binding.render_issue_binding(), []).append(item)
+    if len(by_payload) != 1:
+        raise R02Error("conflicting IssueInternalPRBinding payloads block managed Issue progression")
+    binding_item = min(next(iter(by_payload.values())), key=lambda item: item.comment.database_id)
+    binding = binding_item.binding
+    pr_number = binding.pull_request_number
+    try:
+        pr = client.get_pull_request_metadata(repository, pr_number)
+        pr_issue = client.get_issue_metadata(repository, pr_number)
+        pr_comments = tuple(client.list_issue_comments(repository, pr_number))
+    except Exception as error:
+        raise StaleAuthorityError(f"bound Issue PR state is unavailable: {_bounded_reason(error)}") from None
+    _issue_pr_authority_fence(
+        pr_comments, app, allow_cancellation_fence=allow_cancellation_fence,
+    )
+    _validate_issue_binding_cross_link(binding, anchor, lease, central_repository_node_id)
+    if (
+        type(pr) is not PullRequestMetadata
+        or pr.number != pr_number
+        or pr.author_id != app.bot_node_id
+        or pr.author_login != app.bot_login
+        or pr.head_ref != lease.lease.branch_ref.removeprefix("refs/heads/")
+        or pr.head_repository_id != central_repository_node_id
+        or pr.head_repository != repository
+        or pr.base_repository_id != central_repository_node_id
+        or pr.base_repository != repository
+        or pr.base_ref != "main"
+        or type(pr.draft) is not bool
+        or (not allow_pr_stage_state and pr.draft is not False)
+        or pr.body != render_request_body(anchor.anchor.initial_request)
+        or pr.last_edited_at is not None
+        or pr.includes_created_edit is not False
+    ):
+        raise R02Error("bound Issue PR immutable identity/body/topology is invalid")
+    if (
+        type(pr_issue) is not IssueMetadata
+        or pr_issue.is_pull_request is not True
+        or pr_issue.number != pr_number
+        or pr_issue.database_id != binding.pull_request_database_id
+        or pr_issue.node_id != binding.pull_request_node_id
+        or pr_issue.author_id != app.bot_node_id
+        or pr_issue.author_login != app.bot_login
+        or (require_open_lifecycle and pr_issue.state != "open")
+        or pr_issue.body != pr.body
+    ):
+        raise R02Error("bound Issue PR composite identity/lifecycle/body is invalid")
+    pr_binding_candidates = _binding_comment_candidates(
+        pr_comments, app, PR_ISSUE_ORIGIN_BINDING_MARKER,
+        parse_pr_issue_origin_binding, "PRIssueOriginBinding",
+    )
+    if not pr_binding_candidates or any(item.binding != binding for item in pr_binding_candidates):
+        raise R02Error("PRIssueOriginBinding does not match the exact persisted Issue binding")
+    pr_binding_comment = min(pr_binding_candidates, key=lambda item: item.comment.database_id).comment
+    return IssuePRBindingState(
+        issue_anchor=anchor,
+        lease=lease,
+        binding=binding,
+        issue_binding_comment=binding_item.comment,
+        pr_binding_comment=pr_binding_comment,
+        pr=pr,
+        pr_issue=pr_issue,
+        owning_issue=issue,
+    )
+
+
+def _require_same_managed_issue_pr_binding(
+    before: IssuePRBindingState,
+    after: IssuePRBindingState,
+) -> None:
+    if (
+        before.issue_anchor.anchor != after.issue_anchor.anchor
+        or before.issue_anchor.comment.database_id != after.issue_anchor.comment.database_id
+        or before.issue_anchor.comment.body != after.issue_anchor.comment.body
+        or before.lease.lease != after.lease.lease
+        or before.lease.comment.database_id != after.lease.comment.database_id
+        or before.lease.comment.body != after.lease.comment.body
+        or before.binding != after.binding
+        or before.issue_binding_comment.database_id != after.issue_binding_comment.database_id
+        or before.issue_binding_comment.body != after.issue_binding_comment.body
+        or before.pr_binding_comment.database_id != after.pr_binding_comment.database_id
+        or before.pr_binding_comment.body != after.pr_binding_comment.body
+        or before.owning_issue.number != after.owning_issue.number
+        or before.owning_issue.database_id != after.owning_issue.database_id
+        or before.owning_issue.node_id != after.owning_issue.node_id
+        or before.owning_issue.is_pull_request != after.owning_issue.is_pull_request
+        or before.owning_issue.author_id != after.owning_issue.author_id
+    ):
+        raise StaleAuthorityError("Issue/lease/binding identities changed during managed progression")
+
+
+def _validate_managed_issue_head_history(
+    client: GitHubClient,
+    repository: str,
+    issue_number: int,
+    app: AppIdentity,
+    source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+) -> tuple[IssuePRBindingState, str, tuple[IssueComment, ...], tuple[IssueHeadClaimComment, ...]]:
+    """Prove the current leased Issue head before consulting fresh mutable PATCH authority."""
+    central = client.get_repository_metadata(repository)
+    state = _read_managed_issue_pr_binding_state(
+        client,
+        repository,
+        issue_number,
+        app,
+        central.node_id,
+        source_authority_resolver,
+        validate_fresh_source_authority=False,
+    )
+    branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
+    current_ref = _read_issue_branch_ref(client, repository, branch_short)
+    if current_ref is None or state.pr.head_oid != current_ref:
+        raise StaleAuthorityError("managed Issue PR head is not the exact current leased-ref head")
+    pr_comments = tuple(client.list_issue_comments(repository, state.binding.pull_request_number))
+    _issue_pr_authority_fence(pr_comments, app)
+    history = _issue_authority_history(client, repository, pr_comments, app, state, current_ref)
+    active = tuple(item for item in history if item.target_head_sha == current_ref)
+    if len(active) != 1:
+        raise R02Error("current generated Issue head has no unique validated Issue-owned authority")
+    claims = tuple(
+        IssueHeadClaimComment(item.artifact, item.comment, item.active)
+        for item in history if item.claim_kind == "ISSUE_HEAD_CLAIM"
+    )
+    return state, current_ref, pr_comments, claims
+
+
+def _ensure_managed_issue_pr_request_anchor(
+    client: GitHubClient,
+    repository: str,
+    state: IssuePRBindingState,
+    request_class: RequestClass,
+    app: AppIdentity,
+) -> AnchorComment:
+    """Create or reuse the exact immutable PR RequestAnchor handed off from the Issue anchor."""
+    pr = client.get_pull_request_metadata(repository, state.binding.pull_request_number)
+    if pr.number != state.binding.pull_request_number or pr.head_oid != state.pr.head_oid or pr.body != state.pr.body:
+        raise StaleAuthorityError("generated Issue PR head/body changed before RequestAnchor handoff")
+    comments = tuple(client.list_issue_comments(repository, state.binding.pull_request_number))
+    anchor = create_anchor_once(client, repository, pr, request_class, app, comments)
+    if (
+        anchor.anchor.initial_request != state.issue_anchor.anchor.initial_request
+        or anchor.anchor.request_class is not state.issue_anchor.anchor.request_class
+        or anchor.anchor.initial_body_sha256 != body_sha256(render_request_body(state.issue_anchor.anchor.initial_request))
+    ):
+        raise R02Error("generated PR RequestAnchor does not hand off the exact immutable Issue request")
+    return anchor
 
 
 def capture_snapshot(pr: PullRequestMetadata, comments: Iterable[IssueComment], anchor: AnchorComment) -> RequestSnapshot:
@@ -1056,6 +6138,58 @@ def _derived_source_id(repository: str) -> str:
         raise R02Error("source repository cannot produce a deterministic sourceId") from None
 
 
+def resolve_issue_source_authority(
+    request: Request,
+    request_class: RequestClass,
+    accepted_manifest: c02.Manifest,
+    source_metadata: PublicSourceMetadata,
+) -> IssueSourceAuthority:
+    """Resolve stable source identity once for Issue preflight and C02 planning."""
+    if type(request) is not Request:
+        raise R02Error("source authority requires a validated Request")
+    if request.request_class is not request_class:
+        raise R02Error("request class does not match validated Request")
+    if request_class not in MANUAL_CLASSES:
+        raise R02Error("Issue source authority does not support this request class")
+    if not isinstance(accepted_manifest, c02.Manifest):
+        raise R02Error("source authority requires a validated accepted manifest")
+    if type(source_metadata) is not PublicSourceMetadata:
+        raise R02Error("source authority requires already-read public source metadata")
+
+    locator = _source_locator(request)
+    if source_metadata.full_name.lower() != locator.lower():
+        raise R02Error("resolved source repository identity does not match requested locator")
+
+    if request_class is RequestClass.ADD:
+        source_id = _derived_source_id(locator)
+        if (
+            source_id in accepted_manifest.by_source_id
+            or source_metadata.repository_id in accepted_manifest.by_repository_id
+        ):
+            raise R02Error("ADD source identity is already accepted")
+        identity_kind = IssueSourceIdentityKind.PROPOSED
+    else:
+        matches = tuple(
+            source
+            for source in accepted_manifest.sources
+            if source.repository_id == source_metadata.repository_id
+        )
+        if len(matches) != 1:
+            raise R02Error("request repositoryId does not identify exactly one accepted source")
+        source_id = matches[0].source_id
+        identity_kind = IssueSourceIdentityKind.ACCEPTED
+
+    return IssueSourceAuthority(
+        request_class=request_class,
+        source_id=source_id,
+        source_repository_id=source_metadata.repository_id,
+        source_canonical_full_name=source_metadata.full_name,
+        source_identity_kind=identity_kind,
+        source_default_branch=source_metadata.default_branch,
+        source_description=source_metadata.description,
+    )
+
+
 class C02CandidateBuilder:
     """Production adapter that delegates manifest/package/catalog semantics to C02."""
 
@@ -1111,20 +6245,10 @@ class C02CandidateBuilder:
         _repository, _ = self._current_base(accepted_base_sha)
         accepted_manifest, accepted_lock, accepted_readme, tree = self._central_state(accepted_base_sha)
         source_repo = read_public_source_metadata(_source_locator(request))
-        if source_repo.full_name.lower() != _source_locator(request).lower():
-            raise R02Error("resolved source repository identity does not match requested locator")
-        source_id: str
-        existing: c02.SourceDeclaration | None
-        if request_class is RequestClass.ADD:
-            source_id = _derived_source_id(_source_locator(request))
-            existing = accepted_manifest.by_source_id.get(source_id)
-            if existing is not None or source_repo.repository_id in accepted_manifest.by_repository_id:
-                raise R02Error("ADD source identity is already accepted")
-        else:
-            existing = accepted_manifest.by_repository_id.get(source_repo.repository_id)
-            if existing is None:
-                raise R02Error("request repositoryId does not identify one accepted source")
-            source_id = existing.source_id
+        authority = resolve_issue_source_authority(request, request_class, accepted_manifest, source_repo)
+        source_id = authority.source_id
+        source_repository_id = authority.source_repository_id
+        existing = accepted_manifest.by_source_id.get(source_id)
         accepted_line_refs = tuple(line.ref for line in existing.lines) if existing is not None else ()
         default_prefixes = (
             request.skill_prefixes
@@ -1156,14 +6280,14 @@ class C02CandidateBuilder:
             request,
             accepted_manifest,
             source_id=source_id,
-            repository_id=source_repo.repository_id,
-            default_branch=source_repo.default_branch,
-            default_description=source_repo.description or "Federated source repository",
+            repository_id=source_repository_id,
+            default_branch=authority.source_default_branch,
+            default_description=authority.source_description or "Federated source repository",
             default_prefixes=tuple(default_prefixes),
         )
         if request_class is RequestClass.ADD:
             self._validate_add_source(candidate_manifest.sources[-1])
-            return {"federation.json": ("100644", _manifest_bytes(candidate_manifest))}, tree, source_id, source_repo.repository_id
+            return {"federation.json": ("100644", _manifest_bytes(candidate_manifest))}, tree, source_id, source_repository_id
 
         bound_sources, discovered = c02.discover_manifest_skills(
             self._capsule_temp_root,
@@ -1197,7 +6321,7 @@ class C02CandidateBuilder:
         for path, (mode, object_type, _sha) in tree.items():
             if path.startswith("skills/") and object_type == "blob" and path not in desired_files:
                 desired_files[path] = ("", b"")
-        return desired_files, tree, source_id, source_repo.repository_id
+        return desired_files, tree, source_id, source_repository_id
 
     def __call__(self, request: Request, request_class: RequestClass, accepted_base_sha: str, head_sha: str) -> ProposalCandidate:
         with trusted_c02_execution() as temp_root:
@@ -1207,10 +6331,18 @@ class C02CandidateBuilder:
             finally:
                 self._capsule_temp_root = None
         changed = tuple(sorted(path for path, (mode, data) in desired.items() if mode == "" or tree.get(path, (None, None, None))[0:2] != (mode, "blob") or (mode != "" and self.client.get_blob(self.central_repository, tree[path][2]) != data)))
-        if request_class in {RequestClass.UPDATE, RequestClass.REMOVE} and "federation.json" not in changed:
-            raise R02Error("UPDATE/REMOVE requires an actual federation.json trust/configuration change")
         if not changed:
-            return ProposalCandidate(accepted_base_sha, accepted_base_sha, (), request_class, source_id, repository_id, False)
+            return ProposalCandidate(
+                accepted_base_sha,
+                accepted_base_sha,
+                (),
+                request_class,
+                source_id,
+                repository_id,
+                False,
+            )
+        if request_class in {RequestClass.UPDATE, RequestClass.REMOVE} and "federation.json" not in changed:
+            raise R02Error(_LEGACY_UPDATE_REMOVE_NO_FEDERATION_ERROR)
         base_tree, _entries = self.client.get_commit_tree(self.central_repository, accepted_base_sha)
         tree_updates: list[Mapping[str, Any]] = []
         for path in changed:
@@ -1225,11 +6357,11 @@ class C02CandidateBuilder:
         commit = self.client.create_commit(self.central_repository, f"Swift Stream federation {request_class.value}\n", tree_object.sha, [accepted_base_sha], timestamp=bot_timestamp)
         return ProposalCandidate(commit.sha, accepted_base_sha, changed, request_class, source_id, repository_id, False)
 
-    def _machine_desired(self, accepted_base_sha: str, source_id: str) -> tuple[dict[str, tuple[str, bytes]], dict[str, tuple[str, str, str]], c02.SourceDeclaration]:
+    def _machine_desired(self, accepted_base_sha: str, source_id: str) -> tuple[dict[str, tuple[str, bytes]], dict[str, tuple[str, str, str]], c02.SourceDeclaration, RepositoryMetadata]:
         """Compute machine bytes through C02, returning no trust/configuration bytes."""
         if self._capsule_temp_root is None:
             raise R02Error("C02 machine planning requires the trusted execution capsule")
-        _repository, _ = self._current_base(accepted_base_sha)
+        repository, _ = self._current_base(accepted_base_sha)
         accepted_manifest, accepted_lock, accepted_readme, tree = self._central_state(accepted_base_sha)
         sources = [item for item in accepted_manifest.sources if item.source_id == source_id]
         if len(sources) != 1:
@@ -1262,9 +6394,9 @@ class C02CandidateBuilder:
         for path, (_mode, object_type, _sha) in tree.items():
             if path.startswith("skills/") and object_type == "blob" and path not in files:
                 files[path] = ("", b"")
-        return files, tree, sources[0]
+        return files, tree, sources[0], repository
 
-    def _machine_plan(self, accepted_base_sha: str, source_id: str) -> tuple[dict[str, tuple[str, bytes]], dict[str, tuple[str, str, str]], c02.SourceDeclaration]:
+    def _machine_plan(self, accepted_base_sha: str, source_id: str) -> tuple[dict[str, tuple[str, bytes]], dict[str, tuple[str, str, str]], c02.SourceDeclaration, RepositoryMetadata]:
         with trusted_c02_execution() as temp_root:
             self._capsule_temp_root = temp_root
             try:
@@ -1272,10 +6404,18 @@ class C02CandidateBuilder:
             finally:
                 self._capsule_temp_root = None
 
-    def machine_candidate(self, accepted_base_sha: str, source_id: str) -> ProposalCandidate:
-        desired, tree, source = self._machine_plan(accepted_base_sha, source_id)
+    def _machine_candidate(
+        self,
+        accepted_base_sha: str,
+        source_id: str,
+        *,
+        require_claim_generation: bool,
+    ) -> ProposalCandidate:
+        if type(require_claim_generation) is not bool:
+            raise R02Error("machine claim-generation requirement must be an exact bool")
+        desired, tree, source, repository = self._machine_plan(accepted_base_sha, source_id)
         changed = tuple(sorted(path for path, (mode, data) in desired.items() if mode == "" or tree.get(path, (None, None, None))[:2] != (mode, "blob") or (mode != "" and path in tree and self.client.get_blob(self.central_repository, tree[path][2]) != data)))
-        if not changed:
+        if not changed and not require_claim_generation:
             return ProposalCandidate(accepted_base_sha, accepted_base_sha, (), RequestClass.MACHINE_PUBLICATION, source.source_id, source.repository_id, False)
         base_tree, _entries = self.client.get_commit_tree(self.central_repository, accepted_base_sha)
         updates: list[Mapping[str, Any]] = []
@@ -1286,13 +6426,76 @@ class C02CandidateBuilder:
             else:
                 blob = self.client.create_blob(self.central_repository, base64.b64encode(data).decode("ascii"))
                 updates.append({"path": path, "mode": mode, "type": "blob", "sha": blob.sha})
-        tree_object = self.client.create_tree(self.central_repository, base_tree, updates)
+        candidate_tree_sha = (
+            self.client.create_tree(self.central_repository, base_tree, updates).sha
+            if updates
+            else base_tree
+        )
         bot_timestamp = self.client.bot_commit_timestamp_after(self.central_repository, accepted_base_sha)
-        commit = self.client.create_commit(self.central_repository, "Swift Stream federation machine publication\n", tree_object.sha, [accepted_base_sha], timestamp=bot_timestamp)
-        return ProposalCandidate(commit.sha, accepted_base_sha, changed, RequestClass.MACHINE_PUBLICATION, source.source_id, source.repository_id, False)
+        changed_paths = tuple(sorted(changed, key=lambda item: item.encode("utf-8")))
+        scope_digest = hashlib.sha256(
+            b"swiftstream-federation-machine-ref-claim-scope:v1\n"
+            + json.dumps(
+                {"schemaVersion": 1, "candidateTreeSha": candidate_tree_sha, "changedPaths": list(changed_paths)},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        owner_key = f"{repository.node_id}:{source.source_id}"
+        # Build the marker with one nonce value; no ref preimage participates.
+        nonce = new_carrier_nonce()
+        generation = claim_generation_id(
+            authority_preimage_digest=machine_ref_claim_authority_digest(
+                central_repository_node_id=repository.node_id,
+                owner_key=owner_key,
+                source_id=source.source_id,
+                source_repository_id=source.repository_id,
+                machine_ref=f"refs/heads/{_machine_branch(source.source_id)}",
+                accepted_base_sha=accepted_base_sha,
+                accepted_base_tree_sha=base_tree,
+                candidate_tree_sha=candidate_tree_sha,
+                candidate_scope_digest=scope_digest,
+            ),
+            carrier_nonce=nonce,
+            central_repository_node_id=repository.node_id,
+            owner_key=owner_key,
+            from_head_sha=accepted_base_sha,
+            from_tree_sha=base_tree,
+            claim_kind="MACHINE_REF_CLAIM",
+            role=CarrierRole.MACHINE_PUBLICATION.value,
+            owner_kind="MACHINE_SOURCE",
+            transition_kind="MACHINE_PUBLICATION",
+        )
+        marker = ClaimedHeadMarker(
+            "MACHINE_REF_CLAIM", CarrierRole.MACHINE_PUBLICATION.value, "MACHINE_SOURCE",
+            owner_key, generation, nonce, "MACHINE_PUBLICATION",
+        )
+        commit = self.client.create_commit(self.central_repository, marker.render(), candidate_tree_sha, [accepted_base_sha], timestamp=bot_timestamp)
+        return ProposalCandidate(
+            commit.sha, accepted_base_sha, changed_paths, RequestClass.MACHINE_PUBLICATION,
+            source.source_id, source.repository_id, True, marker, candidate_tree_sha,
+        )
+
+    def machine_candidate(self, accepted_base_sha: str, source_id: str) -> ProposalCandidate:
+        return self._machine_candidate(
+            accepted_base_sha,
+            source_id,
+            require_claim_generation=False,
+        )
+
+    def machine_claim_candidate(self, accepted_base_sha: str, source_id: str) -> ProposalCandidate:
+        """Create a fresh v2 claimed head even when the desired tree is byte-identical.
+
+        This is reserved for exact legacy H -> fresh H2 authority migration. Ordinary
+        machine reconciliation keeps its no-diff NOOP behavior.
+        """
+        return self._machine_candidate(
+            accepted_base_sha,
+            source_id,
+            require_claim_generation=True,
+        )
 
     def validate_machine_head(self, accepted_base_sha: str, source_id: str, head_sha: str) -> tuple[bool, str]:
-        desired, base_tree, source = self._machine_plan(accepted_base_sha, source_id)
+        desired, base_tree, source, _repository = self._machine_plan(accepted_base_sha, source_id)
         if source.source_id != source_id:
             return False, "MACHINE_SOURCE_MISMATCH"
         _tree_sha, entries = self.client.get_commit_tree(self.central_repository, head_sha)
@@ -1424,6 +6627,2191 @@ class R02Controller:
             raise StaleAuthorityError("central repository metadata does not bind to configured repository")
         return repository, self.client.get_ref_oid(self.central_repository, repository.default_branch)
 
+    def derive_activation_boundary_evidence(self) -> ActivationBoundaryEvidence:
+        """Derive the Wave11 boundary from protected-main discovery and merged-result blobs.
+
+        The protected-main contract is a lookup hint only. It is validated against a
+        frozen governance tuple before the sole fixed PR #27 read, then rebound to
+        byte-identical contract content at the exact trusted merge result.
+        """
+        expected_writers = (
+            ".github/workflows/federation-g8-issue-intake.yml",
+            ".github/workflows/federation-g8-interactive.yml",
+            ".github/workflows/federation-g8-trusted-validation.yml",
+            ".github/workflows/federation-g8-state-finalize.yml",
+            ".github/workflows/federation-g8-main-advance.yml",
+            ".github/workflows/federation-g8-reconcile.yml",
+        )
+        expected_manifest = ".github/federation/g8-authority-surface.json"
+        expected_keys = {
+            "schemaVersion", "centralRepositoryNodeId", "implementationPrNumber",
+            "implementationPrDatabaseId", "implementationPrNodeId", "baseRef",
+            "activationRef", "activationStatusContext", "exactNewWriterPaths",
+            "authoritySurfaceManifestPath", "contractVersion",
+        }
+        expected_tuple = {
+            "schemaVersion": 1,
+            "contractVersion": "correction-12",
+            "centralRepositoryNodeId": "R_kgDOUId1Tw",
+            "implementationPrNumber": 27,
+            "implementationPrDatabaseId": 4780363432,
+            "implementationPrNodeId": "PR_kwDOUId1T88AAAABHO6OqA",
+            "baseRef": "main",
+            "activationRef": "refs/heads/bot/federation-g8-activation",
+            "activationStatusContext": "federation/g8-activation",
+            "authoritySurfaceManifestPath": expected_manifest,
+            "exactNewWriterPaths": list(expected_writers),
+        }
+        contract_path = ".github/federation/g8-activation-contract.json"
+        expected_surface = {
+            ".github/federation/g8-activation-contract.json",
+            ".github/federation/g8-authority-surface.json",
+            *expected_writers,
+            "automation/federation/__init__.py",
+            "automation/federation/controller.py",
+            "automation/federation/github_api.py",
+            "automation/federation/request_model.py",
+            "automation/federation/workspace.py",
+            "scripts/federate.py",
+        }
+
+        def exact_json(data: bytes, label: str, keys: set[str]) -> dict[str, Any]:
+            try:
+                text = data.decode("utf-8")
+                value = c02.decode_json(text)
+            except Exception as error:
+                raise R02Error(f"{label} is not valid canonical UTF-8 JSON: {_bounded_reason(error)}") from None
+            if type(value) is not dict or set(value) != keys:
+                raise R02Error(f"{label} has an invalid exact key set")
+            canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+            if data != canonical.encode("utf-8"):
+                raise R02Error(f"{label} is not canonical JSON")
+            return value
+
+        def committed_blobs(commit_sha: str, label: str) -> tuple[str, dict[str, GitTreeEntry]]:
+            try:
+                tree_sha, entries = self.client.get_commit_tree(self.central_repository, commit_sha)
+            except Exception as error:
+                raise R02Error(f"{label} commit tree is unavailable: {_bounded_reason(error)}") from None
+            by_path = {entry.path: entry for entry in entries}
+            if len(by_path) != len(entries):
+                raise R02Error(f"{label} tree contains duplicate paths")
+            return tree_sha, by_path
+
+        def exact_blob(by_path: Mapping[str, GitTreeEntry], path: str, label: str) -> tuple[str, bytes]:
+            entry = by_path.get(path)
+            if entry is None or entry.object_type != "blob" or entry.mode != "100644":
+                raise R02Error(f"{label} is missing or is not an exact regular 100644 blob")
+            try:
+                return entry.sha, self.client.get_blob(self.central_repository, entry.sha)
+            except Exception as error:
+                raise R02Error(f"{label} blob is unavailable: {_bounded_reason(error)}") from None
+
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            if (
+                repository.full_name != "swiftstream/skills"
+                or repository.node_id != "R_kgDOUId1Tw"
+                or repository.id != 1351054671
+                or repository.default_branch != "main"
+            ):
+                raise R02Error("fresh central repository identity/default branch is not the frozen authority")
+            current_main = self.client.get_ref_oid(self.central_repository, "main")
+            _main_tree, main_blobs = committed_blobs(current_main, "protected-main discovery")
+            _discovery_blob_oid, discovery_bytes = exact_blob(main_blobs, contract_path, "protected-main discovery contract")
+            discovery = exact_json(discovery_bytes, "protected-main discovery contract", expected_keys)
+            if discovery != expected_tuple:
+                raise R02Error("protected-main discovery contract differs from the frozen governance tuple")
+
+            # The query target is a source-code constant; no event/env/caller value
+            # can choose a different PR or be queried before the hint is validated.
+            merged_pr = self.client.get_merged_pull_request_metadata(self.central_repository, 27)
+            if type(merged_pr) is not MergedPullRequestMetadata:
+                raise R02Error("trusted merged PR read returned the wrong model")
+            if (
+                merged_pr.repository_full_name != "swiftstream/skills"
+                or merged_pr.repository_node_id != "R_kgDOUId1Tw"
+                or merged_pr.repository_database_id != 1351054671
+                or merged_pr.pull_request_node_id != "PR_kwDOUId1T88AAAABHO6OqA"
+                or merged_pr.pull_request_database_id != 4780363432
+                or merged_pr.pull_request_number != 27
+                or merged_pr.head_ref != "g8/issue-first-federation-implementation"
+                or merged_pr.base_ref != "main"
+                or merged_pr.head_repository_node_id != "R_kgDOUId1Tw"
+                or merged_pr.head_repository_database_id != 1351054671
+                or merged_pr.head_repository_full_name != "swiftstream/skills"
+                or merged_pr.base_repository_node_id != "R_kgDOUId1Tw"
+                or merged_pr.base_repository_database_id != 1351054671
+                or merged_pr.base_repository_full_name != "swiftstream/skills"
+            ):
+                raise R02Error("trusted implementation PR identity/topology does not match the frozen implementation PR")
+            if (
+                merged_pr.state == "OPEN"
+                and merged_pr.merged is False
+                and merged_pr.merged_at is None
+                and merged_pr.merge_commit_oid is None
+            ):
+                raise PreG8NotApplicableError("fixed implementation PR has not formed a merged G8 boundary")
+            if (
+                merged_pr.state != "CLOSED"
+                or merged_pr.is_draft is not False
+                or merged_pr.merged is not True
+                or merged_pr.merged_at is None
+                or merged_pr.merge_commit_oid is None
+            ):
+                raise R02Error("fixed implementation PR merge state is contradictory")
+            merged_result_oid = merged_pr.merge_commit_oid
+            try:
+                compare_status, compare_base, compare_merge_base = self.client.compare_commits(
+                    self.central_repository, merged_result_oid, current_main,
+                )
+            except Exception as error:
+                raise R02Error(f"protected-main merged-result containment could not be proved: {_bounded_reason(error)}") from None
+            if compare_base != merged_result_oid or not (
+                compare_status == "identical" and current_main == merged_result_oid and compare_merge_base == merged_result_oid
+                or compare_status == "ahead" and compare_merge_base == merged_result_oid
+            ):
+                raise R02Error("merged result is not proven equal to or an ancestor of protected main")
+
+            _merged_tree, merged_blobs = committed_blobs(merged_result_oid, "merged-result")
+            merged_contract_blob_oid, merged_contract_bytes = exact_blob(merged_blobs, contract_path, "merged-result activation contract")
+            if merged_contract_bytes != discovery_bytes:
+                raise R02Error("protected-main discovery and merged-result contract bytes differ")
+            merged_contract = exact_json(merged_contract_bytes, "merged-result activation contract", expected_keys)
+            if merged_contract != expected_tuple:
+                raise R02Error("merged-result activation contract differs from frozen PR/governance identity")
+
+            manifest_blob_oid, manifest_bytes = exact_blob(merged_blobs, expected_manifest, "merged-result authority manifest")
+            manifest = exact_json(manifest_bytes, "merged-result authority manifest", {"schemaVersion", "paths"})
+            paths = manifest["paths"]
+            if (
+                type(manifest["schemaVersion"]) is not int or manifest["schemaVersion"] != 2
+                or type(paths) is not list or any(type(path) is not str for path in paths)
+                or paths != sorted(set(paths), key=lambda item: item.encode("utf-8"))
+                or set(paths) != expected_surface or len(paths) != 14
+            ):
+                raise R02Error("merged-result authority manifest is not the exact canonical 14-path surface")
+            entries: list[dict[str, str]] = []
+            writer_entries: list[dict[str, str]] = []
+            for path in paths:
+                blob_oid, blob_bytes = exact_blob(merged_blobs, path, f"authority surface path {path}")
+                item = {"path": path, "blobOid": blob_oid, "sha256": hashlib.sha256(blob_bytes).hexdigest()}
+                entries.append(item)
+            by_entry = {item["path"]: item for item in entries}
+            for path in expected_writers:
+                writer_entries.append(by_entry[path])
+            surface_digest = authority_surface_digest(merged_contract_blob_oid, manifest_blob_oid, entries)
+            topology_digest = new_writer_topology_digest(writer_entries)
+            boundary_id = activation_boundary_id_digest(
+                "R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA",
+                merged_result_oid, surface_digest, topology_digest,
+            )
+            return ActivationBoundaryEvidence(
+                schema_version=1,
+                central_repository_node_id="R_kgDOUId1Tw",
+                implementation_pr_number=27,
+                implementation_pr_database_id=4780363432,
+                implementation_pr_node_id="PR_kwDOUId1T88AAAABHO6OqA",
+                implementation_reviewed_head_sha=merged_pr.head_oid,
+                merged_result_oid=merged_result_oid,
+                authority_surface_digest=surface_digest,
+                new_writer_topology_digest=topology_digest,
+                activation_boundary_id=boundary_id,
+            )
+        except R02Error:
+            raise
+        except (RequestModelError, GitHubAPIError, ValueError, TypeError) as error:
+            raise R02Error(f"trusted activation boundary derivation failed: {_bounded_reason(error)}") from None
+
+    @staticmethod
+    def _g8_authority_surface_paths() -> frozenset[str]:
+        return frozenset({
+            ".github/federation/g8-activation-contract.json",
+            ".github/federation/g8-authority-surface.json",
+            *G8_NEW_WRITER_PATHS,
+            "automation/federation/__init__.py",
+            "automation/federation/controller.py",
+            "automation/federation/github_api.py",
+            "automation/federation/request_model.py",
+            "automation/federation/workspace.py",
+            "scripts/federate.py",
+        })
+
+    def _require_current_g8_guard_surface(
+        self,
+        boundary: ActivationBoundaryEvidence,
+    ) -> str:
+        if type(boundary) is not ActivationBoundaryEvidence:
+            raise R02Error("G8 guard surface validation requires exact ActivationBoundaryEvidence")
+        trusted_checkout = self.environ.get("FEDERATION_TRUSTED_CHECKOUT_SHA")
+        if type(trusted_checkout) is not str or re.fullmatch(r"[0-9a-f]{40}", trusted_checkout) is None:
+            raise R02Error("G8 guard trusted checkout SHA is missing or malformed")
+        repository, current_main = self.current_accepted_main()
+        if (
+            repository.full_name != "swiftstream/skills"
+            or repository.node_id != G8_CENTRAL_REPOSITORY_NODE_ID
+            or repository.id != 1351054671
+            or repository.default_branch != "main"
+        ):
+            raise R02Error("G8 guard fresh repository identity is not the frozen central repository")
+        if current_main != trusted_checkout:
+            raise R02Error("G8 guard trusted checkout is stale relative to protected main")
+        try:
+            compare_status, compare_base, compare_merge_base = self.client.compare_commits(
+                self.central_repository,
+                boundary.merged_result_oid,
+                current_main,
+            )
+        except Exception as error:
+            raise R02Error(f"G8 guard merged-result containment is unavailable: {_bounded_reason(error)}") from None
+        if compare_base != boundary.merged_result_oid or not (
+            compare_status == "identical"
+            and current_main == boundary.merged_result_oid
+            and compare_merge_base == boundary.merged_result_oid
+            or compare_status == "ahead"
+            and compare_merge_base == boundary.merged_result_oid
+        ):
+            raise R02Error("G8 guard current main no longer contains the activation merged result")
+
+        try:
+            _merged_tree, merged_entries = self.client.get_commit_tree(
+                self.central_repository, boundary.merged_result_oid,
+            )
+            _current_tree, current_entries = self.client.get_commit_tree(
+                self.central_repository, current_main,
+            )
+        except Exception as error:
+            raise R02Error(f"G8 guard authority surface tree read failed: {_bounded_reason(error)}") from None
+        merged_by_path = {entry.path: entry for entry in merged_entries}
+        current_by_path = {entry.path: entry for entry in current_entries}
+        if len(merged_by_path) != len(merged_entries) or len(current_by_path) != len(current_entries):
+            raise R02Error("G8 guard authority surface tree contains duplicate paths")
+        for authority_path in self._g8_authority_surface_paths():
+            merged = merged_by_path.get(authority_path)
+            current = current_by_path.get(authority_path)
+            if (
+                merged is None
+                or current is None
+                or merged.object_type != "blob"
+                or current.object_type != "blob"
+                or merged.mode not in {"100644", "100755"}
+                or current.mode != merged.mode
+                or current.sha != merged.sha
+            ):
+                raise R02Error("G8 guard current authority surface differs from activated reviewed surface")
+        return current_main
+
+    @staticmethod
+    def _g8_positive_run_env(environ: Mapping[str, str], key: str) -> int:
+        value = environ.get(key)
+        if type(value) is not str or re.fullmatch(r"[1-9][0-9]{0,18}", value) is None:
+            raise R02Error(f"{key} must be an exact positive decimal integer")
+        parsed = int(value)
+        if parsed > 9_223_372_036_854_775_807:
+            raise R02Error(f"{key} exceeds the signed-64 bound")
+        return parsed
+
+    def _require_g8_activation_run_authority(
+        self,
+        mode: str,
+    ) -> tuple[int, int, str]:
+        if mode != "activate-g8":
+            raise R02Error("G8 activation mode must be exact activate-g8")
+        if self.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+            raise R02Error("G8 activation requires exact workflow_dispatch event authority")
+        if self.environ.get("GITHUB_REF") != "refs/heads/main":
+            raise R02Error("G8 activation requires exact refs/heads/main trigger ref")
+        actor = self.environ.get("GITHUB_ACTOR")
+        if (
+            type(actor) is not str
+            or not 1 <= len(actor) <= 128
+            or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,126}[A-Za-z0-9])?", actor) is None
+        ):
+            raise R02Error("G8 activation actor login is missing or malformed")
+        run_id = self._g8_positive_run_env(self.environ, "GITHUB_RUN_ID")
+        run_attempt = self._g8_positive_run_env(self.environ, "GITHUB_RUN_ATTEMPT")
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            if (
+                type(repository) is not RepositoryMetadata
+                or repository.full_name != "swiftstream/skills"
+                or repository.node_id != G8_CENTRAL_REPOSITORY_NODE_ID
+                or repository.id != 1_351_054_671
+                or repository.default_branch != "main"
+            ):
+                raise R02Error("G8 activation repository identity/default branch is not exact")
+            permission = self.client.get_collaborator_permission(self.central_repository, actor)
+        except R02Error:
+            raise
+        except Exception as error:
+            raise R02Error(f"G8 activation actor authorization is unavailable: {_bounded_reason(error)}") from None
+        if permission != "admin":
+            raise R02Error("G8 activation initiating actor does not have exact admin permission")
+        guard = self.derive_g8_activation_guard()
+        if guard != _g8_activation_guard_result(G8RuntimeState.MERGED_UNPROVEN):
+            raise R02Error("G8 activation requires exact MERGED_UNPROVEN guard authority")
+        return run_id, run_attempt, actor
+
+    def g8_activation_preflight_decision(self) -> str:
+        """Authorize the read-only workflow gate and return a closed decision."""
+        if self.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+            raise R02Error("G8 activation requires exact workflow_dispatch event authority")
+        if self.environ.get("GITHUB_REF") != "refs/heads/main":
+            raise R02Error("G8 activation requires exact refs/heads/main trigger ref")
+        if self.environ.get("INPUT_MODE") != "activate-g8":
+            raise R02Error("G8 activation requires exact activate-g8 dispatch input")
+        trusted_sha = self.environ.get("FEDERATION_TRUSTED_CHECKOUT_SHA")
+        if type(trusted_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", trusted_sha) is None:
+            raise R02Error("G8 activation trusted checkout SHA is missing or malformed")
+        self._g8_positive_run_env(self.environ, "GITHUB_RUN_ID")
+        self._g8_positive_run_env(self.environ, "GITHUB_RUN_ATTEMPT")
+        actor = self.environ.get("GITHUB_ACTOR")
+        if type(actor) is not str or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,126}[A-Za-z0-9])?", actor) is None:
+            raise R02Error("G8 activation actor login is missing or malformed")
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            permission = self.client.get_collaborator_permission(self.central_repository, actor)
+        except Exception as error:
+            raise R02Error(f"G8 activation actor authorization is unavailable: {_bounded_reason(error)}") from None
+        if (
+            type(repository) is not RepositoryMetadata
+            or repository.full_name != "swiftstream/skills"
+            or repository.node_id != G8_CENTRAL_REPOSITORY_NODE_ID
+            or repository.id != 1_351_054_671
+            or repository.default_branch != "main"
+            or permission != "admin"
+        ):
+            raise R02Error("G8 activation repository/admin authorization is not exact")
+        guard = self.derive_g8_activation_guard()
+        if guard == _g8_activation_guard_result(G8RuntimeState.ACTIVE_G8):
+            return "ACTIVE_NOOP"
+        if guard == _g8_activation_guard_result(G8RuntimeState.MERGED_UNPROVEN):
+            try:
+                boundary = self.derive_activation_boundary_evidence()
+                activation_branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+                if f"refs/heads/{activation_branch}" != G8_ACTIVATION_REF:
+                    raise R02Error("G8 activation ref constant is malformed")
+                expected_activation_ref = self.client.get_optional_ref_oid(
+                    self.central_repository, activation_branch,
+                )
+                self._g8_activation_preflight(
+                    boundary,
+                    expected_activation_ref=expected_activation_ref,
+                )
+            except R02Error:
+                raise
+            except Exception as error:
+                raise R02Error(
+                    f"G8 activation read-only preflight is unavailable: {_bounded_reason(error)}"
+                ) from None
+            return "READY"
+        return "BLOCKED"
+
+    def _g8_activation_preflight(
+        self,
+        boundary: ActivationBoundaryEvidence,
+        *,
+        expected_activation_ref: str | None = None,
+    ) -> G8ActivationPreflightResult:
+        if type(boundary) is not ActivationBoundaryEvidence:
+            raise R02Error("G8 activation preflight requires exact boundary evidence")
+        fresh_boundary = self.derive_activation_boundary_evidence()
+        if fresh_boundary != boundary:
+            raise R02Error("G8 activation boundary changed before preflight")
+        current_main = self._require_current_g8_guard_surface(boundary)
+        if current_main != boundary.merged_result_oid:
+            raise R02Error("G8 activation requires current main equal to exact implementation merged result")
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            current_main_again = self.client.get_ref_oid(self.central_repository, "main")
+            current_tree_sha, current_entries = self.client.get_commit_tree(
+                self.central_repository, current_main_again,
+            )
+            del current_tree_sha
+        except Exception as error:
+            raise R02Error(f"G8 activation preflight current tree is unavailable: {_bounded_reason(error)}") from None
+        if (
+            type(repository) is not RepositoryMetadata
+            or repository.full_name != "swiftstream/skills"
+            or repository.node_id != G8_CENTRAL_REPOSITORY_NODE_ID
+            or repository.id != 1_351_054_671
+            or repository.default_branch != "main"
+            or current_main_again != current_main
+        ):
+            raise R02Error("G8 activation repository/main changed during preflight")
+        by_path = {entry.path: entry for entry in current_entries}
+        if len(by_path) != len(current_entries):
+            raise R02Error("G8 activation current main tree contains duplicate paths")
+
+        old_path_rows = []
+        for path, workflow_id in sorted(G8_OLD_WRITERS, key=lambda item: item[0].encode("utf-8")):
+            old_path_rows.append({
+                "path": path,
+                "historicWorkflowId": workflow_id,
+                "pathPresent": path in by_path,
+            })
+        try:
+            old_path_digest = old_path_absence_proof_digest(
+                boundary.merged_result_oid,
+                current_main,
+                old_path_rows,
+            )
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation old writer path proof failed: {_bounded_reason(error)}") from None
+
+        workflow_proofs: list[G8ActivationWorkflowProof] = []
+        seen_workflow_ids: set[int] = set()
+        for path in G8_NEW_WRITER_PATHS:
+            entry = by_path.get(path)
+            if (
+                entry is None
+                or entry.object_type != "blob"
+                or entry.mode not in {"100644", "100755"}
+            ):
+                raise R02Error("G8 activation exact new workflow blob is missing from current main")
+            try:
+                blob_bytes = self.client.get_blob(self.central_repository, entry.sha)
+                by_path_metadata = self.client.get_workflow_metadata_by_path(
+                    self.central_repository, path,
+                )
+                if type(by_path_metadata) is not WorkflowMetadata:
+                    raise R02Error("G8 activation workflow path lookup returned the wrong model")
+                by_id_metadata = self.client.get_workflow_metadata_by_id(
+                    self.central_repository, by_path_metadata.id,
+                )
+            except R02Error:
+                raise
+            except Exception as error:
+                raise R02Error(f"G8 activation new workflow identity is unavailable: {_bounded_reason(error)}") from None
+            if (
+                type(by_id_metadata) is not WorkflowMetadata
+                or by_id_metadata != by_path_metadata
+                or by_path_metadata.path != path
+                or by_path_metadata.state != "active"
+                or by_path_metadata.id in seen_workflow_ids
+            ):
+                raise R02Error("G8 activation new workflow path/ID/state mapping is ambiguous")
+            seen_workflow_ids.add(by_path_metadata.id)
+            workflow_proofs.append(G8ActivationWorkflowProof(
+                path,
+                entry.sha,
+                hashlib.sha256(blob_bytes).hexdigest(),
+                by_path_metadata.id,
+                by_path_metadata.state,
+            ))
+        try:
+            workflow_digest = six_workflow_identity_digest(
+                tuple(item.as_value() for item in workflow_proofs),
+            )
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation six-workflow identity proof failed: {_bounded_reason(error)}") from None
+
+        old_run_rows: list[dict[str, Any]] = []
+        for path, workflow_id in G8_OLD_WRITERS:
+            try:
+                metadata = self.client.get_workflow_metadata_by_id(
+                    self.central_repository, workflow_id,
+                )
+            except NotFoundError:
+                old_run_rows.append({
+                    "path": path,
+                    "historicWorkflowId": workflow_id,
+                    "enumerationState": "DELETED_ID_UNAVAILABLE",
+                    "runs": [],
+                })
+                continue
+            except Exception as error:
+                raise R02Error(f"G8 activation old workflow identity is unavailable: {_bounded_reason(error)}") from None
+            if (
+                type(metadata) is not WorkflowMetadata
+                or metadata.id != workflow_id
+                or metadata.path != path
+                or metadata.state == "active"
+            ):
+                raise R02Error("G8 activation old workflow remains active or has identity drift")
+            try:
+                runs = self.client.list_workflow_runs(
+                    self.central_repository, workflow_id, max_pages=100,
+                )
+            except Exception as error:
+                raise R02Error(f"G8 activation old workflow run inventory is unavailable: {_bounded_reason(error)}") from None
+            normalized_runs: list[dict[str, Any]] = []
+            for run in sorted(runs, key=lambda item: (item.id, item.run_attempt)):
+                if type(run) is not WorkflowRunMetadata or run.workflow_id != workflow_id:
+                    raise R02Error("G8 activation old workflow run inventory contains the wrong model")
+                if run.status != "completed":
+                    raise R02Error("G8 activation old workflow has a nonterminal run")
+                normalized_runs.append({
+                    "runId": run.id,
+                    "runAttempt": run.run_attempt,
+                    "status": run.status,
+                    "conclusion": run.conclusion,
+                    "event": run.event,
+                    "headBranch": run.head_branch,
+                    "headSha": run.head_sha,
+                })
+            old_run_rows.append({
+                "path": path,
+                "historicWorkflowId": workflow_id,
+                "enumerationState": "COMPLETE",
+                "runs": normalized_runs,
+            })
+        try:
+            old_run_digest = old_run_terminal_proof_digest(old_run_rows)
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation old-run terminal proof failed: {_bounded_reason(error)}") from None
+
+        try:
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            if current_app != self.app:
+                raise R02Error("G8 activation App/Bot identity changed during preflight")
+            activation_branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+            if f"refs/heads/{activation_branch}" != G8_ACTIVATION_REF:
+                raise R02Error("G8 activation ref constant is malformed")
+            observed_activation_ref = self.client.get_optional_ref_oid(
+                self.central_repository, activation_branch,
+            )
+            if observed_activation_ref != expected_activation_ref:
+                raise StaleAuthorityError("G8 activation ref changed during final preflight")
+            statuses = self.client.list_commit_statuses(
+                self.central_repository, boundary.merged_result_oid,
+            )
+        except R02Error:
+            raise
+        except Exception as error:
+            raise R02Error(f"G8 activation ref/status preflight is unavailable: {_bounded_reason(error)}") from None
+        if any(
+            status.context == G8_ACTIVATION_STATUS_CONTEXT
+            and status.creator_database_id == current_app.bot_id
+            and status.creator_node_id == current_app.bot_node_id
+            and status.creator_login == current_app.bot_login
+            and status.creator_type == "Bot"
+            for status in statuses
+        ):
+            raise R02Error("G8 activation preflight found a conflicting exact-App activation status")
+
+        return G8ActivationPreflightResult(
+            boundary,
+            current_main,
+            tuple(workflow_proofs),
+            old_path_digest,
+            old_run_digest,
+            workflow_digest,
+        )
+
+    @staticmethod
+    def _g8_activation_inventory_material(
+        result: Wave08UniversalRecoveryResult,
+        preflight: G8ActivationPreflightResult,
+    ) -> dict[str, Any]:
+        if type(result) is not Wave08UniversalRecoveryResult:
+            raise R02Error("G8 activation inventory requires exact universal recovery evidence")
+        if type(preflight) is not G8ActivationPreflightResult:
+            raise R02Error("G8 activation inventory requires exact preflight evidence")
+        if result.status_actions:
+            raise R02Error("G8 activation read-only inventory unexpectedly contains status actions")
+
+        decisions: list[dict[str, Any]] = []
+        for decision in result.decisions:
+            marker = decision.resolution.marker
+            decisions.append({
+                "headSha": decision.head_sha,
+                "activation": decision.resolution.activation.value,
+                "role": None if decision.resolution.role is None else decision.resolution.role.value,
+                "marker": None if marker is None else marker.render(),
+                "pullRequestNumbers": list(decision.pull_request_numbers),
+                "owningPrNumber": decision.owning_pr_number,
+                "kind": decision.kind.value,
+                "reason": decision.reason.value,
+                "dispatchTarget": None if decision.dispatch_target is None else decision.dispatch_target.value,
+            })
+        issues = [{
+            "issueNumber": item.issue_number,
+            "issueDatabaseId": item.issue_database_id,
+            "issueNodeId": item.issue_node_id,
+            "outcome": item.outcome,
+            "reason": item.reason,
+        } for item in result.issue_recoveries]
+        machine_refs = [{
+            "ref": item.ref,
+            "sourceId": item.source_id,
+            "headSha": item.head_sha,
+            "outcome": item.outcome,
+            "reason": item.reason,
+        } for item in result.machine_refs]
+        intents = [{
+            "target": item.target.value,
+            "centralRepositoryNodeId": item.central_repository_node_id,
+            "issueNumber": item.issue_number,
+            "reason": item.reason,
+        } for item in result.dispatch_intents]
+        return {
+            "complete": result.complete,
+            "openPrInventoryCount": result.open_pr_inventory_count,
+            "freshPrCount": result.fresh_pr_count,
+            "distinctPrHeadCount": result.distinct_pr_head_count,
+            "issueInventoryCount": result.issue_inventory_count,
+            "relevantIssueCount": result.relevant_issue_count,
+            "machineRefInventoryCount": result.machine_ref_inventory_count,
+            "decisions": decisions,
+            "issueRecoveries": issues,
+            "machineRefs": machine_refs,
+            "dispatchIntents": intents,
+            "blockedReasons": list(result.blocked_reasons),
+            "deferredCount": result.deferred_count,
+            "oldPathAbsenceProofDigest": preflight.old_path_absence_proof_digest,
+            "oldRunTerminalDigest": preflight.old_run_terminal_digest,
+            "sixWorkflowIdentityDigest": preflight.six_workflow_identity_digest,
+        }
+
+    @staticmethod
+    def _g8_activation_fatal_pre_recovery_reasons(
+        result: Wave08UniversalRecoveryResult,
+    ) -> tuple[str, ...]:
+        if type(result) is not Wave08UniversalRecoveryResult:
+            raise R02Error("G8 activation PRE blocker filter requires exact universal recovery evidence")
+        decisions_by_head = {decision.head_sha: decision for decision in result.decisions}
+        recoverable: set[str] = set()
+        for record in result.machine_refs:
+            decision = decisions_by_head.get(record.head_sha)
+            if decision is None or decision.kind not in {
+                Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED,
+                Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED,
+            }:
+                continue
+            recoverable.add(f"{record.ref}:SHA_ROLE_DOES_NOT_AUTHORIZE_MACHINE_RECOVERY")
+        return tuple(
+            reason for reason in result.blocked_reasons
+            if reason not in recoverable
+        )
+
+    @staticmethod
+    def _g8_require_post_machine_refs_converged(
+        result: Wave08UniversalRecoveryResult,
+    ) -> None:
+        if type(result) is not Wave08UniversalRecoveryResult:
+            raise R02Error("G8 activation POST machine-ref proof requires exact universal recovery evidence")
+        unresolved = tuple(
+            record for record in result.machine_refs
+            if record.outcome != "DISPATCHED"
+        )
+        if unresolved:
+            raise R02Error("G8 activation POST inventory contains a non-converged machine ref")
+
+    def _g8_activation_recovery_mutation_guard(
+        self,
+        boundary: ActivationBoundaryEvidence,
+    ) -> None:
+        fresh_boundary = self.derive_activation_boundary_evidence()
+        if fresh_boundary != boundary:
+            raise StaleAuthorityError("G8 activation boundary changed before recovery mutation")
+        current_main = self._require_current_g8_guard_surface(boundary)
+        if current_main != boundary.merged_result_oid:
+            raise StaleAuthorityError("G8 activation main moved before recovery mutation")
+        guard = self.derive_g8_activation_guard()
+        if guard != _g8_activation_guard_result(G8RuntimeState.MERGED_UNPROVEN):
+            raise StaleAuthorityError("G8 activation guard changed before recovery mutation")
+
+    def _g8_recover_cancel_failure(
+        self,
+        decision: Wave08Decision,
+        boundary: ActivationBoundaryEvidence,
+    ) -> tuple[IssueCancellationFence, ExactAppRequiredStatusSnapshot, bool]:
+        if (
+            type(decision) is not Wave08Decision
+            or decision.kind is not Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY
+            or decision.owning_pr_number is None
+            or decision.resolution.marker is None
+        ):
+            raise R02Error("G8 activation cancellation recovery requires exact ISSUE_CANCEL decision")
+        owner = derive_issue_owner_pr(
+            self.client,
+            self.central_repository,
+            decision.head_sha,
+            decision.resolution,
+            self.app.slug,
+            role_already_resolved=True,
+        )
+        if owner.pull_request_number != decision.owning_pr_number:
+            raise R02Error("G8 activation cancellation owner differs from role-first inventory")
+        current_app = resolve_app_identity(self.client, self.app.slug)
+        if current_app != self.app:
+            raise R02Error("G8 activation cancellation App identity changed")
+        authority = _fresh_issue_cancellation_authority(
+            self.client,
+            self.central_repository,
+            owner.issue_number,
+            current_app,
+            allow_pr_stage_state=True,
+        )
+        current_ref = _read_issue_branch_ref(
+            self.client,
+            self.central_repository,
+            authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        fences, _comments = self._read_issue_cancellation_fences(
+            authority,
+            current_ref or ZERO_OID,
+        )
+        exact = tuple(
+            item.fence
+            for item in fences
+            if (
+                item.fence.cancellation_head_sha == decision.head_sha
+                and _issue_cancellation_fence_marker(item.fence) == decision.resolution.marker
+            )
+        )
+        if (
+            len(exact) != 1
+            or authority.pull_request_number != owner.pull_request_number
+            or current_ref != decision.head_sha
+            or authority.pr.head_oid != decision.head_sha
+            or authority.raw_pr_state != "OPEN"
+            or authority.raw_pr_merged
+        ):
+            raise StaleAuthorityError("G8 activation cancellation authority changed before failure publication")
+        fence = exact[0]
+        existing = _latest_exact_cancel_status_evidence(
+            self.client,
+            self.central_repository,
+            fence,
+            self.app,
+        )
+        self._g8_activation_recovery_mutation_guard(boundary)
+        snapshot = self.publish_issue_cancel_failure(owner.issue_number, fence)
+        return fence, snapshot, existing is not None
+
+    def _g8_exact_app_recovery_evidence_comments(
+        self,
+        app: AppIdentity,
+    ) -> tuple[tuple[IssueComment, ActivationRecoveryEvidence, str], ...]:
+        if type(app) is not AppIdentity:
+            raise R02Error("G8 recovery evidence scan requires exact App identity")
+        try:
+            comments = self.client.list_issue_comments(
+                self.central_repository,
+                G8_IMPLEMENTATION_PR_NUMBER,
+            )
+        except Exception as error:
+            raise R02Error(f"G8 recovery evidence thread is unavailable: {_bounded_reason(error)}") from None
+        found: list[tuple[IssueComment, ActivationRecoveryEvidence, str]] = []
+        for comment in comments:
+            body = comment.body
+            if type(body) is not str or not body.startswith(G8_ACTIVATION_RECOVERY_EVIDENCE_MARKER):
+                continue
+            exact_app = (
+                comment.author_id == app.bot_node_id
+                and comment.author_login == app.bot_login
+                and comment.author_type in {None, "Bot"}
+            )
+            if not exact_app:
+                continue
+            if _issue_comment_edited(comment):
+                raise R02Error("exact-App G8 recovery evidence comment was edited")
+            try:
+                evidence = parse_activation_recovery_evidence(body)
+                digest = activation_recovery_result_digest(evidence)
+            except (RequestModelError, ValueError, TypeError) as error:
+                raise R02Error(f"exact-App G8 recovery evidence is malformed: {_bounded_reason(error)}") from None
+            found.append((comment, evidence, digest))
+        found.sort(key=lambda item: item[0].database_id)
+        return tuple(found)
+
+    def _persist_g8_activation_recovery_evidence(
+        self,
+        evidence: ActivationRecoveryEvidence,
+        app: AppIdentity,
+        boundary: ActivationBoundaryEvidence,
+    ) -> int:
+        if type(evidence) is not ActivationRecoveryEvidence:
+            raise R02Error("G8 activation persistence requires exact recovery evidence")
+        if type(app) is not AppIdentity or type(boundary) is not ActivationBoundaryEvidence:
+            raise R02Error("G8 activation persistence requires exact App/boundary authority")
+        if app != self.app:
+            raise R02Error("G8 activation persistence App identity differs from configured exact App")
+        if (
+            evidence.central_repository_node_id != boundary.central_repository_node_id
+            or evidence.implementation_pr_number != boundary.implementation_pr_number
+            or evidence.implementation_pr_database_id != boundary.implementation_pr_database_id
+            or evidence.implementation_pr_node_id != boundary.implementation_pr_node_id
+            or evidence.activation_boundary_id != boundary.activation_boundary_id
+            or evidence.merged_result_oid != boundary.merged_result_oid
+            or evidence.authority_surface_digest != boundary.authority_surface_digest
+            or evidence.new_writer_topology_digest != boundary.new_writer_topology_digest
+        ):
+            raise R02Error("G8 activation persistence evidence does not bind the selected boundary")
+        body = evidence.render()
+        run_key = (
+            evidence.activation_boundary_id,
+            evidence.activation_run_id,
+            evidence.activation_run_attempt,
+        )
+
+        def select(
+            rows: tuple[tuple[IssueComment, ActivationRecoveryEvidence, str], ...],
+        ) -> int | None:
+            same_run = [
+                (comment, candidate)
+                for comment, candidate, _digest in rows
+                if (
+                    candidate.activation_boundary_id,
+                    candidate.activation_run_id,
+                    candidate.activation_run_attempt,
+                ) == run_key
+            ]
+            bodies = {candidate.render() for _comment, candidate in same_run}
+            if len(bodies) > 1:
+                raise R02Error("G8 recovery evidence has conflicting exact-App same-run bodies")
+            if same_run and bodies != {body}:
+                raise R02Error("G8 recovery evidence same-run key is already bound to different content")
+            exact = [
+                comment.database_id
+                for comment, candidate in same_run
+                if candidate.render() == body
+            ]
+            return min(exact) if exact else None
+
+        existing = select(self._g8_exact_app_recovery_evidence_comments(app))
+        if existing is not None:
+            return existing
+
+        self._g8_activation_recovery_mutation_guard(boundary)
+        post_error: Exception | None = None
+        try:
+            self.client.create_issue_comment(
+                self.central_repository,
+                G8_IMPLEMENTATION_PR_NUMBER,
+                body,
+            )
+        except Exception as error:
+            post_error = error
+
+        # The POST response is never persistence authority. Full immutable thread
+        # read-back is mandatory for success and also resolves response-loss.
+        try:
+            reread = self._g8_exact_app_recovery_evidence_comments(app)
+            persisted = select(reread)
+        except Exception:
+            raise
+        if persisted is not None:
+            return persisted
+        if post_error is not None:
+            raise R02Error(
+                f"G8 recovery evidence POST was not confirmed by durable read-back: {_bounded_reason(post_error)}"
+            ) from None
+        raise R02Error("G8 recovery evidence POST returned but durable read-back did not contain exact evidence")
+
+    def _g8_recovery_action(
+        self,
+        sequence: int,
+        action_class: ActivationRecoveryActionClass,
+        subject: Mapping[str, Any],
+        effect: Mapping[str, Any],
+        result_class: ActivationRecoveryResultClass,
+    ) -> ActivationRecoveryAction:
+        try:
+            subject_value = dict(subject)
+            effect_value = dict(effect)
+            _g8_validate_recovery_action_material(
+                action_class,
+                subject_value,
+                effect_value,
+                result_class,
+            )
+            return ActivationRecoveryAction(
+                1,
+                sequence,
+                action_class,
+                _g8_recovery_material_digest(_G8_RECOVERY_SUBJECT_PREFIX, subject_value),
+                _g8_recovery_material_digest(_G8_RECOVERY_EFFECT_PREFIX, effect_value),
+                result_class,
+            )
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation recovery action construction failed: {_bounded_reason(error)}") from None
+
+    def _run_g8_activation_recovery(
+        self,
+        boundary: ActivationBoundaryEvidence,
+        preflight: G8ActivationPreflightResult,
+        pre: Wave08UniversalRecoveryResult,
+    ) -> tuple[ActivationRecoveryAction, ...]:
+        if not pre.complete or self._g8_activation_fatal_pre_recovery_reasons(pre):
+            raise R02Error("G8 activation pre-recovery inventory is incomplete or has fatal unresolved authority")
+        actions: list[ActivationRecoveryAction] = []
+
+        def append(
+            action_class: ActivationRecoveryActionClass,
+            subject: Mapping[str, Any],
+            effect: Mapping[str, Any],
+            result_class: ActivationRecoveryResultClass,
+        ) -> None:
+            actions.append(self._g8_recovery_action(
+                len(actions), action_class, subject, effect, result_class,
+            ))
+
+        def publish_and_record_legacy_failure(
+            head_sha: str,
+            evidence: LegacyQuarantineEvidence,
+        ) -> StatusWriteReceipt:
+            self._g8_activation_recovery_mutation_guard(boundary)
+            receipt = self.publish_legacy_failure(
+                head_sha,
+                boundary.activation_boundary_id,
+                implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+            )
+            returned = receipt.returned_status
+            append(
+                ActivationRecoveryActionClass.LEGACY_FAILURE_STATUS,
+                {
+                    "headSha": head_sha,
+                    "legacyEvidence": evidence.as_value(),
+                },
+                {
+                    "repository": receipt.repository,
+                    "requestedSha": receipt.requested_sha,
+                    "method": receipt.method,
+                    "route": receipt.route,
+                    "state": receipt.requested_state,
+                    "context": receipt.requested_context,
+                    "description": receipt.requested_description,
+                    "targetUrl": receipt.requested_target_url,
+                    "returnedStatusId": returned.id,
+                    "returnedStatusNodeId": returned.node_id,
+                    "returnedCreatorDatabaseId": returned.creator_database_id,
+                    "returnedCreatorNodeId": returned.creator_node_id,
+                    "returnedCreatorLogin": returned.creator_login,
+                    "returnedCreatorType": returned.creator_type,
+                    "returnedCreatedAt": returned.created_at,
+                    "returnedUpdatedAt": returned.updated_at,
+                },
+                ActivationRecoveryResultClass.APPLIED,
+            )
+            return receipt
+
+        def recover_current_reserved_machine(
+            record: Wave08MachineRefRecord,
+            resolution: ShaCarrierResolution,
+        ) -> None:
+            marker = resolution.marker
+            if (
+                resolution.activation is not CarrierActivation.RESERVED_INACTIVE
+                or resolution.role is not CarrierRole.MACHINE_PUBLICATION
+                or marker is None
+                or marker.claim_kind != "MACHINE_REF_CLAIM"
+                or marker.owner_kind != "MACHINE_SOURCE"
+                or record.ref != f"refs/heads/bot/federation/{record.source_id}"
+            ):
+                raise R02Error("G8 activation reserved machine recovery requires exact current v2 machine authority")
+            repository, current_main = self.current_accepted_main()
+            if current_main != boundary.merged_result_oid:
+                raise StaleAuthorityError("G8 activation main moved before reserved machine recovery")
+            sources = tuple(
+                source for source in self._accepted_sources(current_main)
+                if source.source_id == record.source_id
+                and marker.owner_key == f"{repository.node_id}:{source.source_id}"
+            )
+            if len(sources) != 1:
+                raise R02Error("G8 activation reserved machine source is not exactly accepted")
+            try:
+                current_ref = self.client.get_ref_oid(
+                    self.central_repository,
+                    record.ref.removeprefix("refs/heads/"),
+                )
+            except Exception as error:
+                raise R02Error(
+                    f"G8 activation reserved machine ref read failed: {_bounded_reason(error)}"
+                ) from None
+            if current_ref != record.head_sha:
+                raise StaleAuthorityError("G8 activation reserved machine ref changed since bounded inventory")
+
+            self._g8_activation_recovery_mutation_guard(boundary)
+            result = self.reconcile(
+                sources[0].repository_id,
+                pre_mutation_guard=lambda: self._g8_activation_recovery_mutation_guard(boundary),
+                dispatch_finalizer=False,
+            )
+            if result.outcome == "FAIL":
+                raise R02Error(f"G8 activation reserved machine recovery failed: {result.reason}")
+            try:
+                after_head = self.client.get_ref_oid(
+                    self.central_repository,
+                    record.ref.removeprefix("refs/heads/"),
+                )
+                after_resolution = self.resolve_current_sha_carrier_role(after_head)
+            except Exception as error:
+                raise R02Error(
+                    f"G8 activation reserved machine recovery read-back failed: {_bounded_reason(error)}"
+                ) from None
+            if (
+                after_resolution.activation is not CarrierActivation.ACTIVE
+                or after_resolution.role is not CarrierRole.MACHINE_PUBLICATION
+                or after_resolution.marker is None
+                or after_resolution.marker.claim_kind != "MACHINE_REF_CLAIM"
+                or after_resolution.marker.owner_kind != "MACHINE_SOURCE"
+                or after_resolution.marker.owner_key != marker.owner_key
+            ):
+                raise R02Error("G8 activation reserved machine recovery did not converge to exact ACTIVE authority")
+            append(
+                ActivationRecoveryActionClass.RESERVED_TRANSITION_RECOVERY,
+                {
+                    "headSha": record.head_sha,
+                    "role": CarrierRole.MACHINE_PUBLICATION.value,
+                    "machineRef": record.ref,
+                    "sourceId": record.source_id,
+                    "repositoryId": sources[0].repository_id,
+                    "marker": marker.render(),
+                },
+                {
+                    "afterHeadSha": after_head,
+                    "afterActivation": after_resolution.activation.value,
+                    "afterRole": after_resolution.role.value,
+                    "afterMarker": after_resolution.marker.render(),
+                    "outcome": result.outcome,
+                    "sourceId": result.source_id,
+                    "repositoryId": result.repository_id,
+                    "reason": result.reason,
+                },
+                (
+                    ActivationRecoveryResultClass.APPLIED
+                    if result.outcome == "CHANGED"
+                    else ActivationRecoveryResultClass.ALREADY_CONVERGED
+                ),
+            )
+
+        recovery_decisions = list(pre.decisions)
+        covered_heads = {decision.head_sha for decision in recovery_decisions}
+        uncovered_reserved_machine: list[tuple[Wave08MachineRefRecord, ShaCarrierResolution]] = []
+        seen_machine_heads: set[str] = set()
+        for record in sorted(pre.machine_refs, key=lambda item: (item.ref, item.source_id, item.head_sha)):
+            if record.head_sha in seen_machine_heads:
+                raise R02Error("G8 activation machine-ref inventory maps one head through multiple refs")
+            seen_machine_heads.add(record.head_sha)
+            if record.head_sha in covered_heads:
+                continue
+            resolution = self.resolve_current_sha_carrier_role(record.head_sha)
+            if resolution.activation is CarrierActivation.LEGACY_CUTOVER_QUARANTINE:
+                classification = self.classify_legacy_head(
+                    record.head_sha,
+                    implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                )
+                if (
+                    type(classification) is not LegacyClassificationResult
+                    or classification.outcome is not LegacyClassificationOutcome.QUARANTINE
+                    or classification.evidence is None
+                    or classification.evidence.evidence_class is not LegacyQuarantineClass.MACHINE
+                    or classification.evidence.head_sha != record.head_sha
+                ):
+                    raise R02Error("G8 activation uncovered machine ref is not exact legacy-machine authority")
+                recovery_decisions.append(Wave08Decision(
+                    record.head_sha,
+                    resolution,
+                    (),
+                    None,
+                    Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED,
+                    Wave08DecisionReason.LEGACY_CLASSIFIER_DEFERRED,
+                ))
+                covered_heads.add(record.head_sha)
+                continue
+            if (
+                resolution.activation is CarrierActivation.RESERVED_INACTIVE
+                and resolution.role is CarrierRole.MACHINE_PUBLICATION
+            ):
+                uncovered_reserved_machine.append((record, resolution))
+                covered_heads.add(record.head_sha)
+                continue
+            raise R02Error("G8 activation uncovered machine ref has unresolved or contradictory authority")
+
+        for decision in sorted(recovery_decisions, key=lambda item: item.head_sha):
+            if decision.kind is Wave08DecisionKind.CONFLICTING_BLOCKED:
+                raise R02Error("G8 activation recovery encountered a conflicting SHA role")
+            if decision.kind is Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED:
+                classification = self.classify_legacy_head(
+                    decision.head_sha,
+                    implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                )
+                if (
+                    type(classification) is not LegacyClassificationResult
+                    or classification.outcome is not LegacyClassificationOutcome.QUARANTINE
+                    or classification.evidence is None
+                    or classification.evidence.head_sha != decision.head_sha
+                ):
+                    raise StaleAuthorityError("G8 activation legacy classification changed before recovery")
+                subject = {
+                    "headSha": decision.head_sha,
+                    "legacyEvidence": classification.evidence.as_value(),
+                }
+                if classification.evidence.evidence_class is LegacyQuarantineClass.MACHINE:
+                    matching_refs = tuple(
+                        item for item in pre.machine_refs
+                        if item.head_sha == decision.head_sha
+                        and item.ref == f"refs/heads/bot/federation/{item.source_id}"
+                    )
+                    if len(matching_refs) != 1:
+                        raise R02Error("G8 activation legacy machine recovery requires one exact machine ref")
+                    repository, current_main = self.current_accepted_main()
+                    if current_main != boundary.merged_result_oid:
+                        raise StaleAuthorityError("G8 activation main moved before legacy machine migration")
+                    sources = tuple(
+                        source for source in self._accepted_sources(current_main)
+                        if source.source_id == matching_refs[0].source_id
+                    )
+                    if len(sources) != 1:
+                        raise R02Error("G8 activation legacy machine source is not exactly accepted")
+                    legacy_failure_receipt = publish_and_record_legacy_failure(
+                        decision.head_sha,
+                        classification.evidence,
+                    )
+                    self._g8_activation_recovery_mutation_guard(boundary)
+                    result = self.reconcile(
+                        sources[0].repository_id,
+                        pre_mutation_guard=lambda: self._g8_activation_recovery_mutation_guard(boundary),
+                        dispatch_finalizer=False,
+                        legacy_failure_receipt=legacy_failure_receipt,
+                    )
+                    if result.outcome == "FAIL":
+                        raise R02Error(f"G8 activation legacy machine migration failed: {result.reason}")
+                    try:
+                        after_head = self.client.get_ref_oid(
+                            self.central_repository,
+                            matching_refs[0].ref.removeprefix("refs/heads/"),
+                        )
+                        after_resolution = self.resolve_current_sha_carrier_role(after_head)
+                    except Exception as error:
+                        raise R02Error(
+                            f"G8 activation legacy machine migration read-back failed: {_bounded_reason(error)}"
+                        ) from None
+                    if (
+                        after_head == decision.head_sha
+                        or after_resolution.activation is not CarrierActivation.ACTIVE
+                        or after_resolution.role is not CarrierRole.MACHINE_PUBLICATION
+                        or after_resolution.marker is None
+                        or after_resolution.marker.claim_kind != "MACHINE_REF_CLAIM"
+                        or after_resolution.marker.owner_kind != "MACHINE_SOURCE"
+                    ):
+                        raise R02Error("G8 activation legacy machine migration did not establish exact fresh v2 H2 authority")
+                    append(
+                        ActivationRecoveryActionClass.LEGACY_MACHINE_MIGRATION,
+                        {
+                            **subject,
+                            "machineRef": matching_refs[0].ref,
+                            "sourceId": sources[0].source_id,
+                            "repositoryId": sources[0].repository_id,
+                        },
+                        {
+                            "beforeHeadSha": decision.head_sha,
+                            "afterHeadSha": after_head,
+                            "afterActivation": after_resolution.activation.value,
+                            "afterRole": after_resolution.role.value,
+                            "afterMarker": after_resolution.marker.render(),
+                            "outcome": result.outcome,
+                            "sourceId": result.source_id,
+                            "repositoryId": result.repository_id,
+                            "reason": result.reason,
+                        },
+                        (
+                            ActivationRecoveryResultClass.APPLIED
+                            if result.outcome == "CHANGED"
+                            else ActivationRecoveryResultClass.ALREADY_CONVERGED
+                        ),
+                    )
+                else:
+                    publish_and_record_legacy_failure(
+                        decision.head_sha,
+                        classification.evidence,
+                    )
+                continue
+
+            if decision.kind is Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY:
+                fence, status, reused = self._g8_recover_cancel_failure(decision, boundary)
+                append(
+                    ActivationRecoveryActionClass.CANCEL_FAILURE_STATUS,
+                    {
+                        "issueNumber": fence.issue_number,
+                        "fenceId": fence.fence_id,
+                        "cancellationHeadSha": fence.cancellation_head_sha,
+                        "pullRequestNumber": fence.pull_request_number,
+                    },
+                    status.as_value(),
+                    (
+                        ActivationRecoveryResultClass.ALREADY_CONVERGED
+                        if reused
+                        else ActivationRecoveryResultClass.APPLIED
+                    ),
+                )
+                append(
+                    ActivationRecoveryActionClass.ISSUE_TERMINAL_CLEANUP,
+                    {
+                        "issueNumber": fence.issue_number,
+                        "fenceId": fence.fence_id,
+                        "cancellationHeadSha": fence.cancellation_head_sha,
+                    },
+                    {"deferredUntil": "ACTIVE_G8", "reason": "CANCELLATION_CLEANUP_POST_ACTIVE"},
+                    ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE,
+                )
+                continue
+
+            if decision.kind is Wave08DecisionKind.RESERVED_OWNER_RECOVERY:
+                append(
+                    ActivationRecoveryActionClass.RESERVED_TRANSITION_RECOVERY,
+                    {
+                        "headSha": decision.head_sha,
+                        "role": decision.resolution.role.value if decision.resolution.role is not None else None,
+                        "owningPrNumber": decision.owning_pr_number,
+                    },
+                    {"deferredUntil": "ACTIVE_G8", "reason": "RESERVED_ISSUE_TRANSITION_POST_ACTIVE"},
+                    ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE,
+                )
+                continue
+
+            if decision.kind is Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED:
+                matching_refs = tuple(
+                    item for item in pre.machine_refs
+                    if item.head_sha == decision.head_sha
+                    and item.ref == f"refs/heads/bot/federation/{item.source_id}"
+                )
+                if len(matching_refs) != 1:
+                    raise R02Error(
+                        "G8 activation reserved machine decision requires one exact machine ref"
+                    )
+                if decision.resolution != self.resolve_current_sha_carrier_role(decision.head_sha):
+                    raise StaleAuthorityError(
+                        "G8 activation reserved machine role changed before recovery"
+                    )
+                recover_current_reserved_machine(matching_refs[0], decision.resolution)
+                continue
+
+            if decision.kind is Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY:
+                append(
+                    ActivationRecoveryActionClass.ISSUE_REQUEST_RECOVERY,
+                    {
+                        "headSha": decision.head_sha,
+                        "role": decision.resolution.role.value if decision.resolution.role is not None else None,
+                        "owningPrNumber": decision.owning_pr_number,
+                    },
+                    {"deferredUntil": "ACTIVE_G8", "reason": "PASSING_FINALIZER_FORBIDDEN_PRE_EPOCH"},
+                    ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE,
+                )
+
+        for record, resolution in uncovered_reserved_machine:
+            recover_current_reserved_machine(record, resolution)
+
+        seen_issue_intents: set[tuple[str, int, str]] = set()
+        for intent in sorted(
+            pre.dispatch_intents,
+            key=lambda item: (item.central_repository_node_id, item.issue_number, item.target.value),
+        ):
+            key = (intent.central_repository_node_id, intent.issue_number, intent.target.value)
+            if key in seen_issue_intents:
+                raise R02Error("G8 activation recovery inventory contains duplicate Issue dispatch intents")
+            seen_issue_intents.add(key)
+            append(
+                ActivationRecoveryActionClass.ISSUE_REQUEST_RECOVERY,
+                {
+                    "centralRepositoryNodeId": intent.central_repository_node_id,
+                    "issueNumber": intent.issue_number,
+                    "target": intent.target.value,
+                },
+                {"deferredUntil": "ACTIVE_G8", "reason": intent.reason},
+                ActivationRecoveryResultClass.DEFERRED_POST_ACTIVE,
+            )
+        return tuple(actions)
+
+    def run_g8_activation_recovery(
+        self,
+        mode: str,
+    ) -> G8ActivationRecoveryExecution:
+        run_id, run_attempt, _actor = self._require_g8_activation_run_authority(mode)
+        boundary = self.derive_activation_boundary_evidence()
+        preflight = self._g8_activation_preflight(boundary)
+
+        pre = self.recover_universal_role_first(None, read_only=True)
+        if not pre.complete or self._g8_activation_fatal_pre_recovery_reasons(pre):
+            raise R02Error("G8 activation pre-recovery inventory is incomplete or fatally unresolved")
+        try:
+            pre_digest = activation_recovery_inventory_digest(
+                "PRE",
+                self._g8_activation_inventory_material(pre, preflight),
+            )
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation pre-recovery digest failed: {_bounded_reason(error)}") from None
+
+        actions = self._run_g8_activation_recovery(boundary, preflight, pre)
+
+        final_boundary = self.derive_activation_boundary_evidence()
+        if final_boundary != boundary:
+            raise StaleAuthorityError("G8 activation boundary changed after recovery")
+        final_preflight = self._g8_activation_preflight(boundary)
+        if final_preflight != preflight:
+            raise StaleAuthorityError("G8 activation workflow/run preflight changed after recovery")
+
+        post = self.recover_universal_role_first(None, read_only=True)
+        if not post.complete or post.blocked_reasons:
+            raise R02Error("G8 activation post-recovery inventory is incomplete or unresolved")
+        self._g8_require_post_machine_refs_converged(post)
+        try:
+            post_digest = activation_recovery_inventory_digest(
+                "POST",
+                self._g8_activation_inventory_material(post, final_preflight),
+            )
+            actions_digest = ordered_recovery_actions_digest(actions)
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation recovery digest construction failed: {_bounded_reason(error)}") from None
+
+        pre_legacy = [
+            item for item in self._g8_activation_inventory_material(pre, preflight)["decisions"]
+            if item["activation"] == CarrierActivation.LEGACY_CUTOVER_QUARANTINE.value
+        ]
+        post_legacy = [
+            item for item in self._g8_activation_inventory_material(post, final_preflight)["decisions"]
+            if item["activation"] == CarrierActivation.LEGACY_CUTOVER_QUARANTINE.value
+        ]
+        legacy_actions = [
+            item.as_value()
+            for item in actions
+            if item.action_class in {
+                ActivationRecoveryActionClass.LEGACY_FAILURE_STATUS,
+                ActivationRecoveryActionClass.LEGACY_MACHINE_MIGRATION,
+            }
+        ]
+        try:
+            legacy_digest = _g8_recovery_material_digest(
+                _G8_LEGACY_RECOVERY_PREFIX,
+                {
+                    "schemaVersion": 1,
+                    "activationBoundaryId": boundary.activation_boundary_id,
+                    "centralRepositoryNodeId": boundary.central_repository_node_id,
+                    "centralRepositoryFullName": self.central_repository,
+                    "preLegacy": pre_legacy,
+                    "legacyActions": legacy_actions,
+                    "postLegacy": post_legacy,
+                },
+            )
+            witness = ActivationRecoveryWitness(
+                1,
+                boundary.activation_boundary_id,
+                run_id,
+                run_attempt,
+                pre_digest,
+                actions_digest,
+                post_digest,
+                0,
+                final_preflight.old_run_terminal_digest,
+                final_preflight.six_workflow_identity_digest,
+            )
+            evidence = ActivationRecoveryEvidence(
+                1,
+                "G8_ACTIVATION_RECOVERY",
+                boundary.central_repository_node_id,
+                boundary.implementation_pr_number,
+                boundary.implementation_pr_database_id,
+                boundary.implementation_pr_node_id,
+                boundary.activation_boundary_id,
+                boundary.merged_result_oid,
+                boundary.authority_surface_digest,
+                boundary.new_writer_topology_digest,
+                run_id,
+                run_attempt,
+                pre_digest,
+                actions_digest,
+                len(actions),
+                post_digest,
+                0,
+                final_preflight.old_run_terminal_digest,
+                final_preflight.six_workflow_identity_digest,
+                legacy_digest,
+                witness.witness_id(),
+                "SUCCESS",
+            )
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation witness/evidence construction failed: {_bounded_reason(error)}") from None
+
+        current_app = resolve_app_identity(self.client, self.app.slug)
+        if current_app != self.app:
+            raise StaleAuthorityError("G8 activation App identity changed before evidence persistence")
+        comment_id = self._persist_g8_activation_recovery_evidence(
+            evidence,
+            current_app,
+            boundary,
+        )
+        return G8ActivationRecoveryExecution(
+            final_preflight,
+            actions,
+            witness,
+            evidence,
+            evidence.result_digest(),
+            comment_id,
+        )
+
+    def _read_g8_activation_epoch(
+        self,
+        boundary: ActivationBoundaryEvidence,
+        hae: str,
+    ) -> ActivationEpochRecord:
+        if type(hae) is not str or re.fullmatch(r"[0-9a-f]{40}", hae) is None:
+            raise R02Error("G8 activation HAE must be exact lowercase 40-hex")
+        try:
+            commit = self.client.get_git_commit_object(self.central_repository, hae)
+        except Exception as error:
+            raise R02Error(f"G8 activation HAE commit is unavailable: {_bounded_reason(error)}") from None
+        if (
+            type(commit) is not GitCommitObject
+            or commit.sha != hae
+            or commit.parents != (boundary.merged_result_oid,)
+            or commit.author.name != "Swift Stream Federation"
+            or commit.author.email != "automation@swiftstream.invalid"
+            or commit.committer.name != "Swift Stream Federation"
+            or commit.committer.email != "automation@swiftstream.invalid"
+            or commit.author.date != commit.committer.date
+        ):
+            raise R02Error("G8 activation HAE commit identity/parent/author is invalid")
+
+        try:
+            _base_tree, base_entries = self.client.get_commit_tree(
+                self.central_repository, boundary.merged_result_oid,
+            )
+            hae_tree_sha, hae_entries = self.client.get_tree(
+                self.central_repository, commit.tree_sha,
+            )
+        except Exception as error:
+            raise R02Error(f"G8 activation HAE tree is unavailable: {_bounded_reason(error)}") from None
+        if hae_tree_sha != commit.tree_sha:
+            raise R02Error("G8 activation HAE tree identity does not match commit")
+        base_by_path = {entry.path: entry for entry in base_entries}
+        hae_by_path = {entry.path: entry for entry in hae_entries}
+        if len(base_by_path) != len(base_entries) or len(hae_by_path) != len(hae_entries):
+            raise R02Error("G8 activation HAE/base tree contains duplicate paths")
+        if G8_ACTIVATION_RECORD_PATH in base_by_path:
+            raise R02Error("G8 activation record path already existed at merged result")
+        if set(hae_by_path) != set(base_by_path) | {G8_ACTIVATION_RECORD_PATH}:
+            raise R02Error("G8 activation HAE tree delta is not exactly one activation record path")
+        for existing_path, existing_entry in base_by_path.items():
+            if hae_by_path.get(existing_path) != existing_entry:
+                raise R02Error("G8 activation HAE rewrites a merged-result tree entry")
+        record_entry = hae_by_path[G8_ACTIVATION_RECORD_PATH]
+        if record_entry.mode != "100644" or record_entry.object_type != "blob":
+            raise R02Error("G8 activation record is not an exact root 100644 blob")
+        try:
+            record_bytes = self.client.get_blob(self.central_repository, record_entry.sha)
+            record_text = record_bytes.decode("utf-8")
+            record = parse_activation_epoch_record(record_text)
+        except (UnicodeError, RequestModelError, GitHubAPIError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 activation record is invalid: {_bounded_reason(error)}") from None
+        expected_message = (
+            "swiftstream-federation-g8-activation:v1\n"
+            f"boundary={boundary.activation_boundary_id}\n"
+            f"record={activation_record_digest(record)}"
+        )
+        if commit.message != expected_message:
+            raise R02Error("G8 activation HAE commit marker does not bind boundary/record")
+        if (
+            record.central_repository_node_id != boundary.central_repository_node_id
+            or record.implementation_pr_number != boundary.implementation_pr_number
+            or record.implementation_pr_database_id != boundary.implementation_pr_database_id
+            or record.implementation_pr_node_id != boundary.implementation_pr_node_id
+            or record.activation_boundary_id != boundary.activation_boundary_id
+            or record.merged_result_oid != boundary.merged_result_oid
+            or record.authority_surface_digest != boundary.authority_surface_digest
+            or record.new_writer_topology_digest != boundary.new_writer_topology_digest
+            or record.created_at != commit.author.date
+        ):
+            raise R02Error("G8 activation record does not bind the fresh activation boundary")
+        return record
+
+    def _read_selected_g8_recovery_evidence(
+        self,
+        boundary: ActivationBoundaryEvidence,
+        record: ActivationEpochRecord,
+        app: AppIdentity,
+    ) -> ActivationRecoveryEvidence:
+        if (
+            boundary.central_repository_node_id != G8_CENTRAL_REPOSITORY_NODE_ID
+            or boundary.implementation_pr_number != G8_IMPLEMENTATION_PR_NUMBER
+            or boundary.implementation_pr_database_id != G8_IMPLEMENTATION_PR_DATABASE_ID
+            or boundary.implementation_pr_node_id != G8_IMPLEMENTATION_PR_NODE_ID
+        ):
+            raise R02Error("G8 recovery evidence lookup is not bound to fixed implementation PR identity")
+        exact_app_evidence = [
+            (evidence, digest)
+            for _comment, evidence, digest in self._g8_exact_app_recovery_evidence_comments(app)
+        ]
+
+        selected = [
+            (evidence, digest)
+            for evidence, digest in exact_app_evidence
+            if digest == record.activation_recovery_result_digest
+        ]
+        if not selected:
+            raise R02Error("G8 activation record selected recovery evidence is missing")
+        rendered_selected = {evidence.render() for evidence, _digest in selected}
+        if len(rendered_selected) != 1:
+            raise R02Error("G8 selected recovery result digest maps to conflicting canonical evidence")
+        evidence = selected[0][0]
+        run_key = (
+            evidence.activation_boundary_id,
+            evidence.activation_run_id,
+            evidence.activation_run_attempt,
+        )
+        same_run_bodies = {
+            candidate.render()
+            for candidate, _digest in exact_app_evidence
+            if (
+                candidate.activation_boundary_id,
+                candidate.activation_run_id,
+                candidate.activation_run_attempt,
+            ) == run_key
+        }
+        if len(same_run_bodies) != 1:
+            raise R02Error("G8 recovery evidence contains conflicting exact-App same-run bodies")
+        try:
+            witness = evidence.to_witness()
+            witness_id = activation_recovery_witness_id(witness)
+        except (RequestModelError, ValueError, TypeError) as error:
+            raise R02Error(f"G8 recovery evidence witness is invalid: {_bounded_reason(error)}") from None
+        if (
+            evidence.central_repository_node_id != boundary.central_repository_node_id
+            or evidence.implementation_pr_number != boundary.implementation_pr_number
+            or evidence.implementation_pr_database_id != boundary.implementation_pr_database_id
+            or evidence.implementation_pr_node_id != boundary.implementation_pr_node_id
+            or evidence.activation_boundary_id != boundary.activation_boundary_id
+            or evidence.merged_result_oid != boundary.merged_result_oid
+            or evidence.authority_surface_digest != boundary.authority_surface_digest
+            or evidence.new_writer_topology_digest != boundary.new_writer_topology_digest
+            or evidence.activation_recovery_witness_id != record.activation_recovery_witness_id
+            or witness_id != record.activation_recovery_witness_id
+            or evidence.result_digest() != record.activation_recovery_result_digest
+            or evidence.legacy_inventory_quarantine_migration_digest
+            != record.legacy_inventory_quarantine_migration_digest
+        ):
+            raise R02Error("G8 selected recovery evidence does not bind the activation record/current boundary")
+        return evidence
+
+    def _has_exact_g8_activation_status(
+        self,
+        record: ActivationEpochRecord,
+        hae: str,
+        boundary: ActivationBoundaryEvidence,
+        app: AppIdentity,
+    ) -> bool:
+        try:
+            statuses = self.client.list_commit_statuses(self.central_repository, hae)
+        except Exception as error:
+            raise R02Error(f"G8 activation status inventory is unavailable: {_bounded_reason(error)}") from None
+        exact_app_context = [
+            status
+            for status in statuses
+            if (
+                status.context == G8_ACTIVATION_STATUS_CONTEXT
+                and status.creator_database_id == app.bot_id
+                and status.creator_node_id == app.bot_node_id
+                and status.creator_login == app.bot_login
+                and status.creator_type == "Bot"
+            )
+        ]
+        if not exact_app_context:
+            return False
+        latest = max(exact_app_context, key=lambda status: (status.updated_at, status.created_at, status.id))
+        expected_description = activation_status_description(
+            record, hae, boundary.activation_boundary_id,
+        )
+        if (
+            latest.state != "success"
+            or latest.context != G8_ACTIVATION_STATUS_CONTEXT
+            or latest.description != expected_description
+            or latest.target_url is not None
+        ):
+            raise R02Error("latest exact-App G8 activation status conflicts with selected epoch")
+        return True
+
+    @staticmethod
+    def _g8_activation_record_matches_evidence(
+        record: ActivationEpochRecord,
+        boundary: ActivationBoundaryEvidence,
+        preflight: G8ActivationPreflightResult,
+        evidence: ActivationRecoveryEvidence,
+    ) -> bool:
+        workflows = tuple(
+            ActivationWorkflowIdentity(item.path, item.workflow_id, item.workflow_state)
+            for item in preflight.new_workflows
+        )
+        old_workflows = tuple(
+            HistoricWorkflowIdentity(path, workflow_id)
+            for path, workflow_id in G8_OLD_WRITERS
+        )
+        return (
+            record.activation_boundary_id == boundary.activation_boundary_id
+            and record.central_repository_node_id == boundary.central_repository_node_id
+            and record.implementation_pr_number == boundary.implementation_pr_number
+            and record.implementation_pr_database_id == boundary.implementation_pr_database_id
+            and record.implementation_pr_node_id == boundary.implementation_pr_node_id
+            and record.merged_result_oid == boundary.merged_result_oid
+            and record.authority_surface_digest == boundary.authority_surface_digest
+            and record.new_writer_topology_digest == boundary.new_writer_topology_digest
+            and record.new_workflows == workflows
+            and record.old_workflows == old_workflows
+            and record.old_path_absence_proof_digest == preflight.old_path_absence_proof_digest
+            and record.old_run_terminal_proof_digest == preflight.old_run_terminal_digest
+            and record.activation_recovery_witness_id == evidence.activation_recovery_witness_id
+            and record.activation_recovery_result_digest == evidence.result_digest()
+            and record.legacy_inventory_quarantine_migration_digest
+            == evidence.legacy_inventory_quarantine_migration_digest
+            and record.activation_workflow_run_id == evidence.activation_run_id
+            and record.activation_workflow_run_attempt == evidence.activation_run_attempt
+        )
+
+    def _revalidate_g8_activation_epoch(
+        self,
+        record: ActivationEpochRecord,
+        expected_ref: str | None,
+    ) -> tuple[ActivationBoundaryEvidence, AppIdentity, ActivationRecoveryEvidence]:
+        """Rebuild every mutable authority input before an epoch write or status retry."""
+        try:
+            boundary = self.derive_activation_boundary_evidence()
+            if (
+                type(boundary) is not ActivationBoundaryEvidence
+                or boundary.activation_boundary_id != record.activation_boundary_id
+                or boundary.merged_result_oid != record.merged_result_oid
+                or boundary.authority_surface_digest != record.authority_surface_digest
+                or boundary.new_writer_topology_digest != record.new_writer_topology_digest
+            ):
+                raise StaleAuthorityError("G8 activation boundary changed since selected epoch")
+            self._require_current_g8_guard_surface(boundary)
+            preflight = self._g8_activation_preflight(
+                boundary,
+                expected_activation_ref=expected_ref,
+            )
+            app = resolve_app_identity(self.client, self.app.slug)
+            if app != self.app:
+                raise StaleAuthorityError("G8 activation App identity changed during revalidation")
+            evidence = self._read_selected_g8_recovery_evidence(boundary, record, app)
+            # Reconstruct the exact prior-run witness from durable evidence. No
+            # process-local witness or body participates in a restarted attempt.
+            witness = evidence.to_witness()
+            if (
+                activation_recovery_witness_id(witness) != record.activation_recovery_witness_id
+                or evidence.old_run_terminal_digest != preflight.old_run_terminal_digest
+                or evidence.six_workflow_identity_digest != preflight.six_workflow_identity_digest
+                or not self._g8_activation_record_matches_evidence(
+                    record, boundary, preflight, evidence,
+                )
+            ):
+                raise R02Error("G8 selected durable evidence does not reconstruct the exact epoch")
+            post = self.recover_universal_role_first(None, read_only=True)
+            if not post.complete or post.blocked_reasons:
+                raise R02Error("G8 final activation inventory is incomplete or newly ambiguous")
+            self._g8_require_post_machine_refs_converged(post)
+            post_digest = activation_recovery_inventory_digest(
+                "POST",
+                self._g8_activation_inventory_material(post, preflight),
+            )
+            if post_digest != evidence.post_recovery_inventory_digest:
+                raise StaleAuthorityError("G8 post-recovery inventory changed since selected evidence")
+            # Final boundary/surface/ref reads close the revalidation window.
+            final_boundary = self.derive_activation_boundary_evidence()
+            if final_boundary != boundary:
+                raise StaleAuthorityError("G8 activation boundary changed at final revalidation")
+            self._require_current_g8_guard_surface(final_boundary)
+            final_app = resolve_app_identity(self.client, self.app.slug)
+            if final_app != app:
+                raise StaleAuthorityError("G8 activation App identity changed at final revalidation")
+            branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+            if self.client.get_optional_ref_oid(self.central_repository, branch) != expected_ref:
+                raise StaleAuthorityError("G8 activation ref changed at final revalidation")
+            # Evidence may have been edited or removed during the preceding reads.
+            final_evidence = self._read_selected_g8_recovery_evidence(
+                final_boundary, record, final_app,
+            )
+            if final_evidence.render() != evidence.render():
+                raise StaleAuthorityError("G8 selected recovery evidence changed during final revalidation")
+            return final_boundary, final_app, final_evidence
+        except (R02Error, StaleAuthorityError):
+            raise
+        except Exception as error:
+            raise R02Error(f"G8 activation final revalidation failed: {_bounded_reason(error)}") from None
+
+    @staticmethod
+    def _g8_activation_record_from_execution(
+        execution: G8ActivationRecoveryExecution,
+        created_at: str,
+    ) -> ActivationEpochRecord:
+        if type(execution) is not G8ActivationRecoveryExecution:
+            raise R02Error("G8 activation epoch publication requires exact recovery execution")
+        preflight = execution.preflight
+        evidence = execution.evidence
+        return ActivationEpochRecord(
+            1,
+            preflight.boundary.activation_boundary_id,
+            preflight.boundary.central_repository_node_id,
+            preflight.boundary.implementation_pr_number,
+            preflight.boundary.implementation_pr_database_id,
+            preflight.boundary.implementation_pr_node_id,
+            preflight.boundary.merged_result_oid,
+            preflight.boundary.authority_surface_digest,
+            preflight.boundary.new_writer_topology_digest,
+            tuple(
+                ActivationWorkflowIdentity(item.path, item.workflow_id, item.workflow_state)
+                for item in preflight.new_workflows
+            ),
+            tuple(HistoricWorkflowIdentity(path, workflow_id) for path, workflow_id in G8_OLD_WRITERS),
+            preflight.old_path_absence_proof_digest,
+            preflight.old_run_terminal_digest,
+            evidence.legacy_inventory_quarantine_migration_digest,
+            execution.witness.witness_id(),
+            execution.result_digest,
+            evidence.activation_run_id,
+            evidence.activation_run_attempt,
+            created_at,
+        )
+
+    def _publish_exact_g8_activation_status(
+        self,
+        record: ActivationEpochRecord,
+        hae: str,
+        boundary: ActivationBoundaryEvidence,
+        app: AppIdentity,
+    ) -> None:
+        if self.client.get_optional_ref_oid(
+            self.central_repository,
+            G8_ACTIVATION_REF.removeprefix("refs/heads/"),
+        ) != hae:
+            raise StaleAuthorityError("G8 activation status requires exact persisted HAE ref")
+        if not self._has_exact_g8_activation_status(record, hae, boundary, app):
+            description = activation_status_description(
+                record, hae, boundary.activation_boundary_id,
+            )
+            write_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    receipt = self.client.create_commit_status(
+                        self.central_repository,
+                        hae,
+                        "success",
+                        G8_ACTIVATION_STATUS_CONTEXT,
+                        description,
+                        None,
+                    )
+                    returned = receipt.returned_status
+                    if (
+                        returned.context != G8_ACTIVATION_STATUS_CONTEXT
+                        or returned.state != "success"
+                        or returned.description != description
+                        or returned.target_url is not None
+                        or returned.creator_database_id != app.bot_id
+                        or returned.creator_node_id != app.bot_node_id
+                        or returned.creator_login != app.bot_login
+                        or returned.creator_type != "Bot"
+                    ):
+                        raise R02Error("G8 activation status response is not the exact configured-App tuple")
+                    write_error = None
+                    break
+                except Exception as error:
+                    write_error = error
+                    # The response may have been lost after acceptance. Always
+                    # read the exact-App latest tuple before any retry.
+                    try:
+                        if self._has_exact_g8_activation_status(record, hae, boundary, app):
+                            write_error = None
+                            break
+                    except Exception:
+                        raise
+                    if attempt == 0:
+                        # Retry is status-only, follows a full fresh proof, and
+                        # uses the same exact persisted candidate.
+                        fresh_boundary, fresh_app, _evidence = self._revalidate_g8_activation_epoch(
+                            record, hae,
+                        )
+                        if fresh_boundary != boundary or fresh_app != app:
+                            raise StaleAuthorityError(
+                                "G8 activation status retry authority changed after ambiguous response"
+                            )
+                        continue
+                    break
+            if write_error is not None:
+                raise R02Error(
+                    f"G8 activation status publication failed: {_bounded_reason(write_error)}"
+                ) from None
+        if not self._has_exact_g8_activation_status(record, hae, boundary, app):
+            raise R02Error("G8 activation status readback did not prove the exact latest-App tuple")
+        if self.client.get_optional_ref_oid(
+            self.central_repository,
+            G8_ACTIVATION_REF.removeprefix("refs/heads/"),
+        ) != hae:
+            raise StaleAuthorityError("G8 activation ref changed during status publication/readback")
+
+    def publish_g8_activation_epoch(
+        self,
+        execution: G8ActivationRecoveryExecution,
+        *,
+        created_at: str,
+    ) -> tuple[ActivationEpochRecord, str]:
+        """Publish one deterministic local Task03 HAE/ref/status candidate."""
+        record = self._g8_activation_record_from_execution(execution, created_at)
+        branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+        initial_ref = self.client.get_optional_ref_oid(self.central_repository, branch)
+        if initial_ref is not None:
+            initial_boundary = self.derive_activation_boundary_evidence()
+            existing_record = self._read_g8_activation_epoch(initial_boundary, initial_ref)
+            if existing_record.render() != record.render():
+                raise R02Error("existing G8 activation ref selects a different epoch")
+        boundary, app, evidence = self._revalidate_g8_activation_epoch(record, initial_ref)
+        if evidence.render() != execution.evidence.render():
+            raise StaleAuthorityError("G8 selected evidence differs from durable recovery execution")
+        current_ref = self.client.get_optional_ref_oid(self.central_repository, branch)
+        if current_ref is None:
+            try:
+                _base_tree, base_entries = self.client.get_commit_tree(
+                    self.central_repository, boundary.merged_result_oid,
+                )
+                if any(entry.path == G8_ACTIVATION_RECORD_PATH for entry in base_entries):
+                    raise R02Error("G8 activation record path already exists in merged result")
+                record_blob = self.client.create_blob(
+                    self.central_repository,
+                    base64.b64encode(record.render().encode("utf-8")).decode("ascii"),
+                    encoding="base64",
+                )
+                tree = self.client.create_tree(
+                    self.central_repository,
+                    _base_tree,
+                    [{
+                        "path": G8_ACTIVATION_RECORD_PATH,
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": record_blob.sha,
+                    }],
+                )
+                message = (
+                    "swiftstream-federation-g8-activation:v1\n"
+                    f"boundary={boundary.activation_boundary_id}\n"
+                    f"record={activation_record_digest(record)}"
+                )
+                commit = self.client.create_commit(
+                    self.central_repository,
+                    message,
+                    tree.sha,
+                    [boundary.merged_result_oid],
+                    timestamp=created_at,
+                )
+                hae = commit.sha
+            except Exception as error:
+                if isinstance(error, R02Error):
+                    raise
+                raise R02Error(f"G8 activation HAE creation failed: {_bounded_reason(error)}") from None
+            readback = self._read_g8_activation_epoch(boundary, hae)
+            if readback.render() != record.render():
+                raise R02Error("G8 activation HAE readback differs from exact candidate")
+            expected = None
+            for attempt in range(2):
+                self._revalidate_g8_activation_epoch(record, expected)
+                try:
+                    self.client.update_refs(
+                        boundary.central_repository_node_id,
+                        [RefUpdate(G8_ACTIVATION_REF, ZERO_OID, hae, force=False)],
+                    )
+                    expected = hae
+                    break
+                except Exception as error:
+                    try:
+                        observed = self.client.get_optional_ref_oid(self.central_repository, branch)
+                    except Exception as read_error:
+                        raise R02Error(
+                            f"G8 activation ref response ambiguous and fresh read failed: {_bounded_reason(read_error)}"
+                        ) from None
+                    if observed == hae:
+                        expected = hae
+                        break
+                    if observed is not None:
+                        raise R02Error("G8 activation ref CAS encountered a third value") from None
+                    if attempt == 0:
+                        continue
+                    raise R02Error(
+                        f"G8 activation ref CAS failed after one same-candidate retry: {_bounded_reason(error)}"
+                    ) from None
+        else:
+            hae = current_ref
+            readback = self._read_g8_activation_epoch(boundary, hae)
+            if readback.render() != record.render():
+                raise R02Error("existing G8 activation ref selects a different epoch")
+            self._revalidate_g8_activation_epoch(record, hae)
+        final_boundary, final_app, final_evidence = self._revalidate_g8_activation_epoch(record, hae)
+        if final_evidence.render() != evidence.render():
+            raise StaleAuthorityError("G8 selected evidence changed before status publication")
+        self._publish_exact_g8_activation_status(record, hae, final_boundary, final_app)
+        return record, hae
+
+    def resume_g8_activation_epoch(self) -> tuple[ActivationEpochRecord, str]:
+        """Recover a persisted HAE after process restart and retry only its status."""
+        try:
+            boundary = self.derive_activation_boundary_evidence()
+            branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+            hae = self.client.get_optional_ref_oid(self.central_repository, branch)
+            if hae is None:
+                raise R02Error("G8 activation resume requires an already-persisted activation ref")
+            record = self._read_g8_activation_epoch(boundary, hae)
+            final_boundary, app, _evidence = self._revalidate_g8_activation_epoch(record, hae)
+            self._publish_exact_g8_activation_status(record, hae, final_boundary, app)
+            return record, hae
+        except (R02Error, StaleAuthorityError):
+            raise
+        except Exception as error:
+            raise R02Error(f"G8 activation restart recovery failed: {_bounded_reason(error)}") from None
+
+    def derive_g8_activation_guard(self) -> G8ActivationGuardResult:
+        """Derive the one production Wave12 guard from fresh platform reads only."""
+        try:
+            boundary = self.derive_activation_boundary_evidence()
+        except PreG8NotApplicableError:
+            return _g8_activation_guard_result(G8RuntimeState.PRE_G8_NOT_APPLICABLE)
+        except Exception:
+            return _g8_activation_guard_result(G8RuntimeState.BLOCKED_POST_MERGE)
+
+        try:
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            if current_app != self.app:
+                raise R02Error("G8 guard App identity changed during evaluation")
+            self._require_current_g8_guard_surface(boundary)
+            branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+            if f"refs/heads/{branch}" != G8_ACTIVATION_REF:
+                raise R02Error("G8 activation ref constant is malformed")
+            hae = self.client.get_optional_ref_oid(self.central_repository, branch)
+            if hae is None:
+                return _g8_activation_guard_result(G8RuntimeState.MERGED_UNPROVEN)
+            record = self._read_g8_activation_epoch(boundary, hae)
+            self._read_selected_g8_recovery_evidence(boundary, record, current_app)
+            self._require_current_g8_guard_surface(boundary)
+            if not self._has_exact_g8_activation_status(record, hae, boundary, current_app):
+                return _g8_activation_guard_result(G8RuntimeState.MERGED_UNPROVEN)
+            final_boundary = self.derive_activation_boundary_evidence()
+            if final_boundary != boundary:
+                raise R02Error("G8 activation boundary changed during guard proof")
+            final_app = resolve_app_identity(self.client, self.app.slug)
+            if final_app != current_app:
+                raise R02Error("G8 guard App identity changed before final proof")
+            self._require_current_g8_guard_surface(final_boundary)
+            self._read_selected_g8_recovery_evidence(final_boundary, record, final_app)
+            if not self._has_exact_g8_activation_status(record, hae, final_boundary, final_app):
+                raise R02Error("G8 activation status disappeared before final proof")
+            final_ref = self.client.get_optional_ref_oid(self.central_repository, branch)
+            if final_ref != hae:
+                raise R02Error("G8 activation ref changed during guard proof")
+            return _g8_activation_guard_result(G8RuntimeState.ACTIVE_G8)
+        except Exception:
+            return _g8_activation_guard_result(G8RuntimeState.BLOCKED_POST_MERGE)
+
+    def resolve_current_sha_carrier_role(self, head_sha: str) -> ShaCarrierResolution:
+        """Resolve one SHA's role from fresh trusted authority, without caller role input."""
+        if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+            return _conflicting_sha_carrier()
+        try:
+            repository, accepted_main = self.current_accepted_main()
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            commit = self.client.get_git_commit_object(self.central_repository, head_sha)
+            if (
+                type(repository) is not RepositoryMetadata
+                or repository.full_name != self.central_repository
+                or repository.default_branch != "main"
+                or current_app != self.app
+                or type(commit) is not GitCommitObject
+                or commit.sha != head_sha
+                or type(commit.message) is not str
+            ):
+                return _conflicting_sha_carrier()
+        except Exception:
+            return _conflicting_sha_carrier()
+
+        marker_count = commit.message.count(_CLAIMED_HEAD_FAMILY)
+        if marker_count:
+            if marker_count != 1 or not commit.message.startswith(CLAIMED_HEAD_MARKER_HEADER + "\n"):
+                return _conflicting_sha_carrier()
+            try:
+                marker = parse_claimed_head_marker(commit.message)
+            except RequestModelError:
+                return _conflicting_sha_carrier()
+            if marker.claim_kind == "MACHINE_REF_CLAIM":
+                return self._resolve_machine_v2_carrier(
+                    head_sha, commit, marker, repository, accepted_main, current_app,
+                )
+            # Keep Issue provenance parsing in the established exact resolver.
+            return resolve_sha_carrier_role(
+                self.client, self.central_repository, head_sha, self.app.slug,
+                LegacyEvidenceDisposition.CONFLICTING,
+            )
+
+        try:
+            boundary = self.derive_activation_boundary_evidence()
+            if type(boundary) is not ActivationBoundaryEvidence:
+                return _conflicting_sha_carrier()
+            classification = self.classify_legacy_head(
+                head_sha,
+                implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+            )
+            if type(classification) is not LegacyClassificationResult:
+                return _conflicting_sha_carrier()
+            disposition = legacy_classification_disposition(classification)
+            if disposition is LegacyEvidenceDisposition.QUARANTINE:
+                return ShaCarrierResolution(CarrierActivation.LEGACY_CUTOVER_QUARANTINE)
+            if disposition is LegacyEvidenceDisposition.ABSENT:
+                return ShaCarrierResolution(CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION)
+            return _conflicting_sha_carrier()
+        except Exception:
+            return _conflicting_sha_carrier()
+
+    def _resolve_machine_v2_carrier(
+        self,
+        head_sha: str,
+        commit: GitCommitObject,
+        marker: ClaimedHeadMarker,
+        repository: RepositoryMetadata,
+        accepted_main: str,
+        current_app: AppIdentity,
+    ) -> ShaCarrierResolution:
+        """Validate the ref-authenticated MACHINE_REF_CLAIM exception."""
+        try:
+            if (
+                marker.claim_kind != "MACHINE_REF_CLAIM"
+                or marker.role != CarrierRole.MACHINE_PUBLICATION.value
+                or marker.owner_kind != "MACHINE_SOURCE"
+                or marker.transition_kind != "MACHINE_PUBLICATION"
+            ):
+                return _conflicting_sha_carrier(marker)
+            central_node_id, separator, source_id = marker.owner_key.partition(":")
+            if separator != ":" or central_node_id != repository.node_id or not _is_canonical_wave08_source_id(source_id):
+                return _conflicting_sha_carrier(marker)
+            accepted_sources = tuple(source for source in self._accepted_sources(accepted_main) if source.source_id == source_id)
+            if len(accepted_sources) != 1:
+                return _conflicting_sha_carrier(marker)
+            source = accepted_sources[0]
+            if type(source.repository_id) is not int or source.repository_id <= 0:
+                return _conflicting_sha_carrier(marker)
+            public_source = read_public_source_metadata(source.repository)
+            if (
+                type(public_source) is not PublicSourceMetadata
+                or public_source.repository_id != source.repository_id
+                or public_source.full_name.lower() != source.repository.lower()
+            ):
+                return _conflicting_sha_carrier(marker)
+            base = self.client.get_git_commit_object(self.central_repository, accepted_main)
+            if type(base) is not GitCommitObject or base.sha != accepted_main or commit.parents != (accepted_main,):
+                return _conflicting_sha_carrier(marker)
+            changed_paths = validate_machine_generated_scope(
+                self.client, self.central_repository, accepted_main, head_sha,
+            )
+            if (
+                type(changed_paths) is not tuple
+                or tuple(sorted(set(changed_paths), key=lambda item: item.encode("utf-8"))) != changed_paths
+            ):
+                return _conflicting_sha_carrier(marker)
+            canonical_json = lambda value: json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ).encode("utf-8")
+            scope_digest = hashlib.sha256(
+                b"swiftstream-federation-machine-ref-claim-scope:v1\n"
+                + canonical_json({
+                    "schemaVersion": 1,
+                    "changedPaths": list(changed_paths),
+                    "candidateTreeSha": commit.tree_sha,
+                })
+            ).hexdigest()
+            owner_key = f"{repository.node_id}:{source.source_id}"
+            authority_digest = machine_ref_claim_authority_digest(
+                central_repository_node_id=repository.node_id,
+                owner_key=owner_key,
+                source_id=source.source_id,
+                source_repository_id=source.repository_id,
+                machine_ref=f"refs/heads/{_machine_branch(source.source_id)}",
+                accepted_base_sha=accepted_main,
+                accepted_base_tree_sha=base.tree_sha,
+                candidate_tree_sha=commit.tree_sha,
+                candidate_scope_digest=scope_digest,
+            )
+            expected_generation = claim_generation_id(
+                authority_preimage_digest=authority_digest,
+                carrier_nonce=marker.carrier_nonce,
+                central_repository_node_id=repository.node_id,
+                owner_key=owner_key,
+                from_head_sha=accepted_main,
+                from_tree_sha=base.tree_sha,
+                claim_kind="MACHINE_REF_CLAIM",
+                role=CarrierRole.MACHINE_PUBLICATION.value,
+                owner_kind="MACHINE_SOURCE",
+                transition_kind="MACHINE_PUBLICATION",
+            )
+            if marker.claim_generation_id != expected_generation:
+                return _conflicting_sha_carrier(marker)
+
+            # The current ref determines today's role only. It is intentionally
+            # excluded from the durable generation material so a restart after
+            # B -> H can reconstruct the marker without remembering B.
+            try:
+                current_ref = self.client.get_ref_oid(
+                    self.central_repository, _machine_branch(source.source_id),
+                )
+            except NotFoundError:
+                current_ref = None
+
+            summaries = self.client.list_open_pull_requests(self.central_repository)
+            if type(summaries) not in (tuple, list):
+                return _conflicting_sha_carrier(marker)
+            exact_prs: list[PullRequestMetadata] = []
+            source_branch_prs: list[PullRequestMetadata] = []
+            branch = _machine_branch(source.source_id)
+            for summary in summaries:
+                if type(summary) is not dict or type(summary.get("number")) is not int or summary["number"] <= 0:
+                    return _conflicting_sha_carrier(marker)
+                pr = self.client.get_pull_request_metadata(self.central_repository, summary["number"])
+                if type(pr) is not PullRequestMetadata or pr.number != summary["number"]:
+                    return _conflicting_sha_carrier(marker)
+                if pr.head_ref != branch and pr.head_oid != head_sha:
+                    continue
+                if pr.head_ref == branch:
+                    source_branch_prs.append(pr)
+                if (
+                    pr.author_id != current_app.bot_node_id
+                    or pr.author_login != current_app.bot_login
+                    or pr.head_repository != repository.full_name
+                    or pr.base_repository != repository.full_name
+                    or pr.head_repository_id != repository.node_id
+                    or pr.base_repository_id != repository.node_id
+                    or pr.head_ref != branch
+                    or pr.base_ref != "main"
+                    or pr.base_oid != accepted_main
+                ):
+                    return _conflicting_sha_carrier(marker)
+                if pr.head_oid == head_sha:
+                    exact_prs.append(pr)
+            if len(exact_prs) > 1:
+                return _conflicting_sha_carrier(marker)
+            if current_ref == head_sha and exact_prs:
+                return ShaCarrierResolution(CarrierActivation.ACTIVE, CarrierRole.MACHINE_PUBLICATION, marker)
+            if current_ref == head_sha and source_branch_prs:
+                return _conflicting_sha_carrier(marker)
+            if current_ref == head_sha:
+                # The ref CAS is durable before PR creation. A restart in that
+                # interval must preserve this exact generation for recovery.
+                return ShaCarrierResolution(CarrierActivation.RESERVED_INACTIVE, CarrierRole.MACHINE_PUBLICATION, marker)
+            if current_ref in {accepted_main, None}:
+                return ShaCarrierResolution(CarrierActivation.RESERVED_INACTIVE, CarrierRole.MACHINE_PUBLICATION, marker)
+            return _conflicting_sha_carrier(marker)
+        except Exception:
+            return _conflicting_sha_carrier(marker)
+
+    def current_issue_source_authority(self, request: Request, request_class: RequestClass) -> IssueSourceAuthority:
+        """Resolve fresh Issue source identity only from the exact trusted accepted main."""
+        repository, current_main = self.current_accepted_main()
+        if repository.default_branch != "main":
+            raise StaleAuthorityError("managed Issue source authority requires central default branch main")
+        try:
+            with trusted_c02_execution():
+                if c02.head_commit_oid() != current_main:
+                    raise StaleTrustedCheckoutError("TRUSTED_CHECKOUT_CODE_STALE")
+                accepted_manifest = c02.load_trusted_previous_manifest()
+                source_metadata = read_public_source_metadata(_source_locator(request))
+                return resolve_issue_source_authority(
+                    request, request_class, accepted_manifest, source_metadata,
+                )
+        except (StaleTrustedCheckoutError, StaleAuthorityError):
+            raise
+        except Exception as error:
+            raise R02Error(f"fresh Issue source authority is unavailable: {_bounded_reason(error)}") from None
+
     def _accepted_sources(self, current_main: str | None = None) -> tuple[c02.SourceDeclaration, ...]:
         """Read accepted C02 authority only inside the audited capsule.
 
@@ -1444,6 +8832,501 @@ class R02Controller:
         except Exception as error:
             raise R02Error(f"accepted federation manifest is unavailable: {_bounded_reason(error)}") from None
         return tuple(manifest.sources)
+
+    def classify_legacy_head(
+        self,
+        head_sha: str,
+        *,
+        implementation_reviewed_head_sha: str | None,
+    ) -> LegacyClassificationResult:
+        """Classify exact current legacy evidence without performing any mutation."""
+        absent = lambda reason: LegacyClassificationResult(LegacyClassificationOutcome.ABSENT, None, reason)
+        conflicting = lambda reason: LegacyClassificationResult(LegacyClassificationOutcome.CONFLICTING, None, reason)
+        if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+            return conflicting("INVALID_HEAD_SHA")
+        if implementation_reviewed_head_sha is not None and (
+            type(implementation_reviewed_head_sha) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", implementation_reviewed_head_sha) is None
+        ):
+            return conflicting("INVALID_IMPLEMENTATION_REVIEWED_HEAD_SHA")
+
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            if (
+                type(repository) is not RepositoryMetadata
+                or repository.full_name != self.central_repository
+                or repository.default_branch != "main"
+                or type(repository.id) is not int
+                or repository.id <= 0
+                or type(repository.node_id) is not str
+                or not repository.node_id
+                or len(repository.node_id) > 256
+                or c02.contains_control(repository.node_id)
+            ):
+                return conflicting("CURRENT_LEGACY_EVIDENCE_UNAVAILABLE")
+            commit = self.client.get_git_commit_object(self.central_repository, head_sha)
+            if (
+                type(commit) is not GitCommitObject
+                or commit.sha != head_sha
+                or type(commit.message) is not str
+                or type(commit.tree_sha) is not str
+                or re.fullmatch(r"[0-9a-f]{40}", commit.tree_sha) is None
+                or type(commit.parents) is not tuple
+                or any(type(parent) is not str or re.fullmatch(r"[0-9a-f]{40}", parent) is None for parent in commit.parents)
+            ):
+                return conflicting("CURRENT_LEGACY_EVIDENCE_UNAVAILABLE")
+        except Exception:
+            return conflicting("CURRENT_LEGACY_EVIDENCE_UNAVAILABLE")
+
+        # The entire marker family is reserved. This check must precede every
+        # machine/manual/collision read and predicate, including valid v2.
+        if "swiftstream-federation-head:" in commit.message:
+            return conflicting("RESERVED_CLAIM_FAMILY_PRESENT")
+
+        try:
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            if current_app != self.app:
+                return conflicting("CURRENT_LEGACY_EVIDENCE_UNAVAILABLE")
+        except Exception:
+            return conflicting("CURRENT_LEGACY_EVIDENCE_UNAVAILABLE")
+
+        matches: list[LegacyQuarantineEvidence] = []
+        class_conflict = False
+
+        # LEGACY_MACHINE: exact old message plus current accepted source/ref and
+        # old generated candidate semantics. No PR is required when ref-backed.
+        if commit.message == "Swift Stream federation machine publication\n":
+            try:
+                refs = self.client.list_machine_refs(self.central_repository)
+                if type(refs) not in (tuple, list):
+                    raise R02Error("machine-ref inventory is malformed")
+                normalized_refs: list[tuple[str, str, str]] = []
+                for row in refs:
+                    if type(row) is not dict or set(row) != {"ref", "source_id", "sha"}:
+                        raise R02Error("machine-ref row is malformed")
+                    ref, source_id, oid = row["ref"], row["source_id"], row["sha"]
+                    if (
+                        type(ref) is not str or type(source_id) is not str or not _is_canonical_wave08_source_id(source_id)
+                        or ref != _machine_branch(source_id) and ref != f"refs/heads/{_machine_branch(source_id)}"
+                        or type(oid) is not str or re.fullmatch(r"[0-9a-f]{40}", oid) is None
+                    ):
+                        raise R02Error("machine-ref row identity is malformed")
+                    normalized_refs.append((ref, source_id, oid))
+                refs_for_head = [item for item in normalized_refs if item[2] == head_sha]
+                if len(refs_for_head) != 1:
+                    raise R02Error("old machine head has no unique exact current ref")
+                machine_ref, source_id, _oid = refs_for_head[0]
+                if machine_ref != f"refs/heads/{_machine_branch(source_id)}":
+                    raise R02Error("machine ref name is not canonical")
+                trusted_repository, current_main = self.current_accepted_main()
+                if trusted_repository != repository or trusted_repository.default_branch != "main":
+                    raise R02Error("trusted central main identity changed")
+                sources = tuple(source for source in self._accepted_sources(current_main) if source.source_id == source_id)
+                if len(sources) != 1 or type(sources[0].repository_id) is not int or sources[0].repository_id <= 0:
+                    raise R02Error("exact machine source is not uniquely accepted")
+                accepted_source = sources[0]
+                public_source = read_public_source_metadata(accepted_source.repository)
+                if (
+                    type(public_source) is not PublicSourceMetadata
+                    or type(public_source.repository_id) is not int
+                    or public_source.repository_id <= 0
+                    or public_source.repository_id != accepted_source.repository_id
+                    or type(public_source.full_name) is not str
+                    or public_source.full_name.lower() != accepted_source.repository.lower()
+                ):
+                    raise R02Error("current public source identity does not match accepted source")
+                if len(commit.parents) != 1:
+                    raise R02Error("old machine candidate must have exactly one parent")
+                candidate_parent = commit.parents[0]
+                changed_paths = validate_machine_generated_scope(
+                    self.client, self.central_repository, candidate_parent, head_sha,
+                )
+                if type(changed_paths) is not tuple or any(type(path) is not str for path in changed_paths):
+                    raise R02Error("machine candidate scope result is malformed")
+                scope_digest = hashlib.sha256(json.dumps(
+                    list(changed_paths), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+                ).encode("utf-8")).hexdigest()
+
+                machine_pr: dict[str, Any] | None = None
+                summaries = self.client.list_open_pull_requests(self.central_repository)
+                if type(summaries) not in (tuple, list):
+                    raise R02Error("open PR inventory is malformed")
+                exact_candidates: list[PullRequestMetadata] = []
+                for summary in summaries:
+                    if type(summary) is not dict or type(summary.get("number")) is not int or summary["number"] <= 0:
+                        raise R02Error("open PR summary is malformed")
+                    pr = self.client.get_pull_request_metadata(self.central_repository, summary["number"])
+                    if type(pr) is not PullRequestMetadata or pr.number != summary["number"]:
+                        raise R02Error("fresh machine PR metadata is malformed")
+                    appears_relevant = pr.head_oid == head_sha or pr.head_ref == _machine_branch(source_id)
+                    if not appears_relevant:
+                        continue
+                    exact = (
+                        pr.author_id == current_app.bot_node_id
+                        and pr.author_login == current_app.bot_login
+                        and pr.head_repository == repository.full_name
+                        and pr.base_repository == repository.full_name
+                        and pr.head_repository_id == repository.node_id
+                        and pr.base_repository_id == repository.node_id
+                        and pr.head_ref == _machine_branch(source_id)
+                        and pr.base_ref == "main"
+                        and pr.head_oid == head_sha
+                    )
+                    if exact:
+                        exact_candidates.append(pr)
+                    elif pr.author_id == current_app.bot_node_id or pr.author_login == current_app.bot_login:
+                        raise R02Error("current App machine PR evidence conflicts with exact ref authority")
+                if len(exact_candidates) > 1:
+                    raise R02Error("multiple exact current machine PRs claim the legacy head")
+                if exact_candidates:
+                    pr = exact_candidates[0]
+                    machine_pr = {
+                        "number": pr.number,
+                        "authorId": pr.author_id,
+                        "authorLogin": pr.author_login,
+                        "headOid": pr.head_oid,
+                        "baseOid": pr.base_oid,
+                        "headRef": pr.head_ref,
+                        "baseRef": pr.base_ref,
+                        "headRepositoryId": pr.head_repository_id,
+                        "baseRepositoryId": pr.base_repository_id,
+                        "headRepository": pr.head_repository,
+                        "baseRepository": pr.base_repository,
+                        "draft": pr.draft,
+                    }
+                payload = {
+                    "schemaVersion": 1,
+                    "sourceId": source_id,
+                    "sourceRepositoryId": accepted_source.repository_id,
+                    "machineRef": machine_ref,
+                    "currentMachineRefOid": head_sha,
+                    "candidateParentSha": candidate_parent,
+                    "candidateTreeSha": commit.tree_sha,
+                    "candidateScopeDigest": scope_digest,
+                    "machinePr": machine_pr,
+                }
+                digest = _legacy_payload_digest("swiftstream-federation-legacy-machine-evidence:v1\n", payload)
+                matches.append(LegacyQuarantineEvidence(
+                    1, LegacyQuarantineClass.MACHINE, repository.id, repository.node_id,
+                    repository.full_name, head_sha, digest,
+                ))
+            except Exception:
+                class_conflict = True
+
+        # Read the full current PR inventory once for legacy manual anchors.
+        try:
+            summaries = self.client.list_pull_requests(self.central_repository, state="all")
+            if type(summaries) not in (tuple, list):
+                raise R02Error("PR inventory is malformed")
+            manual_evidence: list[LegacyQuarantineEvidence] = []
+            for summary in summaries:
+                if type(summary) is not dict or type(summary.get("number")) is not int or summary["number"] <= 0:
+                    raise R02Error("PR summary is malformed")
+                pr = self.client.get_pull_request_metadata(self.central_repository, summary["number"])
+                if type(pr) is not PullRequestMetadata or pr.number != summary["number"]:
+                    raise R02Error("fresh PR metadata is malformed")
+                if (
+                    pr.head_oid != head_sha
+                    or pr.head_repository != repository.full_name
+                    or pr.base_repository != repository.full_name
+                    or pr.head_repository_id != repository.node_id
+                    or pr.base_repository_id != repository.node_id
+                    or pr.base_ref != "main"
+                    or pr.head_ref.startswith("bot/federation/")
+                ):
+                    continue
+                comments = self.client.list_issue_comments(self.central_repository, pr.number)
+                if type(comments) not in (tuple, list) or any(type(comment) is not IssueComment for comment in comments):
+                    raise R02Error("current PR comment inventory is malformed")
+                anchors_present = [comment for comment in comments if comment.body.startswith(ANCHOR_MARKER)]
+                if not anchors_present:
+                    continue
+                if any(comment.editor_login is not None or comment.editor_type is not None for comment in anchors_present):
+                    raise R02Error("legacy RequestAnchor editor identity is not immutable")
+                anchored = validate_unique_anchor(comments, pr, None, current_app)
+                anchor = anchored.anchor
+                if pr.author_id == current_app.bot_node_id or pr.author_login == current_app.bot_login:
+                    raise R02Error("human RequestAnchor requester identity cannot be the App Bot")
+                files = self.client.list_pull_request_files(self.central_repository, pr.number)
+                if type(files) not in (tuple, list) or any(type(item) is not dict or type(item.get("filename")) is not str for item in files):
+                    raise R02Error("current PR file inventory is malformed")
+                diff = validate_proposal_scope(anchor.request_class, (item["filename"] for item in files))
+                scope_value = {
+                    "changedPaths": list(diff.paths),
+                    "requestClass": anchor.request_class.name.lower(),
+                }
+                scope_json = json.dumps(scope_value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                proposal_scope_digest = hashlib.sha256(
+                    ("swiftstream-federation-legacy-manual-proposal-scope:v1\n" + scope_json).encode("utf-8")
+                ).hexdigest()
+                request_anchor_digest = hashlib.sha256(anchor.render().encode("utf-8")).hexdigest()
+                comment = anchored.comment
+                payload = {
+                    "schemaVersion": 1,
+                    "pullRequestNumber": pr.number,
+                    "originalRequestAuthorNodeId": pr.author_id,
+                    "originalRequestAuthorLogin": pr.author_login,
+                    "headOid": pr.head_oid,
+                    "baseOid": pr.base_oid,
+                    "headRef": pr.head_ref,
+                    "baseRef": pr.base_ref,
+                    "headRepositoryNodeId": pr.head_repository_id,
+                    "baseRepositoryNodeId": pr.base_repository_id,
+                    "headRepositoryFullName": pr.head_repository,
+                    "baseRepositoryFullName": pr.base_repository,
+                    "requestAnchorCommentDatabaseId": comment.database_id,
+                    "requestAnchorCommentNodeId": comment.node_id,
+                    "requestAnchorCanonicalSha256": request_anchor_digest,
+                    "requestClass": anchor.request_class.name.lower(),
+                    "initialBodySha256": anchor.initial_body_sha256,
+                    "appBotDatabaseId": current_app.bot_id,
+                    "appBotNodeId": current_app.bot_node_id,
+                    "appBotLogin": current_app.bot_login,
+                    "anchorCommentAuthorNodeId": comment.author_id,
+                    "anchorCommentAuthorLogin": comment.author_login,
+                    "anchorCommentAuthorType": comment.author_type,
+                    "anchorCommentEditorNodeId": comment.editor_id,
+                    "anchorCommentEditorLogin": comment.editor_login,
+                    "anchorCommentEditorType": comment.editor_type,
+                    "anchorCommentLastEditedAt": comment.last_edited_at,
+                    "anchorCommentIncludesCreatedEdit": comment.includes_created_edit,
+                    "proposalScopeDigest": proposal_scope_digest,
+                }
+                manual_evidence.append(LegacyQuarantineEvidence(
+                    1, LegacyQuarantineClass.MANUAL, repository.id, repository.node_id,
+                    repository.full_name, head_sha,
+                    _legacy_payload_digest("swiftstream-federation-legacy-manual-evidence:v1\n", payload),
+                ))
+            if len(manual_evidence) > 1:
+                class_conflict = True
+            elif manual_evidence:
+                matches.extend(manual_evidence)
+        except Exception:
+            class_conflict = True
+
+        # Same-name exact-App Check Runs are collision evidence only when the
+        # caller supplies the trusted implementation-reviewed-head exclusion.
+        try:
+            checks = self.client.list_check_runs(self.central_repository, head_sha)
+            if type(checks) not in (tuple, list) or any(type(check) is not CheckRun for check in checks):
+                raise R02Error("current Check Run inventory is malformed")
+            exact_checks = [
+                check for check in checks
+                if check.name == TRUSTED_VALIDATION_NAME and check.head_sha == head_sha and check.app_id == current_app.app_id
+            ]
+            if exact_checks:
+                if implementation_reviewed_head_sha is None:
+                    class_conflict = True
+                elif implementation_reviewed_head_sha != head_sha:
+                    if len(exact_checks) != 1:
+                        class_conflict = True
+                    else:
+                        check = exact_checks[0]
+                        if type(check.output) is not str and check.output is not None:
+                            raise R02Error("Check Run output is malformed")
+                        if check.output is not None:
+                            encoded_output = check.output.encode("utf-8")
+                            if len(check.output) > 4096:
+                                raise R02Error("Check Run output exceeds the transport bound")
+                            output_digest: str | None = hashlib.sha256(encoded_output).hexdigest()
+                        else:
+                            output_digest = None
+                        payload = {
+                            "schemaVersion": 1,
+                            "checkRunId": check.id,
+                            "name": check.name,
+                            "headSha": check.head_sha,
+                            "status": check.status,
+                            "conclusion": check.conclusion,
+                            "appId": check.app_id,
+                            "outputDigest": output_digest,
+                            "implementationReviewedHeadSha": implementation_reviewed_head_sha,
+                        }
+                        matches.append(LegacyQuarantineEvidence(
+                            1, LegacyQuarantineClass.CHECK_COLLISION, repository.id, repository.node_id,
+                            repository.full_name, head_sha,
+                            _legacy_payload_digest("swiftstream-federation-legacy-check-collision-evidence:v1\n", payload),
+                        ))
+        except Exception:
+            class_conflict = True
+
+        if class_conflict:
+            return conflicting("AMBIGUOUS_LEGACY_EVIDENCE")
+        if len(matches) > 1:
+            return conflicting("AMBIGUOUS_LEGACY_EVIDENCE")
+        if len(matches) == 1:
+            evidence = matches[0]
+            reason = {
+                LegacyQuarantineClass.MACHINE: "EXACT_LEGACY_MACHINE",
+                LegacyQuarantineClass.MANUAL: "EXACT_LEGACY_MANUAL",
+                LegacyQuarantineClass.CHECK_COLLISION: "EXACT_LEGACY_CHECK_COLLISION",
+            }[evidence.evidence_class]
+            return LegacyClassificationResult(LegacyClassificationOutcome.QUARANTINE, evidence, reason)
+        return absent("EXACT_LEGACY_EVIDENCE_ABSENT")
+
+    def _require_exact_legacy_failure_receipt(
+        self,
+        receipt: StatusWriteReceipt,
+        evidence: LegacyQuarantineEvidence,
+        trusted_activation_boundary_id: str,
+        app: AppIdentity,
+    ) -> StatusWriteReceipt:
+        if (
+            type(receipt) is not StatusWriteReceipt
+            or type(evidence) is not LegacyQuarantineEvidence
+            or type(app) is not AppIdentity
+            or type(trusted_activation_boundary_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", trusted_activation_boundary_id) is None
+        ):
+            raise R02Error("legacy failure receipt verification requires exact typed authority")
+        description = render_status_description(
+            StatusClass.LEGACY,
+            legacy_status_evidence_digest(evidence, trusted_activation_boundary_id),
+        )
+        expected_route = f"/repos/{evidence.central_repository_full_name}/statuses/{evidence.head_sha}"
+        if (
+            receipt.repository != evidence.central_repository_full_name
+            or receipt.requested_sha != evidence.head_sha
+            or receipt.method != "POST"
+            or receipt.route != expected_route
+            or receipt.requested_state != "failure"
+            or receipt.requested_context != _EXTERNAL_STATUS_CONTEXT
+            or receipt.requested_description != description
+            or receipt.requested_target_url is not None
+        ):
+            raise R02Error("legacy failure receipt does not bind exact current quarantine evidence")
+        status = receipt.returned_status
+        if (
+            type(status) is not CommitStatus
+            or status.state != "failure"
+            or status.context != _EXTERNAL_STATUS_CONTEXT
+            or status.description != description
+            or status.target_url is not None
+            or status.creator_database_id != app.bot_id
+            or status.creator_node_id != app.bot_node_id
+            or status.creator_login != app.bot_login
+            or status.creator_type != "Bot"
+        ):
+            raise R02Error("legacy failure receipt does not bind the exact App Bot response")
+        return receipt
+
+    def publish_legacy_failure(
+        self,
+        head_sha: str,
+        trusted_activation_boundary_id: str,
+        *,
+        implementation_reviewed_head_sha: str | None,
+    ) -> StatusWriteReceipt:
+        """Reclassify current evidence and append only its exact legacy failure tuple."""
+        if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+            raise R02Error("legacy failure head SHA must be exact lowercase 40-hex")
+        if type(trusted_activation_boundary_id) is not str or re.fullmatch(r"[0-9a-f]{64}", trusted_activation_boundary_id) is None:
+            raise R02Error("trusted activation boundary ID must be exact lowercase 64-hex")
+        if implementation_reviewed_head_sha is not None and (
+            type(implementation_reviewed_head_sha) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", implementation_reviewed_head_sha) is None
+        ):
+            raise R02Error("implementation reviewed head SHA must be exact lowercase 40-hex")
+
+        classification = self.classify_legacy_head(
+            head_sha,
+            implementation_reviewed_head_sha=implementation_reviewed_head_sha,
+        )
+        if (
+            type(classification) is not LegacyClassificationResult
+            or classification.outcome is not LegacyClassificationOutcome.QUARANTINE
+            or type(classification.evidence) is not LegacyQuarantineEvidence
+            or classification.evidence.head_sha != head_sha
+            or classification.evidence.central_repository_full_name != self.central_repository
+        ):
+            raise R02Error("exact current legacy quarantine evidence is required before failure publication")
+
+        try:
+            fresh_repository = self.client.get_repository_metadata(self.central_repository)
+            if (
+                type(fresh_repository) is not RepositoryMetadata
+                or fresh_repository.full_name != self.central_repository
+                or fresh_repository.default_branch != "main"
+                or fresh_repository.id != classification.evidence.central_repository_database_id
+                or fresh_repository.node_id != classification.evidence.central_repository_node_id
+                or type(fresh_repository.id) is not int
+                or fresh_repository.id <= 0
+                or type(fresh_repository.node_id) is not str
+                or not fresh_repository.node_id
+                or len(fresh_repository.node_id) > 256
+                or c02.contains_control(fresh_repository.node_id)
+            ):
+                raise R02Error("fresh central repository identity does not match legacy evidence")
+            fresh_app = resolve_app_identity(self.client, self.app.slug)
+            if fresh_app != self.app:
+                raise R02Error("fresh App/Bot identity does not match configured exact App")
+            digest = legacy_status_evidence_digest(classification.evidence, trusted_activation_boundary_id)
+            description = render_status_description(StatusClass.LEGACY, digest)
+            if len(description.encode("ascii")) != 81:
+                raise R02Error("canonical legacy status description must be exactly 81 ASCII bytes")
+        except R02Error:
+            raise
+        except Exception as error:
+            raise R02Error(f"fresh legacy failure authority is unavailable: {_bounded_reason(error)}") from None
+
+        receipt = self.client.create_commit_status(
+            fresh_repository.full_name,
+            head_sha,
+            "failure",
+            _EXTERNAL_STATUS_CONTEXT,
+            description,
+            None,
+        )
+        expected_route = f"/repos/{fresh_repository.full_name}/statuses/{head_sha}"
+        if type(receipt) is not StatusWriteReceipt or (
+            receipt.repository != fresh_repository.full_name
+            or receipt.requested_sha != head_sha
+            or receipt.method != "POST"
+            or receipt.route != expected_route
+            or receipt.requested_state != "failure"
+            or receipt.requested_context != _EXTERNAL_STATUS_CONTEXT
+            or receipt.requested_description != description
+            or receipt.requested_target_url is not None
+        ):
+            raise R02Error("legacy failure receipt does not match the exact requested tuple")
+        status = receipt.returned_status
+        if type(status) is not CommitStatus or (
+            status.state != "failure"
+            or status.context != _EXTERNAL_STATUS_CONTEXT
+            or status.description != description
+            or status.target_url is not None
+            or status.creator_database_id != fresh_app.bot_id
+            or status.creator_node_id != fresh_app.bot_node_id
+            or status.creator_login != fresh_app.bot_login
+            or status.creator_type != "Bot"
+        ):
+            raise R02Error("legacy failure response does not match the exact App Bot tuple")
+        return receipt
+
+    def plan_legacy_recovery(
+        self,
+        head_sha: str,
+        *,
+        implementation_reviewed_head_sha: str | None,
+    ) -> LegacyRecoveryDecision:
+        """Return a nonmutating current-evidence recovery decision for exact H."""
+        if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+            raise R02Error("legacy recovery head SHA must be exact lowercase 40-hex")
+        if implementation_reviewed_head_sha is not None and (
+            type(implementation_reviewed_head_sha) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", implementation_reviewed_head_sha) is None
+        ):
+            raise R02Error("implementation reviewed head SHA must be exact lowercase 40-hex")
+        classification = self.classify_legacy_head(
+            head_sha,
+            implementation_reviewed_head_sha=implementation_reviewed_head_sha,
+        )
+        if type(classification) is not LegacyClassificationResult or classification.outcome is not LegacyClassificationOutcome.QUARANTINE:
+            raise R02Error("exact current legacy quarantine evidence is required for recovery planning")
+        try:
+            return legacy_recovery_decision(classification)
+        except RequestModelError as error:
+            raise R02Error(f"legacy recovery planning failed closed: {_bounded_reason(error)}") from None
 
     def _machine_authority(self, summary: Mapping[str, Any], source: c02.SourceDeclaration, current_main: str, repository: RepositoryMetadata) -> MachinePRAuthority | None:
         number = summary.get("number")
@@ -1510,8 +9393,11 @@ class R02Controller:
         *,
         pre_mutation_guard: Callable[[], None] | None = None,
         dispatch_finalizer: bool = True,
+        legacy_failure_receipt: StatusWriteReceipt | None = None,
     ) -> MachineReconcileResult:
         """Reconcile one accepted source; the wake input never supplies source semantics."""
+        if legacy_failure_receipt is not None and type(legacy_failure_receipt) is not StatusWriteReceipt:
+            raise R02Error("legacy failure receipt override must be an exact StatusWriteReceipt")
         hinted_id = parse_repository_id_hint(repository_id)
         for attempt in range(3):
             repository, current_main = self.current_accepted_main()
@@ -1524,63 +9410,318 @@ class R02Controller:
                 raise R02Error("machine C02 candidate builder is unavailable")
             source = sources[0]
             branch = _machine_branch(source.source_id)
+            machine_ref = f"refs/heads/{branch}"
+            legacy_machine_migration_required = False
             try:
-                candidate = self.candidate_builder.machine_candidate(current_main, source.source_id)  # type: ignore[attr-defined]
+                # B is captured before any candidate commit is generated. It is
+                # transition state only; the shared v2 helper never receives it.
+                try:
+                    before_oid = self.client.get_ref_oid(self.central_repository, branch)
+                except NotFoundError:
+                    before_oid = ZERO_OID
+                if type(before_oid) is not str or re.fullmatch(r"(?:[0-9a-f]{40})", before_oid) is None:
+                    raise R02Error("current machine ref is malformed")
+                initial_app = resolve_app_identity(self.client, self.app.slug)
+                if initial_app != self.app:
+                    raise R02Error("current App/Bot identity changed")
+                initial_machine_prs = self._machine_prs(current_main, repository, sources)[source.source_id]
+                if len(initial_machine_prs) > 1:
+                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, "DUPLICATE_MACHINE_PULL_REQUESTS")
+                if initial_machine_prs and not initial_machine_prs[0].valid:
+                    self._close_machine_pr_guarded(
+                        initial_machine_prs[0].number,
+                        "MACHINE_RECONCILE_FAILED",
+                        initial_machine_prs[0].invalid_reason,
+                        pre_mutation_guard,
+                    )
+                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, initial_machine_prs[0].invalid_reason)
+
+                if before_oid != ZERO_OID:
+                    persisted = self.resolve_current_sha_carrier_role(before_oid)
+                    if (
+                        persisted.role is CarrierRole.MACHINE_PUBLICATION
+                        and persisted.marker is not None
+                        and persisted.activation in {CarrierActivation.ACTIVE, CarrierActivation.RESERVED_INACTIVE}
+                    ):
+                        if not hasattr(self.candidate_builder, "validate_machine_head"):
+                            return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_VALIDATOR_UNAVAILABLE")
+                        try:
+                            matches_desired, _reason = self.candidate_builder.validate_machine_head(current_main, source.source_id, before_oid)  # type: ignore[attr-defined]
+                        except Exception:
+                            matches_desired = False
+                        if matches_desired:
+                            existing_number = initial_machine_prs[0].number if initial_machine_prs else None
+                            if existing_number is None:
+                                # A full restart may observe accepted B -> H
+                                # before its PR was created. Reuse H exactly.
+                                fresh_repository, fresh_main = self.current_accepted_main()
+                                fresh_sources = tuple(item for item in self._accepted_sources(fresh_main) if item == source)
+                                fresh_app = resolve_app_identity(self.client, self.app.slug)
+                                try:
+                                    fresh_ref = self.client.get_ref_oid(self.central_repository, branch)
+                                except NotFoundError:
+                                    fresh_ref = ZERO_OID
+                                fresh_role = self.resolve_current_sha_carrier_role(before_oid)
+                                if (
+                                    fresh_repository != repository or fresh_main != current_main
+                                    or fresh_sources != (source,) or fresh_app != initial_app
+                                    or fresh_ref != before_oid or fresh_role.marker != persisted.marker
+                                    or fresh_role.activation not in {CarrierActivation.ACTIVE, CarrierActivation.RESERVED_INACTIVE}
+                                ):
+                                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, "PERSISTED_MACHINE_GENERATION_AUTHORITY_CHANGED")
+                                if pre_mutation_guard is not None:
+                                    pre_mutation_guard()
+                                existing_number = self.client.create_machine_pull_request(
+                                    self.central_repository, head=branch, base=repository.default_branch,
+                                    title=f"Federation publication: {source.source_id}",
+                                    body=f"Automated publication for accepted source {source.source_id}.",
+                                )
+                            pr = self.client.get_pull_request_metadata(self.central_repository, existing_number)
+                            if (
+                                pr.head_oid != before_oid or pr.head_ref != branch
+                                or pr.base_oid != current_main or pr.base_ref != repository.default_branch
+                                or pr.head_repository_id != repository.node_id or pr.base_repository_id != repository.node_id
+                                or pr.author_id != self.app.bot_node_id or pr.author_login != self.app.bot_login
+                            ):
+                                return MachineReconcileResult("FAIL", source.source_id, hinted_id, "PERSISTED_MACHINE_PR_TOPOLOGY_MISMATCH")
+                            active = self.resolve_current_sha_carrier_role(before_oid)
+                            if active.activation is not CarrierActivation.ACTIVE or active.role is not CarrierRole.MACHINE_PUBLICATION or active.marker != persisted.marker:
+                                return MachineReconcileResult("FAIL", source.source_id, hinted_id, "PERSISTED_MACHINE_GENERATION_NOT_ACTIVE")
+                            if pre_mutation_guard is not None:
+                                pre_mutation_guard()
+                            if dispatch_finalizer:
+                                self.client.dispatch_workflow(self.central_repository, "federation-g8-state-finalize.yml", "refs/heads/main", {"expected_source_id": source.source_id})
+                            return MachineReconcileResult("CHANGED" if not initial_machine_prs else "NOOP", source.source_id, hinted_id, f"PERSISTED_MACHINE_PR_{existing_number}")
+                    if persisted.activation is CarrierActivation.LEGACY_CUTOVER_QUARANTINE:
+                        boundary = self.derive_activation_boundary_evidence()
+                        classification = self.classify_legacy_head(
+                            before_oid,
+                            implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                        )
+                        if (
+                            type(boundary) is not ActivationBoundaryEvidence
+                            or type(classification) is not LegacyClassificationResult
+                            or classification.outcome is not LegacyClassificationOutcome.QUARANTINE
+                            or type(classification.evidence) is not LegacyQuarantineEvidence
+                            or classification.evidence.evidence_class is not LegacyQuarantineClass.MACHINE
+                            or classification.evidence.head_sha != before_oid
+                        ):
+                            return MachineReconcileResult("FAIL", source.source_id, hinted_id, "LEGACY_MACHINE_AUTHORITY_NOT_EXACT")
+                        if pre_mutation_guard is not None:
+                            pre_mutation_guard()
+                        if legacy_failure_receipt is None:
+                            self.publish_legacy_failure(
+                                before_oid,
+                                boundary.activation_boundary_id,
+                                implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                            )
+                        else:
+                            self._require_exact_legacy_failure_receipt(
+                                legacy_failure_receipt,
+                                classification.evidence,
+                                boundary.activation_boundary_id,
+                                initial_app,
+                            )
+                        fresh_repository, fresh_main = self.current_accepted_main()
+                        fresh_sources = tuple(item for item in self._accepted_sources(fresh_main) if item == source)
+                        fresh_app = resolve_app_identity(self.client, self.app.slug)
+                        try:
+                            fresh_legacy_ref = self.client.get_ref_oid(self.central_repository, branch)
+                        except NotFoundError:
+                            fresh_legacy_ref = ZERO_OID
+                        if (
+                            fresh_repository != repository or fresh_main != current_main
+                            or fresh_sources != (source,) or fresh_app != initial_app
+                            or fresh_legacy_ref != before_oid
+                        ):
+                            return MachineReconcileResult("FAIL", source.source_id, hinted_id, "LEGACY_MACHINE_AUTHORITY_CHANGED")
+                        legacy_machine_migration_required = True
+
+                if legacy_failure_receipt is not None and not legacy_machine_migration_required:
+                    return MachineReconcileResult(
+                        "FAIL", source.source_id, hinted_id,
+                        "LEGACY_FAILURE_RECEIPT_WITHOUT_EXACT_LEGACY_MACHINE",
+                    )
+                if legacy_machine_migration_required and hasattr(self.candidate_builder, "machine_claim_candidate"):
+                    candidate = self.candidate_builder.machine_claim_candidate(current_main, source.source_id)  # type: ignore[attr-defined]
+                else:
+                    candidate = self.candidate_builder.machine_candidate(current_main, source.source_id)  # type: ignore[attr-defined]
                 validate_proposal_scope(RequestClass.UPDATE, candidate.changed_paths)
                 if any(path == "federation.json" or path.startswith(".github/") or path.startswith("automation/") for path in candidate.changed_paths):
                     raise CandidateScopeError("machine candidate changed a forbidden path")
+                if candidate.changed_paths or legacy_machine_migration_required:
+                    marker = candidate.claimed_head_marker
+                    if (
+                        candidate.request_class is not RequestClass.MACHINE_PUBLICATION
+                        or candidate.marker_present is not True
+                        or type(marker) is not ClaimedHeadMarker
+                        or marker.claim_kind != "MACHINE_REF_CLAIM"
+                        or marker.role != CarrierRole.MACHINE_PUBLICATION.value
+                        or marker.owner_kind != "MACHINE_SOURCE"
+                        or marker.transition_kind != "MACHINE_PUBLICATION"
+                        or marker.owner_key != f"{repository.node_id}:{source.source_id}"
+                        or candidate.source_id != source.source_id
+                        or candidate.repository_id != source.repository_id
+                        or candidate.candidate_tree_sha is None
+                    ):
+                        raise R02Error("machine candidate lacks exact v2 marker evidence")
+                    exact_head = self.client.get_git_commit_object(self.central_repository, candidate.commit_sha)
+                    if (
+                        type(exact_head) is not GitCommitObject
+                        or exact_head.sha != candidate.commit_sha
+                        or exact_head.message != marker.render()
+                        or exact_head.parents != (current_main,)
+                        or exact_head.tree_sha != candidate.candidate_tree_sha
+                    ):
+                        raise R02Error("machine candidate commit read-back differs from exact marker/base/tree")
+            except StaleAuthorityError:
+                raise
             except Exception as error:
-                try:
-                    machine_prs = self._machine_prs(current_main, repository, sources)[source.source_id]
-                    if len(machine_prs) == 1:
-                        self._close_machine_pr_guarded(
-                            machine_prs[0].number,
-                            "MACHINE_RECONCILE_FAILED",
-                            _bounded_reason(error),
-                            pre_mutation_guard,
-                        )
-                except StaleAuthorityError:
-                    raise
-                except Exception:
-                    pass
                 return MachineReconcileResult("FAIL", source.source_id, hinted_id, _bounded_reason(error))
-
-            machine_prs = self._machine_prs(current_main, repository, sources)[source.source_id]
-            if len(machine_prs) > 1:
-                return MachineReconcileResult("FAIL", source.source_id, hinted_id, "DUPLICATE_MACHINE_PULL_REQUESTS")
-            if len(machine_prs) == 1 and not machine_prs[0].valid:
-                self._close_machine_pr_guarded(
-                    machine_prs[0].number,
-                    "MACHINE_RECONCILE_FAILED",
-                    machine_prs[0].invalid_reason,
-                    pre_mutation_guard,
-                )
-                return MachineReconcileResult("FAIL", source.source_id, hinted_id, machine_prs[0].invalid_reason)
-            if not candidate.changed_paths:
-                if len(machine_prs) == 1:
+            if not candidate.changed_paths and not legacy_machine_migration_required:
+                if len(initial_machine_prs) == 1:
                     self._close_machine_pr_guarded(
-                        machine_prs[0].number,
+                        initial_machine_prs[0].number,
                         "MACHINE_RECONCILE_NOOP",
                         "CURRENT_STATE_ALREADY_MATCHES",
                         pre_mutation_guard,
                     )
                 return MachineReconcileResult("NOOP", source.source_id, hinted_id, "CURRENT_STATE_ALREADY_MATCHES")
 
+            marker = candidate.claimed_head_marker
+            update = RefUpdate(machine_ref, before_oid, candidate.commit_sha, force=before_oid != ZERO_OID)
+            # Re-read every mutable transition predicate after H read-back and
+            # immediately before exact B -> H CAS.
             try:
+                fresh_repository, fresh_main = self.current_accepted_main()
+                fresh_sources = tuple(item for item in self._accepted_sources(fresh_main) if item.source_id == source.source_id and item.repository_id == source.repository_id)
+                fresh_app = resolve_app_identity(self.client, self.app.slug)
                 try:
-                    before_oid = self.client.get_ref_oid(self.central_repository, branch)
+                    fresh_before = self.client.get_ref_oid(self.central_repository, branch)
                 except NotFoundError:
-                    before_oid = ZERO_OID
-                if candidate.commit_sha != before_oid:
+                    fresh_before = ZERO_OID
+                fresh_machine_prs = self._machine_prs(fresh_main, fresh_repository, fresh_sources).get(source.source_id, [])
+                if (
+                    fresh_repository != repository
+                    or fresh_main != current_main
+                    or fresh_sources != (source,)
+                    or fresh_app != initial_app
+                    or fresh_before != before_oid
+                    or fresh_machine_prs != initial_machine_prs
+                ):
+                    if fresh_before not in {before_oid, ZERO_OID}:
+                        competing = self.resolve_current_sha_carrier_role(fresh_before)
+                        if competing.activation is CarrierActivation.CONFLICTING:
+                            return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_PRE_CAS_COMPETING_REF_CONFLICTING")
+                    if attempt + 1 < 3:
+                        continue
+                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_AUTHORITY_CHANGED_BEFORE_CAS")
+                if pre_mutation_guard is not None:
+                    pre_mutation_guard()
+            except Exception as error:
+                return MachineReconcileResult("FAIL", source.source_id, hinted_id, _bounded_reason(error))
+
+            outcome = "CONFIRMED_SUCCESS"
+            try:
+                self.client.update_refs(repository.node_id, [update])
+            except RefCASConflict:
+                outcome = "CONFIRMED_CONFLICT"
+            except Exception:
+                outcome = "AMBIGUOUS"
+            try:
+                observed_ref = self.client.get_ref_oid(self.central_repository, branch)
+            except NotFoundError:
+                observed_ref = ZERO_OID
+            except Exception as error:
+                return MachineReconcileResult("FAIL", source.source_id, hinted_id, f"MACHINE_POST_CAS_REF_UNAVAILABLE:{_bounded_reason(error)}")
+
+            if observed_ref == candidate.commit_sha:
+                pass  # persisted H dominates the client response class
+            elif observed_ref == before_oid and outcome == "AMBIGUOUS":
+                # One exact same-generation retry is allowed only after the
+                # complete mutable pre-CAS authority has been re-read unchanged.
+                try:
+                    retry_repository, retry_main = self.current_accepted_main()
+                    retry_sources = tuple(item for item in self._accepted_sources(retry_main) if item.source_id == source.source_id and item.repository_id == source.repository_id)
+                    retry_app = resolve_app_identity(self.client, self.app.slug)
+                    try:
+                        retry_ref = self.client.get_ref_oid(self.central_repository, branch)
+                    except NotFoundError:
+                        retry_ref = ZERO_OID
+                    retry_prs = self._machine_prs(retry_main, retry_repository, retry_sources).get(source.source_id, [])
+                    if (
+                        retry_repository != repository
+                        or retry_main != current_main
+                        or retry_sources != (source,)
+                        or retry_app != initial_app
+                        or retry_ref != before_oid
+                        or retry_prs != initial_machine_prs
+                    ):
+                        return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_AMBIGUOUS_AUTHORITY_CHANGED")
                     if pre_mutation_guard is not None:
                         pre_mutation_guard()
-                    self.client.update_refs(repository.node_id, [RefUpdate(f"refs/heads/{branch}", before_oid, candidate.commit_sha, force=before_oid != ZERO_OID)])
-            except RefCASConflict:
+                except Exception as error:
+                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, _bounded_reason(error))
+                try:
+                    self.client.update_refs(repository.node_id, [update])
+                except RefCASConflict:
+                    outcome = "CONFIRMED_CONFLICT"
+                except Exception:
+                    outcome = "AMBIGUOUS"
+                try:
+                    observed_ref = self.client.get_ref_oid(self.central_repository, branch)
+                except NotFoundError:
+                    observed_ref = ZERO_OID
+                except Exception as error:
+                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, f"MACHINE_POST_RETRY_REF_UNAVAILABLE:{_bounded_reason(error)}")
+                if observed_ref == candidate.commit_sha:
+                    pass
+                elif observed_ref == before_oid:
+                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_AMBIGUOUS_RETRY_EXHAUSTED")
+                else:
+                    losing = self.resolve_current_sha_carrier_role(observed_ref)
+                    if losing.activation is CarrierActivation.CONFLICTING:
+                        return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_THIRD_REF_CONFLICTING")
+                    if attempt + 1 < 3:
+                        continue
+                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_BRANCH_CAS_RECOMPUTE_EXHAUSTED")
+            elif observed_ref == before_oid and outcome == "CONFIRMED_CONFLICT":
+                if attempt + 1 < 3:
+                    continue  # confirmed loser: a new loop creates a fresh nonce/head
+                return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_BRANCH_CAS_CONFLICT_RECOMPUTE_EXHAUSTED")
+            elif observed_ref != before_oid:
+                losing = self.resolve_current_sha_carrier_role(observed_ref)
+                if losing.activation is CarrierActivation.CONFLICTING:
+                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_THIRD_REF_CONFLICTING")
+                if outcome == "CONFIRMED_SUCCESS":
+                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_CAS_SUCCESS_REF_CONTRADICTION")
                 if attempt + 1 < 3:
                     continue
-                return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_BRANCH_CAS_CONFLICT_RECOMPUTE_EXHAUSTED")
-            if len(machine_prs) == 1:
-                number = machine_prs[0].number
+                return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_BRANCH_CAS_RECOMPUTE_EXHAUSTED")
+            else:
+                return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_CAS_FAILED_WITHOUT_REF_CHANGE")
+
+            # Ref persistence is established above. Recover/create the PR next;
+            # canonical ACTIVE resolution requires its exact App-owned topology.
+            try:
+                post_cas_repository, post_cas_main = self.current_accepted_main()
+                post_cas_sources = tuple(item for item in self._accepted_sources(post_cas_main) if item == source)
+                post_cas_app = resolve_app_identity(self.client, self.app.slug)
+                try:
+                    post_cas_ref = self.client.get_ref_oid(self.central_repository, branch)
+                except NotFoundError:
+                    post_cas_ref = ZERO_OID
+                if (
+                    post_cas_repository != repository or post_cas_main != current_main
+                    or post_cas_sources != (source,) or post_cas_app != initial_app
+                    or post_cas_ref != candidate.commit_sha
+                ):
+                    return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_PERSISTED_GENERATION_AUTHORITY_STALE")
+            except Exception as error:
+                return MachineReconcileResult("FAIL", source.source_id, hinted_id, _bounded_reason(error))
+            current_machine_prs = self._machine_prs(current_main, repository, sources)[source.source_id]
+            if len(current_machine_prs) == 1:
+                number = current_machine_prs[0].number
             else:
                 if pre_mutation_guard is not None:
                     pre_mutation_guard()
@@ -1591,10 +9732,25 @@ class R02Controller:
                     title=f"Federation publication: {source.source_id}",
                     body=f"Automated publication for accepted source {source.source_id}.",
                 )
+            current_pr = self.client.get_pull_request_metadata(self.central_repository, number)
+            if (
+                current_pr.head_oid != candidate.commit_sha
+                or current_pr.head_ref != branch
+                or current_pr.base_ref != repository.default_branch
+                or current_pr.base_oid != current_main
+            ):
+                return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_PR_HEAD_OR_BASE_MISMATCH")
+            resolved_with_pr = self.resolve_current_sha_carrier_role(candidate.commit_sha)
+            if (
+                resolved_with_pr.activation is not CarrierActivation.ACTIVE
+                or resolved_with_pr.role is not CarrierRole.MACHINE_PUBLICATION
+                or resolved_with_pr.marker != marker
+            ):
+                return MachineReconcileResult("FAIL", source.source_id, hinted_id, "MACHINE_ACTIVE_ROLE_NOT_ESTABLISHED")
             if pre_mutation_guard is not None:
                 pre_mutation_guard()
             if dispatch_finalizer:
-                self.client.dispatch_workflow(self.central_repository, "federation-state-finalize.yml", "refs/heads/main", {"expected_source_id": source.source_id})
+                self.client.dispatch_workflow(self.central_repository, "federation-g8-state-finalize.yml", "refs/heads/main", {"expected_source_id": source.source_id})
             return MachineReconcileResult("CHANGED", source.source_id, hinted_id, f"MACHINE_PR_{number}")
         raise AssertionError("bounded reconcile loop did not return")
 
@@ -1608,7 +9764,7 @@ class R02Controller:
             # removed or moved during the sweep is therefore a bounded NOOP.
             results.append(self.reconcile(source.repository_id, dispatch_finalizer=False))
         if any(result.outcome == "CHANGED" for result in results):
-            self.client.dispatch_workflow(self.central_repository, "federation-state-finalize.yml", "refs/heads/main", {})
+            self.client.dispatch_workflow(self.central_repository, "federation-g8-state-finalize.yml", "refs/heads/main", {})
         return tuple(results)
 
     def _manual_reconcile_guard(
@@ -1708,6 +9864,7 @@ class R02Controller:
     def anchor_and_reconstruct_existing(self, pr_number: int, request_class: RequestClass, semantic_validator: Callable[[Request], bool] | None = None) -> tuple[PullRequestMetadata, AnchorComment, PatchFoldResult, tuple[IssueComment, ...]]:
         pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
         require_same_repository_head(pr, self.central_repository)
+        _raise_if_reserved_issue_pr(pr)
         comments = self.client.list_issue_comments(self.central_repository, pr.number)
         anchor = validate_unique_anchor(comments, pr, request_class, self.app)
         return pr, anchor, reconstruct_from_github(self.client, self.central_repository, pr, anchor, comments, semantic_validator), comments
@@ -1715,6 +9872,7 @@ class R02Controller:
     def interactive_anchor_and_reconstruct(self, pr_number: int, request_class: RequestClass, semantic_validator: Callable[[Request], bool] | None = None) -> tuple[PullRequestMetadata, AnchorComment, PatchFoldResult, tuple[IssueComment, ...]]:
         pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
         require_same_repository_head(pr, self.central_repository)
+        _raise_if_reserved_issue_pr(pr)
         comments = self.client.list_issue_comments(self.central_repository, pr.number)
         if not _anchor_candidates(comments):
             create_anchor_once(self.client, self.central_repository, pr, request_class, self.app, comments)
@@ -1724,6 +9882,9 @@ class R02Controller:
         return pr, anchor, reconstruct_from_github(self.client, self.central_repository, pr, anchor, comments, semantic_validator), comments
 
     def interactive_proposal(self, pr_number: int, request_class: RequestClass, accepted_base_sha: str, request_ref: str, *, semantic_validator: Callable[[Request], bool] | None = None) -> ProposalCandidate:
+        pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+        require_same_repository_head(pr, self.central_repository)
+        _raise_if_reserved_issue_pr(pr)
         if request_class not in MANUAL_CLASSES:
             raise R02Error("interactive proposal class is not an R02 manual class")
         if self.candidate_builder is None:
@@ -1747,6 +9908,3800 @@ class R02Controller:
         replace_request_ref_cas(self.client, repository.node_id, request_ref, snapshot.head_oid, candidate)
         return candidate
 
+    def interactive_issue_managed_proposal(
+        self,
+        issue_number: int,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> IssueHeadClaim:
+        """Advance one bound Issue PR through immutable claim, wrapper, and ref-CAS authority."""
+        if not callable(source_authority_resolver):
+            raise R02Error("a fresh Issue source-authority resolver is required")
+        if self.candidate_builder is None:
+            raise R02Error("C02 candidate builder is not configured")
+        state, historical_ref, _historical_pr_comments, _historical_claims = _validate_managed_issue_head_history(
+            self.client,
+            self.central_repository,
+            issue_number,
+            self.app,
+            source_authority_resolver,
+        )
+        self._require_no_issue_cancellation_fence(state, historical_ref)
+        request_class = state.issue_anchor.anchor.request_class
+        _ensure_managed_issue_pr_request_anchor(
+            self.client, self.central_repository, state, request_class, self.app,
+        )
+        issue_comments = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+        pr_comments = tuple(self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number))
+        issue = self.client.get_issue_metadata(self.central_repository, issue_number)
+        if issue.state != "open" or issue.is_pull_request:
+            raise R02Error("managed Issue progression requires the exact open source Issue")
+        fold, expected_projections = _fresh_issue_projection_set(
+            self.client,
+            self.central_repository,
+            issue,
+            state.issue_anchor,
+            state.binding,
+            issue_comments,
+            pr_comments,
+            self.app,
+            semantic_validator,
+        )
+        try:
+            fresh_source = source_authority_resolver(fold.request, request_class)
+        except Exception as error:
+            raise StaleAuthorityError(f"fresh ACTIVE_PRE_MERGE Issue source authority is unavailable: {_bounded_reason(error)}") from None
+        _validate_issue_source_authority(state.issue_anchor.anchor, fresh_source)
+
+        repository, current_main = self.current_accepted_main()
+        if repository.node_id != state.binding.central_repository_node_id or repository.default_branch != "main":
+            raise StaleAuthorityError("central repository identity/default branch changed during managed Issue progression")
+        _main_meta, current_main_tree, _main_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, current_main,
+        )
+        branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
+        current_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if current_ref is None or current_ref != historical_ref:
+            raise StaleAuthorityError("bound Issue branch ref is absent")
+        pr = self.client.get_pull_request_metadata(self.central_repository, state.binding.pull_request_number)
+        if pr.head_oid != current_ref or pr.base_oid != current_main:
+            raise StaleAuthorityError("bound Issue PR head/base does not match the fresh ref/main snapshot")
+        pr_comments = tuple(self.client.list_issue_comments(self.central_repository, pr.number))
+        _issue_pr_authority_fence(pr_comments, self.app)
+        verified_fold, verified_projections = _fresh_issue_projection_set(
+            self.client,
+            self.central_repository,
+            issue,
+            state.issue_anchor,
+            state.binding,
+            issue_comments,
+            pr_comments,
+            self.app,
+            semantic_validator,
+        )
+        if (
+            verified_fold != fold
+            or tuple(item.render() for item in verified_projections)
+            != tuple(item.render() for item in expected_projections)
+        ):
+            raise StaleAuthorityError("Issue PATCH/projection snapshot changed before claim progression")
+        authority_history = _issue_authority_history(
+            self.client, self.central_repository, pr_comments, self.app, state, current_ref,
+        )
+        historical = tuple(
+            IssueHeadClaimComment(node.artifact, node.comment, node.active)
+            for node in authority_history if node.claim_kind == "ISSUE_HEAD_CLAIM"
+        )
+        active = tuple(item for item in historical if item.active)
+        if len(active) > 1:
+            raise R02Error("multiple distinct IssueHeadClaims are active at the same generated ref")
+        pending = tuple(item for item in historical if item.claim.from_head_sha == current_ref and not item.active)
+        if pending:
+            # Crash replay: the stored target/evidence/nonce is authoritative. Do not
+            # rebuild it from mutable PATCH comments or create a second CAS here.
+            replay = min(pending, key=lambda item: item.comment.database_id).claim
+            latest_state = _read_managed_issue_pr_binding_state(
+                self.client, self.central_repository, issue_number, self.app,
+                state.binding.central_repository_node_id, source_authority_resolver,
+            )
+            _require_same_managed_issue_pr_binding(state, latest_state)
+            latest_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            if latest_ref != current_ref or latest_state.pr.head_oid != current_ref:
+                raise StaleAuthorityError("pending IssueHeadClaim ref/PR authority changed before crash replay")
+            state = latest_state
+            self._apply_persisted_issue_head_claim(state, replay, current_ref)
+            return replay
+
+        fold, expected_projections, issue_comments, pr_comments = _synchronize_issue_patch_projections(
+            self.client,
+            self.central_repository,
+            issue,
+            state.issue_anchor,
+            state.binding,
+            issue_comments,
+            pr_comments,
+            self.app,
+            semantic_validator,
+        )
+        try:
+            fresh_source = source_authority_resolver(fold.request, request_class)
+        except Exception as error:
+            raise StaleAuthorityError(f"fresh ACTIVE_PRE_MERGE Issue source authority is unavailable: {_bounded_reason(error)}") from None
+        _validate_issue_source_authority(state.issue_anchor.anchor, fresh_source)
+        projection_digest = issue_patch_projection_evidence_digest(expected_projections)
+        request_digest = effective_request_digest(fold.request)
+
+        # Projection writes do not grant trust authority. Rebind the active ref and
+        # accepted main after those POSTs before choosing a new claimed transition.
+        latest_state = _read_managed_issue_pr_binding_state(
+            self.client, self.central_repository, issue_number, self.app,
+            state.binding.central_repository_node_id, source_authority_resolver,
+        )
+        _require_same_managed_issue_pr_binding(state, latest_state)
+        state = latest_state
+        repository, current_main = self.current_accepted_main()
+        if repository.node_id != state.binding.central_repository_node_id or repository.default_branch != "main":
+            raise StaleAuthorityError("central repository identity/default branch changed during projection synchronization")
+        _main_meta, current_main_tree, main_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, current_main,
+        )
+        try:
+            fresh_source = source_authority_resolver(fold.request, request_class)
+        except Exception as error:
+            raise StaleAuthorityError(f"fresh ACTIVE_PRE_MERGE Issue source authority is unavailable: {_bounded_reason(error)}") from None
+        _validate_issue_source_authority(state.issue_anchor.anchor, fresh_source)
+        current_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if current_ref is None:
+            raise StaleAuthorityError("bound Issue branch ref disappeared during projection synchronization")
+        pr = self.client.get_pull_request_metadata(self.central_repository, state.binding.pull_request_number)
+        if pr.head_oid != current_ref or pr.base_oid != current_main:
+            raise StaleAuthorityError("bound Issue PR/ref/main changed during projection synchronization")
+        pr_comments = tuple(self.client.list_issue_comments(self.central_repository, pr.number))
+        _issue_pr_authority_fence(pr_comments, self.app)
+        verified_fold, verified_projections = _fresh_issue_projection_set(
+            self.client,
+            self.central_repository,
+            issue,
+            state.issue_anchor,
+            state.binding,
+            issue_comments,
+            pr_comments,
+            self.app,
+            semantic_validator,
+            require_complete=True,
+        )
+        if (
+            verified_fold != fold
+            or tuple(item.render() for item in verified_projections)
+            != tuple(item.render() for item in expected_projections)
+        ):
+            raise StaleAuthorityError("Issue PATCH/projection snapshot changed before claim progression")
+        authority_history = _issue_authority_history(
+            self.client, self.central_repository, pr_comments, self.app, state, current_ref,
+        )
+        historical = tuple(
+            IssueHeadClaimComment(node.artifact, node.comment, node.active)
+            for node in authority_history if node.claim_kind == "ISSUE_HEAD_CLAIM"
+        )
+        active = tuple(item for item in historical if item.active)
+        if len(active) > 1:
+            raise R02Error("multiple distinct IssueHeadClaims are active at the same generated ref")
+        pending = tuple(item for item in historical if item.claim.from_head_sha == current_ref and not item.active)
+        if pending:
+            replay = min(pending, key=lambda item: item.comment.database_id).claim
+            latest_state = _read_managed_issue_pr_binding_state(
+                self.client, self.central_repository, issue_number, self.app,
+                state.binding.central_repository_node_id, source_authority_resolver,
+            )
+            _require_same_managed_issue_pr_binding(state, latest_state)
+            latest_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            if latest_ref != current_ref or latest_state.pr.head_oid != current_ref:
+                raise StaleAuthorityError("pending IssueHeadClaim ref/PR authority changed before crash replay")
+            state = latest_state
+            self._apply_persisted_issue_head_claim(state, replay, current_ref)
+            return replay
+
+        current_authority = next(
+            (node for node in authority_history if node.target_head_sha == current_ref), None,
+        )
+        if current_authority is None:
+            compatibility_claims = _issue_head_claim_comments(
+                self.client, self.central_repository, pr_comments, self.app, state, current_ref,
+            )
+            compatibility_claim = next((item for item in compatibility_claims if item.active), None)
+            if compatibility_claim is not None:
+                current_authority = _IssueAuthorityNode(
+                    "ISSUE_HEAD_CLAIM", CarrierRole.ISSUE_ACTIVE,
+                    compatibility_claim.claim.to_head_sha, compatibility_claim.claim.from_head_sha,
+                    compatibility_claim.claim.to_tree_sha, compatibility_claim.claim.transition_kind,
+                    compatibility_claim.claim.claim_id, _binding_comment_sha256(compatibility_claim.comment),
+                    compatibility_claim.comment, compatibility_claim.claim, active=True,
+                    proposal_origin=(compatibility_claim if compatibility_claim.claim.transition_kind != "NORMALIZE" else None),
+                )
+        if current_authority is None:
+            raise StaleAuthorityError("current Issue ref has no active unified Issue authority")
+        if current_authority.claim_kind == "ISSUE_HEAD_CLAIM":
+            active_claim = current_authority.artifact
+        elif current_authority.claim_kind == "REQUIRED_STATUS_EPOCH":
+            origin = current_authority.proposal_origin
+            active_claim = origin.artifact if origin is not None else None
+        else:
+            active_claim = None
+        if active_claim is None:
+            if current_authority.claim_kind == "ISSUE_BRANCH_LEASE":
+                transition = (
+                    "PROPOSAL"
+                    if current_main == state.lease.lease.accepted_base_sha
+                    else "NORMALIZE"
+                )
+            else:
+                transition = (
+                    "PROPOSAL"
+                    if current_main == state.lease.lease.accepted_base_sha
+                    else "MAIN_ADVANCE"
+                )
+        else:
+            transition = classify_issue_head_claim_progression(
+                active_claim,
+                fresh_effective_request_digest=request_digest,
+                fresh_patch_projection_evidence_digest=projection_digest,
+                fresh_accepted_base_sha=current_main,
+                fresh_accepted_base_tree_sha=current_main_tree,
+                proposal_exists=active_claim.transition_kind != "NORMALIZE",
+            )
+            if transition is None:
+                return active_claim
+
+        candidate = _plan_issue_managed_candidate(
+            self.candidate_builder, fold.request, request_class, current_main, current_ref,
+        )
+        if candidate.marker_present:
+            raise CandidateScopeError("claimed proposal candidate must remove the transient request marker")
+        validate_proposal_scope(request_class, candidate.changed_paths)
+        candidate_meta, candidate_tree, candidate_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, candidate.commit_sha,
+        )
+        if candidate_meta.parents != (current_main,):
+            raise CandidateScopeError("raw C02 candidate parent must be the exact accepted main")
+        actual_changed, target_entries = _proposal_tree_evidence(
+            self.client, self.central_repository, main_entries, candidate_entries,
+        )
+        if actual_changed != candidate.changed_paths:
+            raise CandidateScopeError("raw C02 candidate tree does not match its exact changed_paths")
+        if REQUEST_MARKER in _lease_leaf_map(candidate_entries):
+            raise CandidateScopeError("raw C02 candidate retains the transient Issue request marker")
+
+        from_meta, from_tree, _from_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, current_ref,
+        )
+        if from_meta.sha != current_ref:
+            raise R02Error("current Issue ref commit identity changed")
+        if transition == "NORMALIZE":
+            request_bytes = (request_class.value + "\n").encode("utf-8")
+            blob = self.client.create_blob(self.central_repository, base64.b64encode(request_bytes).decode("ascii"))
+            expected_blob_sha = hashlib.sha1(
+                b"blob " + str(len(request_bytes)).encode("ascii") + b"\0" + request_bytes
+            ).hexdigest()
+            if blob.sha != expected_blob_sha:
+                raise R02Error("NORMALIZE request marker blob SHA does not bind the exact request class")
+            created_tree_sha = self.client.create_tree(
+                self.central_repository,
+                current_main_tree,
+                [{"path": REQUEST_MARKER, "mode": "100644", "type": "blob", "sha": blob.sha}],
+            ).sha
+            target_tree, target_entries = self.client.get_tree(
+                self.central_repository, created_tree_sha,
+            )
+            if target_tree != created_tree_sha:
+                raise R02Error("NORMALIZE tree readback identity does not match the created tree")
+            _validate_marker_only_tree_delta(main_entries, target_entries, expected_blob_sha)
+            target_digest = normalize_target_evidence_digest(
+                request_class=request_class,
+                request_marker_blob_sha=expected_blob_sha,
+                target_tree_sha=target_tree,
+            )
+        else:
+            target_tree = candidate_tree
+            target_entries = candidate_entries
+            target_digest = proposal_target_evidence_digest(
+                candidate_tree_sha=target_tree,
+                changed=target_entries,
+                candidate_changed_paths=actual_changed,
+            )
+
+        nonce = (nonce_factory or new_carrier_nonce)()
+        if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{64}", nonce):
+            raise R02Error("IssueHeadClaim nonce must be lowercase 256-bit hex")
+        common = dict(
+            schema_version=1,
+            issue_number=state.issue_anchor.anchor.issue_number,
+            issue_database_id=state.issue_anchor.anchor.issue_database_id,
+            issue_node_id=state.issue_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+            issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+            issue_branch_lease_sha256=_binding_comment_sha256(state.lease.comment),
+            binding_id=state.binding.binding_id,
+            source_id=state.issue_anchor.anchor.source_id,
+            source_repository_id=state.issue_anchor.anchor.source_repository_id,
+            pull_request_number=state.binding.pull_request_number,
+            pull_request_database_id=state.binding.pull_request_database_id,
+            pull_request_node_id=state.binding.pull_request_node_id,
+            central_repository_node_id=state.binding.central_repository_node_id,
+            branch_ref=state.binding.branch_ref,
+            request_class=request_class,
+            accepted_base_sha=current_main,
+            accepted_base_tree_sha=current_main_tree,
+            from_head_sha=current_ref,
+            from_tree_sha=from_tree,
+            to_head_sha="0" * 40,
+            to_tree_sha=target_tree,
+            transition_kind=transition,
+            carrier_nonce=nonce,
+            effective_request_digest=request_digest,
+            patch_projection_evidence_digest=projection_digest,
+            target_evidence_digest=target_digest,
+        )
+        prepared = IssueHeadClaim.create(**common)
+        marker_text = _issue_head_claim_marker(prepared).render()
+        timestamp = self.client.bot_commit_timestamp_after(self.central_repository, current_ref)
+        wrapper = self.client.create_commit(
+            self.central_repository, marker_text, target_tree, [current_ref], timestamp=timestamp,
+        )
+        final = IssueHeadClaim.create(**{**common, "to_head_sha": wrapper.sha})
+        _validate_issue_head_claim_target(self.client, self.central_repository, final, state.lease.lease)
+        self._persist_issue_head_claim(state, final)
+        latest_state = _read_managed_issue_pr_binding_state(
+            self.client, self.central_repository, issue_number, self.app,
+            state.binding.central_repository_node_id, source_authority_resolver,
+        )
+        _require_same_managed_issue_pr_binding(state, latest_state)
+        latest_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if latest_ref != current_ref or latest_state.pr.head_oid != current_ref:
+            raise StaleAuthorityError("Issue ref/PR head changed after claim persistence; stored claim remains historical")
+        state = latest_state
+        self._apply_persisted_issue_head_claim(state, final, current_ref)
+        return final
+
+    def validate_issue_managed_head_history(
+        self,
+        issue_number: int,
+    ) -> tuple[IssuePRBindingState, str, tuple[IssueHeadClaimComment, ...]]:
+        """Read-only history/provenance gate for the pre-green trusted-validation route."""
+        state, current_ref, _comments, claims = _validate_managed_issue_head_history(
+            self.client,
+            self.central_repository,
+            issue_number,
+            self.app,
+            lambda _request, _request_class: None,  # Deliberately not used in historical validation.
+        )
+        return state, current_ref, claims
+
+    def interactive_issue_managed_route(
+        self,
+        issue_number: int,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> IssueManagedRouteResult:
+        """Dedicated Wave 04 route boundary; semantic no-change is an exact NOOP."""
+        try:
+            claim = self.interactive_issue_managed_proposal(
+                issue_number,
+                source_authority_resolver,
+                semantic_validator=semantic_validator,
+                nonce_factory=nonce_factory,
+            )
+        except IssueManagedNoSemanticChange as error:
+            return IssueManagedRouteResult("NOOP", error.reason, error.request_class)
+        return IssueManagedRouteResult("CLAIM_READY", claim.transition_kind, claim.request_class)
+
+    def _persist_issue_head_claim(self, state: IssuePRBindingState, claim: IssueHeadClaim) -> IssueHeadClaimComment:
+        self._require_no_issue_cancellation_fence(state, claim.from_head_sha)
+        body = claim.render()
+        if len(body.encode("utf-8")) > 16_384:
+            raise R02Error("IssueHeadClaim comment exceeds the generic Issue-comment bound")
+        try:
+            self.client.create_issue_comment(self.central_repository, state.binding.pull_request_number, body)
+        except GitHubAPIError as error:
+            try:
+                comments = tuple(self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number))
+                current_ref = _read_issue_branch_ref(
+                    self.client, self.central_repository,
+                    state.binding.branch_ref.removeprefix("refs/heads/"),
+                )
+                _issue_head_claim_comments(self.client, self.central_repository, comments, self.app, state, current_ref or ZERO_OID)
+            except Exception as read_error:
+                raise StaleAuthorityError(f"ambiguous IssueHeadClaim POST could not be diagnosed: {_bounded_reason(read_error)}") from None
+            raise StaleAuthorityError(f"ambiguous IssueHeadClaim POST; stop and reread on a later invocation: {_bounded_reason(error)}") from None
+        try:
+            comments = tuple(self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number))
+            current_ref = _read_issue_branch_ref(
+                self.client, self.central_repository,
+                state.binding.branch_ref.removeprefix("refs/heads/"),
+            )
+            claims = _issue_head_claim_comments(
+                self.client, self.central_repository, comments, self.app, state, current_ref or ZERO_OID,
+            )
+        except Exception as error:
+            raise StaleAuthorityError(f"persisted IssueHeadClaim could not be reread: {_bounded_reason(error)}") from None
+        matches = [item for item in claims if item.claim.render() == body]
+        if not matches:
+            raise StaleAuthorityError("persisted IssueHeadClaim is absent or differs from the exact intended payload")
+        return min(matches, key=lambda item: item.comment.database_id)
+
+    def _apply_persisted_issue_head_claim(
+        self,
+        state: IssuePRBindingState,
+        claim: IssueHeadClaim,
+        expected_ref: str,
+    ) -> None:
+        self._require_no_issue_cancellation_fence(state, expected_ref)
+        branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
+        before = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if before == claim.to_head_sha:
+            return
+        if before != expected_ref or before != claim.from_head_sha:
+            raise StaleAuthorityError("persisted IssueHeadClaim lost its exact from-head ref CAS")
+        try:
+            self.client.update_refs(
+                state.binding.central_repository_node_id,
+                [RefUpdate(state.binding.branch_ref, before, claim.to_head_sha, force=False)],
+            )
+        except (RefCASConflict, GitHubAPIError) as error:
+            after = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            try:
+                comments = tuple(self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number))
+                _issue_head_claim_comments(self.client, self.central_repository, comments, self.app, state, after or ZERO_OID)
+            except Exception as read_error:
+                raise StaleAuthorityError(f"ambiguous IssueHeadClaim CAS cannot be diagnosed: {_bounded_reason(read_error)}") from None
+            if after == claim.to_head_sha:
+                return
+            raise StaleAuthorityError(f"IssueHeadClaim CAS did not reach its exact target; claim remains historical: {_bounded_reason(error)}") from None
+        after = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if after != claim.to_head_sha:
+            raise StaleAuthorityError("IssueHeadClaim CAS did not read back the exact target head")
+
+    def _read_issue_epoch_snapshot(
+        self,
+        issue_number: int,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        semantic_validator: Callable[[Request], bool] | None,
+        *,
+        allow_source_mismatch: bool = False,
+        allow_base_mismatch: bool = False,
+    ) -> _IssueEpochSnapshot:
+        if not callable(source_authority_resolver):
+            raise R02Error("a fresh Issue source-authority resolver is required")
+        repository, accepted_main = self.current_accepted_main()
+        if (
+            repository.full_name != self.central_repository
+            or repository.default_branch != "main"
+            or type(repository.node_id) is not str
+            or not repository.node_id
+        ):
+            raise StaleAuthorityError("central repository identity/default branch is not the exact accepted main")
+        state = _read_managed_issue_pr_binding_state(
+            self.client, self.central_repository, issue_number, self.app,
+            repository.node_id, lambda _request, _request_class: None,
+            validate_fresh_source_authority=False,
+        )
+        if state.binding.central_repository_node_id != repository.node_id:
+            raise StaleAuthorityError("managed Issue binding belongs to a different central repository identity")
+        issue = self.client.get_issue_metadata(self.central_repository, issue_number)
+        issue_comments = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+        pr_comments = tuple(self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number))
+        if (
+            issue.number != state.owning_issue.number
+            or issue.database_id != state.owning_issue.database_id
+            or issue.node_id != state.owning_issue.node_id
+            or issue.is_pull_request
+            or issue.state != "open"
+        ):
+            raise StaleAuthorityError("owning Issue identity or lifecycle changed during epoch validation")
+        fold, projections = _fresh_issue_projection_set(
+            self.client, self.central_repository, issue, state.issue_anchor, state.binding,
+            issue_comments, pr_comments, self.app, semantic_validator,
+            require_complete=not allow_source_mismatch,
+        )
+        fresh_source: IssueSourceAuthority | None = None
+        source_error: str | None = None
+        try:
+            fresh_source = source_authority_resolver(fold.request, state.issue_anchor.anchor.request_class)
+        except Exception as error:
+            source_error = f"UNAVAILABLE:{_bounded_reason(error)}"
+        else:
+            try:
+                _validate_issue_source_authority(state.issue_anchor.anchor, fresh_source)
+            except Exception as error:
+                source_error = f"MISMATCH:{_bounded_reason(error)}"
+        if source_error is not None and not allow_source_mismatch:
+            raise StaleAuthorityError(
+                f"fresh Issue source authority is unavailable or changed: {source_error}"
+            ) from None
+
+        main_meta, main_tree, main_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, accepted_main,
+        )
+        if main_meta.sha != accepted_main:
+            raise StaleAuthorityError("accepted central main commit identity changed")
+        branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
+        current_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        pr = self.client.get_pull_request_metadata(self.central_repository, state.binding.pull_request_number)
+        if (
+            current_ref is None
+            or current_ref != pr.head_oid
+            or (not allow_base_mismatch and pr.base_oid != accepted_main)
+            or pr.base_ref != repository.default_branch
+            or state.pr.head_oid != pr.head_oid
+            or state.pr.base_oid != pr.base_oid
+            or state.pr_issue.state != "open"
+        ):
+            raise StaleAuthorityError("bound Issue PR/ref/base is not the exact current accepted snapshot")
+        _issue_pr_authority_fence(pr_comments, self.app)
+        history = _issue_authority_history(
+            self.client, self.central_repository, pr_comments, self.app, state, current_ref,
+        )
+        current_nodes = tuple(node for node in history if node.target_head_sha == current_ref)
+        if len(current_nodes) != 1:
+            raise StaleAuthorityError("current Issue ref has no unique validated authority node")
+        current_authority = current_nodes[0]
+        marker = (
+            _issue_head_claim_marker(current_authority.artifact)
+            if current_authority.claim_kind == "ISSUE_HEAD_CLAIM"
+            else _required_status_epoch_marker(current_authority.artifact)
+            if current_authority.claim_kind == "REQUIRED_STATUS_EPOCH"
+            else _issue_finalization_epoch_marker(current_authority.artifact)
+            if current_authority.claim_kind == "ISSUE_FINALIZATION_EPOCH"
+            else _lease_marker_for(current_authority.artifact)
+        )
+        resolution = self.resolve_current_sha_carrier_role(current_ref)
+        if (
+            resolution.activation is not CarrierActivation.ACTIVE
+            or resolution.role is not current_authority.role
+            or resolution.marker != marker
+        ):
+            raise StaleAuthorityError("current Issue head is not ACTIVE under the real SHA-global resolver")
+        return _IssueEpochSnapshot(
+            state, repository, accepted_main, main_tree, main_entries, current_ref,
+            issue, issue_comments, pr_comments, fold, projections, fresh_source,
+            source_error, history, current_authority, resolution,
+        )
+
+    def _derive_issue_proposal_scope(
+        self,
+        snapshot: _IssueEpochSnapshot,
+        proposal_head_sha: str,
+        proposal_origin: _IssueAuthorityNode,
+    ) -> tuple[str, str, str]:
+        if type(proposal_origin.artifact) is not IssueHeadClaim or proposal_origin.transition_kind == "NORMALIZE":
+            raise R02Error("finalizer authority requires a proposal-bearing IssueHeadClaim origin")
+        if self.candidate_builder is None:
+            raise R02Error("fresh C02 proposal candidate builder is unavailable")
+        request_class = snapshot.state.issue_anchor.anchor.request_class
+        request_digest = effective_request_digest(snapshot.fold.request)
+        projection_digest = issue_patch_projection_evidence_digest(snapshot.projections)
+        candidate = _plan_issue_managed_candidate(
+            self.candidate_builder,
+            snapshot.fold.request,
+            request_class,
+            snapshot.accepted_main_sha,
+            proposal_head_sha,
+        )
+        candidate_meta, candidate_tree, candidate_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, candidate.commit_sha,
+        )
+        if candidate_meta.parents != (snapshot.accepted_main_sha,):
+            raise CandidateScopeError("fresh finalizer candidate is not an exact child of accepted main")
+        actual_changed, candidate_evidence = _proposal_tree_evidence(
+            self.client, self.central_repository,
+            snapshot.accepted_main_entries, candidate_entries,
+        )
+        if actual_changed != candidate.changed_paths:
+            raise CandidateScopeError("fresh finalizer candidate changed paths do not match its Git tree")
+        validate_proposal_scope(request_class, actual_changed)
+        if REQUEST_MARKER in _lease_leaf_map(candidate_entries):
+            raise CandidateScopeError("fresh finalizer candidate retains the transient Issue request marker")
+        target_meta, target_tree, target_entries = _lease_tree_snapshot(
+            self.client, self.central_repository, proposal_head_sha,
+        )
+        if target_meta.sha != proposal_head_sha or target_tree != candidate_tree:
+            raise CandidateScopeError("current proposal head tree differs from the freshly built accepted-base candidate")
+        actual_target_changed, target_evidence = _proposal_tree_evidence(
+            self.client, self.central_repository,
+            snapshot.accepted_main_entries, target_entries,
+        )
+        if actual_target_changed != actual_changed:
+            raise CandidateScopeError("current proposal head changed-path scope differs from the fresh candidate")
+        candidate_digest = proposal_target_evidence_digest(
+            candidate_tree_sha=candidate_tree,
+            changed=candidate_evidence,
+            candidate_changed_paths=actual_changed,
+        )
+        target_digest = proposal_target_evidence_digest(
+            candidate_tree_sha=target_tree,
+            changed=target_evidence,
+            candidate_changed_paths=actual_target_changed,
+        )
+        origin_claim = proposal_origin.artifact
+        if (
+            candidate_digest != target_digest
+            or target_digest != origin_claim.target_evidence_digest
+            or request_digest != origin_claim.effective_request_digest
+            or projection_digest != origin_claim.patch_projection_evidence_digest
+        ):
+            raise StaleAuthorityError("fresh request/projection/proposal evidence differs from the proposal-origin claim")
+        return target_digest, request_digest, projection_digest
+
+    def _persist_issue_epoch_artifact(
+        self,
+        state: IssuePRBindingState,
+        artifact: IssueFinalizationEpoch | RequiredStatusEpoch,
+        expected_ref: str,
+    ) -> IssueComment:
+        self._require_no_issue_cancellation_fence(state, expected_ref)
+        body = artifact.render()
+        if len(body.encode("utf-8")) > 16_384:
+            raise R02Error("Issue epoch comment exceeds the generic Issue-comment bound")
+        try:
+            self.client.create_issue_comment(
+                self.central_repository, state.binding.pull_request_number, body,
+            )
+        except Exception as error:
+            # An ambiguous POST is diagnosed, then left for a later invocation to
+            # replay. It never creates a replacement target in this invocation.
+            try:
+                comments = tuple(self.client.list_issue_comments(
+                    self.central_repository, state.binding.pull_request_number,
+                ))
+                _issue_authority_history(
+                    self.client, self.central_repository, comments, self.app, state, expected_ref,
+                )
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous Issue epoch POST could not be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            raise StaleAuthorityError(
+                f"ambiguous Issue epoch POST; exact artifact is reserved for a later invocation: {_bounded_reason(error)}"
+            ) from None
+        try:
+            comments = tuple(self.client.list_issue_comments(
+                self.central_repository, state.binding.pull_request_number,
+            ))
+            history = _issue_authority_history(
+                self.client, self.central_repository, comments, self.app, state, expected_ref,
+            )
+        except Exception as error:
+            raise StaleAuthorityError(f"persisted Issue epoch could not be validated: {_bounded_reason(error)}") from None
+        marker = (
+            ISSUE_FINALIZATION_EPOCH_MARKER
+            if type(artifact) is IssueFinalizationEpoch else REQUIRED_STATUS_EPOCH_MARKER
+        )
+        matches = [
+            node.comment for node in history
+            if node.comment.body.startswith(marker)
+            and node.artifact == artifact
+            and node.artifact_sha256 == hashlib.sha256(body.encode("utf-8")).hexdigest()
+        ]
+        if not matches:
+            raise StaleAuthorityError("persisted Issue epoch is absent or differs from the exact intended payload")
+        return min(matches, key=lambda item: item.database_id)
+
+    def _apply_persisted_issue_epoch_target(
+        self,
+        state: IssuePRBindingState,
+        from_head_sha: str,
+        target_head_sha: str,
+        expected_ref: str,
+    ) -> None:
+        self._require_no_issue_cancellation_fence(state, expected_ref)
+        branch_short = state.binding.branch_ref.removeprefix("refs/heads/")
+        before = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if before == target_head_sha:
+            return
+        if before != expected_ref or before != from_head_sha:
+            raise StaleAuthorityError("persisted Issue epoch lost its exact from-head ref CAS")
+        try:
+            self.client.update_refs(
+                state.binding.central_repository_node_id,
+                [RefUpdate(state.binding.branch_ref, before, target_head_sha, force=False)],
+            )
+        except (RefCASConflict, GitHubAPIError) as error:
+            after = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            try:
+                comments = tuple(self.client.list_issue_comments(
+                    self.central_repository, state.binding.pull_request_number,
+                ))
+                _issue_authority_history(
+                    self.client, self.central_repository, comments, self.app, state, after or ZERO_OID,
+                )
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous Issue epoch CAS cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            if after == target_head_sha:
+                return
+            raise StaleAuthorityError(
+                f"Issue epoch CAS did not reach its exact target; target remains historical: {_bounded_reason(error)}"
+            ) from None
+        after = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if after != target_head_sha:
+            raise StaleAuthorityError("Issue epoch CAS did not read back the exact target head")
+
+    def _require_no_issue_cancellation_fence(
+        self,
+        state: IssuePRBindingState,
+        current_ref: str,
+        comments: Iterable[IssueComment] | None = None,
+    ) -> None:
+        if comments is not None:
+            # _read_issue_epoch_snapshot has already validated these exact
+            # comments through the unified provenance reader.
+            if any(
+                type(comment.body) is str
+                and comment.body.startswith(ISSUE_CANCELLATION_FENCE_MARKER)
+                for comment in comments
+            ):
+                raise StaleAuthorityError("persisted IssueCancellationFence is a one-way gate for non-cancellation progression")
+            return
+        fresh_comments = tuple(
+            self.client.list_issue_comments(self.central_repository, state.binding.pull_request_number)
+        )
+        if any(
+            type(comment.body) is str
+            and comment.body.startswith(ISSUE_CANCELLATION_FENCE_MARKER)
+            for comment in fresh_comments
+        ):
+            raise StaleAuthorityError("persisted IssueCancellationFence is a one-way gate for non-cancellation progression")
+
+    def _read_issue_cancellation_fences(
+        self,
+        authority: _IssueCancellationAuthority,
+        current_ref: str,
+    ) -> tuple[tuple[IssueCancellationFenceComment, ...], tuple[IssueComment, ...]]:
+        comments = tuple(self.client.list_issue_comments(
+            self.central_repository, authority.pull_request_number,
+        ))
+        _issue_pr_authority_fence(comments, self.app, allow_cancellation_fence=True)
+        fences = _issue_cancellation_fence_comments(
+            self.client, self.central_repository, comments, self.app, authority, current_ref,
+        )
+        if authority.binding_authority == "FULL_BINDING":
+            if authority.binding_state is None:
+                raise R02Error("FULL_BINDING cancellation history lost its exact binding state")
+            history = _issue_authority_history(
+                self.client, self.central_repository, comments, self.app,
+                authority.binding_state, current_ref,
+            )
+            for item in fences:
+                if sum(
+                    node.claim_kind == "ISSUE_CANCELLATION_FENCE"
+                    and node.artifact == item.fence
+                    and node.comment.database_id == item.comment.database_id
+                    for node in history
+                ) != 1:
+                    raise R02Error("persisted full-binding fence is not reachable from exact unified history")
+        return fences, comments
+
+    def _persist_issue_cancellation_fence(
+        self,
+        authority: _IssueCancellationAuthority,
+        fence: IssueCancellationFence,
+        expected_ref: str,
+    ) -> IssueCancellationFenceComment:
+        body = fence.render()
+        existing, _existing_comments = self._read_issue_cancellation_fences(
+            authority, expected_ref,
+        )
+        matches = tuple(item for item in existing if item.fence.render() == body)
+        if matches:
+            if len(matches) != 1:
+                raise R02Error("equivalent cancellation fence comments did not collapse to one canonical record")
+            return matches[0]
+        try:
+            self.client.create_issue_comment(
+                self.central_repository, authority.pull_request_number, body,
+            )
+        except Exception as error:
+            # An ambiguous POST is usable only when exact readback proves that
+            # this same immutable fence was persisted.
+            try:
+                fences, _comments = self._read_issue_cancellation_fences(authority, expected_ref)
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous cancellation-fence POST cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            matches = tuple(item for item in fences if item.fence.render() == body)
+            if len(matches) == 1:
+                return matches[0]
+            raise StaleAuthorityError(
+                f"cancellation-fence POST was not confirmed by exact readback: {_bounded_reason(error)}"
+            ) from None
+        fences, _comments = self._read_issue_cancellation_fences(authority, expected_ref)
+        matches = tuple(item for item in fences if item.fence.render() == body)
+        if len(matches) != 1:
+            raise StaleAuthorityError("persisted cancellation fence is absent or differs from the exact intended payload")
+        return matches[0]
+
+    def prepare_issue_cancellation_fence(
+        self,
+        issue_number: int,
+        *,
+        classification: str | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> IssueCancellationFence:
+        """Persist and activate one immutable D/E cancellation fence; publish no status."""
+        if type(issue_number) is not int or not 1 <= issue_number <= 9_223_372_036_854_775_807:
+            raise R02Error("cancellation Issue number must be a positive signed-64 integer")
+        authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+            require_prebinding_lease_root=True,
+        )
+        expected_classification = "D" if authority.binding_authority == "PRE_BINDING" else "E"
+        if classification is not None and classification != expected_classification:
+            raise R02Error("cancellation fence accepts only the exact PR-backed D/E classification")
+        if authority.owning_issue.state != "closed":
+            raise R02Error("PR-backed cancellation fence requires a terminal closed owning Issue")
+        if authority.raw_pr_merged:
+            raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+        if authority.raw_pr_state != "OPEN" or authority.pr_issue.state != "open":
+            raise R02Error("new cancellation fence requires the exact open unmerged generated PR")
+        branch_short = authority.lease.lease.branch_ref.removeprefix("refs/heads/")
+        original_head_sha = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if original_head_sha is None or authority.pr.head_oid != original_head_sha:
+            raise StaleAuthorityError("cancellation requires the exact current generated ref and PR head")
+        if authority.binding_authority == "PRE_BINDING" and original_head_sha != authority.lease.lease.initial_head_sha:
+            raise R02Error("PRE_BINDING cancellation must originate from the exact lease-root head")
+        original = _resolve_issue_cancellation_original_node(
+            self.client, self.central_repository, authority, self.app, original_head_sha,
+            self.resolve_current_sha_carrier_role,
+        )
+        if (original.claim_kind, original.role) not in {
+            ("ISSUE_BRANCH_LEASE", CarrierRole.ISSUE_ACTIVE),
+            ("ISSUE_HEAD_CLAIM", CarrierRole.ISSUE_ACTIVE),
+            ("REQUIRED_STATUS_EPOCH", CarrierRole.ISSUE_ACTIVE),
+            ("ISSUE_FINALIZATION_EPOCH", CarrierRole.ISSUE_FINALIZING),
+        }:
+            raise R02Error("cancellation original authority has an unsupported exact kind/role")
+
+        # Existing immutable evidence is inspected before taking a new status
+        # snapshot or nonce. This makes crash replay reuse the original tuple.
+        persisted, _comments = self._read_issue_cancellation_fences(authority, original_head_sha)
+        fence: IssueCancellationFence | None = None
+        if persisted:
+            fence = persisted[0].fence
+            if (
+                fence.original_head_sha != original_head_sha
+                or not _issue_cancellation_fence_predecessor_matches(original, fence)
+                or fence.binding_authority != _cancellation_binding_authority_id(authority)
+            ):
+                raise StaleAuthorityError("persisted cancellation fence belongs to a different original authority")
+            current_ref = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            if current_ref == fence.cancellation_head_sha:
+                resolution = self.resolve_current_sha_carrier_role(fence.cancellation_head_sha)
+                if resolution != ShaCarrierResolution(
+                    CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL,
+                    _issue_cancellation_fence_marker(fence),
+                ):
+                    raise StaleAuthorityError("persisted cancellation fence is not ACTIVE under the real resolver")
+                return fence
+            if current_ref != original_head_sha:
+                raise StaleAuthorityError("persisted cancellation fence lost to a different generated ref head")
+        else:
+            current_ref = original_head_sha
+
+        if fence is None:
+            pre_fence_status, visible_issue_final_success, _any_exact_app_success, _latest_status = _read_latest_exact_app_required_status_snapshot(
+                self.client, self.central_repository, original_head_sha, self.app,
+            )
+            success_may_exist = (
+                original.role is CarrierRole.ISSUE_FINALIZING
+                or visible_issue_final_success
+                or (
+                    pre_fence_status.is_present
+                    and pre_fence_status.state == "success"
+                    and pre_fence_status.status_class is StatusClass.ISSUE_FINAL
+                )
+            )
+            # Fence read immediately before nonce generation closes the POST race.
+            latest_persisted, _latest_comments = self._read_issue_cancellation_fences(
+                authority, original_head_sha,
+            )
+            if latest_persisted:
+                fence = latest_persisted[0].fence
+                if (
+                    fence.original_head_sha != original_head_sha
+                    or fence.pre_fence_required_status != pre_fence_status
+                    or not _issue_cancellation_fence_predecessor_matches(original, fence)
+                ):
+                    raise StaleAuthorityError("concurrent cancellation fence does not match this exact status/predecessor")
+            else:
+                nonce = (nonce_factory or new_carrier_nonce)()
+                if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{64}", nonce):
+                    raise R02Error("IssueCancellationFence nonce must be lowercase 256-bit hex")
+                anchor = authority.issue_anchor
+                lease = authority.lease
+                fields = dict(
+                    schema_version=1,
+                    issue_number=anchor.anchor.issue_number,
+                    issue_database_id=anchor.anchor.issue_database_id,
+                    issue_node_id=anchor.anchor.issue_node_id,
+                    issue_request_anchor_comment_database_id=anchor.comment.database_id,
+                    issue_request_anchor_sha256=anchor.anchor.canonical_sha256(),
+                    issue_branch_lease_comment_database_id=lease.comment.database_id,
+                    issue_branch_lease_sha256=_binding_comment_sha256(lease.comment),
+                    binding_authority=_cancellation_binding_authority_id(authority),
+                    source_id=anchor.anchor.source_id,
+                    source_repository_id=anchor.anchor.source_repository_id,
+                    branch_ref=lease.lease.branch_ref,
+                    pull_request_number=authority.pull_request_number,
+                    pull_request_database_id=authority.pull_request_database_id,
+                    pull_request_node_id=authority.pull_request_node_id,
+                    central_repository_node_id=authority.central_repository_node_id,
+                    base_repository_node_id=authority.base_repository_node_id,
+                    base_ref="main",
+                    original_head_sha=original_head_sha,
+                    original_head_tree_sha=original.tree_sha,
+                    original_head_claim_kind=original.claim_kind,
+                    original_head_claim_role=original.role.value,
+                    original_head_artifact_comment_database_id=original.comment.database_id,
+                    original_head_artifact_id=original.artifact_id,
+                    original_head_artifact_sha256=original.artifact_sha256,
+                    cancellation_carrier_nonce=nonce,
+                    cancellation_head_sha=("f" * 40 if original_head_sha != "f" * 40 else "e" * 40),
+                    cancellation_head_tree_sha=original.tree_sha,
+                    pre_fence_required_status=pre_fence_status,
+                    pre_fence_success_may_exist=success_may_exist,
+                )
+                prepared = IssueCancellationFence.create(**fields)
+                marker_text = _issue_cancellation_fence_marker(prepared).render()
+                timestamp = self.client.bot_commit_timestamp_after(
+                    self.central_repository, original_head_sha,
+                )
+                wrapper = self.client.create_commit(
+                    self.central_repository, marker_text, original.tree_sha,
+                    [original_head_sha], timestamp=timestamp,
+                )
+                fence = IssueCancellationFence.create(**{
+                    **fields,
+                    "cancellation_head_sha": wrapper.sha,
+                })
+                _validate_issue_cancellation_fence_target(
+                    self.client, self.central_repository, fence,
+                )
+
+        assert fence is not None
+        self._persist_issue_cancellation_fence(authority, fence, original_head_sha)
+        latest_authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+            require_prebinding_lease_root=True,
+        )
+        if (
+            latest_authority.binding_authority != authority.binding_authority
+            or latest_authority.issue_anchor.anchor != authority.issue_anchor.anchor
+            or latest_authority.issue_anchor.comment.database_id != authority.issue_anchor.comment.database_id
+            or latest_authority.lease.lease != authority.lease.lease
+            or latest_authority.pull_request_number != authority.pull_request_number
+            or latest_authority.pull_request_database_id != authority.pull_request_database_id
+            or latest_authority.pull_request_node_id != authority.pull_request_node_id
+            or latest_authority.binding != authority.binding
+            or latest_authority.raw_pr_state != "OPEN"
+            or latest_authority.raw_pr_merged
+            or latest_authority.owning_issue.state != "closed"
+        ):
+            raise StaleAuthorityError("central cancellation ownership/PR lifecycle changed after fence persistence")
+        before_cas = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if before_cas != original_head_sha or latest_authority.pr.head_oid != original_head_sha:
+            raise StaleAuthorityError("cancellation fence was persisted but original ref/PR head changed before CAS")
+        persisted_again, _comments = self._read_issue_cancellation_fences(
+            latest_authority, original_head_sha,
+        )
+        if not persisted_again or persisted_again[0].fence != fence:
+            raise StaleAuthorityError("exact persisted cancellation fence changed before ref exposure")
+        _fresh_original = _resolve_issue_cancellation_original_node(
+            self.client, self.central_repository, latest_authority, self.app, original_head_sha,
+            self.resolve_current_sha_carrier_role,
+        )
+        if not _issue_cancellation_fence_predecessor_matches(_fresh_original, fence):
+            raise StaleAuthorityError("cancellation predecessor changed before ref exposure")
+
+        update = RefUpdate(fence.branch_ref, original_head_sha, fence.cancellation_head_sha, force=False)
+        try:
+            self.client.update_refs(fence.central_repository_node_id, [update])
+        except Exception as first_error:
+            after_error = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+            if after_error == fence.cancellation_head_sha:
+                pass
+            elif after_error == original_head_sha:
+                try:
+                    # Retry only the byte-identical persisted target.
+                    self.client.update_refs(fence.central_repository_node_id, [update])
+                except Exception as second_error:
+                    after_retry = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+                    if after_retry != fence.cancellation_head_sha:
+                        raise StaleAuthorityError(
+                            f"same-target cancellation CAS did not activate: {_bounded_reason(second_error)}"
+                        ) from None
+                else:
+                    after_retry = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+                    if after_retry != fence.cancellation_head_sha:
+                        raise StaleAuthorityError("same-target cancellation CAS did not read back exact HC")
+            else:
+                raise StaleAuthorityError(
+                    f"cancellation CAS lost to a different ref head: {_bounded_reason(first_error)}"
+                ) from None
+        after_cas = _read_issue_branch_ref(self.client, self.central_repository, branch_short)
+        if after_cas != fence.cancellation_head_sha:
+            raise StaleAuthorityError("cancellation CAS did not read back exact cancellationHeadSha")
+        final_authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+        )
+        if (
+            final_authority.binding_authority != authority.binding_authority
+            or final_authority.binding != authority.binding
+            or final_authority.pr.head_oid != fence.cancellation_head_sha
+            or final_authority.raw_pr_state != "OPEN"
+            or final_authority.raw_pr_merged
+        ):
+            raise StaleAuthorityError("post-CAS cancellation PR/ownership readback is not the exact unmerged HC")
+        final_resolution = self.resolve_current_sha_carrier_role(fence.cancellation_head_sha)
+        if final_resolution != ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL,
+            _issue_cancellation_fence_marker(fence),
+        ):
+            raise StaleAuthorityError("cancellation HC is not ACTIVE under the real SHA-global resolver")
+        return fence
+
+    def publish_issue_cancel_failure(
+        self,
+        issue_number: int,
+        fence: IssueCancellationFence,
+    ) -> ExactAppRequiredStatusSnapshot:
+        """Publish/reuse only the exact App failure tuple for an ACTIVE cancellation fence."""
+        if type(fence) is not IssueCancellationFence or fence.issue_number != issue_number:
+            raise R02Error("cancel status publication requires the exact IssueCancellationFence")
+        authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+        )
+        current_ref = _read_issue_branch_ref(
+            self.client, self.central_repository, fence.branch_ref.removeprefix("refs/heads/"),
+        )
+        fences, _comments = self._read_issue_cancellation_fences(authority, current_ref or ZERO_OID)
+        if not fences or fences[0].fence != fence or current_ref != fence.cancellation_head_sha:
+            raise StaleAuthorityError("cancel status requires the exact persisted current HC fence")
+        if (
+            _cancellation_binding_authority_id(authority) != fence.binding_authority
+            or authority.pull_request_number != fence.pull_request_number
+            or authority.pull_request_database_id != fence.pull_request_database_id
+            or authority.pull_request_node_id != fence.pull_request_node_id
+            or authority.pr.head_oid != fence.cancellation_head_sha
+            or authority.raw_pr_state != "OPEN"
+            or authority.raw_pr_merged
+        ):
+            raise StaleAuthorityError("cancel status requires exact current unmerged central PR authority")
+        resolution = self.resolve_current_sha_carrier_role(fence.cancellation_head_sha)
+        if resolution != ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL,
+            _issue_cancellation_fence_marker(fence),
+        ):
+            raise StaleAuthorityError("cancel status requires ACTIVE(ISSUE_CANCEL) under the real resolver")
+        reused = _latest_exact_cancel_status_evidence(
+            self.client, self.central_repository, fence, self.app,
+        )
+        if reused is not None:
+            return reused
+        repository = self.client.get_repository_metadata(self.central_repository)
+        if (
+            type(repository) is not RepositoryMetadata
+            or repository.full_name != self.central_repository
+            or repository.node_id != fence.central_repository_node_id
+        ):
+            raise StaleAuthorityError("cancel status central repository identity changed")
+        digest = cancel_status_evidence_digest(
+            central_repository_node_id=repository.node_id,
+            issue_number=fence.issue_number,
+            issue_database_id=fence.issue_database_id,
+            issue_node_id=fence.issue_node_id,
+            fence_id=fence.fence_id,
+            cancellation_head_sha=fence.cancellation_head_sha,
+            binding_authority=fence.binding_authority,
+            pull_request_number=fence.pull_request_number,
+            pull_request_database_id=fence.pull_request_database_id,
+            pull_request_node_id=fence.pull_request_node_id,
+        )
+        description = render_status_description(StatusClass.CANCEL, digest)
+        if len(description.encode("ascii")) != 81:
+            raise R02Error("canonical cancel description must be exactly 81 ASCII bytes")
+        receipt = self.client.create_commit_status(
+            self.central_repository,
+            fence.cancellation_head_sha,
+            "failure",
+            "federation/trusted-validation",
+            description,
+            None,
+        )
+        status = _validate_issue_cancel_status_receipt(receipt, repository, fence, self.app)
+        return _snapshot_required_status_row(status, fence.cancellation_head_sha)
+
+    def _fresh_cancellation_fence_state(
+        self,
+        issue_number: int,
+        expected_fence: IssueCancellationFence | None = None,
+    ) -> tuple[_IssueCancellationAuthority, IssueCancellationFenceComment, tuple[IssueComment, ...], str | None]:
+        authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+            allow_pr_stage_state=True,
+        )
+        current_ref = _read_issue_branch_ref(
+            self.client, self.central_repository,
+            authority.lease.lease.branch_ref.removeprefix("refs/heads/"),
+        )
+        fences, comments = self._read_issue_cancellation_fences(
+            authority, current_ref or ZERO_OID,
+        )
+        if len(fences) != 1:
+            raise StaleAuthorityError("exact persisted IssueCancellationFence is required")
+        fence_item = fences[0]
+        fence = fence_item.fence
+        if expected_fence is not None and fence != expected_fence:
+            raise StaleAuthorityError("persisted IssueCancellationFence differs from the requested fence")
+        if _cancellation_binding_authority_id(authority) != fence.binding_authority:
+            raise StaleAuthorityError("current cancellation binding authority differs from its exact fence")
+        if not authority.raw_pr_merged and (
+            current_ref != fence.cancellation_head_sha
+            or authority.pr.head_oid != fence.cancellation_head_sha
+        ):
+            raise StaleAuthorityError("exact cancellation fence is not the current generated ref and PR head")
+        return authority, fence_item, comments, current_ref
+
+    def _require_current_cancel_failure(
+        self,
+        fence: IssueCancellationFence,
+        expected: ExactAppRequiredStatusSnapshot | None = None,
+    ) -> ExactAppRequiredStatusSnapshot:
+        status = _latest_exact_cancel_status_evidence(
+            self.client, self.central_repository, fence, self.app,
+        )
+        if status is None:
+            raise StaleAuthorityError("latest exact-App status is not the exact cancellation failure for this fence")
+        if expected is not None and status != expected:
+            raise StaleAuthorityError("latest exact-App cancellation failure changed during cancellation progression")
+        return status
+
+    def _require_active_issue_cancel(self, fence: IssueCancellationFence) -> None:
+        resolution = self.resolve_current_sha_carrier_role(fence.cancellation_head_sha)
+        if resolution != ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_CANCEL,
+            _issue_cancellation_fence_marker(fence),
+        ):
+            raise StaleAuthorityError("cancellation stage mutation requires ACTIVE(ISSUE_CANCEL) authority")
+
+    def _run_cancellation_pr_stage(
+        self,
+        authority: _IssueCancellationAuthority,
+        fence: IssueCancellationFence,
+        stage: str,
+    ) -> ExactPullRequestStageMutationEvidence:
+        try:
+            method_name, _operation = _CANCELLATION_STAGE_SPECS[stage]
+        except KeyError:
+            raise R02Error("cancellation PR mutation stage is unsupported") from None
+        method = getattr(self.client, method_name, None)
+        if not callable(method):
+            raise R02Error("fixed PR-stage transport method is unavailable")
+        client_mutation_id = _cancellation_stage_client_mutation_id(fence, stage)
+        try:
+            receipt = method(fence.pull_request_node_id, client_mutation_id)
+        except Exception as error:
+            # A later read may classify a merge race, but can never replace the
+            # missing same-response receipt or create witness/terminal evidence.
+            try:
+                observed = _fresh_issue_cancellation_authority(
+                    self.client, self.central_repository, fence.issue_number,
+                    self.app, allow_pr_stage_state=True,
+                )
+            except Exception:
+                observed = None
+            if observed is not None and observed.raw_pr_merged:
+                raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED") from None
+            raise StaleAuthorityError(
+                f"same-response cancellation {stage} receipt is unavailable: {_bounded_reason(error)}"
+            ) from None
+        return _exact_cancellation_stage_evidence(receipt, authority, fence, stage)
+
+    def _persist_issue_cancellation_draft_witness(
+        self,
+        authority: _IssueCancellationAuthority,
+        fence_item: IssueCancellationFenceComment,
+        status: ExactAppRequiredStatusSnapshot,
+        witness: IssueCancellationDraftWitness,
+    ) -> IssueCancellationDraftWitnessComment:
+        body = witness.render()
+        comments = tuple(self.client.list_issue_comments(
+            self.central_repository, authority.pull_request_number,
+        ))
+        existing = _issue_cancellation_draft_witness_comments(
+            comments, self.app, authority, fence_item, status,
+        )
+        if existing:
+            if existing[0].witness.render() != body:
+                raise StaleAuthorityError("a different immutable cancellation draft witness is already persisted")
+            return existing[0]
+        try:
+            self.client.create_issue_comment(
+                self.central_repository, authority.pull_request_number, body,
+            )
+        except Exception as error:
+            try:
+                readback = tuple(self.client.list_issue_comments(
+                    self.central_repository, authority.pull_request_number,
+                ))
+                witnesses = _issue_cancellation_draft_witness_comments(
+                    readback, self.app, authority, fence_item, status,
+                )
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous draft witness POST cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            if len(witnesses) == 1 and witnesses[0].witness.render() == body:
+                return witnesses[0]
+            raise StaleAuthorityError(
+                f"draft witness POST lacks exact same-response authority: {_bounded_reason(error)}"
+            ) from None
+        readback = tuple(self.client.list_issue_comments(
+            self.central_repository, authority.pull_request_number,
+        ))
+        witnesses = _issue_cancellation_draft_witness_comments(
+            readback, self.app, authority, fence_item, status,
+        )
+        if len(witnesses) != 1 or witnesses[0].witness.render() != body:
+            raise StaleAuthorityError("persisted cancellation draft witness is absent or differs from exact payload")
+        return witnesses[0]
+
+    def _persist_issue_terminal_cancelled_result(
+        self,
+        authority: _IssueCancellationAuthority,
+        fence_item: IssueCancellationFenceComment,
+        witness_item: IssueCancellationDraftWitnessComment,
+        status: ExactAppRequiredStatusSnapshot,
+        result: IssueTerminalCancelledResult,
+    ) -> IssueTerminalCancelledResultComment:
+        body = result.render()
+        comments = tuple(self.client.list_issue_comments(
+            self.central_repository, authority.pull_request_number,
+        ))
+        existing = _issue_terminal_cancelled_result_comments(
+            comments, self.app, authority, fence_item, witness_item, status,
+        )
+        if existing:
+            if existing[0].result.render() != body:
+                raise StaleAuthorityError("a different immutable terminal cancellation result is already persisted")
+            return existing[0]
+        try:
+            self.client.create_issue_comment(
+                self.central_repository, authority.pull_request_number, body,
+            )
+        except Exception as error:
+            try:
+                readback = tuple(self.client.list_issue_comments(
+                    self.central_repository, authority.pull_request_number,
+                ))
+                results = _issue_terminal_cancelled_result_comments(
+                    readback, self.app, authority, fence_item, witness_item, status,
+                )
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous terminal result POST cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            if len(results) == 1 and results[0].result.render() == body:
+                return results[0]
+            raise StaleAuthorityError(
+                f"terminal result POST lacks exact canonical readback: {_bounded_reason(error)}"
+            ) from None
+        readback = tuple(self.client.list_issue_comments(
+            self.central_repository, authority.pull_request_number,
+        ))
+        results = _issue_terminal_cancelled_result_comments(
+            readback, self.app, authority, fence_item, witness_item, status,
+        )
+        if len(results) != 1 or results[0].result.render() != body:
+            raise StaleAuthorityError("persisted terminal cancellation result is absent or differs from exact payload")
+        return results[0]
+
+    def establish_issue_cancellation_draft_witness(
+        self,
+        issue_number: int,
+    ) -> IssueCancellationDraftWitness:
+        """Normalize the exact cancellation PR to draft using only same-response proof."""
+        authority, fence_item, comments, current_ref = self._fresh_cancellation_fence_state(issue_number)
+        fence = fence_item.fence
+        if authority.raw_pr_merged:
+            raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+        if current_ref != fence.cancellation_head_sha or authority.pr.head_oid != fence.cancellation_head_sha:
+            raise StaleAuthorityError("draft witness requires exact current HC ref and PR head")
+        self._require_active_issue_cancel(fence)
+        status = self._require_current_cancel_failure(fence)
+        witnesses = _issue_cancellation_draft_witness_comments(
+            comments, self.app, authority, fence_item, status,
+        )
+        if witnesses:
+            # A replayed witness survives PR ready/close state changes. Only a
+            # merge or immutable identity/head drift can make it unusable.
+            latest_authority, latest_fence, _latest_comments, latest_ref = self._fresh_cancellation_fence_state(
+                issue_number, fence,
+            )
+            if latest_authority.raw_pr_merged:
+                raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+            if latest_ref != fence.cancellation_head_sha or latest_authority.pr.head_oid != fence.cancellation_head_sha:
+                raise StaleAuthorityError("persisted draft witness no longer matches exact current HC")
+            if self._require_current_cancel_failure(fence) != status:
+                raise StaleAuthorityError("current cancellation failure changed during witness replay")
+            return witnesses[0].witness
+
+        reopen_evidence: ExactPullRequestStageMutationEvidence | None = None
+        ready_evidence: ExactPullRequestStageMutationEvidence | None = None
+        is_draft = authority.pr.draft
+        if authority.raw_pr_state == "CLOSED":
+            reopen_evidence = self._run_cancellation_pr_stage(authority, fence, "DRAFT_REOPEN")
+            is_draft = reopen_evidence.is_draft
+            self._require_active_issue_cancel(fence)
+        elif authority.raw_pr_state != "OPEN":
+            raise R02Error("cancellation draft normalization requires exact OPEN or CLOSED PR state")
+        if is_draft:
+            ready_evidence = self._run_cancellation_pr_stage(authority, fence, "DRAFT_READY")
+            is_draft = ready_evidence.is_draft
+        if authority.raw_pr_state == "CLOSED" and reopen_evidence is None:
+            raise R02Error("closed PR normalization lacks its exact same-response reopen receipt")
+        if is_draft:
+            raise StaleAuthorityError("draft PR did not return to OPEN ready state before draft conversion")
+        status_before_convert = self._require_current_cancel_failure(fence, status)
+        draft_evidence = self._run_cancellation_pr_stage(authority, fence, "DRAFT_CONVERT")
+        try:
+            witness = IssueCancellationDraftWitness.create(
+                schema_version=1,
+                **_cancellation_witness_expected_fields(authority, fence_item, status_before_convert),
+                returned_base_ref_oid=draft_evidence.base_ref_oid,
+                reopen_evidence=reopen_evidence,
+                ready_evidence=ready_evidence,
+                draft_evidence=draft_evidence,
+            )
+        except RequestModelError as error:
+            raise R02Error(f"same-response cancellation draft witness is invalid: {_bounded_reason(error)}") from None
+        persisted = self._persist_issue_cancellation_draft_witness(
+            authority, fence_item, status_before_convert, witness,
+        )
+        latest_authority, latest_fence, latest_comments, latest_ref = self._fresh_cancellation_fence_state(
+            issue_number, fence,
+        )
+        if latest_authority.raw_pr_merged:
+            raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+        if latest_ref != fence.cancellation_head_sha:
+            raise StaleAuthorityError("persisted draft witness lost exact generated ref HC")
+        latest_status = self._require_current_cancel_failure(fence, status_before_convert)
+        witnesses = _issue_cancellation_draft_witness_comments(
+            latest_comments, self.app, latest_authority, latest_fence, latest_status,
+        )
+        if len(witnesses) != 1 or witnesses[0].witness != persisted.witness:
+            raise StaleAuthorityError("draft witness readback differs from the exact same-response evidence")
+        return persisted.witness
+
+    def establish_issue_terminal_cancelled_result(
+        self,
+        issue_number: int,
+    ) -> IssueTerminalCancelledResult:
+        """Close the witnessed unmerged PR and persist exact same-response terminal proof."""
+        authority, fence_item, comments, current_ref = self._fresh_cancellation_fence_state(issue_number)
+        fence = fence_item.fence
+        if current_ref != fence.cancellation_head_sha:
+            raise StaleAuthorityError("terminal cancellation requires exact current ref HC")
+        status = self._require_current_cancel_failure(fence)
+        witnesses = _issue_cancellation_draft_witness_comments(
+            comments, self.app, authority, fence_item, status,
+        )
+        if len(witnesses) != 1:
+            raise StaleAuthorityError("exact persisted cancellation draft witness is required before terminal close")
+        witness_item = witnesses[0]
+        results = _issue_terminal_cancelled_result_comments(
+            comments, self.app, authority, fence_item, witness_item, status,
+        )
+        if results:
+            if authority.pr.head_oid != fence.cancellation_head_sha:
+                raise StaleAuthorityError("persisted terminal result PR head no longer matches HC")
+            if self._require_current_cancel_failure(fence) != status:
+                raise StaleAuthorityError("current cancellation failure changed during terminal-result replay")
+            return results[0].result
+        if authority.raw_pr_merged:
+            raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+        if authority.pr.head_oid != fence.cancellation_head_sha:
+            raise StaleAuthorityError("terminal close requires exact current PR head HC")
+        reopen_evidence: ExactPullRequestStageMutationEvidence | None = None
+        if authority.raw_pr_state == "CLOSED":
+            reopen_evidence = self._run_cancellation_pr_stage(authority, fence, "CLOSE_REOPEN")
+        elif authority.raw_pr_state != "OPEN":
+            raise R02Error("terminal close normalization requires exact OPEN or CLOSED PR state")
+        current_status = self._require_current_cancel_failure(fence, status)
+        close_evidence = self._run_cancellation_pr_stage(authority, fence, "TERMINAL_CLOSE")
+        if close_evidence.state != "CLOSED":
+            raise StaleAuthorityError("terminal close same-response evidence did not return CLOSED")
+        # The exact close response is the proof. A fresh merged read can veto
+        # cancellation, but it can never replace a missing or contradictory receipt.
+        latest_authority, latest_fence, latest_comments, latest_ref = self._fresh_cancellation_fence_state(
+            issue_number, fence,
+        )
+        if latest_authority.raw_pr_merged:
+            raise StaleAuthorityError("CANCELLATION_MERGED_OBSERVED")
+        if latest_ref != fence.cancellation_head_sha or latest_authority.pr.head_oid != fence.cancellation_head_sha:
+            raise StaleAuthorityError("post-close cancellation authority/ref no longer matches exact HC")
+        latest_status = self._require_current_cancel_failure(fence, current_status)
+        latest_witnesses = _issue_cancellation_draft_witness_comments(
+            latest_comments, self.app, latest_authority, latest_fence, latest_status,
+        )
+        if len(latest_witnesses) != 1 or latest_witnesses[0].witness != witness_item.witness:
+            raise StaleAuthorityError("draft witness changed during terminal close")
+        try:
+            proof_kind = (
+                IssueTerminalCancelledProofKind.PR_BACKED_PRE_BINDING
+                if _cancellation_binding_authority_id(latest_authority) == "PRE_BINDING"
+                else IssueTerminalCancelledProofKind.PR_BACKED_FULL_BINDING
+            )
+            result = IssueTerminalCancelledResult.create(
+                schema_version=1,
+                **_cancellation_terminal_result_expected_fields(
+                    latest_authority, latest_fence, latest_witnesses[0], latest_status,
+                ),
+                close_evidence=close_evidence,
+                proof_kind=proof_kind,
+            )
+        except RequestModelError as error:
+            raise R02Error(f"same-response terminal close result is invalid: {_bounded_reason(error)}") from None
+        persisted = self._persist_issue_terminal_cancelled_result(
+            latest_authority, latest_fence, latest_witnesses[0], latest_status, result,
+        )
+        final_authority, final_fence, final_comments, final_ref = self._fresh_cancellation_fence_state(
+            issue_number, fence,
+        )
+        if final_ref != fence.cancellation_head_sha:
+            raise StaleAuthorityError("terminal result readback no longer has exact generated ref HC")
+        final_status = self._require_current_cancel_failure(fence, latest_status)
+        final_witnesses = _issue_cancellation_draft_witness_comments(
+            final_comments, self.app, final_authority, final_fence, final_status,
+        )
+        if len(final_witnesses) != 1:
+            raise StaleAuthorityError("terminal-result replay lost the exact persisted draft witness")
+        final_results = _issue_terminal_cancelled_result_comments(
+            final_comments, self.app, final_authority, final_fence, final_witnesses[0], final_status,
+        )
+        if len(final_results) != 1 or final_results[0].result != persisted.result:
+            raise StaleAuthorityError("terminal cancellation result readback differs from exact close receipt")
+        return persisted.result
+
+    def _persist_issue_no_pr_cancelled_result(
+        self,
+        issue_number: int,
+        anchor: IssueAnchorComment,
+        lease: IssueBranchLeaseComment | None,
+        result: IssueNoPRCancelledResult,
+    ) -> IssueNoPRCancelledResult:
+        body = result.render()
+        try:
+            comments = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+        except Exception as error:
+            raise StaleAuthorityError(f"no-PR result target Issue comments are unavailable: {_bounded_reason(error)}") from None
+        existing = _issue_no_pr_cancelled_result_comments(comments, self.app, anchor, lease)
+        if existing:
+            if existing[0].result != result:
+                raise StaleAuthorityError("a different immutable no-PR cancellation result is already persisted")
+            return existing[0].result
+        try:
+            self.client.create_issue_comment(self.central_repository, issue_number, body)
+        except Exception as error:
+            try:
+                readback = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+                persisted = _issue_no_pr_cancelled_result_comments(readback, self.app, anchor, lease)
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"ambiguous no-PR result POST cannot be diagnosed: {_bounded_reason(read_error)}"
+                ) from None
+            if len(persisted) == 1 and persisted[0].result.render() == body:
+                return persisted[0].result
+            raise StaleAuthorityError(
+                f"no-PR result POST lacks exact canonical readback: {_bounded_reason(error)}"
+            ) from None
+        try:
+            readback = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+            persisted = _issue_no_pr_cancelled_result_comments(readback, self.app, anchor, lease)
+        except Exception as error:
+            raise StaleAuthorityError(f"persisted no-PR result could not be verified: {_bounded_reason(error)}") from None
+        if len(persisted) != 1 or persisted[0].result.render() != body:
+            raise StaleAuthorityError("persisted no-PR result is absent or differs from exact canonical payload")
+        return persisted[0].result
+
+    @staticmethod
+    def _no_pr_cancelled_result_fields(
+        state: IssueCancellationState,
+        proof_kind: IssueNoPRCancelledProofKind,
+        *,
+        status: ExactAppRequiredStatusSnapshot | None = None,
+        legacy_digest: str | None = None,
+        cleanup_before_oid: str | None = None,
+        cleanup_ref_absent_after: bool | None = None,
+    ) -> dict[str, Any]:
+        anchor = state.issue_anchor
+        fields: dict[str, Any] = {
+            "schema_version": 1,
+            "issue_number": anchor.anchor.issue_number,
+            "issue_database_id": anchor.anchor.issue_database_id,
+            "issue_node_id": anchor.anchor.issue_node_id,
+            "issue_request_anchor_comment_database_id": anchor.comment.database_id,
+            "issue_request_anchor_sha256": anchor.anchor.canonical_sha256(),
+            "source_id": anchor.anchor.source_id,
+            "source_repository_id": anchor.anchor.source_repository_id,
+            "proof_kind": proof_kind,
+        }
+        if proof_kind is not IssueNoPRCancelledProofKind.ANCHOR_ONLY:
+            if state.lease is None:
+                raise R02Error("lease-backed no-PR result requires the exact IssueBranchLease")
+            fields.update({
+                "lease_comment_database_id": state.lease.comment.database_id,
+                "lease_sha256": _binding_comment_sha256(state.lease.comment),
+                "lease_id": state.lease.lease.lease_id,
+                "branch_ref": state.lease.lease.branch_ref,
+                "lease_initial_head_sha": state.lease.lease.initial_head_sha,
+                "all_state_pr_enumeration_digest": state.all_state_pr_enumeration_digest,
+            })
+        if proof_kind is IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS:
+            fields.update({
+                "required_status": status,
+                "legacy_carrier_evidence_digest": legacy_digest,
+                "cleanup_before_oid": cleanup_before_oid,
+                "cleanup_ref_absent_after": cleanup_ref_absent_after,
+            })
+        return fields
+
+    def cancel_issue_without_pr(self, issue_number: int) -> IssueNoPRCancelledResult:
+        """Persist exact A/B no-PR terminal evidence or CAS-delete an exact zero-PR lease root."""
+        state = self._read_issue_cancellation_state(issue_number)
+        if state.classification not in {
+            IssueCancellationClass.A_ANCHOR_ONLY,
+            IssueCancellationClass.B_LEASE_REF_ABSENT,
+            IssueCancellationClass.C_LEASE_ZERO_PR,
+        }:
+            raise StaleAuthorityError("no-PR cancellation is limited to exact classes A/B/C")
+        if state.pr_candidates:
+            raise R02Error("no-PR cancellation cannot proceed while any exact reserved-branch PR exists")
+
+        existing = state.no_pr_results
+        if len(existing) > 1:
+            raise R02Error("conflicting no-PR terminal results block cancellation")
+        if existing:
+            result = existing[0]
+            if state.classification is IssueCancellationClass.A_ANCHOR_ONLY:
+                expected = IssueNoPRCancelledProofKind.ANCHOR_ONLY
+            elif state.classification is IssueCancellationClass.B_LEASE_REF_ABSENT:
+                expected = result.proof_kind
+                if expected not in {
+                    IssueNoPRCancelledProofKind.LEASE_REF_ABSENT,
+                    IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS,
+                }:
+                    raise R02Error("existing no-PR result proof kind does not match the absent-ref class")
+            else:
+                raise R02Error("lease root was restored after a durable no-PR terminal result")
+            if result.proof_kind is not expected:
+                raise R02Error("existing no-PR result proof kind differs from exact current cancellation class")
+            return result
+
+        if state.issue.state != "closed":
+            raise StaleAuthorityError("a fresh no-PR cancellation result requires the exact Issue to be closed")
+
+        if state.classification is IssueCancellationClass.A_ANCHOR_ONLY:
+            result = IssueNoPRCancelledResult.create(**self._no_pr_cancelled_result_fields(
+                state, IssueNoPRCancelledProofKind.ANCHOR_ONLY,
+            ))
+            latest = self._read_issue_cancellation_state(issue_number)
+            if (
+                latest.classification is not IssueCancellationClass.A_ANCHOR_ONLY
+                or latest.issue.state != "closed"
+                or latest.issue_anchor != state.issue_anchor
+                or latest.no_pr_results
+            ):
+                raise StaleAuthorityError("anchor-only cancellation classification changed before result persistence")
+            return self._persist_issue_no_pr_cancelled_result(
+                issue_number, latest.issue_anchor, latest.lease, result,
+            )
+
+        if state.classification is IssueCancellationClass.B_LEASE_REF_ABSENT:
+            result = IssueNoPRCancelledResult.create(**self._no_pr_cancelled_result_fields(
+                state, IssueNoPRCancelledProofKind.LEASE_REF_ABSENT,
+            ))
+            latest = self._read_issue_cancellation_state(issue_number)
+            if (
+                latest.classification is not IssueCancellationClass.B_LEASE_REF_ABSENT
+                or latest.issue.state != "closed"
+                or latest.issue_anchor != state.issue_anchor
+                or latest.lease != state.lease
+                or latest.no_pr_results
+            ):
+                raise StaleAuthorityError("absent-ref cancellation classification changed before result persistence")
+            result = IssueNoPRCancelledResult.create(**self._no_pr_cancelled_result_fields(
+                latest, IssueNoPRCancelledProofKind.LEASE_REF_ABSENT,
+            ))
+            return self._persist_issue_no_pr_cancelled_result(
+                issue_number, latest.issue_anchor, latest.lease, result,
+            )
+
+        if state.lease is None:
+            raise R02Error("zero-PR lease-root cancellation has no exact IssueBranchLease")
+        lease = state.lease.lease
+        lease_head = lease.initial_head_sha
+        lease_marker = _lease_marker_for(lease)
+        resolution = self.resolve_current_sha_carrier_role(lease_head)
+        if resolution != ShaCarrierResolution(
+            CarrierActivation.ACTIVE, CarrierRole.ISSUE_ACTIVE, lease_marker,
+        ):
+            raise StaleAuthorityError("unbound lease root is not the exact active IssueBranchLease carrier")
+        if any(
+            type(comment.body) is str
+            and comment.body.startswith(ISSUE_FINALIZATION_EPOCH_MARKER)
+            for comment in state.issue_comments
+        ):
+            raise StaleAuthorityError("IssueFinalizationEpoch provenance forbids no-PR lease-root cleanup")
+
+        status, issue_final_success, _any_exact_app_success, _latest_status = (
+            _read_latest_exact_app_required_status_snapshot(
+                self.client, self.central_repository, lease_head, self.app,
+            )
+        )
+        if status.is_present and status.state == "success":
+            raise StaleAuthorityError("latest exact-App required status success blocks lease-root cancellation")
+        if issue_final_success:
+            raise StaleAuthorityError("exact-App success provenance blocks no-PR lease-root cleanup")
+        try:
+            raw_checks = tuple(self.client.list_check_runs(self.central_repository, lease_head))
+        except Exception as error:
+            raise StaleAuthorityError(f"lease-root legacy Check Run inventory is unavailable: {_bounded_reason(error)}") from None
+        if any(type(check) is not CheckRun for check in raw_checks):
+            raise R02Error("lease-root Check Run inventory contains a malformed record")
+        exact_checks = tuple(sorted((
+            check for check in raw_checks
+            if check.name == TRUSTED_VALIDATION_NAME
+            and check.head_sha == lease_head
+            and check.app_id == self.app.app_id
+        ), key=lambda check: check.id))
+        if len(exact_checks) > 1:
+            raise StaleAuthorityError("multiple exact-App legacy trusted-validation Check Runs are ambiguous")
+        if status.is_present and exact_checks:
+            raise StaleAuthorityError("commit status and Check Run carriers are mixed on the unbound lease root")
+        for check in exact_checks:
+            if check.conclusion in {"success", "neutral", "skipped"}:
+                raise StaleAuthorityError("merge-satisfying exact-App legacy Check Run blocks lease-root cancellation")
+            if check.status not in {"queued", "in_progress", "completed", "waiting", "pending", "requested"}:
+                raise R02Error("legacy trusted-validation Check Run has an unknown state")
+            if check.status == "completed" and check.conclusion is None:
+                raise R02Error("completed legacy trusted-validation Check Run lacks a conclusion")
+        legacy_digest_payload = {
+            "checks": [
+                {
+                    "appId": check.app_id,
+                    "conclusion": check.conclusion,
+                    "headSha": check.head_sha,
+                    "id": check.id,
+                    "name": check.name,
+                    "status": check.status,
+                }
+                for check in exact_checks
+            ],
+            "issueFinalSuccess": issue_final_success,
+            "latestStatus": status.as_value(),
+        }
+        legacy_digest = hashlib.sha256(json.dumps(
+            legacy_digest_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")).hexdigest()
+
+        # This second all-state inventory is intentionally the last authority
+        # read before the exact non-force ref deletion.
+        latest = self._read_issue_cancellation_state(issue_number)
+        if (
+            latest.classification is not IssueCancellationClass.C_LEASE_ZERO_PR
+            or latest.issue.state != "closed"
+            or latest.issue_anchor != state.issue_anchor
+            or latest.lease != state.lease
+            or latest.branch_ref_oid != lease_head
+            or latest.pr_candidates
+            or latest.no_pr_results
+        ):
+            raise StaleAuthorityError("zero-PR lease-root proof changed immediately before exact CAS cleanup")
+        update = RefUpdate(lease.branch_ref, lease_head, ZERO_OID, force=False)
+        try:
+            self.client.update_refs(latest.repository.node_id, [update])
+        except Exception as error:
+            try:
+                self._read_issue_cancellation_state(issue_number)
+            except Exception as reclassify_error:
+                raise StaleAuthorityError(
+                    f"lease-root CAS failed and fresh reclassification is unavailable: {_bounded_reason(reclassify_error)}"
+                ) from None
+            raise StaleAuthorityError(
+                f"lease-root exact CAS did not produce terminal proof: {_bounded_reason(error)}"
+            ) from None
+        if _read_issue_branch_ref(
+            self.client, self.central_repository, lease.branch_ref.removeprefix("refs/heads/"),
+        ) is not None:
+            raise StaleAuthorityError("exact lease-root CAS returned without verifying branch-ref absence")
+        result = IssueNoPRCancelledResult.create(**self._no_pr_cancelled_result_fields(
+            latest,
+            IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS,
+            status=status,
+            legacy_digest=legacy_digest,
+            cleanup_before_oid=lease_head,
+            cleanup_ref_absent_after=True,
+        ))
+        return self._persist_issue_no_pr_cancelled_result(
+            issue_number, latest.issue_anchor, latest.lease, result,
+        )
+
+    def _validated_pr_cancellation_cleanup(
+        self,
+        state: IssueCancellationState,
+    ) -> tuple[_IssueCancellationAuthority, IssueCancellationFenceComment,
+               IssueCancellationDraftWitnessComment, IssueTerminalCancelledResult]:
+        if state.classification not in {
+            IssueCancellationClass.D_PRE_BINDING_ONE_PR,
+            IssueCancellationClass.E_FULL_BINDING,
+        } or state.cancellation_authority is None or len(state.pr_candidates) != 1:
+            raise StaleAuthorityError("PR-backed cleanup requires exact classified D/E central ownership")
+        if state.merge_observed or state.cancellation_authority.raw_pr_merged:
+            if state.classification is IssueCancellationClass.E_FULL_BINDING:
+                raise StaleAuthorityError("MERGE_OBSERVED_POST_MERGE_REQUIRED")
+            raise StaleAuthorityError("MERGED_PRE_BINDING_PRESERVE_WITHOUT_POST_MERGE_AUTHORITY")
+        if len(state.fence_items) != 1 or len(state.witness_items) != 1 or len(state.terminal_result_items) != 1:
+            raise StaleAuthorityError("PR-backed cleanup requires exact fence, witness, and terminal result")
+        authority = state.cancellation_authority
+        candidate = state.pr_candidates[0]
+        fence_item = state.fence_items[0]
+        witness_item = state.witness_items[0]
+        terminal = state.terminal_result_items[0].result
+        fence = fence_item.fence
+        expected_kind = (
+            IssueTerminalCancelledProofKind.PR_BACKED_PRE_BINDING
+            if state.classification is IssueCancellationClass.D_PRE_BINDING_ONE_PR
+            else IssueTerminalCancelledProofKind.PR_BACKED_FULL_BINDING
+        )
+        if (
+            terminal.proof_kind is not expected_kind
+            or terminal.binding_authority != fence.binding_authority
+            or terminal.pull_request_number != authority.pull_request_number
+            or terminal.pull_request_database_id != authority.pull_request_database_id
+            or terminal.pull_request_node_id != authority.pull_request_node_id
+            or candidate.pr.head_oid != fence.cancellation_head_sha
+            or candidate.pr.base_ref != "main"
+            or candidate.pr.base_repository_id != state.repository.node_id
+        ):
+            raise StaleAuthorityError("terminal cancellation result differs from exact current D/E fence/PR authority")
+        if state.classification is IssueCancellationClass.D_PRE_BINDING_ONE_PR:
+            if (
+                authority.binding_authority != "PRE_BINDING"
+                or authority.binding is not None
+                or authority.binding_state is not None
+                or fence.binding_authority != "PRE_BINDING"
+                or fence.original_head_sha != authority.lease.lease.initial_head_sha
+            ):
+                raise StaleAuthorityError("PRE_BINDING Mode B cleanup gained complete binding or lost exact lease-root authority")
+        elif (
+            authority.binding_authority != "FULL_BINDING"
+            or authority.binding is None
+            or fence.binding_authority != authority.binding.binding_id
+        ):
+            raise StaleAuthorityError("Mode A cleanup requires the exact full two-sided binding")
+        current_failure = self._require_current_cancel_failure(fence, terminal.current_failure_status)
+        if current_failure != terminal.current_failure_status:
+            raise StaleAuthorityError("current exact-App cancellation failure differs from terminal result snapshot")
+        if state.branch_ref_oid not in {None, fence.cancellation_head_sha}:
+            raise StaleAuthorityError("reserved branch ref moved from exact cancellation HC")
+        if state.branch_ref_oid is None and candidate.pr.head_oid != fence.cancellation_head_sha:
+            raise StaleAuthorityError("absent-ref terminal cleanup no longer matches exact PR head HC")
+        return authority, fence_item, witness_item, terminal
+
+    def cleanup_issue_cancelled_branch(self, issue_number: int) -> IssueTerminalCancelledResult | str:
+        """Delete only an exact terminal D/E cancellation head with non-force compare-and-swap."""
+        state = self._read_issue_cancellation_state(issue_number)
+        if state.merge_observed:
+            if state.classification is IssueCancellationClass.E_FULL_BINDING:
+                return "MERGE_OBSERVED_POST_MERGE_REQUIRED"
+            if state.classification is IssueCancellationClass.D_PRE_BINDING_ONE_PR:
+                raise StaleAuthorityError("MERGED_PRE_BINDING_PRESERVE_WITHOUT_POST_MERGE_AUTHORITY")
+            raise StaleAuthorityError("merged cancellation state is not an exact PR-backed D/E class")
+        _authority, fence_item, _witness_item, terminal = self._validated_pr_cancellation_cleanup(state)
+        fence = fence_item.fence
+        if state.branch_ref_oid is None:
+            return terminal
+        if state.branch_ref_oid != fence.cancellation_head_sha:
+            raise StaleAuthorityError("PR-backed branch cleanup ref differs from exact cancellation HC")
+
+        # Re-read every central proof and the exact current cancellation failure
+        # immediately before deleting the one named branch ref.
+        latest = self._read_issue_cancellation_state(issue_number)
+        _latest_authority, latest_fence_item, _latest_witness, latest_terminal = (
+            self._validated_pr_cancellation_cleanup(latest)
+        )
+        if (
+            latest.classification is not state.classification
+            or latest_fence_item.fence != fence
+            or latest_terminal != terminal
+            or latest.branch_ref_oid != fence.cancellation_head_sha
+        ):
+            raise StaleAuthorityError("PR-backed terminal cancellation authority changed immediately before CAS cleanup")
+        update = RefUpdate(fence.branch_ref, fence.cancellation_head_sha, ZERO_OID, force=False)
+        try:
+            self.client.update_refs(latest.repository.node_id, [update])
+        except Exception as error:
+            try:
+                after_error = self._read_issue_cancellation_state(issue_number)
+                _after_authority, _after_fence, _after_witness, after_terminal = (
+                    self._validated_pr_cancellation_cleanup(after_error)
+                )
+            except Exception as reclassify_error:
+                raise StaleAuthorityError(
+                    f"terminal cleanup CAS failed and fresh reclassification is unavailable: {_bounded_reason(reclassify_error)}"
+                ) from None
+            if after_error.branch_ref_oid is None and after_terminal == terminal:
+                return terminal
+            raise StaleAuthorityError(
+                f"terminal cleanup exact CAS did not remove the authorized HC: {_bounded_reason(error)}"
+            ) from None
+        if _read_issue_branch_ref(
+            self.client, self.central_repository, fence.branch_ref.removeprefix("refs/heads/"),
+        ) is not None:
+            raise StaleAuthorityError("terminal cleanup CAS returned without verifying branch-ref absence")
+        final_state = self._read_issue_cancellation_state(issue_number)
+        _final_authority, _final_fence, _final_witness, final_terminal = (
+            self._validated_pr_cancellation_cleanup(final_state)
+        )
+        if final_state.branch_ref_oid is not None or final_terminal != terminal:
+            raise StaleAuthorityError("terminal cleanup readback lost exact terminal proof or ref absence")
+        return final_terminal
+
+    def _read_issue_cancellation_state(self, issue_number: int) -> IssueCancellationState:
+        """Classify a terminal Issue from fresh central authority without source lookup."""
+        if type(issue_number) is not int or not 1 <= issue_number <= 9_223_372_036_854_775_807:
+            raise R02Error("cancellation Issue number must be a positive signed-64 integer")
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            issue = self.client.get_issue_metadata(self.central_repository, issue_number)
+            issue_comments = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+        except Exception as error:
+            raise StaleAuthorityError(f"central cancellation classification authority is unavailable: {_bounded_reason(error)}") from None
+        if (
+            type(repository) is not RepositoryMetadata
+            or repository.full_name != self.central_repository
+            or repository.default_branch != "main"
+            or not repository.node_id
+            or current_app != self.app
+            or type(issue) is not IssueMetadata
+            or issue.number != issue_number
+            or issue.is_pull_request
+        ):
+            raise StaleAuthorityError("exact central repository/App/Issue identity changed during cancellation classification")
+        anchor = validate_unique_issue_anchor(issue_comments, issue, self.app)
+        _issue_pr_authority_fence(issue_comments, self.app, allow_cancellation_fence=True)
+        lease = _resolve_issue_branch_lease_class(
+            self.client, self.central_repository, issue_comments, self.app,
+            anchor.anchor, anchor.comment.database_id, repository.node_id,
+        )
+        issue_bindings = _binding_comment_candidates(
+            issue_comments, self.app, ISSUE_INTERNAL_PR_BINDING_MARKER,
+            parse_issue_internal_pr_binding, "IssueInternalPRBinding",
+        )
+        binding_conflict = lease is None and bool(issue_bindings)
+        for binding_item in issue_bindings:
+            if lease is None:
+                binding_conflict = True
+                continue
+            try:
+                _validate_issue_binding_cross_link(binding_item.binding, anchor, lease, repository.node_id)
+            except R02Error:
+                binding_conflict = True
+        no_pr_results = tuple(
+            item.result for item in _issue_no_pr_cancelled_result_comments(
+                issue_comments, self.app, anchor, lease,
+            )
+        )
+
+        branch_ref = issue_branch_ref(issue_number)
+        short_ref = branch_ref.removeprefix("refs/heads/")
+        current_ref = _read_issue_branch_ref(self.client, self.central_repository, short_ref)
+        try:
+            inventory = self.client.list_pull_requests(self.central_repository, state="all")
+        except Exception as error:
+            raise StaleAuthorityError(f"bounded all-state PR enumeration failed: {_bounded_reason(error)}") from None
+        if type(inventory) not in {tuple, list}:
+            raise R02Error("all-state PR enumeration must return a sequence")
+        numbers: list[int] = []
+        seen_numbers: set[int] = set()
+        candidates: list[_IssueCancellationPRCandidate] = []
+        topology_conflict = False
+        for raw in inventory:
+            if (
+                type(raw) is not dict
+                or type(raw.get("number")) is not int
+                or not 1 <= raw["number"] <= 9_223_372_036_854_775_807
+                or raw["number"] in seen_numbers
+            ):
+                raise R02Error("all-state PR enumeration contains an invalid or duplicate PR number")
+            number = raw["number"]
+            numbers.append(number)
+            seen_numbers.add(number)
+            try:
+                pr = self.client.get_pull_request_metadata(self.central_repository, number)
+            except Exception as error:
+                raise StaleAuthorityError(f"all-state PR metadata is unavailable: {_bounded_reason(error)}") from None
+            if type(pr) is not PullRequestMetadata or pr.number != number:
+                raise R02Error("all-state PR metadata differs from its enumerated number")
+            if pr.head_ref != short_ref:
+                continue
+            if pr.head_repository_id != repository.node_id:
+                topology_conflict = True
+                continue
+            if (
+                pr.head_repository != self.central_repository
+                or pr.base_repository_id != repository.node_id
+                or pr.base_repository != self.central_repository
+                or pr.base_ref != "main"
+                or pr.author_id != self.app.bot_node_id
+                or pr.author_login != self.app.bot_login
+                or pr.body != render_request_body(anchor.anchor.initial_request)
+                or pr.last_edited_at is not None
+                or pr.includes_created_edit is not False
+                or type(pr.draft) is not bool
+            ):
+                topology_conflict = True
+                continue
+            raw_state = raw.get("state")
+            raw_merged = raw.get("merged")
+            raw_merged_at = raw.get("merged_at")
+            if type(raw_merged) is not bool and "merged_at" in raw:
+                if raw_merged_at is None:
+                    raw_merged = False
+                elif type(raw_merged_at) is str and raw_merged_at:
+                    raw_merged = True
+                else:
+                    raw_merged = None
+            if (
+                type(raw_state) is not str
+                or raw_state not in {"open", "closed"}
+                or type(raw_merged) is not bool
+                or (raw_merged and (type(raw_merged_at) is not str or not raw_merged_at))
+                or (not raw_merged and raw_merged_at is not None)
+            ):
+                topology_conflict = True
+                continue
+            try:
+                pr_issue = self.client.get_issue_metadata(self.central_repository, number)
+                pr_comments = tuple(self.client.list_issue_comments(self.central_repository, number))
+            except Exception as error:
+                raise StaleAuthorityError(f"reserved-branch PR-as-Issue authority is unavailable: {_bounded_reason(error)}") from None
+            if (
+                type(pr_issue) is not IssueMetadata
+                or pr_issue.is_pull_request is not True
+                or pr_issue.number != number
+                or type(pr_issue.database_id) is not int
+                or pr_issue.database_id <= 0
+                or type(pr_issue.node_id) is not str
+                or not pr_issue.node_id
+                or pr_issue.author_id != self.app.bot_node_id
+                or pr_issue.author_login != self.app.bot_login
+                or pr_issue.body != pr.body
+                or pr_issue.state != raw_state
+            ):
+                topology_conflict = True
+                continue
+            _issue_pr_authority_fence(pr_comments, self.app, allow_cancellation_fence=True)
+            pr_bindings = _binding_comment_candidates(
+                pr_comments, self.app, PR_ISSUE_ORIGIN_BINDING_MARKER,
+                parse_pr_issue_origin_binding, "PRIssueOriginBinding",
+            )
+            issue_binding = issue_bindings[0] if issue_bindings else None
+            pr_binding = pr_bindings[0] if pr_bindings else None
+            for item in (issue_binding, pr_binding):
+                if item is not None:
+                    if lease is None:
+                        binding_conflict = True
+                    else:
+                        try:
+                            _validate_issue_binding_cross_link(item.binding, anchor, lease, repository.node_id)
+                        except R02Error:
+                            binding_conflict = True
+                    if (
+                        item.binding.pull_request_number != number
+                        or item.binding.pull_request_database_id != pr_issue.database_id
+                        or item.binding.pull_request_node_id != pr_issue.node_id
+                    ):
+                        binding_conflict = True
+            if issue_binding is not None and pr_binding is not None and issue_binding.binding != pr_binding.binding:
+                binding_conflict = True
+            candidates.append(_IssueCancellationPRCandidate(
+                pr, pr_issue, pr_comments, raw_state.upper(), raw_merged,
+                raw_merged_at, issue_binding, pr_binding,
+            ))
+
+        enum_payload = {
+            "branchRef": branch_ref,
+            "centralRepositoryNodeId": repository.node_id,
+            "listedPullRequestNumbers": sorted(numbers),
+            "reservedBranchCandidates": [
+                {
+                    "baseRef": item.pr.base_ref,
+                    "headRef": item.pr.head_ref,
+                    "headSha": item.pr.head_oid,
+                    "merged": item.raw_merged,
+                    "mergedAt": item.raw_merged_at,
+                    "number": item.pr.number,
+                    "state": item.raw_state,
+                }
+                for item in sorted(candidates, key=lambda candidate: candidate.pr.number)
+            ],
+        }
+        enumeration_digest = hashlib.sha256(json.dumps(
+            enum_payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")).hexdigest()
+
+        def conflicting_state() -> IssueCancellationState:
+            return IssueCancellationState(
+                IssueCancellationClass.F_CONFLICTING, repository, issue, issue_comments,
+                anchor, lease, current_ref, enumeration_digest, tuple(candidates), None,
+                (), (), (), no_pr_results, any(item.raw_merged for item in candidates),
+            )
+
+        if binding_conflict or topology_conflict:
+            return conflicting_state()
+
+        if lease is None:
+            if current_ref is not None or candidates:
+                return conflicting_state()
+            if any(result.proof_kind is not IssueNoPRCancelledProofKind.ANCHOR_ONLY for result in no_pr_results):
+                raise R02Error("anchor-only cancellation has a lease-backed no-PR result")
+            return IssueCancellationState(
+                IssueCancellationClass.A_ANCHOR_ONLY, repository, issue, issue_comments,
+                anchor, None, None, enumeration_digest, (), None, (), (), (), no_pr_results, False,
+            )
+
+        if not candidates:
+            if current_ref is None:
+                if any(result.proof_kind not in {
+                    IssueNoPRCancelledProofKind.LEASE_REF_ABSENT,
+                    IssueNoPRCancelledProofKind.LEASE_ZERO_PR_CAS,
+                } for result in no_pr_results):
+                    raise R02Error("absent-ref cancellation has an incompatible no-PR proof kind")
+                return IssueCancellationState(
+                    IssueCancellationClass.B_LEASE_REF_ABSENT, repository, issue, issue_comments,
+                    anchor, lease, None, enumeration_digest, (), None, (), (), (), no_pr_results, False,
+                )
+            if current_ref == lease.lease.initial_head_sha:
+                if issue_bindings:
+                    return conflicting_state()
+                if no_pr_results:
+                    return conflicting_state()
+                return IssueCancellationState(
+                    IssueCancellationClass.C_LEASE_ZERO_PR, repository, issue, issue_comments,
+                    anchor, lease, current_ref, enumeration_digest, (), None, (), (), (), no_pr_results, False,
+                )
+            return conflicting_state()
+        if no_pr_results:
+            return conflicting_state()
+        if len(candidates) != 1:
+            return conflicting_state()
+
+        candidate = candidates[0]
+        full_binding = (
+            candidate.issue_binding is not None
+            and candidate.pr_binding is not None
+            and candidate.issue_binding.binding == candidate.pr_binding.binding
+        )
+        authority = _fresh_issue_cancellation_authority(
+            self.client, self.central_repository, issue_number, self.app,
+            allow_pr_stage_state=True,
+        )
+        if (
+            authority.issue_anchor.anchor != anchor.anchor
+            or authority.issue_anchor.comment.database_id != anchor.comment.database_id
+            or authority.lease.lease != lease.lease
+            or authority.lease.comment.database_id != lease.comment.database_id
+            or authority.pull_request_number != candidate.pr.number
+            or authority.pull_request_database_id != candidate.pr_issue.database_id
+            or authority.pull_request_node_id != candidate.pr_issue.node_id
+            or authority.raw_pr_state != candidate.raw_state
+            or authority.raw_pr_merged is not candidate.raw_merged
+            or (authority.binding_authority == "FULL_BINDING") != full_binding
+        ):
+            raise StaleAuthorityError("fresh cancellation PR/anchor/lease/binding identity changed during classification")
+        refreshed_ref = _read_issue_branch_ref(self.client, self.central_repository, short_ref)
+        if refreshed_ref != current_ref:
+            raise StaleAuthorityError("reserved Issue branch ref changed during cancellation classification")
+
+        history_ref = current_ref or candidate.pr.head_oid
+        fence_items, pr_comments = self._read_issue_cancellation_fences(authority, history_ref)
+        if len(fence_items) > 1:
+            raise R02Error("conflicting IssueCancellationFence comments block classification")
+        if fence_items:
+            fence = fence_items[0].fence
+            if candidate.pr.head_oid not in {fence.original_head_sha, fence.cancellation_head_sha}:
+                raise R02Error("reserved PR head differs from exact fence original/HC")
+            if current_ref not in {None, fence.original_head_sha, fence.cancellation_head_sha}:
+                raise R02Error("reserved branch ref differs from exact fence original/HC")
+        elif candidate.pr.head_oid != current_ref:
+            raise R02Error("reserved PR head and exact branch ref differ")
+
+        witness_items: tuple[IssueCancellationDraftWitnessComment, ...] = ()
+        terminal_items: tuple[IssueTerminalCancelledResultComment, ...] = ()
+        if fence_items:
+            current_status = _latest_exact_cancel_status_evidence(
+                self.client, self.central_repository, fence_items[0].fence, self.app,
+            )
+            has_witness_marker = any(
+                type(item.body) is str and item.body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER)
+                for item in pr_comments
+            )
+            has_terminal_marker = any(
+                type(item.body) is str and item.body.startswith(ISSUE_TERMINAL_CANCELLED_RESULT_MARKER)
+                for item in pr_comments
+            )
+            if has_witness_marker and current_status is None:
+                raise R02Error("persisted draft witness has no exact current cancellation failure")
+            if current_status is not None:
+                witness_items = _issue_cancellation_draft_witness_comments(
+                    pr_comments, self.app, authority, fence_items[0], current_status,
+                )
+            if has_terminal_marker and (current_status is None or len(witness_items) != 1):
+                raise R02Error("persisted terminal result lacks exact current failure or draft witness")
+            if has_terminal_marker:
+                terminal_items = _issue_terminal_cancelled_result_comments(
+                    pr_comments, self.app, authority, fence_items[0], witness_items[0], current_status,
+                )
+
+        merge_observed = candidate.raw_merged
+        if merge_observed:
+            classification = IssueCancellationClass.E_FULL_BINDING if full_binding else IssueCancellationClass.D_PRE_BINDING_ONE_PR
+        else:
+            if current_ref is None:
+                if not terminal_items or candidate.pr.head_oid != terminal_items[0].result.cancellation_head_sha:
+                    raise R02Error("reserved PR branch is absent without durable terminal cancellation authority")
+            elif candidate.pr.head_oid != current_ref:
+                raise R02Error("reserved PR head and exact branch ref differ")
+            if not full_binding:
+                valid_prebinding_head = candidate.pr.head_oid == lease.lease.initial_head_sha
+                if fence_items:
+                    valid_prebinding_head = valid_prebinding_head or candidate.pr.head_oid == fence_items[0].fence.cancellation_head_sha
+                    valid_prebinding_head = valid_prebinding_head or (
+                        current_ref == fence_items[0].fence.original_head_sha == candidate.pr.head_oid
+                    )
+                if not valid_prebinding_head:
+                    raise R02Error("PRE_BINDING PR head exceeds exact lease-root/fence authority")
+                classification = IssueCancellationClass.D_PRE_BINDING_ONE_PR
+            else:
+                classification = IssueCancellationClass.E_FULL_BINDING
+        return IssueCancellationState(
+            classification, repository, issue, issue_comments, anchor, lease,
+            current_ref, enumeration_digest, tuple(candidates), authority,
+            fence_items, witness_items, terminal_items, no_pr_results, merge_observed,
+        )
+
+    def prepare_issue_finalization_epoch(
+        self,
+        issue_number: int,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> IssueFinalizationEpoch:
+        """Persist and CAS one exact HA -> HF finalization epoch; publish no status."""
+        snapshot = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+        )
+        self._require_no_issue_cancellation_fence(
+            snapshot.state, snapshot.current_ref, snapshot.pr_comments,
+        )
+        current = snapshot.current_authority
+
+        # A retry after a completed CAS returns the already active exact epoch.
+        if current.claim_kind == "ISSUE_FINALIZATION_EPOCH":
+            epoch = current.artifact
+            origin = current.proposal_origin
+            if origin is None:
+                raise StaleAuthorityError("active finalization has no unique proposal-origin claim")
+            scope_digest, request_digest, projection_digest = self._derive_issue_proposal_scope(
+                snapshot, epoch.from_head_sha, origin,
+            )
+            if (
+                type(epoch) is not IssueFinalizationEpoch
+                or epoch.from_head_sha not in {node.target_head_sha for node in snapshot.history}
+                or epoch.accepted_base_sha != snapshot.accepted_main_sha
+                or epoch.accepted_base_tree_sha != snapshot.accepted_main_tree_sha
+                or epoch.claimed_target_evidence_digest != scope_digest
+                or epoch.fresh_proposal_scope_evidence_digest != scope_digest
+                or epoch.effective_request_digest != request_digest
+                or epoch.patch_projection_evidence_digest != projection_digest
+            ):
+                raise StaleAuthorityError("active finalization epoch no longer matches fresh finalizer authority")
+            return epoch
+
+        if (
+            current.role is not CarrierRole.ISSUE_ACTIVE
+            or current.claim_kind not in {"ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH"}
+        ):
+            raise StaleAuthorityError("only an active IssueHeadClaim or RequiredStatusEpoch can enter finalization")
+        origin = current.proposal_origin
+        if origin is None or type(origin.artifact) is not IssueHeadClaim:
+            raise StaleAuthorityError("current Issue head has no unique proposal-bearing IssueHeadClaim ancestry")
+        if origin.transition_kind == "NORMALIZE":
+            raise StaleAuthorityError("normalization-only Issue history cannot enter finalization")
+        target_digest, request_digest, projection_digest = self._derive_issue_proposal_scope(
+            snapshot, snapshot.current_ref, origin,
+        )
+        state = snapshot.state
+        immediate = current
+        stable_fields = dict(
+            schema_version=1,
+            issue_number=state.issue_anchor.anchor.issue_number,
+            issue_database_id=state.issue_anchor.anchor.issue_database_id,
+            issue_node_id=state.issue_anchor.anchor.issue_node_id,
+            issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+            issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+            issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+            issue_branch_lease_sha256=_binding_comment_sha256(state.lease.comment),
+            binding_id=state.binding.binding_id,
+            source_id=state.issue_anchor.anchor.source_id,
+            source_repository_id=state.issue_anchor.anchor.source_repository_id,
+            pull_request_number=state.binding.pull_request_number,
+            pull_request_database_id=state.binding.pull_request_database_id,
+            pull_request_node_id=state.binding.pull_request_node_id,
+            central_repository_node_id=state.binding.central_repository_node_id,
+            branch_ref=state.binding.branch_ref,
+            request_class=state.issue_anchor.anchor.request_class,
+            accepted_base_sha=snapshot.accepted_main_sha,
+            accepted_base_tree_sha=snapshot.accepted_main_tree_sha,
+            base_ref="main",
+            from_head_sha=snapshot.current_ref,
+            from_tree_sha=immediate.tree_sha,
+            final_head_sha="0" * 40,
+            final_tree_sha=immediate.tree_sha,
+            carrier_nonce="0" * 64,
+            from_authority_kind=immediate.claim_kind,
+            from_authority_comment_database_id=immediate.comment.database_id,
+            from_authority_artifact_id=immediate.artifact_id,
+            from_authority_artifact_sha256=immediate.artifact_sha256,
+            from_authority_role=immediate.role.value,
+            proposal_origin_claim_comment_database_id=origin.comment.database_id,
+            proposal_origin_claim_id=origin.artifact.claim_id,
+            proposal_origin_claim_sha256=origin.artifact_sha256,
+            effective_request_digest=request_digest,
+            patch_projection_evidence_digest=projection_digest,
+            claimed_target_evidence_digest=target_digest,
+            fresh_proposal_scope_evidence_digest=target_digest,
+        )
+
+        pending = tuple(
+            node for node in snapshot.history
+            if node.claim_kind == "ISSUE_FINALIZATION_EPOCH"
+            and node.from_head_sha == snapshot.current_ref
+        )
+        replay_pending = bool(pending)
+        if len(pending) > 1:
+            raise R02Error("multiple pending finalization epochs from the current HA conflict")
+        if pending:
+            epoch = pending[0].artifact
+            expected = stable_fields.copy()
+            for name in ("final_head_sha", "carrier_nonce"):
+                expected.pop(name)
+            actual = {
+                "schema_version": epoch.schema_version,
+                "issue_number": epoch.issue_number,
+                "issue_database_id": epoch.issue_database_id,
+                "issue_node_id": epoch.issue_node_id,
+                "issue_request_anchor_comment_database_id": epoch.issue_request_anchor_comment_database_id,
+                "issue_request_anchor_sha256": epoch.issue_request_anchor_sha256,
+                "issue_branch_lease_comment_database_id": epoch.issue_branch_lease_comment_database_id,
+                "issue_branch_lease_sha256": epoch.issue_branch_lease_sha256,
+                "binding_id": epoch.binding_id,
+                "source_id": epoch.source_id,
+                "source_repository_id": epoch.source_repository_id,
+                "pull_request_number": epoch.pull_request_number,
+                "pull_request_database_id": epoch.pull_request_database_id,
+                "pull_request_node_id": epoch.pull_request_node_id,
+                "central_repository_node_id": epoch.central_repository_node_id,
+                "branch_ref": epoch.branch_ref,
+                "request_class": epoch.request_class,
+                "accepted_base_sha": epoch.accepted_base_sha,
+                "accepted_base_tree_sha": epoch.accepted_base_tree_sha,
+                "base_ref": epoch.base_ref,
+                "from_head_sha": epoch.from_head_sha,
+                "from_tree_sha": epoch.from_tree_sha,
+                "final_tree_sha": epoch.final_tree_sha,
+                "from_authority_kind": epoch.from_authority_kind,
+                "from_authority_comment_database_id": epoch.from_authority_comment_database_id,
+                "from_authority_artifact_id": epoch.from_authority_artifact_id,
+                "from_authority_artifact_sha256": epoch.from_authority_artifact_sha256,
+                "from_authority_role": epoch.from_authority_role,
+                "proposal_origin_claim_comment_database_id": epoch.proposal_origin_claim_comment_database_id,
+                "proposal_origin_claim_id": epoch.proposal_origin_claim_id,
+                "proposal_origin_claim_sha256": epoch.proposal_origin_claim_sha256,
+                "effective_request_digest": epoch.effective_request_digest,
+                "patch_projection_evidence_digest": epoch.patch_projection_evidence_digest,
+                "claimed_target_evidence_digest": epoch.claimed_target_evidence_digest,
+                "fresh_proposal_scope_evidence_digest": epoch.fresh_proposal_scope_evidence_digest,
+            }
+            if actual != expected:
+                raise StaleAuthorityError("pending finalization epoch does not match the freshly resolved HA authority")
+        else:
+            nonce = (nonce_factory or new_carrier_nonce)()
+            if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{64}", nonce):
+                raise R02Error("IssueFinalizationEpoch nonce must be lowercase 256-bit hex")
+            stable_fields["carrier_nonce"] = nonce
+            prepared = IssueFinalizationEpoch.create(**stable_fields)
+            marker_text = _issue_finalization_epoch_marker(prepared).render()
+            timestamp = self.client.bot_commit_timestamp_after(
+                self.central_repository, snapshot.current_ref,
+            )
+            wrapper = self.client.create_commit(
+                self.central_repository, marker_text, immediate.tree_sha,
+                [snapshot.current_ref], timestamp=timestamp,
+            )
+            epoch = IssueFinalizationEpoch.create(**{
+                **stable_fields,
+                "final_head_sha": wrapper.sha,
+            })
+            _validate_issue_finalization_epoch_target(
+                self.client, self.central_repository, epoch, state,
+            )
+
+        if not replay_pending:
+            self._persist_issue_epoch_artifact(state, epoch, snapshot.current_ref)
+        before_cas = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+        )
+        self._require_no_issue_cancellation_fence(
+            before_cas.state, before_cas.current_ref, before_cas.pr_comments,
+        )
+        _require_same_managed_issue_pr_binding(state, before_cas.state)
+        if (
+            before_cas.current_ref != snapshot.current_ref
+            or before_cas.current_authority.claim_kind != immediate.claim_kind
+            or before_cas.current_authority.artifact_id != immediate.artifact_id
+            or before_cas.accepted_main_sha != epoch.accepted_base_sha
+        ):
+            raise StaleAuthorityError("HA, accepted main, or immediate authority changed before finalization CAS")
+        fresh_scope, fresh_request, fresh_projection = self._derive_issue_proposal_scope(
+            before_cas, snapshot.current_ref, before_cas.current_authority.proposal_origin,
+        )
+        if (
+            fresh_scope != epoch.fresh_proposal_scope_evidence_digest
+            or fresh_request != epoch.effective_request_digest
+            or fresh_projection != epoch.patch_projection_evidence_digest
+        ):
+            raise StaleAuthorityError("finalizer-grade proposal evidence changed before finalization CAS")
+        self._apply_persisted_issue_epoch_target(
+            before_cas.state, epoch.from_head_sha, epoch.final_head_sha, snapshot.current_ref,
+        )
+        final_snapshot = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+        )
+        _require_same_managed_issue_pr_binding(state, final_snapshot.state)
+        if (
+            final_snapshot.current_ref != epoch.final_head_sha
+            or final_snapshot.current_authority.claim_kind != "ISSUE_FINALIZATION_EPOCH"
+            or final_snapshot.current_authority.artifact != epoch
+        ):
+            raise StaleAuthorityError("finalization CAS is not the exact active HF")
+        origin = final_snapshot.current_authority.proposal_origin
+        if origin is None:
+            raise StaleAuthorityError("active HF lost its exact proposal-origin ancestry")
+        fresh_scope, fresh_request, fresh_projection = self._derive_issue_proposal_scope(
+            final_snapshot, epoch.from_head_sha, origin,
+        )
+        if (
+            fresh_scope != epoch.fresh_proposal_scope_evidence_digest
+            or fresh_request != epoch.effective_request_digest
+            or fresh_projection != epoch.patch_projection_evidence_digest
+        ):
+            raise StaleAuthorityError("finalizer-grade authority changed after finalization CAS")
+        return epoch
+
+    def publish_issue_final_success(
+        self,
+        issue_number: int,
+        epoch: IssueFinalizationEpoch,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+    ) -> StatusWriteReceipt:
+        """Append only the exact success tuple authorized by the active HF epoch."""
+        if type(epoch) is not IssueFinalizationEpoch:
+            raise R02Error("issue-final publication requires an exact IssueFinalizationEpoch")
+        snapshot = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+        )
+        node = snapshot.current_authority
+        if (
+            node.claim_kind != "ISSUE_FINALIZATION_EPOCH"
+            or node.role is not CarrierRole.ISSUE_FINALIZING
+            or node.artifact != epoch
+            or snapshot.resolution.activation is not CarrierActivation.ACTIVE
+        ):
+            raise StaleAuthorityError("issue-final success requires the exact ACTIVE(ISSUE_FINALIZING) epoch")
+        if (
+            epoch.issue_number != issue_number
+            or epoch.final_head_sha != snapshot.current_ref
+            or snapshot.state.pr.head_oid != epoch.final_head_sha
+            or snapshot.state.owning_issue.state != "open"
+            or snapshot.state.pr_issue.state != "open"
+            or epoch.accepted_base_sha != snapshot.accepted_main_sha
+            or epoch.accepted_base_tree_sha != snapshot.accepted_main_tree_sha
+        ):
+            raise StaleAuthorityError("issue-final epoch, accepted base, or live managed state changed")
+        origin = node.proposal_origin
+        if origin is None:
+            raise StaleAuthorityError("active finalization epoch has no proposal-origin IssueHeadClaim")
+        scope_digest, request_digest, projection_digest = self._derive_issue_proposal_scope(
+            snapshot, epoch.from_head_sha, origin,
+        )
+        if (
+            scope_digest != epoch.claimed_target_evidence_digest
+            or scope_digest != epoch.fresh_proposal_scope_evidence_digest
+            or request_digest != epoch.effective_request_digest
+            or projection_digest != epoch.patch_projection_evidence_digest
+        ):
+            raise StaleAuthorityError("fresh finalizer-grade authority no longer matches the exact HF epoch")
+        receipt = self.client.create_commit_status(
+            self.central_repository,
+            epoch.final_head_sha,
+            "success",
+            epoch.required_status_context,
+            epoch.required_status_description,
+            None,
+        )
+        return _validate_issue_final_status_receipt(receipt, snapshot.repository, epoch, self.app)
+
+    def revoke_required_status_epoch(
+        self,
+        issue_number: int,
+        reason: RequiredStatusEpochReason,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> RequiredStatusEpoch:
+        """Move invalidated current Issue semantics to a fresh no-tree-change HV."""
+        if type(reason) is not RequiredStatusEpochReason:
+            raise R02Error("RequiredStatusEpoch revocation requires an exact closed reason")
+        snapshot = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+            allow_source_mismatch=True,
+            allow_base_mismatch=True,
+        )
+        self._require_no_issue_cancellation_fence(
+            snapshot.state, snapshot.current_ref, snapshot.pr_comments,
+        )
+        current = snapshot.current_authority
+        if current.claim_kind == "REQUIRED_STATUS_EPOCH":
+            epoch = current.artifact
+            if epoch.reason_class is reason:
+                return epoch
+            raise StaleAuthorityError("current active RequiredStatusEpoch already represents a different reason")
+        if current.claim_kind not in {
+            "ISSUE_HEAD_CLAIM", "REQUIRED_STATUS_EPOCH", "ISSUE_FINALIZATION_EPOCH",
+        }:
+            raise StaleAuthorityError("only an active Wave 06 Issue-owned claim/epoch can be revoked")
+        if current.role is CarrierRole.ISSUE_FINALIZING:
+            if (
+                reason is not RequiredStatusEpochReason.FINALIZATION_INVALIDATED
+                or current.claim_kind != "ISSUE_FINALIZATION_EPOCH"
+            ):
+                raise R02Error("an active finalization epoch requires FINALIZATION_INVALIDATED revocation")
+        elif reason is RequiredStatusEpochReason.FINALIZATION_INVALIDATED:
+            raise R02Error("FINALIZATION_INVALIDATED requires an exact active ISSUE_FINALIZING predecessor")
+
+        artifact = current.artifact
+        if reason is RequiredStatusEpochReason.MAIN_ADVANCE_REVALIDATION:
+            if getattr(artifact, "accepted_base_sha", None) == snapshot.accepted_main_sha:
+                raise R02Error("MAIN_ADVANCE_REVALIDATION requires accepted main to have advanced")
+        elif reason is RequiredStatusEpochReason.REQUEST_PATCH_REVALIDATION:
+            origin = current.proposal_origin
+            if origin is None or type(origin.artifact) is not IssueHeadClaim:
+                raise R02Error("REQUEST_PATCH_REVALIDATION requires proposal-bearing claim ancestry")
+            if (
+                effective_request_digest(snapshot.fold.request) == origin.artifact.effective_request_digest
+                and issue_patch_projection_evidence_digest(snapshot.projections)
+                == origin.artifact.patch_projection_evidence_digest
+            ):
+                raise R02Error("REQUEST_PATCH_REVALIDATION requires changed request or PATCH evidence")
+        elif reason is RequiredStatusEpochReason.SOURCE_IDENTITY_REVALIDATION:
+            if snapshot.source_error is None or not snapshot.source_error.startswith("MISMATCH:"):
+                raise R02Error("SOURCE_IDENTITY_REVALIDATION requires a detected source-identity mismatch")
+        elif reason is RequiredStatusEpochReason.ACTIVE_REVALIDATION:
+            if snapshot.source_error is not None:
+                raise R02Error("ACTIVE_REVALIDATION cannot conceal unresolved source identity drift")
+        elif reason is not RequiredStatusEpochReason.FINALIZATION_INVALIDATED and snapshot.source_error is not None:
+            raise R02Error("this revocation reason cannot conceal unresolved source identity drift")
+
+        prior_status = (
+            _latest_exact_issue_final_status_evidence(
+                self.client, self.central_repository, snapshot.current_ref, self.app,
+            )
+            if current.role is CarrierRole.ISSUE_FINALIZING else None
+        )
+        pending = tuple(
+            node for node in snapshot.history
+            if node.claim_kind == "REQUIRED_STATUS_EPOCH"
+            and node.from_head_sha == snapshot.current_ref
+        )
+        replay_pending = bool(pending)
+        if len(pending) > 1:
+            raise R02Error("multiple pending RequiredStatusEpoch artifacts from the current head conflict")
+        if pending:
+            epoch = pending[0].artifact
+            if (
+                epoch.reason_class is not reason
+                or epoch.from_provenance_kind != current.claim_kind
+                or epoch.from_provenance_id != current.artifact_id
+                or epoch.from_provenance_sha256 != current.artifact_sha256
+                or epoch.from_carrier_role != current.role.value
+                or epoch.accepted_base_sha != snapshot.accepted_main_sha
+                or epoch.accepted_base_tree_sha != snapshot.accepted_main_tree_sha
+            ):
+                raise StaleAuthorityError("pending RequiredStatusEpoch does not match the fresh revocation authority")
+        else:
+            nonce = (nonce_factory or new_carrier_nonce)()
+            if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{64}", nonce):
+                raise R02Error("RequiredStatusEpoch nonce must be lowercase 256-bit hex")
+            state = snapshot.state
+            epoch_fields = dict(
+                schema_version=2,
+                issue_number=state.issue_anchor.anchor.issue_number,
+                issue_database_id=state.issue_anchor.anchor.issue_database_id,
+                issue_node_id=state.issue_anchor.anchor.issue_node_id,
+                issue_request_anchor_comment_database_id=state.issue_anchor.comment.database_id,
+                issue_request_anchor_sha256=state.issue_anchor.anchor.canonical_sha256(),
+                issue_branch_lease_comment_database_id=state.lease.comment.database_id,
+                issue_branch_lease_sha256=_binding_comment_sha256(state.lease.comment),
+                binding_id=state.binding.binding_id,
+                source_id=state.issue_anchor.anchor.source_id,
+                source_repository_id=state.issue_anchor.anchor.source_repository_id,
+                pull_request_number=state.binding.pull_request_number,
+                pull_request_database_id=state.binding.pull_request_database_id,
+                pull_request_node_id=state.binding.pull_request_node_id,
+                central_repository_node_id=state.binding.central_repository_node_id,
+                branch_ref=state.binding.branch_ref,
+                request_class=state.issue_anchor.anchor.request_class,
+                accepted_base_sha=snapshot.accepted_main_sha,
+                accepted_base_tree_sha=snapshot.accepted_main_tree_sha,
+                base_ref="main",
+                from_head_sha=snapshot.current_ref,
+                from_tree_sha=current.tree_sha,
+                to_head_sha="0" * 40,
+                to_tree_sha=current.tree_sha,
+                carrier_nonce=nonce,
+                reason_class=reason,
+                from_provenance_kind=current.claim_kind,
+                from_provenance_id=current.artifact_id,
+                from_provenance_sha256=current.artifact_sha256,
+                from_carrier_role=current.role.value,
+                prior_required_status=prior_status,
+            )
+            prepared = RequiredStatusEpoch.create(**epoch_fields)
+            marker_text = _required_status_epoch_marker(prepared).render()
+            timestamp = self.client.bot_commit_timestamp_after(
+                self.central_repository, snapshot.current_ref,
+            )
+            wrapper = self.client.create_commit(
+                self.central_repository, marker_text, current.tree_sha,
+                [snapshot.current_ref], timestamp=timestamp,
+            )
+            epoch = RequiredStatusEpoch.create(**{
+                **epoch_fields,
+                "to_head_sha": wrapper.sha,
+            })
+            _validate_required_status_epoch_target(
+                self.client, self.central_repository, epoch, state,
+            )
+
+        if not replay_pending:
+            self._persist_issue_epoch_artifact(snapshot.state, epoch, snapshot.current_ref)
+        before_cas = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+            allow_source_mismatch=True,
+            allow_base_mismatch=True,
+        )
+        self._require_no_issue_cancellation_fence(
+            before_cas.state, before_cas.current_ref, before_cas.pr_comments,
+        )
+        _require_same_managed_issue_pr_binding(snapshot.state, before_cas.state)
+        if (
+            before_cas.current_ref != snapshot.current_ref
+            or before_cas.current_authority.claim_kind != current.claim_kind
+            or before_cas.current_authority.artifact_id != current.artifact_id
+            or before_cas.accepted_main_sha != epoch.accepted_base_sha
+        ):
+            raise StaleAuthorityError("current head, accepted main, or predecessor changed before revocation CAS")
+        self._apply_persisted_issue_epoch_target(
+            before_cas.state, epoch.from_head_sha, epoch.to_head_sha, snapshot.current_ref,
+        )
+        after_cas = self._read_issue_epoch_snapshot(
+            issue_number, source_authority_resolver, semantic_validator,
+            allow_source_mismatch=True,
+            allow_base_mismatch=True,
+        )
+        _require_same_managed_issue_pr_binding(snapshot.state, after_cas.state)
+        if (
+            after_cas.current_ref != epoch.to_head_sha
+            or after_cas.current_authority.claim_kind != "REQUIRED_STATUS_EPOCH"
+            or after_cas.current_authority.artifact != epoch
+            or after_cas.resolution.role is not CarrierRole.ISSUE_ACTIVE
+        ):
+            raise StaleAuthorityError("revocation CAS is not the exact ACTIVE(ISSUE_ACTIVE) HV")
+        return epoch
+
+    def trusted_validation_role_first(
+        self,
+        pr_number: int,
+        legacy_disposition_resolver: Callable[[str], LegacyEvidenceDisposition] | None,
+        *,
+        central_recovery_dispatcher: Callable[[Wave08Decision, IssueOwnerPR, IssueCancellationFence | None], Any] | None = None,
+        machine_validation_dispatcher: Callable[[Wave08Decision, MachinePRAuthority], Any] | None = None,
+    ) -> Wave08Decision:
+        """Resolve the fresh PR head's SHA role before reading PR-specific authority."""
+        if type(pr_number) is not int or not 1 <= pr_number <= 9_223_372_036_854_775_807:
+            raise R02Error("role-first validation requires a positive exact PR number")
+        if central_recovery_dispatcher is not None and not callable(central_recovery_dispatcher):
+            raise R02Error("central recovery dispatcher must be a semantic callable")
+        if machine_validation_dispatcher is not None and not callable(machine_validation_dispatcher):
+            raise R02Error("machine validation dispatcher must be a semantic callable")
+
+        pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+        if type(pr) is not PullRequestMetadata or pr.number != pr_number:
+            raise StaleAuthorityError("fresh role-first PR identity is malformed")
+        head_sha = pr.head_oid
+        if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+            raise StaleAuthorityError("fresh role-first PR head is not exact lowercase 40-hex")
+
+        # The compatibility callback remains a call-shape input only; trusted
+        # legacy evidence and the reviewed implementation head are derived here.
+        resolution = self.resolve_current_sha_carrier_role(head_sha)
+        pull_request_numbers = (pr_number,)
+
+        def blocked(reason: Wave08DecisionReason) -> Wave08Decision:
+            return Wave08Decision(
+                head_sha, resolution, pull_request_numbers, None,
+                Wave08DecisionKind.CONFLICTING_BLOCKED, reason,
+            )
+
+        if resolution.activation in {
+            CarrierActivation.CONFLICTING,
+            CarrierActivation.LEGACY_CUTOVER_QUARANTINE,
+            CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION,
+        }:
+            decision = wave08_decision_for_resolution(head_sha, resolution, pull_request_numbers)
+            if decision.kind is Wave08DecisionKind.EXTERNAL_STATUS:
+                central = self.client.get_repository_metadata(self.central_repository)
+                fresh_app = resolve_app_identity(self.client, self.app.slug)
+                if (
+                    type(central) is not RepositoryMetadata
+                    or central.full_name != self.central_repository
+                    or central.default_branch != "main"
+                    or fresh_app != self.app
+                ):
+                    return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+                publish_unclaimed_external_success(
+                    self.client, central, head_sha, resolution, fresh_app,
+                )
+            return decision
+
+        if resolution.role is CarrierRole.MACHINE_PUBLICATION:
+            if resolution.activation is CarrierActivation.RESERVED_INACTIVE:
+                return wave08_decision_for_resolution(head_sha, resolution, pull_request_numbers)
+            marker = resolution.marker
+            if (
+                resolution.activation is not CarrierActivation.ACTIVE
+                or marker is None
+                or marker.owner_kind != "MACHINE_SOURCE"
+                or marker.claim_kind != "MACHINE_REF_CLAIM"
+            ):
+                return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+            try:
+                repository, accepted_main = self.current_accepted_main()
+                if repository.default_branch != "main":
+                    raise StaleAuthorityError("machine role requires central main")
+                accepted_sources = self._accepted_sources(accepted_main)
+                owner_key_matches = tuple(
+                    source for source in accepted_sources
+                    if marker.owner_key == f"{repository.node_id}:{source.source_id}"
+                )
+                if len(owner_key_matches) != 1:
+                    raise StaleAuthorityError("machine claim owner is not one exact accepted source")
+                source = owner_key_matches[0]
+                authority = self._machine_authority(
+                    {"number": pr_number}, source, accepted_main, repository,
+                )
+                current_machine_ref = self.client.get_ref_oid(
+                    self.central_repository, f"bot/federation/{source.source_id}",
+                )
+                if (
+                    authority is None
+                    or not authority.valid
+                    or authority.number != pr_number
+                    or authority.source_id != source.source_id
+                    or authority.repository_id != source.repository_id
+                    or authority.head_sha != head_sha
+                    or current_machine_ref != head_sha
+                    or pr.head_ref != _machine_branch(source.source_id)
+                    or pr.head_repository != repository.full_name
+                    or pr.head_repository_id != repository.node_id
+                    or pr.base_repository != repository.full_name
+                    or pr.base_repository_id != repository.node_id
+                    or pr.base_oid != accepted_main
+                ):
+                    raise StaleAuthorityError("machine PR/ref/source owner does not bind the exact role head")
+                decision = wave08_decision_for_resolution(
+                    head_sha, resolution, pull_request_numbers, owner_pr_number=pr_number,
+                    machine_target=Wave08DispatchTarget.MACHINE_VALIDATION,
+                )
+            except Exception:
+                return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+            if machine_validation_dispatcher is not None:
+                try:
+                    machine_validation_dispatcher(decision, authority)
+                except Exception:
+                    return blocked(Wave08DecisionReason.DISPATCH_FAILED)
+            return decision
+
+        if resolution.role not in {
+            CarrierRole.ISSUE_ACTIVE,
+            CarrierRole.ISSUE_FINALIZING,
+            CarrierRole.ISSUE_CANCEL,
+        }:
+            return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+        try:
+            owner = derive_issue_owner_pr(
+                self.client, self.central_repository, head_sha, resolution, self.app.slug,
+                role_already_resolved=True,
+            )
+        except Exception:
+            return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+        if owner.pull_request_number != pr_number:
+            return wave08_decision_for_resolution(head_sha, resolution, pull_request_numbers)
+
+        fence: IssueCancellationFence | None = None
+        if (
+            resolution.role is CarrierRole.ISSUE_CANCEL
+            and resolution.activation is CarrierActivation.ACTIVE
+        ):
+            try:
+                cancellation = _fresh_issue_cancellation_authority(
+                    self.client, self.central_repository, owner.issue_number, self.app,
+                    allow_pr_stage_state=True,
+                )
+                current_ref = _read_issue_branch_ref(
+                    self.client, self.central_repository,
+                    cancellation.lease.lease.branch_ref.removeprefix("refs/heads/"),
+                )
+                fences, _comments = self._read_issue_cancellation_fences(
+                    cancellation, current_ref or ZERO_OID,
+                )
+                exact_fences = tuple(
+                    item.fence for item in fences
+                    if item.fence.cancellation_head_sha == head_sha
+                    and _issue_cancellation_fence_marker(item.fence) == resolution.marker
+                )
+                if (
+                    len(exact_fences) != 1
+                    or cancellation.pull_request_number != pr_number
+                    or current_ref != head_sha
+                    or cancellation.pr.head_oid != head_sha
+                    or cancellation.raw_pr_state != "OPEN"
+                    or cancellation.raw_pr_merged
+                ):
+                    raise StaleAuthorityError("current cancellation fence/owner PR is not exact")
+                fence = exact_fences[0]
+                self.publish_issue_cancel_failure(owner.issue_number, fence)
+            except Exception:
+                return blocked(Wave08DecisionReason.FRESH_AUTHORITY_FAILED)
+
+        decision = wave08_decision_for_resolution(
+            head_sha, resolution, pull_request_numbers, owner_pr_number=pr_number,
+        )
+        if central_recovery_dispatcher is not None:
+            try:
+                central_recovery_dispatcher(decision, owner, fence)
+            except Exception:
+                return blocked(Wave08DecisionReason.DISPATCH_FAILED)
+        return decision
+
+    def recover_issue_first_authority(
+        self,
+        issue_number: int,
+        source_authority_resolver: Callable[[Request, RequestClass], IssueSourceAuthority],
+        *,
+        semantic_validator: Callable[[Request], bool] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> Wave08IssueRecoveryRecord:
+        """Wg1-like explicit Issue intake/terminal recovery using Wave 02-07 authorities."""
+        if type(issue_number) is not int or not 1 <= issue_number <= 9_223_372_036_854_775_807:
+            raise R02Error("Issue recovery requires a positive exact Issue number")
+        if not callable(source_authority_resolver):
+            raise R02Error("Issue recovery requires a fresh source-authority resolver")
+
+        # The cancellation classifier is deliberately the first authority path.
+        # A missing anchor is the sole expected reason to fall through to open intake.
+        terminal_state: IssueCancellationState | None = None
+        try:
+            terminal_state = self._read_issue_cancellation_state(issue_number)
+        except DuplicateAnchorError as error:
+            try:
+                snapshot = self.client.get_issue_metadata(self.central_repository, issue_number)
+            except Exception as read_error:
+                raise StaleAuthorityError(
+                    f"Issue identity is unavailable after anchor classification: {_bounded_reason(read_error)}"
+                ) from None
+            if (
+                type(snapshot) is not IssueMetadata
+                or snapshot.number != issue_number
+                or snapshot.is_pull_request
+            ):
+                raise StaleAuthorityError("fresh Issue identity is malformed after anchor classification") from None
+            if snapshot.state != "open":
+                return Wave08IssueRecoveryRecord(
+                    issue_number, snapshot.database_id, snapshot.node_id,
+                    "BLOCKED", f"CLOSED_ISSUE_REQUIRES_UNIQUE_ANCHOR:{_bounded_reason(error)}",
+                )
+            terminal_state = None
+        except Exception as error:
+            # A closed Issue with malformed/ambiguous cancellation authority must
+            # not be reinterpreted through live source-registry eligibility.
+            try:
+                snapshot = self.client.get_issue_metadata(self.central_repository, issue_number)
+            except Exception:
+                raise StaleAuthorityError(
+                    f"Issue cancellation authority is unavailable: {_bounded_reason(error)}"
+                ) from None
+            if type(snapshot) is not IssueMetadata or snapshot.number != issue_number or snapshot.is_pull_request:
+                raise StaleAuthorityError("fresh Issue identity is malformed during cancellation recovery") from None
+            if snapshot.state != "open":
+                raise StaleAuthorityError(
+                    f"closed Issue cancellation classification is blocked: {_bounded_reason(error)}"
+                ) from None
+            # Open unanchored Issues do not yet have cancellation provenance.
+            terminal_state = None
+
+        if terminal_state is not None and terminal_state.issue.state == "closed":
+            state = terminal_state
+            if state.classification in {
+                IssueCancellationClass.A_ANCHOR_ONLY,
+                IssueCancellationClass.B_LEASE_REF_ABSENT,
+                IssueCancellationClass.C_LEASE_ZERO_PR,
+            }:
+                result = self.cancel_issue_without_pr(issue_number)
+                return Wave08IssueRecoveryRecord(
+                    issue_number, state.issue.database_id, state.issue.node_id,
+                    "CANCELLED_NO_PR", result.proof_kind.value,
+                )
+            if state.classification is IssueCancellationClass.F_CONFLICTING:
+                return Wave08IssueRecoveryRecord(
+                    issue_number, state.issue.database_id, state.issue.node_id,
+                    "BLOCKED", "CANCELLATION_CLASS_F_CONFLICTING",
+                )
+            if state.classification not in {
+                IssueCancellationClass.D_PRE_BINDING_ONE_PR,
+                IssueCancellationClass.E_FULL_BINDING,
+            }:
+                return Wave08IssueRecoveryRecord(
+                    issue_number, state.issue.database_id, state.issue.node_id,
+                    "BLOCKED", "UNKNOWN_CANCELLATION_CLASS",
+                )
+            if state.merge_observed:
+                if state.classification is IssueCancellationClass.E_FULL_BINDING:
+                    return Wave08IssueRecoveryRecord(
+                        issue_number, state.issue.database_id, state.issue.node_id,
+                        "MERGE_WINS", "POST_MERGE_RECOVERY_REQUIRED",
+                    )
+                return Wave08IssueRecoveryRecord(
+                    issue_number, state.issue.database_id, state.issue.node_id,
+                    "PRESERVED", "MERGED_PRE_BINDING_HAS_NO_CANCELLATION_DELETE_AUTHORITY",
+                )
+
+            fence = self.prepare_issue_cancellation_fence(
+                issue_number,
+                classification="D" if state.classification is IssueCancellationClass.D_PRE_BINDING_ONE_PR else "E",
+                nonce_factory=nonce_factory,
+            )
+            try:
+                self._require_current_cancel_failure(fence)
+            except Exception as error:
+                return Wave08IssueRecoveryRecord(
+                    issue_number, state.issue.database_id, state.issue.node_id,
+                    "DEFERRED", f"WAITING_FOR_WG6_CANCEL_FAILURE:{_bounded_reason(error)}",
+                )
+            self.establish_issue_cancellation_draft_witness(issue_number)
+            self.establish_issue_terminal_cancelled_result(issue_number)
+            terminal = self.cleanup_issue_cancelled_branch(issue_number)
+            return Wave08IssueRecoveryRecord(
+                issue_number, state.issue.database_id, state.issue.node_id,
+                "CANCELLED_PR_BACKED", "EXACT_TERMINAL_RESULT_AND_REF_CAS_VERIFIED",
+            )
+
+        if terminal_state is not None:
+            if terminal_state.classification is IssueCancellationClass.F_CONFLICTING:
+                return Wave08IssueRecoveryRecord(
+                    issue_number, terminal_state.issue.database_id, terminal_state.issue.node_id,
+                    "BLOCKED", "OPEN_ISSUE_CANCELLATION_PROVENANCE_CONFLICT",
+                )
+            if (
+                terminal_state.issue.state == "open"
+                and terminal_state.classification in {
+                    IssueCancellationClass.D_PRE_BINDING_ONE_PR,
+                    IssueCancellationClass.E_FULL_BINDING,
+                }
+            ):
+                authority = terminal_state.cancellation_authority
+                head_sha = authority.pr.head_oid if authority is not None else None
+                if type(head_sha) is not str or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+                    return Wave08IssueRecoveryRecord(
+                        issue_number, terminal_state.issue.database_id, terminal_state.issue.node_id,
+                        "DEFERRED", "CURRENT_ISSUE_CARRIER_ROLE_UNAVAILABLE_FOR_WG1",
+                    )
+                try:
+                    current_resolution = self.resolve_current_sha_carrier_role(head_sha)
+                except Exception:
+                    current_resolution = _conflicting_sha_carrier()
+                if current_resolution.role is CarrierRole.ISSUE_FINALIZING and current_resolution.activation in {
+                    CarrierActivation.ACTIVE,
+                    CarrierActivation.RESERVED_INACTIVE,
+                }:
+                    return Wave08IssueRecoveryRecord(
+                        issue_number, terminal_state.issue.database_id, terminal_state.issue.node_id,
+                        "DEFERRED", "ISSUE_FINALIZER_OWNED_BY_WG4",
+                    )
+                if current_resolution.activation not in {
+                    CarrierActivation.ACTIVE,
+                    CarrierActivation.RESERVED_INACTIVE,
+                }:
+                    return Wave08IssueRecoveryRecord(
+                        issue_number, terminal_state.issue.database_id, terminal_state.issue.node_id,
+                        "DEFERRED", "CURRENT_ISSUE_CARRIER_ROLE_UNRESOLVED_FOR_WG1",
+                    )
+            issue = terminal_state.issue
+            comments = terminal_state.issue_comments
+        else:
+            try:
+                issue = self.client.get_issue_metadata(self.central_repository, issue_number)
+                comments = tuple(self.client.list_issue_comments(self.central_repository, issue_number))
+            except Exception as error:
+                raise StaleAuthorityError(f"fresh open Issue intake authority is unavailable: {_bounded_reason(error)}") from None
+        if (
+            type(issue) is not IssueMetadata
+            or issue.number != issue_number
+            or issue.is_pull_request
+            or issue.state != "open"
+        ):
+            return Wave08IssueRecoveryRecord(
+                issue_number,
+                issue.database_id if type(issue) is IssueMetadata else None,
+                issue.node_id if type(issue) is IssueMetadata else None,
+                "NOOP", "ISSUE_NOT_OPEN",
+            )
+
+        try:
+            repository = self.client.get_repository_metadata(self.central_repository)
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            if (
+                type(repository) is not RepositoryMetadata
+                or repository.full_name != self.central_repository
+                or repository.default_branch != "main"
+                or not repository.node_id
+                or current_app != self.app
+            ):
+                raise StaleAuthorityError("central repository/App identity is not the exact current main")
+        except Exception as error:
+            raise StaleAuthorityError(f"Issue intake central authority is unavailable: {_bounded_reason(error)}") from None
+
+        try:
+            anchors = _issue_anchor_candidates(comments)
+            if len(anchors) > 1:
+                raise R02Error("duplicate IssueRequestAnchor comments block intake")
+            if anchors:
+                anchor = validate_unique_issue_anchor(comments, issue, current_app)
+                fresh_source = source_authority_resolver(
+                    anchor.anchor.initial_request, anchor.anchor.request_class,
+                )
+                _validate_issue_source_authority(anchor.anchor, fresh_source)
+                anchor = create_or_validate_issue_anchor(
+                    self.client, self.central_repository, issue, comments,
+                    current_app, fresh_source, source_authority_resolver,
+                )
+            else:
+                try:
+                    request = parse_issue_request_body(issue.body)
+                except RequestModelError as error:
+                    if type(issue.body) is str and issue.body.lstrip().startswith("### Federation request type"):
+                        return Wave08IssueRecoveryRecord(
+                            issue_number, issue.database_id, issue.node_id,
+                            "BLOCKED", f"MALFORMED_RECOGNIZED_ISSUE_REQUEST:{_bounded_reason(error)}",
+                        )
+                    return Wave08IssueRecoveryRecord(
+                        issue_number, issue.database_id, issue.node_id,
+                        "NOOP", "UNRELATED_OPEN_ISSUE",
+                    )
+                source_authority = source_authority_resolver(request, request.request_class)
+                anchor = create_or_validate_issue_anchor(
+                    self.client, self.central_repository, issue, comments,
+                    current_app, source_authority, source_authority_resolver,
+                )
+            lease = create_or_validate_issue_branch_lease(
+                self.client, self.central_repository, anchor, current_app,
+                repository.node_id, source_authority_resolver,
+                nonce_factory=nonce_factory,
+            )
+            binding_state = create_or_recover_issue_pr_binding(
+                self.client, self.central_repository, issue_number, current_app,
+                repository.node_id, source_authority_resolver,
+            )
+            if binding_state.lease != lease.lease or binding_state.issue_anchor != anchor:
+                raise StaleAuthorityError("recovered Issue lease/binding differs from the exact anchor authority")
+            if self.candidate_builder is None:
+                return Wave08IssueRecoveryRecord(
+                    issue_number, issue.database_id, issue.node_id,
+                    "BINDING_READY", "EXACT_ANCHOR_LEASE_AND_PR_BINDING_RECOVERED",
+                )
+            route = self.interactive_issue_managed_route(
+                issue_number, source_authority_resolver,
+                semantic_validator=semantic_validator,
+                nonce_factory=nonce_factory,
+            )
+            return Wave08IssueRecoveryRecord(
+                issue_number, issue.database_id, issue.node_id,
+                route.outcome, route.reason,
+            )
+        except Exception as error:
+            return Wave08IssueRecoveryRecord(
+                issue_number, issue.database_id, issue.node_id,
+                "BLOCKED", _bounded_reason(error),
+            )
+
+    def recover_universal_role_first(
+        self,
+        legacy_disposition_resolver: Callable[[str], LegacyEvidenceDisposition] | None,
+        *,
+        read_only: bool = False,
+        issue_intake_terminal_dispatcher: Callable[[Wave08IssueRecoveryIntent], Any] | None = None,
+        issue_finalizer_dispatcher: Callable[[Wave08Decision, IssueOwnerPR], Any] | None = None,
+        machine_validation_dispatcher: Callable[[Wave08Decision, MachinePRAuthority], Any] | None = None,
+        machine_finalizer_dispatcher: Callable[[Wave08Decision, MachinePRAuthority], Any] | None = None,
+        max_pages: int = 100,
+    ) -> Wave08UniversalRecoveryResult:
+        """Wg6-like bounded inventory, SHA-role-first dispatch and status recovery."""
+        if type(max_pages) is not int or not 1 <= max_pages <= 100:
+            raise R02Error("universal recovery max_pages must be an exact integer from 1 to 100")
+        if type(read_only) is not bool:
+            raise R02Error("universal recovery read_only mode must be an exact bool")
+        callbacks = (
+            issue_intake_terminal_dispatcher,
+            issue_finalizer_dispatcher,
+            machine_validation_dispatcher,
+            machine_finalizer_dispatcher,
+        )
+        if any(callback is not None and not callable(callback) for callback in callbacks):
+            raise R02Error("universal recovery callbacks must be semantic callables")
+        if read_only and any(callback is not None for callback in callbacks):
+            raise R02Error("universal recovery read_only mode forbids semantic dispatch callbacks")
+
+        # Complete every required bounded inventory before any write or dispatch.
+        inventories: dict[str, tuple[Any, ...]] = {}
+        inventory_errors: list[str] = []
+        for key, reader in (
+            ("open_prs", lambda: self.client.list_open_pull_requests(self.central_repository, max_pages=max_pages)),
+            ("issues", lambda: self.client.list_repository_issues(self.central_repository, state="all", max_pages=max_pages)),
+            ("machine_refs", lambda: self.client.list_machine_refs(self.central_repository, max_pages=max_pages)),
+        ):
+            try:
+                value = reader()
+                if type(value) not in {tuple, list}:
+                    raise R02Error(f"{key} bounded inventory did not return a sequence")
+                inventories[key] = tuple(value)
+            except Exception as error:
+                inventory_errors.append(f"{key}:{_bounded_reason(error)}")
+        if inventory_errors:
+            return Wave08UniversalRecoveryResult(
+                False, len(inventories.get("open_prs", ())), 0, 0,
+                len(inventories.get("issues", ())), 0,
+                len(inventories.get("machine_refs", ())), (), (), (), (), (),
+                tuple(inventory_errors), 0,
+            )
+
+        raw_prs = inventories["open_prs"]
+        raw_issues = inventories["issues"]
+        raw_machine_refs = inventories["machine_refs"]
+        blocked: list[str] = []
+        deferred_count = 0
+        machine_inventory_ambiguous = False
+        seen_pr_numbers: set[int] = set()
+        seen_issue_numbers: set[int] = set()
+        seen_machine_refs: set[str] = set()
+        pr_inventory_valid = True
+        for row in raw_prs:
+            if (
+                type(row) is not dict
+                or type(row.get("number")) is not int
+                or not 1 <= row["number"] <= 9_223_372_036_854_775_807
+                or row["number"] in seen_pr_numbers
+            ):
+                pr_inventory_valid = False
+                break
+            seen_pr_numbers.add(row["number"])
+        if not pr_inventory_valid:
+            blocked.append("OPEN_PR_INVENTORY_ROWS_MALFORMED_OR_DUPLICATE")
+        issue_inventory_valid = True
+        for row in raw_issues:
+            if (
+                type(row) is not dict
+                or type(row.get("number")) is not int
+                or not 1 <= row["number"] <= 9_223_372_036_854_775_807
+                or row["number"] in seen_issue_numbers
+            ):
+                issue_inventory_valid = False
+                break
+            seen_issue_numbers.add(row["number"])
+        if not issue_inventory_valid:
+            blocked.append("ISSUE_INVENTORY_ROWS_MALFORMED_OR_DUPLICATE")
+
+        machine_rows: list[dict[str, str]] = []
+        for row in raw_machine_refs:
+            if (
+                type(row) is not dict
+                or type(row.get("ref")) is not str
+                or type(row.get("source_id")) is not str
+                or type(row.get("sha")) is not str
+                or re.fullmatch(r"refs/heads/bot/federation/[a-z0-9]+(?:-[a-z0-9]+)*", row["ref"]) is None
+                or row["ref"] != f"refs/heads/bot/federation/{row['source_id']}"
+                or not _is_canonical_wave08_source_id(row["source_id"])
+                or re.fullmatch(r"[0-9a-f]{40}", row["sha"]) is None
+                or row["ref"] in seen_machine_refs
+            ):
+                blocked.append("MACHINE_REF_ROW_MALFORMED_OR_DUPLICATE")
+                machine_inventory_ambiguous = True
+                continue
+            seen_machine_refs.add(row["ref"])
+            machine_rows.append({"ref": row["ref"], "source_id": row["source_id"], "sha": row["sha"]})
+
+        try:
+            central = self.client.get_repository_metadata(self.central_repository)
+            current_app = resolve_app_identity(self.client, self.app.slug)
+            if (
+                type(central) is not RepositoryMetadata
+                or central.full_name != self.central_repository
+                or central.default_branch != "main"
+                or not central.node_id
+                or current_app != self.app
+            ):
+                raise StaleAuthorityError("central repository/App identity is not the exact current main")
+        except Exception as error:
+            blocked.append(f"CENTRAL_APP_AUTHORITY_UNAVAILABLE:{_bounded_reason(error)}")
+            central = None
+            current_app = None
+
+        fresh_prs: dict[int, PullRequestMetadata] = {}
+        head_groups: dict[str, list[PullRequestMetadata]] = {}
+        failed_fresh_pr_numbers: set[int] = set()
+        global_head_ambiguous = not pr_inventory_valid
+        for row in sorted((item for item in raw_prs if type(item) is dict), key=lambda item: item.get("number", 0) if type(item.get("number")) is int else 0):
+            number = row.get("number")
+            if type(number) is not int:
+                continue
+            try:
+                pr = self.client.get_pull_request_metadata(self.central_repository, number)
+                if (
+                    type(pr) is not PullRequestMetadata
+                    or pr.number != number
+                    or type(pr.head_oid) is not str
+                    or re.fullmatch(r"[0-9a-f]{40}", pr.head_oid) is None
+                ):
+                    raise R02Error("fresh PR metadata/head is malformed")
+            except Exception as error:
+                failed_fresh_pr_numbers.add(number)
+                blocked.append(f"PR_{number}_FRESH_METADATA_UNAVAILABLE:{_bounded_reason(error)}")
+                continue
+            fresh_prs[number] = pr
+            head_groups.setdefault(pr.head_oid, []).append(pr)
+        for group in head_groups.values():
+            group.sort(key=lambda item: item.number)
+
+        fresh_issues: dict[int, tuple[IssueMetadata, tuple[IssueComment, ...], str | None]] = {}
+        issue_inventory_records: dict[int, Wave08IssueRecoveryRecord] = {}
+        relevant_issue_numbers: set[int] = set()
+        if current_app is None:
+            issue_app = None
+        else:
+            issue_app = current_app
+        recognized_markers = (
+            ISSUE_REQUEST_ANCHOR_MARKER,
+            ISSUE_BRANCH_LEASE_MARKER,
+            ISSUE_INTERNAL_PR_BINDING_MARKER,
+            ISSUE_CANCELLATION_FENCE_MARKER,
+            ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER,
+            ISSUE_TERMINAL_CANCELLED_RESULT_MARKER,
+            ISSUE_NO_PR_CANCELLED_RESULT_MARKER,
+            ISSUE_PATCH_PROJECTION_MARKER,
+            ISSUE_HEAD_CLAIM_MARKER,
+            REQUIRED_STATUS_EPOCH_MARKER,
+            ISSUE_FINALIZATION_EPOCH_MARKER,
+        )
+        for row in sorted((item for item in raw_issues if type(item) is dict), key=lambda item: item.get("number", 0) if type(item.get("number")) is int else 0):
+            number = row.get("number")
+            if type(number) is not int:
+                continue
+            try:
+                issue = self.client.get_issue_metadata(self.central_repository, number)
+                if (
+                    type(issue) is not IssueMetadata
+                    or issue.number != number
+                    or issue.is_pull_request
+                ):
+                    raise R02Error("fresh Issue metadata differs from exact Issue inventory identity")
+                comments = tuple(self.client.list_issue_comments(self.central_repository, number))
+                if any(type(comment) is not IssueComment for comment in comments):
+                    raise R02Error("Issue comment inventory contains a malformed record")
+            except Exception as error:
+                reason = f"FRESH_AUTHORITY_UNAVAILABLE:{_bounded_reason(error)}"
+                blocked.append(f"ISSUE_{number}_{reason}")
+                issue_inventory_records[number] = Wave08IssueRecoveryRecord(
+                    number, None, None, "BLOCKED", reason,
+                )
+                continue
+
+            relevant = False
+            issue_reason: str | None = None
+            recognized = [comment for comment in comments if any(
+                type(comment.body) is str and comment.body.startswith(marker)
+                for marker in recognized_markers
+            )]
+            if recognized:
+                relevant = True
+                if issue_app is None:
+                    issue_reason = "APP_IDENTITY_UNAVAILABLE_FOR_RECOGNIZED_ARTIFACT"
+                else:
+                    try:
+                        anchors = _issue_anchor_candidates(comments)
+                        if anchors:
+                            validate_unique_issue_anchor(comments, issue, issue_app)
+                        elif any(comment.body.startswith(ISSUE_REQUEST_ANCHOR_MARKER) for comment in recognized):
+                            raise R02Error("IssueRequestAnchor was recognized but not parsed")
+                        # Parse every recognized marker and validate its immutable
+                        # App-authored comment envelope before retaining relevance.
+                        for comment in recognized:
+                            body = comment.body
+                            if body.startswith(ISSUE_REQUEST_ANCHOR_MARKER):
+                                parse_issue_request_anchor(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueRequestAnchor")
+                            elif body.startswith(ISSUE_BRANCH_LEASE_MARKER):
+                                parse_issue_branch_lease(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueBranchLease")
+                            elif body.startswith(ISSUE_INTERNAL_PR_BINDING_MARKER):
+                                parse_issue_internal_pr_binding(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueInternalPRBinding")
+                            elif body.startswith(ISSUE_CANCELLATION_FENCE_MARKER):
+                                parse_issue_cancellation_fence(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueCancellationFence")
+                            elif body.startswith(ISSUE_CANCELLATION_DRAFT_WITNESS_MARKER):
+                                parse_issue_cancellation_draft_witness(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueCancellationDraftWitness")
+                            elif body.startswith(ISSUE_TERMINAL_CANCELLED_RESULT_MARKER):
+                                parse_issue_terminal_cancelled_result(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueTerminalCancelledResult")
+                            elif body.startswith(ISSUE_NO_PR_CANCELLED_RESULT_MARKER):
+                                parse_issue_no_pr_cancelled_result(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueNoPRCancelledResult")
+                            elif body.startswith(ISSUE_PATCH_PROJECTION_MARKER):
+                                parse_issue_patch_projection(body)
+                                _epoch_comment_authority(comment, issue_app, "IssuePatchProjection")
+                                raise R02Error("IssuePatchProjection is not valid on the owning Issue")
+                            else:
+                                # Claimed-head artifacts belong on the generated
+                                # PR, so their appearance on an Issue blocks it.
+                                parser = (
+                                    parse_issue_head_claim if body.startswith(ISSUE_HEAD_CLAIM_MARKER)
+                                    else parse_required_status_epoch if body.startswith(REQUIRED_STATUS_EPOCH_MARKER)
+                                    else parse_issue_finalization_epoch
+                                )
+                                parser(body)
+                                _epoch_comment_authority(comment, issue_app, "IssueHeadAuthority")
+                                raise R02Error("claimed-head epoch artifact is misplaced on the owning Issue")
+                        if anchors and central is not None:
+                            _resolve_issue_branch_lease_class(
+                                self.client, self.central_repository, comments, issue_app,
+                                anchors[0].anchor, anchors[0].comment.database_id, central.node_id,
+                            )
+                    except Exception as error:
+                        issue_reason = f"RECOGNIZED_ARTIFACT_BLOCKED:{_bounded_reason(error)}"
+            if issue.state == "open" and not recognized:
+                try:
+                    parse_issue_request_body(issue.body)
+                    relevant = True
+                except RequestModelError as error:
+                    if type(issue.body) is str and issue.body.lstrip().startswith("### Federation request type"):
+                        relevant = True
+                        issue_reason = f"MALFORMED_RECOGNIZED_ISSUE_REQUEST:{_bounded_reason(error)}"
+            if relevant:
+                relevant_issue_numbers.add(number)
+            fresh_issues[number] = (issue, comments, issue_reason)
+
+        # Load accepted-source authority once, after the complete inventories and
+        # fresh central identity are known. Failure defers machine routing only.
+        machine_sources: tuple[c02.SourceDeclaration, ...] | None = None
+        machine_main: str | None = None
+        if machine_rows and central is not None:
+            try:
+                machine_main = self.client.get_ref_oid(self.central_repository, "main")
+                machine_sources = self._accepted_sources(machine_main)
+            except Exception as error:
+                blocked.append(f"ACCEPTED_MACHINE_SOURCE_AUTHORITY_UNAVAILABLE:{_bounded_reason(error)}")
+
+        machine_refs_by_sha: dict[str, list[dict[str, str]]] = {}
+        for row in machine_rows:
+            machine_refs_by_sha.setdefault(row["sha"], []).append(row)
+
+        decisions: list[Wave08Decision] = []
+        issue_intents_by_key: dict[tuple[str, int], Wave08IssueRecoveryIntent] = {}
+        finalizer_owned_issue_keys: set[tuple[str, int]] = set()
+        finalizer_work: list[tuple[Wave08Decision, IssueOwnerPR]] = []
+        machine_work: list[tuple[Wave08Decision, MachinePRAuthority, Wave08DispatchTarget]] = []
+        status_actions: list[tuple[str, str]] = []
+        issue_records_by_number: dict[int, Wave08IssueRecoveryRecord] = dict(issue_inventory_records)
+
+        for number in sorted(relevant_issue_numbers):
+            issue, _comments, reason = fresh_issues[number]
+            if reason is not None:
+                issue_records_by_number[number] = Wave08IssueRecoveryRecord(
+                    number, issue.database_id, issue.node_id, "BLOCKED", reason,
+                )
+                blocked.append(f"ISSUE_{number}:{reason}")
+                continue
+            if central is None:
+                reason = "CENTRAL_REPOSITORY_IDENTITY_UNAVAILABLE"
+                issue_records_by_number[number] = Wave08IssueRecoveryRecord(
+                    number, issue.database_id, issue.node_id, "BLOCKED", reason,
+                )
+                blocked.append(f"ISSUE_{number}:{reason}")
+                continue
+            target = (
+                Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY
+                if issue.state == "closed"
+                else Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY
+            )
+            intent = Wave08IssueRecoveryIntent(
+                target, central.node_id,
+                number, "ALL_ISSUE_RECOVERY_INVENTORY",
+            )
+            issue_intents_by_key[(intent.central_repository_node_id, number)] = intent
+            issue_records_by_number[number] = Wave08IssueRecoveryRecord(
+                number, issue.database_id, issue.node_id, "DISPATCH_INTENT", intent.target.value,
+            )
+
+        if global_head_ambiguous:
+            blocked.append("FRESH_PR_HEAD_UNAVAILABLE_OR_GROUPING_AMBIGUOUS; SHA ACTIONS SUPPRESSED")
+        elif central is not None and current_app is not None:
+            for head_sha in sorted(head_groups):
+                prs = head_groups[head_sha]
+                numbers = tuple(pr.number for pr in prs)
+                resolution = self.resolve_current_sha_carrier_role(head_sha)
+                machine_rows_for_head = machine_refs_by_sha.get(head_sha, [])
+                if resolution.activation is CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION and (
+                    machine_rows_for_head or machine_inventory_ambiguous
+                ):
+                    decision = Wave08Decision(
+                        head_sha, resolution, numbers, None,
+                        Wave08DecisionKind.CONFLICTING_BLOCKED,
+                        Wave08DecisionReason.CONFLICTING_EVIDENCE,
+                    )
+                    decisions.append(decision)
+                    blocked.append(f"{head_sha}:UNCLAIMED_SUPPRESSED_BY_MACHINE_REF_NAMESPACE")
+                    continue
+                if (
+                    resolution.role is CarrierRole.MACHINE_PUBLICATION
+                    and resolution.activation in {CarrierActivation.ACTIVE, CarrierActivation.RESERVED_INACTIVE}
+                ):
+                    marker = resolution.marker
+                    if (
+                        marker is None or marker.owner_kind != "MACHINE_SOURCE"
+                        or marker.claim_kind != "MACHINE_REF_CLAIM"
+                    ):
+                        decisions.append(Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=marker),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.CONFLICTING_EVIDENCE,
+                        ))
+                        blocked.append(f"{head_sha}:MACHINE_MARKER_NOT_EXACT")
+                        continue
+                    if resolution.activation is CarrierActivation.RESERVED_INACTIVE:
+                        decisions.append(wave08_decision_for_resolution(head_sha, resolution, numbers))
+                        deferred_count += 1
+                        continue
+                    owner_key_prefix = f"{central.node_id}:"
+                    source_id = marker.owner_key[len(owner_key_prefix):] if marker.owner_key.startswith(owner_key_prefix) else ""
+                    sources = tuple(
+                        source for source in (machine_sources or ())
+                        if source.source_id == source_id and marker.owner_key == f"{central.node_id}:{source.source_id}"
+                    )
+                    matching_refs = tuple(
+                        row for row in machine_rows_for_head
+                        if row["source_id"] == source_id
+                        and row["ref"] == f"refs/heads/bot/federation/{source_id}"
+                    )
+                    matching_prs = tuple(
+                        pr for pr in prs
+                        if source_id and pr.head_ref == _machine_branch(source_id)
+                        and pr.head_repository_id == central.node_id
+                        and pr.head_repository == central.full_name
+                        and pr.base_repository_id == central.node_id
+                        and pr.base_repository == central.full_name
+                        and pr.base_ref == "main"
+                    )
+                    if len(sources) != 1 or len(matching_refs) != 1 or len(matching_prs) != 1:
+                        decisions.append(Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=marker),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.FRESH_AUTHORITY_FAILED,
+                        ))
+                        blocked.append(f"{head_sha}:MACHINE_OWNER_SOURCE_REF_OR_PR_NOT_EXACT")
+                        continue
+                    try:
+                        authority = self._machine_authority(
+                            {"number": matching_prs[0].number}, sources[0],
+                            machine_main or "", central,
+                        )
+                        if (
+                            authority is None or not authority.valid
+                            or authority.head_sha != head_sha
+                            or matching_refs[0]["sha"] != head_sha
+                        ):
+                            raise StaleAuthorityError("machine PR/ref/source does not bind exact active H")
+                        decision = wave08_decision_for_resolution(
+                            head_sha, resolution, numbers,
+                            owner_pr_number=authority.number,
+                            machine_target=Wave08DispatchTarget.MACHINE_VALIDATION,
+                        )
+                        decisions.append(decision)
+                        machine_work.append((decision, authority, Wave08DispatchTarget.MACHINE_VALIDATION))
+                    except Exception as error:
+                        decisions.append(Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=marker),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.FRESH_AUTHORITY_FAILED,
+                        ))
+                        blocked.append(f"{head_sha}:MACHINE_AUTHORITY_FAILED:{_bounded_reason(error)}")
+                    continue
+
+                owner: IssueOwnerPR | None = None
+                if resolution.role in {
+                    CarrierRole.ISSUE_ACTIVE,
+                    CarrierRole.ISSUE_FINALIZING,
+                    CarrierRole.ISSUE_CANCEL,
+                } and resolution.activation in {
+                    CarrierActivation.ACTIVE,
+                    CarrierActivation.RESERVED_INACTIVE,
+                }:
+                    try:
+                        owner = derive_issue_owner_pr(
+                            self.client, self.central_repository, head_sha, resolution,
+                            self.app.slug, role_already_resolved=True,
+                        )
+                    except Exception as error:
+                        decisions.append(Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=resolution.marker),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.FRESH_AUTHORITY_FAILED,
+                        ))
+                        blocked.append(f"{head_sha}:ISSUE_OWNER_AUTHORITY_FAILED:{_bounded_reason(error)}")
+                        continue
+
+                active_issue_finalizer = (
+                    owner is not None
+                    and resolution.activation is CarrierActivation.ACTIVE
+                    and resolution.role in {
+                        CarrierRole.ISSUE_ACTIVE,
+                        CarrierRole.ISSUE_FINALIZING,
+                    }
+                )
+                if active_issue_finalizer:
+                    # Exact active role plus exact derived owner proves finalizer
+                    # ownership independently of first-pass group membership.
+                    finalizer_owned_issue_keys.add((central.node_id, owner.issue_number))
+
+                    owner_number = owner.pull_request_number
+                    if owner_number not in numbers:
+                        if owner_number not in seen_pr_numbers:
+                            blocked.append(
+                                f"{head_sha}:ISSUE_OWNER_PR_NOT_IN_OPEN_PR_INVENTORY"
+                            )
+                        elif owner_number not in failed_fresh_pr_numbers:
+                            blocked.append(
+                                f"{head_sha}:ISSUE_OWNER_PR_NOT_IN_CURRENT_H_GROUP"
+                            )
+                        else:
+                            try:
+                                revalidated_owner_pr = self.client.get_pull_request_metadata(
+                                    self.central_repository, owner_number,
+                                )
+                                if (
+                                    type(revalidated_owner_pr) is not PullRequestMetadata
+                                    or revalidated_owner_pr.number != owner_number
+                                    or type(revalidated_owner_pr.head_oid) is not str
+                                    or re.fullmatch(r"[0-9a-f]{40}", revalidated_owner_pr.head_oid) is None
+                                ):
+                                    raise R02Error("owner PR revalidation metadata is malformed")
+                                if revalidated_owner_pr.head_oid != head_sha:
+                                    blocked.append(
+                                        f"{head_sha}:ISSUE_OWNER_PR_HEAD_CHANGED"
+                                    )
+                                else:
+                                    # Re-admit only the explicit fresh current-H
+                                    # read. The failed inventory row remains a hint.
+                                    group = head_groups.get(head_sha)
+                                    if group is None:
+                                        raise R02Error("current H group disappeared before owner re-admission")
+                                    if all(item.number != owner_number for item in group):
+                                        group.append(revalidated_owner_pr)
+                                        group.sort(key=lambda item: item.number)
+                                    fresh_prs[owner_number] = revalidated_owner_pr
+                                    prs = group
+                                    numbers = tuple(item.number for item in group)
+                            except Exception as error:
+                                blocked.append(
+                                    f"{head_sha}:ISSUE_OWNER_PR_REVALIDATION_UNAVAILABLE:{_bounded_reason(error)}"
+                                )
+
+                owner_number = owner.pull_request_number if owner is not None and owner.pull_request_number in numbers else None
+                decision = wave08_decision_for_resolution(
+                    head_sha, resolution, numbers, owner_pr_number=owner_number,
+                )
+                decisions.append(decision)
+                if decision.kind is Wave08DecisionKind.EXTERNAL_STATUS:
+                    try:
+                        latest_central = self.client.get_repository_metadata(self.central_repository)
+                        latest_app = resolve_app_identity(self.client, self.app.slug)
+                        if (
+                            type(latest_central) is not RepositoryMetadata
+                            or latest_central.full_name != self.central_repository
+                            or latest_central.default_branch != "main"
+                            or latest_central.node_id != central.node_id
+                            or latest_app != current_app
+                        ):
+                            raise StaleAuthorityError("external status central/App identity changed before write")
+                        if not read_only:
+                            publish_unclaimed_external_success(
+                                self.client, latest_central, head_sha, resolution, latest_app,
+                            )
+                            status_actions.append((head_sha, "EXTERNAL_SUCCESS"))
+                    except Exception as error:
+                        decisions[-1] = Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.FRESH_AUTHORITY_FAILED,
+                        )
+                        blocked.append(f"{head_sha}:UNCLAIMED_EXTERNAL_STATUS_FAILED:{_bounded_reason(error)}")
+                    continue
+                if decision.kind is Wave08DecisionKind.LEGACY_QUARANTINE_DEFERRED:
+                    deferred_count += 1
+                    if not read_only:
+                        try:
+                            boundary = self.derive_activation_boundary_evidence()
+                            classification = self.classify_legacy_head(
+                                head_sha,
+                                implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                            )
+                            if (
+                                type(classification) is not LegacyClassificationResult
+                                or classification.outcome is not LegacyClassificationOutcome.QUARANTINE
+                                or classification.evidence is None
+                            ):
+                                raise StaleAuthorityError("legacy evidence changed before Wg6 recovery")
+                            if classification.evidence.evidence_class is LegacyQuarantineClass.MACHINE:
+                                if len(machine_rows_for_head) != 1:
+                                    raise StaleAuthorityError("legacy machine ref/source binding is not unique")
+                                machine_source_matches = tuple(
+                                    source for source in (machine_sources or ())
+                                    if source.source_id == machine_rows_for_head[0]["source_id"]
+                                    and machine_rows_for_head[0]["ref"] == f"refs/heads/bot/federation/{source.source_id}"
+                                    and machine_rows_for_head[0]["sha"] == head_sha
+                                )
+                                if len(machine_source_matches) != 1:
+                                    raise StaleAuthorityError("legacy machine source is not exactly accepted")
+                                migrated = self.reconcile(
+                                    machine_source_matches[0].repository_id,
+                                )
+                                if migrated.outcome == "FAIL":
+                                    raise StaleAuthorityError("legacy machine migration did not complete")
+                            else:
+                                self.publish_legacy_failure(
+                                    head_sha, boundary.activation_boundary_id,
+                                    implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                                )
+                            status_actions.append((head_sha, "LEGACY_FAILURE"))
+                        except Exception as error:
+                            blocked.append(f"{head_sha}:LEGACY_RECOVERY_FAILED:{_bounded_reason(error)}")
+                    continue
+                if decision.kind in {
+                    Wave08DecisionKind.CONFLICTING_BLOCKED,
+                    Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED,
+                }:
+                    if decision.kind is Wave08DecisionKind.MACHINE_RECOVERY_DEFERRED:
+                        deferred_count += 1
+                    else:
+                        blocked.append(f"{head_sha}:CONFLICTING_SHA_ROLE")
+                    continue
+                if owner_number is None or owner is None:
+                    continue
+                if decision.kind is Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY:
+                    finalizer_work.append((decision, owner))
+                elif decision.kind is Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY:
+                    try:
+                        cancellation = _fresh_issue_cancellation_authority(
+                            self.client, self.central_repository, owner.issue_number,
+                            current_app, allow_pr_stage_state=True,
+                        )
+                        current_ref = _read_issue_branch_ref(
+                            self.client, self.central_repository,
+                            cancellation.lease.lease.branch_ref.removeprefix("refs/heads/"),
+                        )
+                        fences, _ = self._read_issue_cancellation_fences(
+                            cancellation, current_ref or ZERO_OID,
+                        )
+                        exact_fences = tuple(
+                            item.fence for item in fences
+                            if item.fence.cancellation_head_sha == head_sha
+                            and _issue_cancellation_fence_marker(item.fence) == resolution.marker
+                        )
+                        if (
+                            len(exact_fences) != 1
+                            or cancellation.pull_request_number != owner.pull_request_number
+                            or current_ref != head_sha
+                            or cancellation.pr.head_oid != head_sha
+                            or cancellation.raw_pr_state != "OPEN"
+                            or cancellation.raw_pr_merged
+                        ):
+                            raise StaleAuthorityError("exact active cancellation owner/ref/PR/H changed")
+                        if not read_only:
+                            self.publish_issue_cancel_failure(owner.issue_number, exact_fences[0])
+                            status_actions.append((head_sha, "ISSUE_CANCEL_FAILURE"))
+                        intent = Wave08IssueRecoveryIntent(
+                            Wave08DispatchTarget.ISSUE_CANCELLATION_RECOVERY,
+                            central.node_id, owner.issue_number, "ACTIVE_ISSUE_CANCEL_EXACT_HC",
+                        )
+                        issue_intents_by_key[(central.node_id, owner.issue_number)] = intent
+                        issue_records_by_number[owner.issue_number] = Wave08IssueRecoveryRecord(
+                            owner.issue_number, None, None, "DISPATCH_INTENT", "ACTIVE_ISSUE_CANCEL_EXACT_HC",
+                        )
+                    except Exception as error:
+                        decisions[-1] = Wave08Decision(
+                            head_sha, ShaCarrierResolution(CarrierActivation.CONFLICTING, marker=resolution.marker),
+                            numbers, None, Wave08DecisionKind.CONFLICTING_BLOCKED,
+                            Wave08DecisionReason.FRESH_AUTHORITY_FAILED,
+                        )
+                        blocked.append(f"{head_sha}:WG6_CANCEL_FAILURE_RECOVERY_FAILED:{_bounded_reason(error)}")
+                elif decision.kind is Wave08DecisionKind.RESERVED_OWNER_RECOVERY:
+                    intent = Wave08IssueRecoveryIntent(
+                        Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY,
+                        central.node_id, owner.issue_number, "RESERVED_ISSUE_OWNER_RECOVERY",
+                    )
+                    issue_intents_by_key[(central.node_id, owner.issue_number)] = intent
+
+        # Exact active finalizer ownership supersedes only the provisional generic
+        # all-Issue Wg1 intake intent for that same central repository and Issue.
+        # Explicit cancellation and RESERVED owner-recovery intents remain intact.
+        for key in sorted(finalizer_owned_issue_keys):
+            intent = issue_intents_by_key.get(key)
+            if (
+                intent is None
+                or intent.target is not Wave08DispatchTarget.ISSUE_INTAKE_TERMINAL_RECOVERY
+                or intent.reason != "ALL_ISSUE_RECOVERY_INVENTORY"
+            ):
+                continue
+            del issue_intents_by_key[key]
+            issue = fresh_issues[key[1]][0]
+            issue_records_by_number[key[1]] = Wave08IssueRecoveryRecord(
+                key[1], issue.database_id, issue.node_id,
+                "DEFERRED", "EXACT_ACTIVE_ISSUE_FINALIZER_OWNS_WG4_DISPATCH",
+            )
+
+        # Correction 01: active Issue role recovery dispatches only the closed
+        # ISSUE_FINALIZER semantic to Wg4. Wg1 gets a separate intake/terminal intent.
+        for decision, owner in finalizer_work:
+            if decision.dispatch_target is not Wave08DispatchTarget.ISSUE_FINALIZER:
+                blocked.append(f"{decision.head_sha}:ISSUE_FINALIZER_TARGET_DRIFT")
+                continue
+            if issue_finalizer_dispatcher is not None:
+                try:
+                    issue_finalizer_dispatcher(decision, owner)
+                except Exception as error:
+                    blocked.append(f"{decision.head_sha}:ISSUE_FINALIZER_DISPATCH_FAILED:{_bounded_reason(error)}")
+
+        for intent in sorted(
+            issue_intents_by_key.values(),
+            key=lambda item: (item.central_repository_node_id, item.issue_number, item.target.value),
+        ):
+            if issue_intake_terminal_dispatcher is not None:
+                try:
+                    issue_intake_terminal_dispatcher(intent)
+                except Exception as error:
+                    blocked.append(f"ISSUE_{intent.issue_number}:WG1_DISPATCH_FAILED:{_bounded_reason(error)}")
+
+        for decision, authority, target in machine_work:
+            callback = (
+                machine_finalizer_dispatcher
+                if target is Wave08DispatchTarget.MACHINE_FINALIZER
+                else machine_validation_dispatcher
+            )
+            if callback is not None:
+                try:
+                    callback(decision, authority)
+                except Exception as error:
+                    blocked.append(f"{decision.head_sha}:MACHINE_DISPATCH_FAILED:{_bounded_reason(error)}")
+
+        machine_records: list[Wave08MachineRefRecord] = []
+        accepted_source_ids = {source.source_id for source in (machine_sources or ())}
+        for row in sorted(machine_rows, key=lambda item: (item["source_id"], item["ref"])):
+            head = row["sha"]
+            if row["source_id"] not in accepted_source_ids:
+                outcome, reason = "DEFERRED_ORPHANED_SOURCE", "SOURCE_ID_NOT_CURRENTLY_ACCEPTED"
+                deferred_count += 1
+            elif not head_groups.get(head):
+                outcome, reason = "DEFERRED_NO_OPEN_PR", "MACHINE_REF_IS_DISCOVERY_ONLY"
+                deferred_count += 1
+            elif any(
+                decision.head_sha == head and decision.resolution.role is CarrierRole.MACHINE_PUBLICATION
+                and decision.kind in {
+                    Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH,
+                    Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH,
+                }
+                for decision in decisions
+            ):
+                outcome, reason = "DISPATCHED", "EXACT_MACHINE_ROLE_AND_OWNER_PR_VALIDATED"
+            elif any(decision.head_sha == head for decision in decisions):
+                outcome, reason = "BLOCKED", "SHA_ROLE_DOES_NOT_AUTHORIZE_MACHINE_RECOVERY"
+                blocked.append(f"{row['ref']}:SHA_ROLE_DOES_NOT_AUTHORIZE_MACHINE_RECOVERY")
+            else:
+                outcome, reason = "DEFERRED", "SHA_ROLE_NOT_RESOLVED"
+                deferred_count += 1
+            machine_records.append(Wave08MachineRefRecord(row["ref"], row["source_id"], head, outcome, reason))
+        for row in raw_machine_refs:
+            if type(row) is not dict or not all(type(row.get(key)) is str for key in ("ref", "source_id", "sha")):
+                machine_records.append(Wave08MachineRefRecord(
+                    "INVALID", "INVALID", "0" * 40, "BLOCKED", "MALFORMED_MACHINE_REF_INVENTORY_ROW",
+                ))
+
+        issue_records = tuple(
+            issue_records_by_number[number]
+            for number in sorted(issue_records_by_number)
+        )
+        decisions.sort(key=lambda item: item.head_sha)
+        return Wave08UniversalRecoveryResult(
+            True,
+            len(raw_prs),
+            len(fresh_prs),
+            len(head_groups),
+            len(raw_issues),
+            len(relevant_issue_numbers),
+            len(raw_machine_refs),
+            tuple(decisions),
+            issue_records,
+            tuple(machine_records),
+            tuple(sorted(
+                issue_intents_by_key.values(),
+                key=lambda item: (item.central_repository_node_id, item.issue_number, item.target.value),
+            )),
+            tuple(status_actions),
+            tuple(blocked),
+            deferred_count,
+        )
+
     def trusted_machine_validation(self, pr_number: int, accepted_base_sha: str, *, expected_head_sha: str | None = None) -> TrustedValidationResult:
         repository, current_main = self.current_accepted_main()
         if current_main != accepted_base_sha:
@@ -1756,6 +13711,9 @@ class R02Controller:
             return TrustedValidationResult("failure", bounded_check_output(RequestClass.MACHINE_PUBLICATION, expected_head_sha, current_main, reason="VALIDATION_HEAD_CHANGED"))
         if pr.base_oid != current_main or pr.base_ref != repository.default_branch:
             return TrustedValidationResult("failure", bounded_check_output(RequestClass.MACHINE_PUBLICATION, pr.head_oid, current_main, reason="MACHINE_PR_BASE_MISMATCH"))
+        resolution = self.resolve_current_sha_carrier_role(pr.head_oid)
+        if resolution.activation is not CarrierActivation.ACTIVE or resolution.role is not CarrierRole.MACHINE_PUBLICATION:
+            return TrustedValidationResult("failure", bounded_check_output(RequestClass.MACHINE_PUBLICATION, pr.head_oid, current_main, reason="MACHINE_SHA_ROLE_INVALID"))
         sources = self._accepted_sources(current_main)
         matches: list[c02.SourceDeclaration] = []
         invalid_reasons: list[str] = []
@@ -1779,8 +13737,172 @@ class R02Controller:
             valid, reason = False, "MACHINE_CANDIDATE_VALIDATION_FAILED"
         return TrustedValidationResult("failure", bounded_check_output(RequestClass.MACHINE_PUBLICATION, pr.head_oid, current_main, source.source_id, source.repository_id, "FINALIZER_AUTHORITY_REQUIRED" if valid else reason))
 
+    def trusted_validation_route(self, pr_number: int) -> str:
+        """Return a read-only Wg3 lane after resolving the current PR head role."""
+        if type(pr_number) is not int or not 1 <= pr_number <= 9_223_372_036_854_775_807:
+            return "BLOCKED"
+        try:
+            repository, accepted_main = self.current_accepted_main()
+            pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+            if type(pr) is not PullRequestMetadata or pr.number != pr_number:
+                return "BLOCKED"
+            if (
+                pr.base_ref != repository.default_branch
+                or pr.base_repository != repository.full_name
+                or pr.base_repository_id != repository.node_id
+                or pr.base_oid != accepted_main
+            ):
+                return "MANUAL_STATUS"
+            resolution = self.resolve_current_sha_carrier_role(pr.head_oid)
+            if resolution.role is not CarrierRole.MACHINE_PUBLICATION:
+                return "MANUAL_STATUS"
+            if resolution.activation is CarrierActivation.RESERVED_INACTIVE:
+                # A reserved machine SHA may be associated with unrelated PR
+                # metadata, but that never transfers machine write authority.
+                return "MANUAL_STATUS"
+            marker = resolution.marker
+            if resolution.activation is not CarrierActivation.ACTIVE or marker is None:
+                return "MANUAL_STATUS"
+            source_matches = tuple(
+                source for source in self._accepted_sources(accepted_main)
+                if marker.owner_key == f"{repository.node_id}:{source.source_id}"
+                and marker.owner_kind == "MACHINE_SOURCE"
+                and marker.claim_kind == "MACHINE_REF_CLAIM"
+            )
+            if len(source_matches) != 1:
+                return "BLOCKED"
+            source = source_matches[0]
+            authority = self._machine_authority({"number": pr_number}, source, accepted_main, repository)
+            try:
+                current_ref = self.client.get_ref_oid(
+                    self.central_repository, f"bot/federation/{source.source_id}",
+                )
+            except Exception:
+                return "BLOCKED"
+            if (
+                authority is None or not authority.valid
+                or authority.number != pr_number
+                or authority.source_id != source.source_id
+                or authority.repository_id != source.repository_id
+                or authority.head_sha != pr.head_oid or current_ref != pr.head_oid
+                or pr.head_ref != _machine_branch(source.source_id)
+                or pr.head_repository != repository.full_name
+                or pr.head_repository_id != repository.node_id
+            ):
+                return "BLOCKED"
+            return "MACHINE_VALIDATION"
+        except Exception:
+            return "BLOCKED"
+
+    def trusted_validation_manual(self, pr_number: int) -> str:
+        """Re-resolve role and perform only the Wg3 manual/status lane actions."""
+        repository, accepted_main = self.current_accepted_main()
+        pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+        if (
+            type(pr) is not PullRequestMetadata or pr.number != pr_number
+            or pr.base_oid != accepted_main or pr.base_ref != repository.default_branch
+            or pr.base_repository != repository.full_name
+            or pr.base_repository_id != repository.node_id
+        ):
+            return "NOOP_STALE_PR"
+        resolution = self.resolve_current_sha_carrier_role(pr.head_oid)
+        if resolution.role is CarrierRole.MACHINE_PUBLICATION:
+            # Includes active machine ownership and reserved/unrelated machine
+            # references. The manual writer never takes over machine work.
+            return "NOOP_MACHINE_ROLE"
+        if resolution.activation is CarrierActivation.LEGACY_CUTOVER_QUARANTINE:
+            boundary = self.derive_activation_boundary_evidence()
+            classification = self.classify_legacy_head(
+                pr.head_oid,
+                implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+            )
+            if (
+                type(classification) is LegacyClassificationResult
+                and classification.outcome is LegacyClassificationOutcome.QUARANTINE
+                and type(classification.evidence) is LegacyQuarantineEvidence
+                and classification.evidence.head_sha == pr.head_oid
+            ):
+                self.publish_legacy_failure(
+                    pr.head_oid, boundary.activation_boundary_id,
+                    implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                )
+                return "LEGACY_FAILURE"
+            return "BLOCKED"
+
+        def dispatch_manual_recovery(
+            decision: Wave08Decision,
+            _owner: IssueOwnerPR,
+            _fence: IssueCancellationFence | None,
+        ) -> None:
+            if decision.dispatch_target is not None:
+                self.client.dispatch_workflow(
+                    self.central_repository,
+                    "federation-g8-state-finalize.yml",
+                    "refs/heads/main",
+                    {"pull_number": str(pr_number)},
+                )
+
+        decision = self.trusted_validation_role_first(
+            pr_number, None, central_recovery_dispatcher=dispatch_manual_recovery,
+        )
+        return decision.kind.value
+
+    def trusted_validation_machine(self, pr_number: int) -> str:
+        """Re-resolve exact ACTIVE machine authority before writing its Check Run."""
+        repository, accepted_main = self.current_accepted_main()
+        pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+        if type(pr) is not PullRequestMetadata or pr.number != pr_number:
+            raise StaleAuthorityError("machine validation PR identity is unavailable")
+        head_sha = pr.head_oid
+        resolution = self.resolve_current_sha_carrier_role(head_sha)
+        if resolution.activation is not CarrierActivation.ACTIVE or resolution.role is not CarrierRole.MACHINE_PUBLICATION:
+            raise StaleAuthorityError("machine validation requires canonical ACTIVE(MACHINE_PUBLICATION)")
+        result = self.trusted_machine_validation(pr_number, accepted_main, expected_head_sha=head_sha)
+
+        # Re-read the full mutable authority after candidate validation and
+        # immediately before the Check Run write.
+        latest_repository, latest_main = self.current_accepted_main()
+        latest_pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+        latest_role = self.resolve_current_sha_carrier_role(head_sha)
+        marker = latest_role.marker
+        sources = tuple(
+            source for source in self._accepted_sources(latest_main)
+            if marker is not None and marker.owner_key == f"{latest_repository.node_id}:{source.source_id}"
+            and marker.claim_kind == "MACHINE_REF_CLAIM"
+            and marker.owner_kind == "MACHINE_SOURCE"
+        )
+        if len(sources) != 1:
+            raise StaleAuthorityError("machine validation owner source is no longer exact")
+        source = sources[0]
+        authority = self._machine_authority({"number": pr_number}, source, latest_main, latest_repository)
+        try:
+            current_ref = self.client.get_ref_oid(
+                self.central_repository, f"bot/federation/{source.source_id}",
+            )
+        except Exception as error:
+            raise StaleAuthorityError(f"machine validation current ref is unavailable: {_bounded_reason(error)}") from None
+        if (
+            latest_repository != repository or latest_main != accepted_main
+            or latest_pr.head_oid != head_sha or latest_pr.base_oid != accepted_main
+            or latest_pr.base_ref != latest_repository.default_branch
+            or latest_role.activation is not CarrierActivation.ACTIVE
+            or latest_role.role is not CarrierRole.MACHINE_PUBLICATION
+            or authority is None or not authority.valid or authority.head_sha != head_sha
+            or current_ref != head_sha
+        ):
+            raise StaleAuthorityError("machine validation authority changed before Check Run write")
+        self.publish_validation_result(result)
+        self.client.dispatch_workflow(
+            self.central_repository,
+            "federation-g8-state-finalize.yml",
+            "refs/heads/main",
+            {"pull_number": str(pr_number)},
+        )
+        return "MACHINE_VALIDATION_WRITTEN"
+
     def trusted_validation(self, pr_number: int, accepted_base_sha: str, candidate_check: Callable[[], tuple[bool, str]], *, expected_head_sha: str | None = None, allow_success: bool = False) -> TrustedValidationResult:
         pr = self.client.get_pull_request_metadata(self.central_repository, pr_number)
+        _raise_if_reserved_issue_pr(pr)
         if expected_head_sha is not None and pr.head_oid != expected_head_sha:
             return TrustedValidationResult("failure", bounded_check_output(RequestClass.UNRELATED, expected_head_sha, accepted_base_sha, reason="VALIDATION_HEAD_CHANGED"))
         try:
@@ -1859,7 +13981,7 @@ class R02Controller:
             raise R02Error("trusted-validation recovery PR number is invalid")
         self.client.dispatch_workflow(
             self.central_repository,
-            "federation-trusted-validation.yml",
+            "federation-g8-trusted-validation.yml",
             "refs/heads/main",
             {"pull_number": str(pr_number)},
         )
@@ -1880,58 +14002,54 @@ class R02Controller:
         pr = self.client.get_pull_request_metadata(self.central_repository, authority.number)
         if pr.head_oid != authority.head_sha or pr.base_oid != accepted_main or pr.base_ref != repository.default_branch:
             return "stale"
-        if self.candidate_builder is None or not hasattr(self.candidate_builder, "machine_candidate"):
+        head_sha = pr.head_oid
+        role = self.resolve_current_sha_carrier_role(head_sha)
+        if role.activation is not CarrierActivation.ACTIVE or role.role is not CarrierRole.MACHINE_PUBLICATION:
+            return "stale"
+        if self.candidate_builder is None or not hasattr(self.candidate_builder, "validate_machine_head"):
             return "builder-unavailable"
         try:
-            candidate = self.candidate_builder.machine_candidate(accepted_main, source.source_id)  # type: ignore[attr-defined]
+            valid_head, validation_reason = self.candidate_builder.validate_machine_head(accepted_main, source.source_id, head_sha)  # type: ignore[attr-defined]
         except Exception as error:
             self._close_machine_pr(authority.number, "MACHINE_RECONCILE_FAILED", _bounded_reason(error))
             return "closed"
-        if not candidate.changed_paths:
-            self._close_machine_pr(authority.number, "MACHINE_RECONCILE_NOOP", "CURRENT_STATE_ALREADY_MATCHES")
+        if not valid_head:
+            self._close_machine_pr(authority.number, "MACHINE_RECONCILE_FAILED", validation_reason)
             return "closed"
-        branch = _machine_branch(source.source_id)
-        try:
-            branch_head = self.client.get_ref_oid(self.central_repository, branch)
-            if branch_head != candidate.commit_sha:
-                self.client.update_refs(repository.node_id, [RefUpdate(f"refs/heads/{branch}", branch_head, candidate.commit_sha, force=True)])
-            refreshed = self.client.get_pull_request_metadata(self.central_repository, authority.number)
-            if refreshed.head_oid != candidate.commit_sha:
-                return "stale"
-            validate_machine_generated_scope(self.client, self.central_repository, accepted_main, refreshed.head_oid)
-        except (GitHubAPIError, CandidateScopeError, R02Error):
-            return "stale"
 
-        checks = tuple(item for item in self.client.list_check_runs(self.central_repository, candidate.commit_sha) if item.name == TRUSTED_VALIDATION_NAME and item.head_sha == candidate.commit_sha and item.app_id == self.app.app_id)
+        checks = tuple(item for item in self.client.list_check_runs(self.central_repository, head_sha) if item.name == TRUSTED_VALIDATION_NAME and item.head_sha == head_sha and item.app_id == self.app.app_id)
         if len(checks) > 1:
             return "duplicate-check"
         if checks:
             try:
                 verify_machine_check_identity(
                     checks[0],
-                    head_sha=candidate.commit_sha,
+                    head_sha=head_sha,
                     accepted_base_sha=accepted_main,
                     source_id=source.source_id,
                     repository_id=source.repository_id,
                 )
             except R02Error:
                 return "check-evidence-blocked"
-        valid, reason = self.candidate_builder.validate_machine_head(accepted_main, source.source_id, candidate.commit_sha)  # type: ignore[attr-defined]
+        valid, reason = self.candidate_builder.validate_machine_head(accepted_main, source.source_id, head_sha)  # type: ignore[attr-defined]
         if not valid:
-            result = TrustedValidationResult("failure", bounded_check_output(RequestClass.MACHINE_PUBLICATION, candidate.commit_sha, accepted_main, source.source_id, source.repository_id, reason))
+            result = TrustedValidationResult("failure", bounded_check_output(RequestClass.MACHINE_PUBLICATION, head_sha, accepted_main, source.source_id, source.repository_id, reason))
             if checks:
-                self.client.update_check_run(self.central_repository, checks[0].id, head_sha=candidate.commit_sha, conclusion="failure", output=render_check_run_output(result))
+                self.client.update_check_run(self.central_repository, checks[0].id, head_sha=head_sha, conclusion="failure", output=render_check_run_output(result))
             self._close_machine_pr(authority.number, "MACHINE_RECONCILE_FAILED", reason)
             return "closed"
         # The final explicit reads close the main/head TOCTOU window before the
         # API's expected-head merge gate is invoked.
         latest_repository, latest_main = self.current_accepted_main()
         latest_pr = self.client.get_pull_request_metadata(self.central_repository, authority.number)
-        if latest_repository.default_branch != repository.default_branch or latest_main != accepted_main or latest_pr.head_oid != candidate.commit_sha or latest_pr.base_oid != latest_main or latest_pr.base_ref != latest_repository.default_branch:
+        if latest_repository.default_branch != repository.default_branch or latest_main != accepted_main or latest_pr.head_oid != head_sha or latest_pr.base_oid != latest_main or latest_pr.base_ref != latest_repository.default_branch:
             return "stale"
-        ready_result = TrustedValidationResult("success", bounded_check_output(RequestClass.MACHINE_PUBLICATION, candidate.commit_sha, accepted_main, source.source_id, source.repository_id, "READY"))
+        latest_role = self.resolve_current_sha_carrier_role(head_sha)
+        if latest_role.activation is not CarrierActivation.ACTIVE or latest_role.role is not CarrierRole.MACHINE_PUBLICATION:
+            return "stale"
+        ready_result = TrustedValidationResult("success", bounded_check_output(RequestClass.MACHINE_PUBLICATION, head_sha, accepted_main, source.source_id, source.repository_id, "READY"))
         if checks:
-            self.client.update_check_run(self.central_repository, checks[0].id, head_sha=candidate.commit_sha, conclusion="success", output=render_check_run_output(ready_result))
+            self.client.update_check_run(self.central_repository, checks[0].id, head_sha=head_sha, conclusion="success", output=render_check_run_output(ready_result))
         else:
             try:
                 created = upsert_trusted_validation_check(
@@ -1947,15 +14065,16 @@ class R02Controller:
             except Exception:
                 self.dispatch_trusted_validation_recovery(authority.number)
                 return "check-recovery-dispatched"
-            if created.name != TRUSTED_VALIDATION_NAME or created.head_sha != candidate.commit_sha or created.app_id != self.app.app_id:
+            if created.name != TRUSTED_VALIDATION_NAME or created.head_sha != head_sha or created.app_id != self.app.app_id:
                 return "check-evidence-blocked"
         final_repository, final_main = self.current_accepted_main()
         final_sources = tuple(item for item in self._accepted_sources(final_main) if item.source_id == source.source_id and item.repository_id == source.repository_id)
         final_pr = self.client.get_pull_request_metadata(self.central_repository, authority.number)
         final_source = final_sources[0] if len(final_sources) == 1 else None
         final_authority = self._machine_authority({"number": authority.number}, final_source, final_main, final_repository) if final_source is not None else None
-        final_checks = tuple(item for item in self.client.list_check_runs(self.central_repository, candidate.commit_sha) if item.name == TRUSTED_VALIDATION_NAME and item.head_sha == candidate.commit_sha and item.app_id == self.app.app_id)
-        final_check_evidence_invalid = _machine_check_identity_invalid(final_checks, candidate.commit_sha, accepted_main, source)
+        final_role = self.resolve_current_sha_carrier_role(head_sha)
+        final_checks = tuple(item for item in self.client.list_check_runs(self.central_repository, head_sha) if item.name == TRUSTED_VALIDATION_NAME and item.head_sha == head_sha and item.app_id == self.app.app_id)
+        final_check_evidence_invalid = _machine_check_identity_invalid(final_checks, head_sha, accepted_main, source)
         try:
             final_app = resolve_app_identity(self.client, self.app.slug)
         except R02Error:
@@ -1963,12 +14082,14 @@ class R02Controller:
         if (
             final_repository.default_branch != repository.default_branch
             or final_main != accepted_main
-            or final_pr.head_oid != candidate.commit_sha
+            or final_pr.head_oid != head_sha
             or final_pr.base_ref != final_repository.default_branch
             or final_pr.base_oid != final_main
             or final_authority is None
             or not final_authority.valid
-            or final_authority.head_sha != candidate.commit_sha
+            or final_authority.head_sha != head_sha
+            or final_role.activation is not CarrierActivation.ACTIVE
+            or final_role.role is not CarrierRole.MACHINE_PUBLICATION
             or final_source != source
             or final_app != self.app
             or len(final_checks) != 1
@@ -1980,20 +14101,23 @@ class R02Controller:
             return "stale"
         pre_merge_repository, pre_merge_main = self.current_accepted_main()
         pre_merge_pr = self.client.get_pull_request_metadata(self.central_repository, authority.number)
-        pre_merge_checks = tuple(item for item in self.client.list_check_runs(self.central_repository, candidate.commit_sha) if item.name == TRUSTED_VALIDATION_NAME and item.head_sha == candidate.commit_sha and item.app_id == self.app.app_id)
+        pre_merge_checks = tuple(item for item in self.client.list_check_runs(self.central_repository, head_sha) if item.name == TRUSTED_VALIDATION_NAME and item.head_sha == head_sha and item.app_id == self.app.app_id)
+        pre_merge_role = self.resolve_current_sha_carrier_role(head_sha)
         if (
             pre_merge_repository.default_branch != repository.default_branch
             or pre_merge_main != accepted_main
-            or pre_merge_pr.head_oid != candidate.commit_sha
+            or pre_merge_pr.head_oid != head_sha
             or pre_merge_pr.base_oid != pre_merge_main
             or pre_merge_pr.base_ref != pre_merge_repository.default_branch
+            or pre_merge_role.activation is not CarrierActivation.ACTIVE
+            or pre_merge_role.role is not CarrierRole.MACHINE_PUBLICATION
             or len(pre_merge_checks) != 1
             or pre_merge_checks[0].conclusion != "success"
-            or _machine_check_identity_invalid(pre_merge_checks, candidate.commit_sha, accepted_main, source)
+            or _machine_check_identity_invalid(pre_merge_checks, head_sha, accepted_main, source)
         ):
-            return "check-evidence-blocked" if _machine_check_identity_invalid(pre_merge_checks, candidate.commit_sha, accepted_main, source) or len(pre_merge_checks) != 1 else "stale"
+            return "check-evidence-blocked" if _machine_check_identity_invalid(pre_merge_checks, head_sha, accepted_main, source) or len(pre_merge_checks) != 1 else "stale"
         try:
-            merged = self.client.merge_machine_pull_request(self.central_repository, authority.number, expected_head_sha=candidate.commit_sha)
+            merged = self.client.merge_machine_pull_request(self.central_repository, authority.number, expected_head_sha=head_sha)
         except GitHubAPIError:
             return "merge-rejected"
         return "merged" if merged.merged else "merge-rejected"
@@ -2001,15 +14125,32 @@ class R02Controller:
     def _state_finalize_machine_sweep(self, *, max_iterations: int, self_wake: Callable[[], None] | None) -> str:
         if max_iterations <= 0:
             raise R02Error("finalizer iteration bound must be positive")
+
+        def retryable_machine_work_remains() -> bool:
+            # Reuse the canonical read-only role-first inventory. A source-local
+            # result alone is not evidence that work remains authoritative.
+            inventory = self.recover_universal_role_first(None, read_only=True)
+            return (
+                inventory.complete
+                and not inventory.blocked_reasons
+                and any(
+                    decision.kind is Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH
+                    for decision in inventory.decisions
+                )
+            )
+
         for _ in range(max_iterations):
             repository, current_main = self.current_accepted_main()
             sources = self._accepted_sources(current_main)
             machine = self._machine_prs(current_main, repository, sources)
             restart = False
+            retryable_results: set[str] = set()
             for source_id in sorted(machine):
                 authorities = machine[source_id]
                 if len(authorities) > 1:
-                    raise R02Error("multiple exact machine PRs exist for one accepted source")
+                    # Duplicate PR authority is local to this source. It cannot
+                    # prevent independent current sources from getting a pass.
+                    continue
                 if not authorities:
                     continue
                 result = self.finalize_one_machine_pr(authorities[0])
@@ -2018,21 +14159,232 @@ class R02Controller:
                     # fresh main/PR enumeration instead of using stale data.
                     restart = True
                     break
+                if result == "builder-unavailable":
+                    # Missing candidate validation is a systemic writer
+                    # incapability, so no source can be safely processed.
+                    return f"machine-{result}"
                 if result in {"stale", "merge-rejected"}:
-                    # A race or platform rejection gets a bounded fresh
-                    # enumeration/recompute.  Only exhaustion self-wakes.
-                    restart = True
-                    break
-                if result in {"check-recovery-dispatched", "check-evidence-blocked"}:
-                    return f"machine-{result}"
-                if result in {"invalid-source", "builder-unavailable", "duplicate-check"}:
-                    return f"machine-{result}"
+                    retryable_results.add(result)
+                # All remaining outcomes are source-local. A dispatched check
+                # recovery already has its own continuation; blocked or
+                # contradictory evidence must not create a tight self-wake.
             if restart:
                 continue
             after_repository, after_main = self.current_accepted_main()
             if after_repository.default_branch != repository.default_branch or after_main != current_main:
                 continue
+            if retryable_results and retryable_machine_work_remains():
+                if self_wake is not None:
+                    self_wake()
+                    return "bounded-work-exhausted-self-wake-dispatched"
+                return "bounded-work-exhausted-self-wake-required"
             return "machine-sweep-complete"
+
+        # Every exhausted attempt ended at a shared-state change, so the old
+        # tail cannot be reused. Confirm current retryable authority using the
+        # same canonical read-only inventory before dispatching a continuation.
+        if not retryable_machine_work_remains():
+            return "machine-sweep-complete"
+        if self_wake is not None:
+            self_wake()
+            return "bounded-work-exhausted-self-wake-dispatched"
+        return "bounded-work-exhausted-self-wake-required"
+
+    def state_finalize_route(
+        self,
+        *,
+        pull_number_hint: Any = None,
+        expected_source_id_hint: Any = None,
+    ) -> dict[str, bool]:
+        """Read-only full inventory for Wg4; hints never select included work."""
+        del pull_number_hint, expected_source_id_hint
+        try:
+            inventory = self.recover_universal_role_first(None, read_only=True)
+        except Exception:
+            return {"blocked": True, "issue_manual_needed": False, "machine_needed": False}
+        issue_manual_needed = any(
+            decision.kind in {
+                Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY,
+                Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY,
+            }
+            for decision in inventory.decisions
+        )
+        machine_needed = any(
+            decision.kind in {
+                Wave08DecisionKind.MACHINE_VALIDATION_DISPATCH,
+                Wave08DecisionKind.MACHINE_FINALIZER_DISPATCH,
+            }
+            for decision in inventory.decisions
+        )
+        legacy_decisions = tuple(
+            decision for decision in inventory.decisions
+            if decision.resolution.activation is CarrierActivation.LEGACY_CUTOVER_QUARANTINE
+        )
+        if inventory.complete and legacy_decisions:
+            try:
+                boundary = self.derive_activation_boundary_evidence()
+            except Exception:
+                return {"blocked": True, "issue_manual_needed": False, "machine_needed": False}
+            for decision in legacy_decisions:
+                classification = self.classify_legacy_head(
+                    decision.head_sha,
+                    implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+                )
+                if (
+                    type(classification) is not LegacyClassificationResult
+                    or classification.outcome is LegacyClassificationOutcome.CONFLICTING
+                ):
+                    return {"blocked": True, "issue_manual_needed": False, "machine_needed": False}
+                if (
+                    classification.outcome is LegacyClassificationOutcome.QUARANTINE
+                    and classification.evidence is not None
+                    and classification.evidence.evidence_class is LegacyQuarantineClass.MANUAL
+                ):
+                    issue_manual_needed = True
+        return {
+            "blocked": not inventory.complete or bool(inventory.blocked_reasons),
+            "issue_manual_needed": issue_manual_needed,
+            "machine_needed": machine_needed,
+        }
+
+    def _finalize_one_wg4_manual_pr(self, summary: Mapping[str, Any]) -> str:
+        """Handle one freshly re-resolved Issue/manual lane item without Check Runs."""
+        number = summary.get("number")
+        if type(number) is not int or not 1 <= number <= 9_223_372_036_854_775_807:
+            raise R02Error("Wg4 manual sweep PR summary has an invalid number")
+        pr = self.client.get_pull_request_metadata(self.central_repository, number)
+        if type(pr) is not PullRequestMetadata or pr.number != number:
+            raise StaleAuthorityError("Wg4 manual sweep PR identity is unavailable")
+        repository, accepted_main = self.current_accepted_main()
+        if (
+            pr.base_repository != repository.full_name
+            or pr.base_repository_id != repository.node_id
+            or pr.base_ref != repository.default_branch
+            or pr.base_oid != accepted_main
+        ):
+            return "NOOP_STALE_PR"
+
+        head_sha = pr.head_oid
+        resolution = self.resolve_current_sha_carrier_role(head_sha)
+        if resolution.activation is CarrierActivation.LEGACY_CUTOVER_QUARANTINE:
+            boundary = self.derive_activation_boundary_evidence()
+            classification = self.classify_legacy_head(
+                head_sha,
+                implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+            )
+            if (
+                type(classification) is not LegacyClassificationResult
+                or classification.outcome is not LegacyClassificationOutcome.QUARANTINE
+                or classification.evidence is None
+                or classification.evidence.evidence_class is not LegacyQuarantineClass.MANUAL
+            ):
+                return "BLOCKED_LEGACY_NOT_EXACT_MANUAL"
+            self.publish_legacy_failure(
+                head_sha, boundary.activation_boundary_id,
+                implementation_reviewed_head_sha=boundary.implementation_reviewed_head_sha,
+            )
+            return "LEGACY_FAILURE"
+
+        if resolution.role is CarrierRole.MACHINE_PUBLICATION:
+            return "NOOP_MACHINE_ROLE"
+        if resolution.activation in {
+            CarrierActivation.CONFLICTING,
+            CarrierActivation.RESERVED_INACTIVE,
+            CarrierActivation.UNCLAIMED_OUT_OF_FEDERATION,
+        }:
+            return "NOOP_NO_MANUAL_AUTHORITY"
+
+        decision = self.trusted_validation_role_first(number, None)
+        if decision.kind is Wave08DecisionKind.ISSUE_OWNER_CANCELLATION_RECOVERY:
+            return "ISSUE_CANCELLATION_RECOVERED"
+        if decision.kind is not Wave08DecisionKind.ISSUE_OWNER_FINALIZER_RECOVERY:
+            return "NOOP_NO_ISSUE_FINALIZER_AUTHORITY"
+        owner = derive_issue_owner_pr(
+            self.client, self.central_repository, head_sha, decision.resolution,
+            self.app.slug, role_already_resolved=True,
+        )
+        if owner.pull_request_number != number:
+            return "NOOP_NOT_ISSUE_OWNER_PR"
+
+        if decision.resolution.role is CarrierRole.ISSUE_ACTIVE:
+            epoch = self.prepare_issue_finalization_epoch(
+                owner.issue_number, self.current_issue_source_authority,
+            )
+            self.publish_issue_final_success(
+                owner.issue_number, epoch, self.current_issue_source_authority,
+            )
+            return "ISSUE_FINAL_SUCCESS"
+
+        if decision.resolution.role is CarrierRole.ISSUE_FINALIZING:
+            try:
+                epoch = self.prepare_issue_finalization_epoch(
+                    owner.issue_number, self.current_issue_source_authority,
+                )
+            except Exception:
+                self.revoke_required_status_epoch(
+                    owner.issue_number,
+                    RequiredStatusEpochReason.FINALIZATION_INVALIDATED,
+                    self.current_issue_source_authority,
+                )
+                return "ISSUE_FINALIZATION_REVOKED"
+            self.publish_issue_final_success(
+                owner.issue_number, epoch, self.current_issue_source_authority,
+            )
+            return "ISSUE_FINAL_SUCCESS_RETRIED"
+        return "NOOP_NO_ISSUE_FINALIZER_AUTHORITY"
+
+    def state_finalize_manual(self, *, max_iterations: int = 8, self_wake: Callable[[], None] | None = None) -> str:
+        """Run a fresh all-manual/Issue sweep, ignoring every wake hint."""
+        if type(max_iterations) is not int or not 1 <= max_iterations <= 64:
+            raise R02Error("Wg4 manual work bound must be an exact integer from 1 to 64")
+        for attempt in range(max_iterations):
+            repository, accepted_main = self.current_accepted_main()
+            summaries = self.client.list_open_pull_requests(self.central_repository, max_pages=100)
+            if type(summaries) not in {tuple, list}:
+                raise R02Error("Wg4 manual PR inventory is malformed")
+            numbers: set[int] = set()
+            for summary in summaries:
+                if (
+                    type(summary) is not dict
+                    or type(summary.get("number")) is not int
+                    or not 1 <= summary["number"] <= 9_223_372_036_854_775_807
+                    or summary["number"] in numbers
+                ):
+                    raise R02Error("Wg4 manual PR inventory contains malformed or duplicate rows")
+                numbers.add(summary["number"])
+            ordered = sorted(summaries, key=lambda item: item["number"])
+            moved = False
+            for summary in ordered:
+                self._finalize_one_wg4_manual_pr(summary)
+                latest_repository, latest_main = self.current_accepted_main()
+                moved = (
+                    latest_repository.id != repository.id
+                    or latest_repository.node_id != repository.node_id
+                    or latest_repository.default_branch != repository.default_branch
+                    or latest_main != accepted_main
+                )
+                if moved:
+                    # Do not use the old inventory tail after shared authority
+                    # changes. The next attempt must fetch a fresh full pass.
+                    break
+            if not moved:
+                latest_repository, latest_main = self.current_accepted_main()
+                moved = (
+                    latest_repository.id != repository.id
+                    or latest_repository.node_id != repository.node_id
+                    or latest_repository.default_branch != repository.default_branch
+                    or latest_main != accepted_main
+                )
+            if not moved:
+                return "manual-sweep-complete"
+            if attempt + 1 < max_iterations:
+                continue
+
+        # A wake is warranted only when a fresh authoritative read confirms
+        # manual/Issue work remains. Raw open PR volume is never work evidence.
+        route = self.state_finalize_route()
+        if route["blocked"] or not route["issue_manual_needed"]:
+            return "manual-sweep-complete"
         if self_wake is not None:
             self_wake()
             return "bounded-work-exhausted-self-wake-dispatched"
@@ -2049,18 +14401,18 @@ class R02Controller:
             return result
         return finalize_manual_trust_sweep(self.client, self.central_repository, process_pr, max_iterations=max_iterations, self_wake=self_wake)
 
-    def main_advance(self) -> str:
+    def main_advance(self) -> str | IssueManagedRouteResult:
         """Wake reconciliation/finalization from current main, never from event text."""
         repository, current_main = self.current_accepted_main()
         sources = self._accepted_sources(current_main)
         machine = self._machine_prs(current_main, repository, sources)
         wake_finalizer = False
-        updated_manual = 0
         dispatched: set[str] = set()
+        managed_issue_noop: IssueManagedRouteResult | None = None
         for source_id in sorted(machine):
             if machine[source_id]:
                 source = next(source for source in sources if source.source_id == source_id)
-                self.client.dispatch_workflow(self.central_repository, "federation-reconcile.yml", "refs/heads/main", {"repository_id": str(source.repository_id)})
+                self.client.dispatch_workflow(self.central_repository, "federation-g8-reconcile.yml", "refs/heads/main", {"repository_id": str(source.repository_id)})
                 dispatched.add(source_id)
                 wake_finalizer = True
         for summary in self.client.list_open_pull_requests(self.central_repository):
@@ -2077,43 +14429,49 @@ class R02Controller:
                     or pr.base_ref != repository.default_branch
                 ):
                     continue
-                comments = self.client.list_issue_comments(self.central_repository, number)
-                anchors = _anchor_candidates(comments)
-                if pr.base_oid != current_main:
-                    # Initial marker-only manual requests are safe to normalize
-                    # automatically when main advances.  The trusted main-advance
-                    # and interactive workflows share one repository-wide GitHub
-                    # Actions concurrency group, so RequestAnchor creation cannot
-                    # overlap this no-anchor classification/update authority
-                    # window.  Validate the request head against the PR's own
-                    # accepted historical base first, then let GitHub merge
-                    # current main into the head with an expected-head CAS.  The
-                    # resulting synchronize event wakes the ordinary
-                    # interactive/trusted-validation cloud path.
-                    if anchors:
+                if _is_reserved_issue_pr_head(pr.head_ref):
+                    # Wave 04 advances only the exact bound Issue head. It never
+                    # asks GitHub to merge main into this reserved branch.
+                    try:
+                        issue_number = reserved_issue_branch_number(pr.head_ref)
+                    except RequestModelError:
                         continue
-                    request_class = read_request_marker(self.client, self.central_repository, pr.head_oid)
-                    if request_class not in MANUAL_CLASSES:
-                        continue
-                    validate_existing_request_head(self.client, self.central_repository, pr, request_class, pr.base_oid)
-                    self.client.update_pull_request_branch(self.central_repository, number, expected_head_sha=pr.head_oid)
-                    updated_manual += 1
+                    if issue_number is not None:
+                        route_result = self.interactive_issue_managed_route(
+                            issue_number, self.current_issue_source_authority,
+                        )
+                        if route_result.outcome == "NOOP":
+                            managed_issue_noop = route_result
                     continue
-                if len(anchors) == 1 and anchors[0].anchor.request_class in MANUAL_CLASSES:
-                    validate_unique_anchor(comments, pr, anchors[0].anchor.request_class, self.app)
-                    wake_finalizer = True
-            except (GitHubAPIError, R02Error):
+                continue
+            except (GitHubAPIError, R02Error, RequestModelError):
                 continue
         if wake_finalizer:
-            self.client.dispatch_workflow(self.central_repository, "federation-state-finalize.yml", "refs/heads/main", {})
-        return f"MAIN_ADVANCE_DISPATCHED:{len(dispatched)}" if (dispatched or wake_finalizer or updated_manual) else "MAIN_ADVANCE_NOOP"
+            self.client.dispatch_workflow(self.central_repository, "federation-g8-state-finalize.yml", "refs/heads/main", {})
+        if not (dispatched or wake_finalizer) and managed_issue_noop is not None:
+            return managed_issue_noop
+        return f"MAIN_ADVANCE_DISPATCHED:{len(dispatched)}" if (dispatched or wake_finalizer) else "MAIN_ADVANCE_NOOP"
 
-    def finalize_one_manual_pr(self, summary: Mapping[str, Any]) -> None:
+    def finalize_one_manual_pr(self, summary: Mapping[str, Any]) -> IssueManagedRouteResult | None:
         """Re-derive one current manual PR; never treats an enumeration hint as authority."""
         number = summary.get("number")
         if type(number) is not int or number <= 0:
             raise R02Error("finalizer PR summary has an invalid number")
         pr = self.client.get_pull_request_metadata(self.central_repository, number)
+        if _is_reserved_issue_pr_head(pr.head_ref):
+            try:
+                issue_number = reserved_issue_branch_number(pr.head_ref)
+                if issue_number is not None:
+                    return self.interactive_issue_managed_route(
+                        issue_number, self.current_issue_source_authority,
+                    )
+            except StaleTrustedCheckoutError:
+                raise
+            except (GitHubAPIError, R02Error, RequestModelError):
+                # Reserved Issue PRs remain pre-green; failed recovery cannot
+                # create validation evidence or enter legacy finalization.
+                return
+            return
         comments = self.client.list_issue_comments(self.central_repository, number)
         anchors = _anchor_candidates(comments)
         if len(anchors) != 1 or anchors[0].anchor.request_class not in MANUAL_CLASSES:
@@ -2230,19 +14588,24 @@ def main(argv: list[str] | None = None) -> int:
     import sys
 
     parser = argparse.ArgumentParser(description="Swift Stream trusted federation controller")
-    parser.add_argument("command", choices=("interactive", "trusted-validation", "state-finalize", "reconcile", "main-advance"))
+    parser.add_argument("command", choices=(
+        "interactive", "trusted-validation", "trusted-validation-route",
+        "trusted-validation-manual", "trusted-validation-machine",
+        "state-finalize", "state-finalize-route", "state-finalize-manual",
+        "state-finalize-machine", "universal-recovery", "reconcile",
+        "main-advance", "activation-guard", "activation-preflight", "activate-g8",
+    ))
     args = parser.parse_args(argv)
     client: GitHubClient | None = None
     number: int | None = None
-    result_kind = "proposal"
-    result_identity: int | None = None
+    reserved_issue_pr = False
     fresh_wake_dispatched = False
 
     def wake_fresh_finalizer() -> None:
         nonlocal fresh_wake_dispatched
         if fresh_wake_dispatched or client is None:
             return
-        client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {})
+        client.dispatch_workflow(repository, "federation-g8-state-finalize.yml", "refs/heads/main", {})
         fresh_wake_dispatched = True
 
     try:
@@ -2257,7 +14620,75 @@ def main(argv: list[str] | None = None) -> int:
         trusted_checkout_sha = env.get("FEDERATION_TRUSTED_CHECKOUT_SHA")
         if type(trusted_checkout_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", trusted_checkout_sha):
             raise R02Error("trusted checkout SHA environment is missing or malformed")
-        controller = R02Controller(client, repository, app, candidate_builder=C02CandidateBuilder(client, repository, trusted_checkout_sha=trusted_checkout_sha), environ=env)
+        if args.command in {"activation-guard", "activation-preflight"}:
+            controller = R02Controller(client, repository, app, environ=env)
+            if args.command == "activation-preflight":
+                decision = controller.g8_activation_preflight_decision()
+                print(json.dumps(
+                    {"decision": decision},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ))
+                return 0
+            result = controller.derive_g8_activation_guard()
+            payload = {
+                "activationWriteAllowed": result.activation_write_allowed,
+                "ordinaryWriteAllowed": result.ordinary_write_allowed,
+                "reason": result.reason,
+                "runtimeState": result.runtime_state.value,
+            }
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
+            return 0
+        controller = R02Controller(
+            client,
+            repository,
+            app,
+            candidate_builder=C02CandidateBuilder(
+                client, repository, trusted_checkout_sha=trusted_checkout_sha,
+            ),
+            environ=env,
+        )
+        if args.command == "activate-g8":
+            controller._require_g8_activation_run_authority("activate-g8")
+            if env.get("INPUT_MODE") != "activate-g8":
+                raise R02Error("G8 activation requires exact activate-g8 dispatch input")
+            branch = G8_ACTIVATION_REF.removeprefix("refs/heads/")
+            persisted_hae = client.get_optional_ref_oid(repository, branch)
+            if persisted_hae is None:
+                execution = controller.run_g8_activation_recovery("activate-g8")
+                record, hae = controller.publish_g8_activation_epoch(
+                    execution,
+                    created_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                )
+                del record
+                outcome = "PUBLISHED"
+            else:
+                record, hae = controller.resume_g8_activation_epoch()
+                del record
+                outcome = "RESUMED"
+            guard = controller.derive_g8_activation_guard()
+            if guard != _g8_activation_guard_result(G8RuntimeState.ACTIVE_G8):
+                raise R02Error("G8 activation common guard did not freshly prove ACTIVE_G8")
+            try:
+                client.dispatch_workflow(
+                    repository,
+                    "federation-g8-reconcile.yml",
+                    "refs/heads/main",
+                    {"mode": "recover"},
+                )
+                catchup = "DISPATCHED"
+            except Exception:
+                catchup = "UNCERTAIN"
+            print(json.dumps(
+                {"catchup": catchup, "epoch": outcome, "hae": hae},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ))
+            return 0
         number_text = env.get("FEDERATION_WAKE_PULL_NUMBER")
         number = int(number_text) if number_text and number_text.isdigit() else _event_pull_number(env.get("FEDERATION_EVENT_PATH"))
         event_kind, triggering_comment_id, triggering_comment_author = _event_trigger(env.get("FEDERATION_EVENT_PATH"))
@@ -2267,62 +14698,85 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "reconcile":
             hint = env.get("FEDERATION_RECONCILE_REPOSITORY_ID")
             controller.reconcile_all() if hint is None or hint == "" else controller.reconcile(hint)
+        elif args.command == "universal-recovery":
+            def dispatch_issue_recovery(intent: Wave08IssueRecoveryIntent) -> None:
+                client.dispatch_workflow(
+                    repository, "federation-g8-issue-intake.yml", "refs/heads/main",
+                    {"issue_number": str(intent.issue_number)},
+                )
+
+            def dispatch_issue_finalizer(_decision: Wave08Decision, _owner: IssueOwnerPR) -> None:
+                client.dispatch_workflow(repository, "federation-g8-state-finalize.yml", "refs/heads/main", {})
+
+            def dispatch_machine_validation(_decision: Wave08Decision, authority: MachinePRAuthority) -> None:
+                client.dispatch_workflow(
+                    repository, "federation-g8-trusted-validation.yml", "refs/heads/main",
+                    {"pull_number": str(authority.number)},
+                )
+
+            def dispatch_machine_finalizer(_decision: Wave08Decision, _authority: MachinePRAuthority) -> None:
+                client.dispatch_workflow(repository, "federation-g8-state-finalize.yml", "refs/heads/main", {})
+
+            controller.recover_universal_role_first(
+                None,
+                issue_intake_terminal_dispatcher=dispatch_issue_recovery,
+                issue_finalizer_dispatcher=dispatch_issue_finalizer,
+                machine_validation_dispatcher=dispatch_machine_validation,
+                machine_finalizer_dispatcher=dispatch_machine_finalizer,
+            )
         elif args.command == "main-advance":
             controller.main_advance()
+        elif args.command == "trusted-validation-route":
+            if number is None:
+                raise R02Error("authoritative PR number is unavailable")
+            route = controller.trusted_validation_route(number)
+            print(json.dumps({"route": route}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
+        elif args.command == "trusted-validation-manual":
+            if number is None:
+                raise R02Error("authoritative PR number is unavailable")
+            controller.trusted_validation_manual(number)
+        elif args.command == "trusted-validation-machine":
+            if number is None:
+                raise R02Error("authoritative PR number is unavailable")
+            controller.trusted_validation_machine(number)
+        elif args.command == "state-finalize-route":
+            route = controller.state_finalize_route(
+                pull_number_hint=number_text,
+                expected_source_id_hint=env.get("FEDERATION_WAKE_EXPECTED_SOURCE_ID"),
+            )
+            print(json.dumps(route, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False))
         elif args.command in {"interactive", "trusted-validation"}:
             if number is None:
                 raise R02Error("authoritative PR number is unavailable")
             if args.command == "interactive":
-                comments = client.list_issue_comments(repository, number)
-                anchors = _anchor_candidates(comments)
-                if anchors:
-                    request_class = anchors[0].anchor.request_class
-                else:
-                    pr = client.get_pull_request_metadata(repository, number)
-                    request_class = read_optional_request_marker(client, repository, pr.head_oid)
-                    if request_class is None:
-                        return 0
-                repository_metadata, accepted_main = controller.current_accepted_main()
-                pr = client.get_pull_request_metadata(repository, number)
-                if request_class is RequestClass.RECONCILE:
-                    result_kind = "reconcile"
-                    anchor = validate_unique_anchor(comments, pr, request_class, app) if anchors else None
-                    if anchor is not None:
-                        result_identity = anchor.comment.database_id
-                    controller.reconcile_interactive_request(number, accepted_main)
-                    return 0
-                if event_kind == "issue_comment":
-                    if triggering_comment_id is None:
-                        raise R02Error("issue-comment trigger ID is unavailable")
-                    result_kind = "patch"
-                    result_identity = triggering_comment_id
-                    trigger_comment = next((item for item in comments if item.database_id == triggering_comment_id), None)
-                    if trigger_comment is None:
-                        raise R02Error("triggering issue comment is not present in the authoritative comment fold")
-                    _pr, trigger_anchor, trigger_fold, _fold_comments = controller.interactive_anchor_and_reconstruct(number, request_class)
-                    trigger_result, should_apply = _trigger_result(trigger_fold.evidence, triggering_comment_id)
-                    if has_result_for_comment(comments, result_kind, result_identity):
-                        return 0
-                    if not should_apply:
-                        _post_bounded_result(client, repository, number, comments, kind=result_kind, identity=result_identity, result=trigger_result, reason="trigger-comment-not-applied")
-                        return 0
-                if event_kind != "issue_comment":
-                    controller.interactive_anchor_and_reconstruct(number, request_class)
-                candidate = controller.interactive_proposal(number, request_class, accepted_main, f"refs/heads/{pr.head_ref}")
-                updated_comments = client.list_issue_comments(repository, number)
-                anchor = validate_unique_anchor(updated_comments, pr, request_class, app)
-                if result_identity is None:
-                    result_identity = anchor.comment.database_id
-                _post_bounded_result(client, repository, number, updated_comments, kind=result_kind, identity=result_identity, result="PROPOSAL_UPDATED", reason=f"{request_class.value}:{len(candidate.changed_paths)}")
-                client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
-            else:
-                _repo, accepted_main = controller.current_accepted_main()
                 initial_pr = client.get_pull_request_metadata(repository, number)
+                if _is_reserved_issue_pr_head(initial_pr.head_ref):
+                    reserved_issue_pr = True
+                    issue_number = reserved_issue_branch_number(initial_pr.head_ref)
+                    if issue_number is None:
+                        raise ReservedIssuePRPendingManagedAuthority("reserved Issue PR has no exact Issue number")
+                    controller.interactive_issue_managed_route(
+                        issue_number, controller.current_issue_source_authority,
+                    )
+                    return 0
+                return 0
+            else:
+                initial_pr = client.get_pull_request_metadata(repository, number)
+                if _is_reserved_issue_pr_head(initial_pr.head_ref):
+                    reserved_issue_pr = True
+                    try:
+                        issue_number = reserved_issue_branch_number(initial_pr.head_ref)
+                        if issue_number is not None:
+                            controller.validate_issue_managed_head_history(issue_number)
+                    except (GitHubAPIError, R02Error, RequestModelError):
+                        pass
+                    return 0
+                _repo, accepted_main = controller.current_accepted_main()
                 comments = client.list_issue_comments(repository, number)
                 if not _anchor_candidates(comments) and _MACHINE_BRANCH_RE.fullmatch(initial_pr.head_ref):
                     result = controller.trusted_machine_validation(number, accepted_main, expected_head_sha=initial_pr.head_oid)
                     controller.publish_validation_result(result)
-                    client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
+                    client.dispatch_workflow(repository, "federation-g8-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
                 else:
                     if not _anchor_candidates(comments) and read_optional_request_marker(client, repository, initial_pr.head_oid) is None:
                         try:
@@ -2351,7 +14805,7 @@ def main(argv: list[str] | None = None) -> int:
                         return 0
                     result = controller.trusted_validation(number, accepted_main, controller.production_candidate_check(number, accepted_main, expected_head_sha=initial_pr.head_oid), expected_head_sha=initial_pr.head_oid)
                     controller.publish_validation_result(result)
-                    client.dispatch_workflow(repository, "federation-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
+                    client.dispatch_workflow(repository, "federation-g8-state-finalize.yml", "refs/heads/main", {"pull_number": str(number)})
         elif args.command == "state-finalize":
             work_limit_text = env.get("FEDERATION_WORK_LIMIT", "3")
             if not re.fullmatch(r"[1-9][0-9]?", work_limit_text):
@@ -2365,22 +14819,26 @@ def main(argv: list[str] | None = None) -> int:
                 process_pr=controller.finalize_one_manual_pr,
                 self_wake=wake_fresh_finalizer,
             )
+        elif args.command == "state-finalize-manual":
+            work_limit_text = env.get("FEDERATION_WORK_LIMIT", "8")
+            if not re.fullmatch(r"[1-9][0-9]?", work_limit_text) or int(work_limit_text) > 64:
+                raise R02Error("FEDERATION_WORK_LIMIT is malformed or out of range")
+            controller.state_finalize_manual(max_iterations=int(work_limit_text), self_wake=wake_fresh_finalizer)
+        elif args.command == "state-finalize-machine":
+            work_limit_text = env.get("FEDERATION_WORK_LIMIT", "8")
+            if not re.fullmatch(r"[1-9][0-9]?", work_limit_text) or int(work_limit_text) > 64:
+                raise R02Error("FEDERATION_WORK_LIMIT is malformed or out of range")
+            controller._state_finalize_machine_sweep(max_iterations=int(work_limit_text), self_wake=wake_fresh_finalizer)
         return 0
     except Exception as error:
-        if isinstance(error, StaleAuthorityError) and client is not None:
+        if (
+            args.command != "trusted-validation-route"
+            and isinstance(error, StaleAuthorityError)
+            and client is not None
+            and (args.command != "interactive" or reserved_issue_pr)
+        ):
             try:
                 wake_fresh_finalizer()
-            except Exception:
-                pass
-        if args.command == "interactive" and client is not None and number is not None:
-            try:
-                comments = client.list_issue_comments(repository, number)
-                identity = result_identity
-                if identity is None:
-                    anchor = next(iter(_anchor_candidates(comments)), None)
-                    identity = anchor.comment.database_id if anchor is not None else None
-                if identity is not None:
-                    _post_bounded_result(client, repository, number, comments, kind=result_kind, identity=identity, result="PROPOSAL_BLOCKED", reason=_bounded_error_reason(error))
             except Exception:
                 pass
         if isinstance(error, GraphQLError):

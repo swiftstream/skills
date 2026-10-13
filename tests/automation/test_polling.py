@@ -72,16 +72,16 @@ class PollingTests(unittest.TestCase):
         controller.reconcile = lambda repository_id, **kwargs: MachineReconcileResult("CHANGED", repository_id=repository_id)
         controller.reconcile_all()
         self.assertEqual(len(dispatches), 1)
-        self.assertEqual(dispatches[0][1], "federation-state-finalize.yml")
+        self.assertEqual(dispatches[0][1], "federation-g8-state-finalize.yml")
 
     def test_reconcile_workflow_is_scheduled_and_manually_targetable(self):
-        workflow = (ROOT / ".github/workflows/federation-reconcile.yml").read_text()
+        workflow = (ROOT / ".github/workflows/federation-g8-reconcile.yml").read_text()
         self.assertIn("schedule:", workflow)
-        self.assertIn("cron: '*/15 * * * *'", workflow)
+        self.assertIn("cron: '7,22,37,52 * * * *'", workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("repository_id:", workflow)
         self.assertRegex(workflow, r"repository_id:\n\s+required: false\n\s+type: string")
-        self.assertIn("group: swiftstream-skills-federation-reconcile", workflow)
+        self.assertIn("group: swiftstream-skills-federation-manual-authority", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("FEDERATION_RECONCILE_REPOSITORY_ID", workflow)
 
