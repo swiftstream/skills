@@ -9171,13 +9171,20 @@ class Wave11ActivationBoundaryControllerTests(unittest.TestCase):
 
     def contract(self, **overrides):
         value = {
-            "schemaVersion": 1, "centralRepositoryNodeId": "R_kgDOUId1Tw",
-            "implementationPrNumber": 27, "implementationPrDatabaseId": 4780363432,
-            "implementationPrNodeId": "PR_kwDOUId1T88AAAABHO6OqA", "baseRef": "main",
+            "schemaVersion": 2, "centralRepositoryNodeId": "R_kgDOUId1Tw",
+            "implementationPrNumber": 28, "implementationPrDatabaseId": 4853644304,
+            "implementationPrNodeId": "PR_kwDOUId1T88AAAABIUy8EA",
+            "implementationHeadRef": "g8/postmerge-activation-repair-01",
+            "predecessorImplementationPrNumber": 27,
+            "predecessorImplementationPrDatabaseId": 4780363432,
+            "predecessorImplementationPrNodeId": "PR_kwDOUId1T88AAAABHO6OqA",
+            "predecessorReviewedHeadSha": "5120141c3d26148d8471c161acfa6d540d412519",
+            "predecessorMergedResultOid": "85530496699d5456af8962c1e1f80bc81dbe83ef",
+            "baseRef": "main",
             "activationRef": "refs/heads/bot/federation-g8-activation",
             "activationStatusContext": "federation/g8-activation",
             "exactNewWriterPaths": list(self.WRITERS), "authoritySurfaceManifestPath": self.MANIFEST_PATH,
-            "contractVersion": "correction-12",
+            "contractVersion": "postmerge-activation-repair-01",
         }
         value.update(overrides)
         return value
@@ -9187,23 +9194,38 @@ class Wave11ActivationBoundaryControllerTests(unittest.TestCase):
         return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
 
     class Client:
-        def __init__(self, test, *, discovery_contract=None, merged_contract=None, manifest=None, pr=None, compare=None):
+        def __init__(self, test, *, discovery_contract=None, merged_contract=None, manifest=None, pr=None, predecessor_pr=None, compare=None, commit_metadata=None):
             self.test = test
             self.calls = []
             self.discovery_contract = discovery_contract
             self.merged_contract = merged_contract
             self.manifest_value = manifest
+            self.predecessor_pr = predecessor_pr or MergedPullRequestMetadata(
+                "swiftstream/skills", "R_kgDOUId1Tw", 1351054671,
+                "PR_kwDOUId1T88AAAABHO6OqA", 4780363432, 27, "MERGED", False, True,
+                "2026-10-08T10:11:12Z", "85530496699d5456af8962c1e1f80bc81dbe83ef", "5120141c3d26148d8471c161acfa6d540d412519", "a" * 40,
+                "g8/issue-first-federation-implementation", "main",
+                "R_kgDOUId1Tw", 1351054671, "swiftstream/skills",
+                "R_kgDOUId1Tw", 1351054671, "swiftstream/skills",
+            )
             self.pr = pr or MergedPullRequestMetadata(
                 "swiftstream/skills", "R_kgDOUId1Tw", 1351054671,
-                "PR_kwDOUId1T88AAAABHO6OqA", 4780363432, 27, "CLOSED", False, True,
-                "2026-10-08T10:11:12Z", "e" * 40, "d" * 40, "c" * 40,
-                "g8/issue-first-federation-implementation", "main",
+                "PR_kwDOUId1T88AAAABIUy8EA", 4853644304, 28, "MERGED", False, True,
+                "2026-10-14T10:11:12Z", "e" * 40, "d" * 40, "85530496699d5456af8962c1e1f80bc81dbe83ef",
+                "g8/postmerge-activation-repair-01", "main",
                 "R_kgDOUId1Tw", 1351054671, "swiftstream/skills",
                 "R_kgDOUId1Tw", 1351054671, "swiftstream/skills",
             )
             self.compare = compare or ("ahead", "e" * 40, "e" * 40)
             self.blobs = {}
             self.trees = {}
+            self.commit_metadata = commit_metadata or {
+                "e" * 40: GitCommitMetadata(
+                    "e" * 40, "e" * 40,
+                    ("85530496699d5456af8962c1e1f80bc81dbe83ef", "d" * 40),
+                ),
+                "d" * 40: GitCommitMetadata("d" * 40, "e" * 40, ("85530496699d5456af8962c1e1f80bc81dbe83ef",)),
+            }
             test._populate_client(self)
 
         def get_repository_metadata(self, repository):
@@ -9218,13 +9240,17 @@ class Wave11ActivationBoundaryControllerTests(unittest.TestCase):
             self.calls.append(("tree", sha))
             return sha, self.trees[sha]
 
+        def get_commit_metadata(self, repository, sha):
+            self.calls.append(("commit", sha))
+            return self.commit_metadata[sha]
+
         def get_blob(self, repository, sha):
             self.calls.append(("blob", sha))
             return self.blobs[sha]
 
         def get_merged_pull_request_metadata(self, repository, number):
             self.calls.append(("pr", number))
-            return self.pr
+            return {27: self.predecessor_pr, 28: self.pr}[number]
 
         def compare_commits(self, repository, base, head):
             self.calls.append(("compare", base, head))
@@ -9260,59 +9286,66 @@ class Wave11ActivationBoundaryControllerTests(unittest.TestCase):
     def controller(self, client):
         return R02Controller(client, "swiftstream/skills", AppIdentity("swift-stream-federation", 1, "A_app", 2, "B_bot", "swift-stream-federation[bot]"), environ={"IMPLEMENTATION_PR_NUMBER": "999"})
 
-    def test_derives_boundary_from_exact_merged_result_and_fixed_pr(self):
+    def test_derives_boundary_from_repair_merge_and_reads_both_fixed_prs(self):
         client = self.Client(self)
         evidence = self.controller(client).derive_activation_boundary_evidence()
         self.assertEqual(evidence.merged_result_oid, "e" * 40)
         self.assertEqual(evidence.implementation_reviewed_head_sha, "d" * 40)
-        self.assertEqual(evidence.implementation_pr_number, 27)
+        self.assertEqual(evidence.implementation_pr_number, 28)
         self.assertEqual(evidence.activation_boundary_id, controller_module.activation_boundary_id_digest(
             evidence.central_repository_node_id, evidence.implementation_pr_number,
             evidence.implementation_pr_database_id, evidence.implementation_pr_node_id,
             evidence.merged_result_oid, evidence.authority_surface_digest, evidence.new_writer_topology_digest,
         ))
-        self.assertEqual([call for call in client.calls if call[0] == "pr"], [("pr", 27)])
+        self.assertEqual([call for call in client.calls if call[0] == "pr"], [("pr", 27), ("pr", 28)])
         self.assertLess(client.calls.index(("blob", f"{len(self.SURFACE) + 21:040x}")), client.calls.index(("pr", 27)))
 
-    def test_open_fixed_pr_is_pre_g8_not_applicable_but_contradictory_closed_unmerged_blocks(self):
-        base = self.Client(self).pr
-        pre_client = self.Client(
-            self,
-            pr=replace(
-                base,
-                state="OPEN",
-                is_draft=True,
-                merged=False,
-                merged_at=None,
-                merge_commit_oid=None,
-            ),
-        )
-        with self.assertRaises(controller_module.PreG8NotApplicableError):
-            self.controller(pre_client).derive_activation_boundary_evidence()
+    def test_predecessor_and_repair_require_raw_merged_semantics(self):
+        fixture = self.Client(self)
+        for label, state, merged, merged_at, merge_oid in (
+            ("predecessor open unmerged", "OPEN", False, None, None),
+            ("predecessor closed unmerged", "CLOSED", False, None, None),
+            ("predecessor closed merged contradiction", "CLOSED", True, "2026-10-08T10:11:12Z", "85530496699d5456af8962c1e1f80bc81dbe83ef"),
+            ("predecessor merged false", "MERGED", False, "2026-10-08T10:11:12Z", "85530496699d5456af8962c1e1f80bc81dbe83ef"),
+            ("predecessor merged timestamp missing", "MERGED", True, None, "85530496699d5456af8962c1e1f80bc81dbe83ef"),
+            ("predecessor wrong merge", "MERGED", True, "2026-10-08T10:11:12Z", "9" * 40),
+        ):
+            with self.subTest(case=label), self.assertRaises(R02Error):
+                predecessor = replace(
+                    fixture.predecessor_pr,
+                    state=state,
+                    merged=merged,
+                    merged_at=merged_at,
+                    merge_commit_oid=merge_oid,
+                )
+                self.controller(self.Client(self, predecessor_pr=predecessor)).derive_activation_boundary_evidence()
 
-        contradictory = self.Client(
-            self,
-            pr=replace(
-                base,
-                state="CLOSED",
-                is_draft=False,
-                merged=False,
-                merged_at=None,
-                merge_commit_oid=None,
-            ),
-        )
-        with self.assertRaises(R02Error) as caught:
-            self.controller(contradictory).derive_activation_boundary_evidence()
-        self.assertNotIsInstance(caught.exception, controller_module.PreG8NotApplicableError)
+        for label, state, merged, merged_at, merge_oid in (
+            ("repair open unmerged", "OPEN", False, None, None),
+            ("repair closed unmerged", "CLOSED", False, None, None),
+            ("repair closed merged contradiction", "CLOSED", True, "2026-10-14T10:11:12Z", "e" * 40),
+            ("repair merged false", "MERGED", False, "2026-10-14T10:11:12Z", "e" * 40),
+            ("repair merged timestamp missing", "MERGED", True, None, "e" * 40),
+            ("repair merge commit missing", "MERGED", True, "2026-10-14T10:11:12Z", None),
+        ):
+            with self.subTest(case=label), self.assertRaises(R02Error):
+                repair = replace(
+                    fixture.pr,
+                    state=state,
+                    merged=merged,
+                    merged_at=merged_at,
+                    merge_commit_oid=merge_oid,
+                )
+                self.controller(self.Client(self, pr=repair)).derive_activation_boundary_evidence()
 
     def test_poisoned_discovery_tuple_fails_before_pr_query(self):
-        bad = self.Client(self, discovery_contract=self.canonical(self.contract(implementationPrNumber=28)))
+        bad = self.Client(self, discovery_contract=self.canonical(self.contract(implementationPrNumber=29)))
         with self.assertRaises(R02Error):
             self.controller(bad).derive_activation_boundary_evidence()
         self.assertFalse(any(call[0] == "pr" for call in bad.calls))
 
     def test_discovery_and_merged_contract_must_be_byte_identical(self):
-        bad = self.Client(self, merged_contract=self.canonical(self.contract(contractVersion="correction-13")))
+        bad = self.Client(self, merged_contract=self.canonical(self.contract(contractVersion="postmerge-activation-repair-02")))
         with self.assertRaises(R02Error):
             self.controller(bad).derive_activation_boundary_evidence()
 
@@ -9320,6 +9353,9 @@ class Wave11ActivationBoundaryControllerTests(unittest.TestCase):
         bad_pr = self.Client(self, pr=replace(self.Client(self).pr, head_ref="other"))
         with self.assertRaises(R02Error):
             self.controller(bad_pr).derive_activation_boundary_evidence()
+        bad_base = self.Client(self, pr=replace(self.Client(self).pr, base_oid="9" * 40))
+        with self.assertRaises(R02Error):
+            self.controller(bad_base).derive_activation_boundary_evidence()
         bad_compare = self.Client(self, compare=("ahead", "e" * 40, "a" * 40))
         with self.assertRaises(R02Error):
             self.controller(bad_compare).derive_activation_boundary_evidence()
@@ -9327,6 +9363,47 @@ class Wave11ActivationBoundaryControllerTests(unittest.TestCase):
             client = self.Client(self, compare=(state, "e" * 40, "a" * 40))
             with self.subTest(state=state), self.assertRaises(R02Error):
                 self.controller(client).derive_activation_boundary_evidence()
+
+    def test_exact_predecessor_identity_and_repair_two_parent_tree_topology(self):
+        valid = self.Client(self)
+        invalid_predecessors = (
+            {"pull_request_database_id": 999},
+            {"pull_request_node_id": "PR_other"},
+            {"head_oid": "9" * 40},
+            {"merge_commit_oid": "9" * 40},
+            {"head_repository_node_id": "R_fork"},
+            {"base_repository_full_name": "fork/skills"},
+        )
+        for changes in invalid_predecessors:
+            with self.subTest(predecessor=changes), self.assertRaises(R02Error):
+                predecessor = replace(valid.predecessor_pr, **changes)
+                self.controller(self.Client(self, predecessor_pr=predecessor)).derive_activation_boundary_evidence()
+
+        invalid_repairs = (
+            {"pull_request_database_id": 999},
+            {"pull_request_node_id": "PR_other"},
+            {"pull_request_number": 27},
+            {"head_repository_node_id": "R_fork"},
+            {"base_repository_full_name": "fork/skills"},
+            {"head_oid": "9" * 40},
+        )
+        for changes in invalid_repairs:
+            with self.subTest(repair=changes), self.assertRaises(R02Error):
+                repair = replace(valid.pr, **changes)
+                self.controller(self.Client(self, pr=repair)).derive_activation_boundary_evidence()
+
+        valid_metadata = valid.commit_metadata
+        topology_cases = (
+            ("wrong parent one", GitCommitMetadata("e" * 40, "e" * 40, ("9" * 40, "d" * 40)), valid_metadata["d" * 40]),
+            ("wrong parent two", GitCommitMetadata("e" * 40, "e" * 40, ("85530496699d5456af8962c1e1f80bc81dbe83ef", "9" * 40)), valid_metadata["d" * 40]),
+            ("missing parent", GitCommitMetadata("e" * 40, "e" * 40, ("85530496699d5456af8962c1e1f80bc81dbe83ef",)), valid_metadata["d" * 40]),
+            ("wrong merge tree", GitCommitMetadata("e" * 40, "9" * 40, ("85530496699d5456af8962c1e1f80bc81dbe83ef", "d" * 40)), valid_metadata["d" * 40]),
+            ("wrong reviewed head tree", valid_metadata["e" * 40], GitCommitMetadata("d" * 40, "9" * 40, ("85530496699d5456af8962c1e1f80bc81dbe83ef",))),
+        )
+        for label, merge_metadata, head_metadata in topology_cases:
+            with self.subTest(topology=label), self.assertRaises(R02Error):
+                metadata = {"e" * 40: merge_metadata, "d" * 40: head_metadata}
+                self.controller(self.Client(self, commit_metadata=metadata)).derive_activation_boundary_evidence()
 
     def test_manifest_and_contract_bytes_must_be_canonical_and_exact(self):
         invalid = (

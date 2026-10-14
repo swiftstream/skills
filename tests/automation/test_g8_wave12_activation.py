@@ -267,7 +267,7 @@ class Wave12ActivationGuardSnapshotTests(unittest.TestCase):
             return self.record.render().encode()
 
         def list_issue_comments(self, repository, number):
-            self.test.assertEqual((repository, number), ("swiftstream/skills", 27))
+            self.test.assertEqual((repository, number), ("swiftstream/skills", rm.G8_IMPLEMENTATION_PR_NUMBER))
             return tuple(self.comments)
 
         def list_commit_statuses(self, repository, sha):
@@ -986,7 +986,7 @@ class Wave12ActivationPublicationExecutionTests(unittest.TestCase):
 
         def list_issue_comments(self, repository, number):
             self.trace.append(("comments", number))
-            self.test.assertEqual((repository, number), ("swiftstream/skills", 27))
+            self.test.assertEqual((repository, number), ("swiftstream/skills", rm.G8_IMPLEMENTATION_PR_NUMBER))
             self.reads["comments"] += 1
             return tuple(IssueComment(
                 row["node_id"], row["database_id"], row["body"], row["author_id"], row["author_login"],
@@ -1211,7 +1211,7 @@ class Wave12ActivationPublicationExecutionTests(unittest.TestCase):
         self.assertTrue(any(event[0] == "compare_main" for event in retry_proof))
         self.assertTrue(all(("workflow_path", path) in retry_proof for path in rm.G8_NEW_WRITER_PATHS))
         self.assertTrue(all(("workflow_runs", workflow_id) in retry_proof for _path, workflow_id in rm.G8_OLD_WRITERS))
-        self.assertIn(("comments", 27), retry_proof)
+        self.assertIn(("comments", rm.G8_IMPLEMENTATION_PR_NUMBER), retry_proof)
         self.assertGreaterEqual(labels.count("comments"), 2)
         self.assertIn("inventory_pr", labels)
         self.assertIn("inventory_issue", labels)
@@ -1222,7 +1222,7 @@ class Wave12ActivationPublicationExecutionTests(unittest.TestCase):
         self.assertGreaterEqual(len(ref_positions), 2)  # ambiguous-response and final revalidation reads
         self.assertGreater(boundary_positions[-1], retry_proof.index(("inventory_machine", "swiftstream/skills", 100)))
         self.assertGreater(ref_positions[-1], boundary_positions[-1])
-        self.assertGreater(retry_proof.index(("comments", 27), ref_positions[-1]), ref_positions[-1])
+        self.assertGreater(retry_proof.index(("comments", rm.G8_IMPLEMENTATION_PR_NUMBER), ref_positions[-1]), ref_positions[-1])
         self.test.assertEqual(client.status_writes[0]["description"], rm.activation_status_description(record, hae, record.activation_boundary_id))
 
     def test_ambiguous_cas_fresh_read_failure_never_retries_or_publishes_status(self):
@@ -1263,7 +1263,7 @@ class Wave12ActivationPublicationExecutionTests(unittest.TestCase):
         self.assertTrue(any(event[0] == "compare_main" for event in retry_proof))
         self.assertTrue(all(("workflow_path", path) in retry_proof for path in rm.G8_NEW_WRITER_PATHS))
         self.assertTrue(all(("workflow_runs", workflow_id) in retry_proof for _path, workflow_id in rm.G8_OLD_WRITERS))
-        self.assertIn(("comments", 27), retry_proof)
+        self.assertIn(("comments", rm.G8_IMPLEMENTATION_PR_NUMBER), retry_proof)
         self.assertGreaterEqual(labels.count("comments"), 2)
         self.assertIn("inventory_pr", labels)
         self.assertIn("inventory_issue", labels)

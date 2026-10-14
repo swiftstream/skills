@@ -97,14 +97,14 @@ class Wave11RuntimeStaticProofTests(unittest.TestCase):
         valid = fixture.canonical(fixture.contract())
         positive = fixture.Client(fixture)
         evidence = fixture.controller(positive).derive_activation_boundary_evidence()
-        self.assertEqual(evidence.implementation_pr_number, 27)
+        self.assertEqual(evidence.implementation_pr_number, 28)
         self.assertEqual(evidence.implementation_reviewed_head_sha, "d" * 40)
-        self.assertEqual([call for call in positive.calls if call[0] == "pr"], [("pr", 27)])
+        self.assertEqual([call for call in positive.calls if call[0] == "pr"], [("pr", 27), ("pr", 28)])
 
         # D01-D08: valid discovery; every frozen lookup field is checked before
-        # the only PR query; bytes and merged tuple are rebound afterward.
+        # both fixed PR reads; bytes and merged tuple are rebound afterward.
         discovery_fields = (
-            {"implementationPrNumber": 28},
+            {"implementationPrNumber": 29},
             {"implementationPrDatabaseId": 999},
             {"implementationPrNodeId": "PR_poison"},
             {"centralRepositoryNodeId": "R_poison"},
@@ -131,7 +131,7 @@ class Wave11RuntimeStaticProofTests(unittest.TestCase):
         poisoned_hint.environ["IMPLEMENTATION_PR_NUMBER"] = "999"
         with self.subTest(case="D07"):
             poisoned_hint.derive_activation_boundary_evidence()
-        self.assertEqual([call for call in poisoned_hint.client.calls if call[0] == "pr"], [("pr", 27)])
+        self.assertEqual([call for call in poisoned_hint.client.calls if call[0] == "pr"], [("pr", 27), ("pr", 28)])
 
         merged_tuple = fixture.Client(
             fixture,
@@ -154,18 +154,21 @@ class Wave11RuntimeStaticProofTests(unittest.TestCase):
         method = ast.get_source_segment(source, function)
         self.assertIsNotNone(method)
         self.assertIn('contract_path = ".github/federation/g8-activation-contract.json"', method)
-        self.assertIn('get_merged_pull_request_metadata(self.central_repository, 27)', method)
+        self.assertIn('G8_PREDECESSOR_IMPLEMENTATION_PR_NUMBER', method)
+        self.assertIn('G8_IMPLEMENTATION_PR_NUMBER', method)
         self.assertIn("merged_contract_bytes != discovery_bytes", method)
         self.assertIn('repository.default_branch != "main"', method)
-        self.assertIn('merged_pr.head_ref != "g8/issue-first-federation-implementation"', method)
-        self.assertIn('merged_pr.base_ref != "main"', method)
-        self.assertIn('merged_pr.merged is not True', method)
-        self.assertIn('merged_pr.state != "CLOSED"', method)
-        self.assertIn('or merged_pr.is_draft is not False', method)
+        self.assertIn('predecessor_pr.head_ref != "g8/issue-first-federation-implementation"', method)
+        self.assertIn('repair_pr.head_ref != G8_IMPLEMENTATION_HEAD_REF', method)
+        self.assertIn('repair_pr.base_oid != G8_PREDECESSOR_MERGED_RESULT_OID', method)
+        self.assertIn('predecessor_pr.state != "MERGED"', method)
+        self.assertIn('repair_pr.state != "MERGED"', method)
+        self.assertIn('repair_merge_metadata.parents != (G8_PREDECESSOR_MERGED_RESULT_OID, repair_pr.head_oid)', method)
+        self.assertIn('repair_merge_metadata.tree_sha != repair_head_metadata.tree_sha', method)
         self.assertIn('len(paths) != 14', method)
         self.assertNotIn("cutoverId", method)
         self.assertNotIn("os.environ", method)
-        self.assertNotIn("IMPLEMENTATION_PR_NUMBER", method)
+        self.assertNotIn('environ.get("IMPLEMENTATION_PR_NUMBER")', method)
 
     def test_merged_pr_head_topology_cases_H01_to_H07(self):
         fixture = CORE_TESTS.Wave11ActivationBoundaryControllerTests()

@@ -49,9 +49,15 @@ EXPECTED_CONTRACT_KEYS = {
     "centralRepositoryNodeId",
     "contractVersion",
     "exactNewWriterPaths",
+    "implementationHeadRef",
     "implementationPrDatabaseId",
     "implementationPrNodeId",
     "implementationPrNumber",
+    "predecessorImplementationPrDatabaseId",
+    "predecessorImplementationPrNodeId",
+    "predecessorImplementationPrNumber",
+    "predecessorMergedResultOid",
+    "predecessorReviewedHeadSha",
     "schemaVersion",
 }
 EXPECTED_MANIFEST_PATHS = (
@@ -709,18 +715,24 @@ class G8WorkflowEpochTests(unittest.TestCase):
         self.assertIs(type(value), dict)
         self.assertEqual(set(value), EXPECTED_CONTRACT_KEYS)
         self.assertIs(type(value["schemaVersion"]), int)
-        self.assertEqual(value["schemaVersion"], 1)
+        self.assertEqual(value["schemaVersion"], 2)
         self.assertEqual(value["centralRepositoryNodeId"], "R_kgDOUId1Tw")
-        self.assertEqual(value["implementationPrNumber"], 27)
+        self.assertEqual(value["implementationPrNumber"], 28)
         self.assertIs(type(value["implementationPrNumber"]), int)
-        self.assertEqual(value["implementationPrDatabaseId"], 4780363432)
+        self.assertEqual(value["implementationPrDatabaseId"], 4853644304)
         self.assertIs(type(value["implementationPrDatabaseId"]), int)
-        self.assertEqual(value["implementationPrNodeId"], "PR_kwDOUId1T88AAAABHO6OqA")
+        self.assertEqual(value["implementationPrNodeId"], "PR_kwDOUId1T88AAAABIUy8EA")
+        self.assertEqual(value["implementationHeadRef"], "g8/postmerge-activation-repair-01")
+        self.assertEqual(value["predecessorImplementationPrNumber"], 27)
+        self.assertEqual(value["predecessorImplementationPrDatabaseId"], 4780363432)
+        self.assertEqual(value["predecessorImplementationPrNodeId"], "PR_kwDOUId1T88AAAABHO6OqA")
+        self.assertEqual(value["predecessorReviewedHeadSha"], "5120141c3d26148d8471c161acfa6d540d412519")
+        self.assertEqual(value["predecessorMergedResultOid"], "85530496699d5456af8962c1e1f80bc81dbe83ef")
         self.assertEqual(value["baseRef"], "main")
         self.assertEqual(value["activationRef"], "refs/heads/bot/federation-g8-activation")
         self.assertEqual(value["activationStatusContext"], "federation/g8-activation")
         self.assertEqual(value["authoritySurfaceManifestPath"], MANIFEST_PATH)
-        self.assertEqual(value["contractVersion"], "correction-12")
+        self.assertEqual(value["contractVersion"], "postmerge-activation-repair-01")
         self.assertEqual(value["exactNewWriterPaths"], list(NEW_WRITER_PATHS))
         self.assertEqual(len(value["exactNewWriterPaths"]), len(set(value["exactNewWriterPaths"])))
         for key in ("implementationPrNumber", "implementationPrDatabaseId"):
