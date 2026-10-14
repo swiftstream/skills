@@ -2714,16 +2714,40 @@ class Wave11ActivationBoundaryModelTests(unittest.TestCase):
         self.assertNotEqual(topology, new_writer_topology_digest(list(reversed(writers))))
 
     def test_boundary_id_hash_has_exact_fields_and_excludes_reviewed_head(self):
-        expected = activation_boundary_id_digest("R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA", "1" * 40, "2" * 64, "3" * 64)
-        evidence = ActivationBoundaryEvidence(1, "R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA", "4" * 40, "1" * 40, "2" * 64, "3" * 64, expected)
+        expected = activation_boundary_id_digest(
+            rm.G8_CENTRAL_REPOSITORY_NODE_ID,
+            rm.G8_IMPLEMENTATION_PR_NUMBER,
+            rm.G8_IMPLEMENTATION_PR_DATABASE_ID,
+            rm.G8_IMPLEMENTATION_PR_NODE_ID,
+            "1" * 40,
+            "2" * 64,
+            "3" * 64,
+        )
+        evidence = ActivationBoundaryEvidence(
+            1, rm.G8_CENTRAL_REPOSITORY_NODE_ID, rm.G8_IMPLEMENTATION_PR_NUMBER,
+            rm.G8_IMPLEMENTATION_PR_DATABASE_ID, rm.G8_IMPLEMENTATION_PR_NODE_ID,
+            "4" * 40, "1" * 40, "2" * 64, "3" * 64, expected,
+        )
         self.assertEqual(evidence.activation_boundary_id, expected)
-        changed_reviewed_head = ActivationBoundaryEvidence(1, "R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA", "5" * 40, "1" * 40, "2" * 64, "3" * 64, expected)
+        changed_reviewed_head = ActivationBoundaryEvidence(
+            1, rm.G8_CENTRAL_REPOSITORY_NODE_ID, rm.G8_IMPLEMENTATION_PR_NUMBER,
+            rm.G8_IMPLEMENTATION_PR_DATABASE_ID, rm.G8_IMPLEMENTATION_PR_NODE_ID,
+            "5" * 40, "1" * 40, "2" * 64, "3" * 64, expected,
+        )
         self.assertEqual(changed_reviewed_head.activation_boundary_id, evidence.activation_boundary_id)
         with self.assertRaises(RequestModelError):
-            ActivationBoundaryEvidence(1, "R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA", "4" * 40, "1" * 40, "2" * 64, "3" * 64, "0" * 64)
+            ActivationBoundaryEvidence(
+                1, rm.G8_CENTRAL_REPOSITORY_NODE_ID, rm.G8_IMPLEMENTATION_PR_NUMBER,
+                rm.G8_IMPLEMENTATION_PR_DATABASE_ID, rm.G8_IMPLEMENTATION_PR_NODE_ID,
+                "4" * 40, "1" * 40, "2" * 64, "3" * 64, "0" * 64,
+            )
         for bad_number in (True, 0, -1):
             with self.subTest(bad_number=bad_number), self.assertRaises(RequestModelError):
-                ActivationBoundaryEvidence(1, "R_kgDOUId1Tw", bad_number, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA", "4" * 40, "1" * 40, "2" * 64, "3" * 64, expected)
+                ActivationBoundaryEvidence(
+                    1, rm.G8_CENTRAL_REPOSITORY_NODE_ID, bad_number,
+                    rm.G8_IMPLEMENTATION_PR_DATABASE_ID, rm.G8_IMPLEMENTATION_PR_NODE_ID,
+                    "4" * 40, "1" * 40, "2" * 64, "3" * 64, expected,
+                )
 
 
 class Wave11MachineAuthorityV2ModelTests(unittest.TestCase):
@@ -2849,9 +2873,15 @@ class Wave12ActivationModelTests(unittest.TestCase):
         return rm.ActivationRecoveryEvidence(**values)
 
     def test_frozen_writer_constants_are_exact_and_unique(self):
-        self.assertEqual(rm.G8_IMPLEMENTATION_PR_NUMBER, 27)
-        self.assertEqual(rm.G8_IMPLEMENTATION_PR_DATABASE_ID, 4780363432)
-        self.assertEqual(rm.G8_IMPLEMENTATION_PR_NODE_ID, "PR_kwDOUId1T88AAAABHO6OqA")
+        self.assertEqual(rm.G8_IMPLEMENTATION_PR_NUMBER, 28)
+        self.assertEqual(rm.G8_IMPLEMENTATION_PR_DATABASE_ID, 4853644304)
+        self.assertEqual(rm.G8_IMPLEMENTATION_PR_NODE_ID, "PR_kwDOUId1T88AAAABIUy8EA")
+        self.assertEqual(rm.G8_IMPLEMENTATION_HEAD_REF, "g8/postmerge-activation-repair-01")
+        self.assertEqual(rm.G8_PREDECESSOR_IMPLEMENTATION_PR_NUMBER, 27)
+        self.assertEqual(rm.G8_PREDECESSOR_IMPLEMENTATION_PR_DATABASE_ID, 4780363432)
+        self.assertEqual(rm.G8_PREDECESSOR_IMPLEMENTATION_PR_NODE_ID, "PR_kwDOUId1T88AAAABHO6OqA")
+        self.assertEqual(rm.G8_PREDECESSOR_REVIEWED_HEAD_SHA, "5120141c3d26148d8471c161acfa6d540d412519")
+        self.assertEqual(rm.G8_PREDECESSOR_MERGED_RESULT_OID, "85530496699d5456af8962c1e1f80bc81dbe83ef")
         self.assertEqual(len(rm.G8_NEW_WRITER_PATHS), 6)
         self.assertEqual(len(set(rm.G8_NEW_WRITER_PATHS)), 6)
         self.assertEqual(
@@ -2963,7 +2993,7 @@ class Wave12ActivationModelTests(unittest.TestCase):
     def test_recovery_evidence_rejects_wrong_authority_and_result_fields(self):
         base = self.evidence()
         cases = (
-            {"implementation_pr_number": 28},
+            {"implementation_pr_number": rm.G8_PREDECESSOR_IMPLEMENTATION_PR_NUMBER},
             {"implementation_pr_database_id": True},
             {"implementation_pr_node_id": "PR_other"},
             {"central_repository_node_id": "R_other"},

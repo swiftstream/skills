@@ -23,6 +23,7 @@ from .github_api import (
     CheckRun,
     CommitStatus,
     GitCommitObject,
+    GitCommitMetadata,
     GitTreeEntry,
     GitHubAPIError,
     GitHubClient,
@@ -100,6 +101,12 @@ from .request_model import (
     G8_IMPLEMENTATION_PR_NUMBER,
     G8_IMPLEMENTATION_PR_DATABASE_ID,
     G8_IMPLEMENTATION_PR_NODE_ID,
+    G8_IMPLEMENTATION_HEAD_REF,
+    G8_PREDECESSOR_IMPLEMENTATION_PR_NUMBER,
+    G8_PREDECESSOR_IMPLEMENTATION_PR_DATABASE_ID,
+    G8_PREDECESSOR_IMPLEMENTATION_PR_NODE_ID,
+    G8_PREDECESSOR_REVIEWED_HEAD_SHA,
+    G8_PREDECESSOR_MERGED_RESULT_OID,
     G8_NEW_WRITER_PATHS,
     G8_OLD_WRITERS,
     parse_activation_epoch_record,
@@ -6628,11 +6635,11 @@ class R02Controller:
         return repository, self.client.get_ref_oid(self.central_repository, repository.default_branch)
 
     def derive_activation_boundary_evidence(self) -> ActivationBoundaryEvidence:
-        """Derive the Wave11 boundary from protected-main discovery and merged-result blobs.
+        """Derive the repaired boundary from both PRs and the exact merge topology.
 
-        The protected-main contract is a lookup hint only. It is validated against a
-        frozen governance tuple before the sole fixed PR #27 read, then rebound to
-        byte-identical contract content at the exact trusted merge result.
+        The protected-main contract is a lookup hint only. It must match the frozen
+        repair/predecessor tuple before fixed fresh reads of PR #27 and PR #28, then
+        rebind byte-for-byte to the repair merge result.
         """
         expected_writers = (
             ".github/workflows/federation-g8-issue-intake.yml",
@@ -6645,17 +6652,26 @@ class R02Controller:
         expected_manifest = ".github/federation/g8-authority-surface.json"
         expected_keys = {
             "schemaVersion", "centralRepositoryNodeId", "implementationPrNumber",
-            "implementationPrDatabaseId", "implementationPrNodeId", "baseRef",
-            "activationRef", "activationStatusContext", "exactNewWriterPaths",
-            "authoritySurfaceManifestPath", "contractVersion",
+            "implementationPrDatabaseId", "implementationPrNodeId", "implementationHeadRef",
+            "predecessorImplementationPrNumber", "predecessorImplementationPrDatabaseId",
+            "predecessorImplementationPrNodeId", "predecessorReviewedHeadSha",
+            "predecessorMergedResultOid", "baseRef", "activationRef",
+            "activationStatusContext", "exactNewWriterPaths", "authoritySurfaceManifestPath",
+            "contractVersion",
         }
         expected_tuple = {
-            "schemaVersion": 1,
-            "contractVersion": "correction-12",
+            "schemaVersion": 2,
+            "contractVersion": "postmerge-activation-repair-01",
             "centralRepositoryNodeId": "R_kgDOUId1Tw",
-            "implementationPrNumber": 27,
-            "implementationPrDatabaseId": 4780363432,
-            "implementationPrNodeId": "PR_kwDOUId1T88AAAABHO6OqA",
+            "implementationPrNumber": G8_IMPLEMENTATION_PR_NUMBER,
+            "implementationPrDatabaseId": G8_IMPLEMENTATION_PR_DATABASE_ID,
+            "implementationPrNodeId": G8_IMPLEMENTATION_PR_NODE_ID,
+            "implementationHeadRef": G8_IMPLEMENTATION_HEAD_REF,
+            "predecessorImplementationPrNumber": G8_PREDECESSOR_IMPLEMENTATION_PR_NUMBER,
+            "predecessorImplementationPrDatabaseId": G8_PREDECESSOR_IMPLEMENTATION_PR_DATABASE_ID,
+            "predecessorImplementationPrNodeId": G8_PREDECESSOR_IMPLEMENTATION_PR_NODE_ID,
+            "predecessorReviewedHeadSha": G8_PREDECESSOR_REVIEWED_HEAD_SHA,
+            "predecessorMergedResultOid": G8_PREDECESSOR_MERGED_RESULT_OID,
             "baseRef": "main",
             "activationRef": "refs/heads/bot/federation-g8-activation",
             "activationStatusContext": "federation/g8-activation",
@@ -6698,6 +6714,15 @@ class R02Controller:
                 raise R02Error(f"{label} tree contains duplicate paths")
             return tree_sha, by_path
 
+        def commit_metadata(commit_sha: str, label: str) -> GitCommitMetadata:
+            try:
+                metadata = self.client.get_commit_metadata(self.central_repository, commit_sha)
+            except Exception as error:
+                raise R02Error(f"{label} commit metadata is unavailable: {_bounded_reason(error)}") from None
+            if type(metadata) is not GitCommitMetadata or metadata.sha != commit_sha:
+                raise R02Error(f"{label} commit metadata identity is invalid")
+            return metadata
+
         def exact_blob(by_path: Mapping[str, GitTreeEntry], path: str, label: str) -> tuple[str, bytes]:
             entry = by_path.get(path)
             if entry is None or entry.object_type != "blob" or entry.mode != "100644":
@@ -6723,44 +6748,71 @@ class R02Controller:
             if discovery != expected_tuple:
                 raise R02Error("protected-main discovery contract differs from the frozen governance tuple")
 
-            # The query target is a source-code constant; no event/env/caller value
-            # can choose a different PR or be queried before the hint is validated.
-            merged_pr = self.client.get_merged_pull_request_metadata(self.central_repository, 27)
-            if type(merged_pr) is not MergedPullRequestMetadata:
-                raise R02Error("trusted merged PR read returned the wrong model")
+            # Both query targets are source-code constants; no event/env/caller
+            # value can select another PR or run before the discovery hint is bound.
+            predecessor_pr = self.client.get_merged_pull_request_metadata(
+                self.central_repository, G8_PREDECESSOR_IMPLEMENTATION_PR_NUMBER,
+            )
+            repair_pr = self.client.get_merged_pull_request_metadata(
+                self.central_repository, G8_IMPLEMENTATION_PR_NUMBER,
+            )
+            if type(predecessor_pr) is not MergedPullRequestMetadata or type(repair_pr) is not MergedPullRequestMetadata:
+                raise R02Error("trusted predecessor/repair PR reads returned the wrong model")
+
+            central_repository_identity = ("swiftstream/skills", "R_kgDOUId1Tw", 1351054671)
             if (
-                merged_pr.repository_full_name != "swiftstream/skills"
-                or merged_pr.repository_node_id != "R_kgDOUId1Tw"
-                or merged_pr.repository_database_id != 1351054671
-                or merged_pr.pull_request_node_id != "PR_kwDOUId1T88AAAABHO6OqA"
-                or merged_pr.pull_request_database_id != 4780363432
-                or merged_pr.pull_request_number != 27
-                or merged_pr.head_ref != "g8/issue-first-federation-implementation"
-                or merged_pr.base_ref != "main"
-                or merged_pr.head_repository_node_id != "R_kgDOUId1Tw"
-                or merged_pr.head_repository_database_id != 1351054671
-                or merged_pr.head_repository_full_name != "swiftstream/skills"
-                or merged_pr.base_repository_node_id != "R_kgDOUId1Tw"
-                or merged_pr.base_repository_database_id != 1351054671
-                or merged_pr.base_repository_full_name != "swiftstream/skills"
+                (predecessor_pr.repository_full_name, predecessor_pr.repository_node_id, predecessor_pr.repository_database_id)
+                != central_repository_identity
+                or (predecessor_pr.pull_request_node_id, predecessor_pr.pull_request_database_id, predecessor_pr.pull_request_number)
+                != (G8_PREDECESSOR_IMPLEMENTATION_PR_NODE_ID, G8_PREDECESSOR_IMPLEMENTATION_PR_DATABASE_ID, G8_PREDECESSOR_IMPLEMENTATION_PR_NUMBER)
+                or predecessor_pr.head_ref != "g8/issue-first-federation-implementation"
+                or predecessor_pr.head_oid != G8_PREDECESSOR_REVIEWED_HEAD_SHA
+                or predecessor_pr.base_ref != "main"
+                or (predecessor_pr.head_repository_node_id, predecessor_pr.head_repository_database_id, predecessor_pr.head_repository_full_name)
+                != ("R_kgDOUId1Tw", 1351054671, "swiftstream/skills")
+                or (predecessor_pr.base_repository_node_id, predecessor_pr.base_repository_database_id, predecessor_pr.base_repository_full_name)
+                != ("R_kgDOUId1Tw", 1351054671, "swiftstream/skills")
             ):
-                raise R02Error("trusted implementation PR identity/topology does not match the frozen implementation PR")
+                raise R02Error("predecessor PR identity/head/topology does not match the frozen predecessor")
             if (
-                merged_pr.state == "OPEN"
-                and merged_pr.merged is False
-                and merged_pr.merged_at is None
-                and merged_pr.merge_commit_oid is None
+                predecessor_pr.state != "MERGED"
+                or predecessor_pr.is_draft is not False
+                or predecessor_pr.merged is not True
+                or predecessor_pr.merged_at is None
+                or predecessor_pr.merge_commit_oid != G8_PREDECESSOR_MERGED_RESULT_OID
             ):
-                raise PreG8NotApplicableError("fixed implementation PR has not formed a merged G8 boundary")
+                raise R02Error("predecessor PR merge state/result is contradictory")
+
             if (
-                merged_pr.state != "CLOSED"
-                or merged_pr.is_draft is not False
-                or merged_pr.merged is not True
-                or merged_pr.merged_at is None
-                or merged_pr.merge_commit_oid is None
+                (repair_pr.repository_full_name, repair_pr.repository_node_id, repair_pr.repository_database_id)
+                != central_repository_identity
+                or (repair_pr.pull_request_node_id, repair_pr.pull_request_database_id, repair_pr.pull_request_number)
+                != (G8_IMPLEMENTATION_PR_NODE_ID, G8_IMPLEMENTATION_PR_DATABASE_ID, G8_IMPLEMENTATION_PR_NUMBER)
+                or repair_pr.head_ref != G8_IMPLEMENTATION_HEAD_REF
+                or repair_pr.base_ref != "main"
+                or repair_pr.base_oid != G8_PREDECESSOR_MERGED_RESULT_OID
+                or (repair_pr.head_repository_node_id, repair_pr.head_repository_database_id, repair_pr.head_repository_full_name)
+                != ("R_kgDOUId1Tw", 1351054671, "swiftstream/skills")
+                or (repair_pr.base_repository_node_id, repair_pr.base_repository_database_id, repair_pr.base_repository_full_name)
+                != ("R_kgDOUId1Tw", 1351054671, "swiftstream/skills")
             ):
-                raise R02Error("fixed implementation PR merge state is contradictory")
-            merged_result_oid = merged_pr.merge_commit_oid
+                raise R02Error("repair PR identity/base/topology does not match the frozen repair boundary")
+            if (
+                repair_pr.state != "MERGED"
+                or repair_pr.is_draft is not False
+                or repair_pr.merged is not True
+                or repair_pr.merged_at is None
+                or repair_pr.merge_commit_oid is None
+            ):
+                raise R02Error("repair PR merge state is contradictory")
+
+            merged_result_oid = repair_pr.merge_commit_oid
+            repair_merge_metadata = commit_metadata(merged_result_oid, "repair merged result")
+            repair_head_metadata = commit_metadata(repair_pr.head_oid, "reviewed repair PR head")
+            if repair_merge_metadata.parents != (G8_PREDECESSOR_MERGED_RESULT_OID, repair_pr.head_oid):
+                raise R02Error("repair merge commit does not have the exact predecessor/head parent tuple")
+            if repair_merge_metadata.tree_sha != repair_head_metadata.tree_sha:
+                raise R02Error("repair merge tree does not match the reviewed repair PR head tree")
             try:
                 compare_status, compare_base, compare_merge_base = self.client.compare_commits(
                     self.central_repository, merged_result_oid, current_main,
@@ -6776,7 +6828,7 @@ class R02Controller:
             _merged_tree, merged_blobs = committed_blobs(merged_result_oid, "merged-result")
             merged_contract_blob_oid, merged_contract_bytes = exact_blob(merged_blobs, contract_path, "merged-result activation contract")
             if merged_contract_bytes != discovery_bytes:
-                raise R02Error("protected-main discovery and merged-result contract bytes differ")
+                raise R02Error("protected-main repair discovery and repair merged-result contract bytes differ")
             merged_contract = exact_json(merged_contract_bytes, "merged-result activation contract", expected_keys)
             if merged_contract != expected_tuple:
                 raise R02Error("merged-result activation contract differs from frozen PR/governance identity")
@@ -6803,16 +6855,17 @@ class R02Controller:
             surface_digest = authority_surface_digest(merged_contract_blob_oid, manifest_blob_oid, entries)
             topology_digest = new_writer_topology_digest(writer_entries)
             boundary_id = activation_boundary_id_digest(
-                "R_kgDOUId1Tw", 27, 4780363432, "PR_kwDOUId1T88AAAABHO6OqA",
+                "R_kgDOUId1Tw", G8_IMPLEMENTATION_PR_NUMBER,
+                G8_IMPLEMENTATION_PR_DATABASE_ID, G8_IMPLEMENTATION_PR_NODE_ID,
                 merged_result_oid, surface_digest, topology_digest,
             )
             return ActivationBoundaryEvidence(
                 schema_version=1,
                 central_repository_node_id="R_kgDOUId1Tw",
-                implementation_pr_number=27,
-                implementation_pr_database_id=4780363432,
-                implementation_pr_node_id="PR_kwDOUId1T88AAAABHO6OqA",
-                implementation_reviewed_head_sha=merged_pr.head_oid,
+                implementation_pr_number=G8_IMPLEMENTATION_PR_NUMBER,
+                implementation_pr_database_id=G8_IMPLEMENTATION_PR_DATABASE_ID,
+                implementation_pr_node_id=G8_IMPLEMENTATION_PR_NODE_ID,
+                implementation_reviewed_head_sha=repair_pr.head_oid,
                 merged_result_oid=merged_result_oid,
                 authority_surface_digest=surface_digest,
                 new_writer_topology_digest=topology_digest,

@@ -1716,7 +1716,7 @@ class GitHubClient:
         if type(returned_number) is not int or type(returned_number) is bool or returned_number != number:
             raise InvalidResponseError("merged PR number does not match requested number")
         state = pull.get("state")
-        if type(state) is not str or state not in {"OPEN", "CLOSED"}:
+        if type(state) is not str or state not in {"OPEN", "CLOSED", "MERGED"}:
             raise InvalidResponseError("merged PR state is invalid")
         is_draft, merged = pull.get("isDraft"), pull.get("merged")
         if type(is_draft) is not bool or type(merged) is not bool:
