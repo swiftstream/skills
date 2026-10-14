@@ -2271,7 +2271,7 @@ class Wave11MergedPullRequestReadTests(unittest.TestCase):
     def payload(self, **pull_overrides):
         pull = {
             "id": "PR_kwDOUId1T88AAAABHO6OqA", "databaseId": 4780363432, "number": 27,
-            "state": "CLOSED", "isDraft": False, "merged": True,
+            "state": "MERGED", "isDraft": False, "merged": True,
             "mergedAt": "2026-10-08T10:11:12Z", "mergeCommit": {"oid": "a" * 40},
             "headRefOid": "b" * 40, "baseRefOid": "c" * 40,
             "headRefName": "g8/issue-first-federation-implementation", "baseRefName": "main",
@@ -2294,6 +2294,7 @@ class Wave11MergedPullRequestReadTests(unittest.TestCase):
     def test_exact_read_only_merged_pr_model(self):
         result, transport = self.read(self.payload())
         self.assertIs(type(result), MergedPullRequestMetadata)
+        self.assertEqual(result.state, "MERGED")
         self.assertEqual(result.repository_full_name, "swiftstream/skills")
         self.assertEqual(result.pull_request_database_id, 4780363432)
         self.assertEqual(result.merge_commit_oid, "a" * 40)
@@ -2304,6 +2305,15 @@ class Wave11MergedPullRequestReadTests(unittest.TestCase):
         request = json.loads(body)
         self.assertEqual(request["query"], MERGED_PULL_REQUEST_QUERY)
         self.assertEqual(request["variables"], {"owner": "swiftstream", "name": "skills", "number": 27})
+
+    def test_accepts_only_known_pull_request_states_and_preserves_raw_state(self):
+        for state in ("OPEN", "CLOSED", "MERGED"):
+            with self.subTest(state=state):
+                result, _transport = self.read(self.payload(state=state))
+                self.assertEqual(result.state, state)
+
+        with self.assertRaises(InvalidResponseError):
+            self.read(self.payload(state="UNKNOWN"))
 
     def test_rejects_wrong_shape_types_and_noncanonical_metadata(self):
         cases = (
